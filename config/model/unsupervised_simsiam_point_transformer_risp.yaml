@@ -1,0 +1,51 @@
+_target_: neural_signatures.modules.unsupervised_modules.SimSiamSignaturePredictionModule
+preprocess_mlp: null
+postprocess_mlp: null
+#postgnn_mlp: null
+postgnn_mlp:
+  _target_: deltaconv.nn.MLP
+  channels: [256, 64]
+  bias: False
+  nonlin:
+    _target_: torch.nn.LeakyReLU
+    negative_slope: 0.2
+output_channels: 128
+#preprocess_mlp:
+#  _target_: neural_signatures.modules.architectures.ConfigurableMLP
+#  channels: [3, 16, 32]
+#  use_batch_norm: False
+#  activation: neural_signatures.nn.activations.Sine
+#postprocess_mlp:
+#  _target_: neural_signatures.modules.architectures.ConfigurableMLP
+#  channels: [256, 128]
+#  use_batch_norm: False
+#  activation: null
+gnn:
+  _target_: deltaconv.models.DeltaNetBase
+  in_channels: 14
+  conv_channels: [32, 32, 64, 128]
+  mlp_depth: 2
+  num_neighbors: 5
+  grad_regularizer: 0.001
+  grad_kernel_width: 1
+#gnn:
+#  _target_: neural_signatures.modules.architectures.ConfigurableGNN
+#  mlp_layers:
+#   - _target_: deltaconv.nn.MLP
+#     channels: [256, 128, 64, 64]
+#     bias: True
+#     nonlin:
+#       _target_: torch.nn.LeakyReLU
+#       negative_slope: 0.2
+#  conv_layers:
+#    - _target_: torch_geometric.nn.conv.TransformerConv
+#      in_channels: 3
+#      out_channels: 32
+#      heads: 8
+#      concat: True
+#  k: 20
+#  recompute_knn: False
+#  concat_residual: False
+pooling_layers: ['torch_geometric.nn.global_mean_pool', 'torch_geometric.nn.global_max_pool']
+criterion:
+  _target_: 'lightly.loss.NegativeCosineSimilarity'

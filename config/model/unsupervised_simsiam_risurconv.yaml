@@ -1,0 +1,20 @@
+_target_: neural_signatures.modules.unsupervised_modules.SimSiamSignaturePredictionModule
+gnn_cfg:
+  _target_: neural_signatures.modules.architectures.ConfigurableGNN
+  _partial_: True
+  conv_class_name: neural_signatures.convolutions.riconv.RISurConv
+  channels: [3, 512, 512, 512, 512]
+  use_batch_norm: True
+  activation_name: torch.nn.GELU
+prepooling_mlp_cfg: null
+pooling_layers: ['torch_geometric.nn.global_mean_pool', 'torch_geometric.nn.global_max_pool']
+postpooling_mlp_cfg:
+  _target_: neural_signatures.modules.architectures.ConfigurableMLP
+  _partial_: True
+  channels: [256, 128]
+  use_batch_norm: True
+  activation: torch.nn.GELU
+gnn_channels_key: 'channels'
+gnn_channels_concat: True
+criterion:
+  _target_: 'lightly.loss.NegativeCosineSimilarity'

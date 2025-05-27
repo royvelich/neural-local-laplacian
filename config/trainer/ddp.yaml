@@ -1,0 +1,7 @@
+defaults:
+  - default@_here_
+
+accelerator: 'gpu'
+strategy: 'auto'
+sync_batchnorm: True
+devices: -1

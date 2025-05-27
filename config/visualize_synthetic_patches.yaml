@@ -1,0 +1,3 @@
+defaults:
+  - data_module: synthetic_visualization_noisy_sphere
+  - globals: visualization

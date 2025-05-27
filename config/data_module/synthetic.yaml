@@ -1,0 +1,38 @@
+_target_: neural_signatures.data_modules.synthetic_data_modules.PolynomialSurfaceDataModule
+train_dataset:
+  _target_: neural_signatures.datasets.synthetic_datasets.PolynomialSurfaceDataset
+  epoch_size: ${globals.train_epoch_size}
+  grid_size: ${globals.grid_size}
+  order_range: ${globals.order_range}
+  coefficient_scale_range: ${globals.coefficient_scale_range}
+  grid_range: ${globals.grid_range}
+  coeff_generation_method: ${globals.coeff_generation_method}
+  sampling_ratio_range: ${globals.sampling_ratio_range}
+  anchors_ratio: ${globals.anchors_ratio}
+  visualization: ${globals.visualization}
+  canonical_pose: ${globals.canonical_pose}
+  sampled_patches: 2
+val_dataset:
+  _target_: neural_signatures.datasets.synthetic_datasets.PolynomialSurfaceDataset
+  epoch_size: ${globals.val_epoch_size}
+  grid_size: ${globals.grid_size}
+  order_range: ${globals.order_range}
+  coefficient_scale_range: ${globals.coefficient_scale_range}
+  grid_range: ${globals.grid_range}
+  coeff_generation_method: ${globals.coeff_generation_method}
+  sampling_ratio_range: ${globals.sampling_ratio_range}
+  anchors_ratio: ${globals.anchors_ratio}
+  visualization: ${globals.visualization}
+  canonical_pose: ${globals.canonical_pose}
+  sampled_patches: 2
+val_mesh_dataset:
+  _target_: neural_signatures.datasets.mesh_datasets.RemeshingDataset
+  root_dirs:
+    - ${globals.mesh_files_base_dir}/shrec07
+    - ${globals.mesh_files_base_dir}/shrec15
+    - ${globals.mesh_files_base_dir}/mpz14
+  remesh_config: null
+  file_size_threshold: 10
+
+batch_size: ${globals.batch_size}
+num_workers: ${globals.num_workers}

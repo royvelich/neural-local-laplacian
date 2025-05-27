@@ -1,0 +1,10 @@
+_target_: neural_signatures.modules.supervised_modules.SignaturePredictionDeltaConvModule
+grid_size: ${globals.grid_size}
+delta_conv_cfg:
+  in_channels: 3
+  conv_channels: [64, 64, 128, 256]
+  mlp_depth: 2
+  num_neighbors: 20
+  grad_regularizer: 0.001
+  grad_kernel_width: 1
+  lin_embeddings: 1024

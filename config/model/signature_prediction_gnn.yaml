@@ -1,0 +1,11 @@
+_target_: neural_signatures.modules.supervised_modules.SignaturePredictionModule
+grid_size: ${globals.grid_size}
+gnn_cfg:
+  conv_class: torch_geometric.nn.conv.PointTransformerConv
+  channels: [3, 512, 512, 512, 512]
+  use_batch_norm: True
+  activation: neural_signatures.nn.activations.Sine
+mlp_cfg:
+  channels: [512, 512, 512, 512]
+  use_batch_norm: True
+  activation: neural_signatures.nn.activations.Sine
