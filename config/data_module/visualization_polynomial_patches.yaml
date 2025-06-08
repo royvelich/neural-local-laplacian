@@ -1,8 +1,8 @@
-_target_: neural_signatures.data_modules.synthetic_data_modules.SyntheticSurfaceDataModule
+_target_: neural_local_laplacian.data_modules.synthetic_data_modules.SyntheticSurfaceDataModule
 train_dataset_specification:
-  _target_: neural_signatures.data_modules.synthetic_data_modules.DatasetSpecification
+  _target_: neural_local_laplacian.data_modules.synthetic_data_modules.DatasetSpecification
   dataset:
-    _target_: neural_signatures.datasets.synthetic_datasets.PolynomialSurfaceDataset
+    _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
     epoch_size: ${globals.train_epoch_size}
     grid_points_count: ${globals.grid_points_count}
     grid_generation_method: ${globals.grid_generation_method}
@@ -13,10 +13,10 @@ train_dataset_specification:
     features_type: ${globals.features_type}
     pose_type: ${globals.pose_type}
     use_autograd: True
-    sampled_patches: 2
+    sampled_patches: 1
     max_ring: null
     seed: ${globals.seed}
-    add_regularized_mesh: True
+    add_regularized_mesh: False
     order_range: ${globals.order_range}
     coefficient_scale_range: ${globals.coefficient_scale_range}
     coeff_generation_method: ${globals.coeff_generation_method}

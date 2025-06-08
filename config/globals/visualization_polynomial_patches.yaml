@@ -11,5 +11,5 @@ val_num_workers: 0
 #coefficient_scale_range: [0.1, 0.4]
 #sampling_ratio_range: [0.1, 0.4]
 pose_type:
-  _target_: neural_signatures.datasets.synthetic_datasets.PoseType
+  _target_: neural_local_laplacian.datasets.synthetic_datasets.PoseType
   _args_: ['none']

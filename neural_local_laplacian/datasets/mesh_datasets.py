@@ -40,7 +40,7 @@ from neural_local_laplacian.datasets.base_datasets import (
 
 # polyscope
 import polyscope as ps
-from gdist import local_gdist_matrix
+# from gdist import local_gdist_matrix
 
 # trimesh
 import trimesh
