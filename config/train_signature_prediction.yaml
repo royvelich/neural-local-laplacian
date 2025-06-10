@@ -1,5 +1,0 @@
-#defaults:
-#  - data_module: synthetic_noisy_sphere
-#  - globals: train
-#  - trainer: default
-#  - optimizer: adamw

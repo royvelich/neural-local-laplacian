@@ -9,7 +9,6 @@ from torch_geometric.data import Dataset, Data
 
 # Local imports
 from neural_local_laplacian.datasets.synthetic_datasets import SyntheticSurfaceDataset
-from neural_local_laplacian.datasets.mesh_datasets import RemeshingDataset
 
 
 # neural signatures
