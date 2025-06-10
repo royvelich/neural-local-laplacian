@@ -86,11 +86,11 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         return self._epoch_size
 
     @abstractmethod
-    def _generate_surface(self, downsample_ratio: Optional[float]) -> Data:
+    def _generate_surfaces(self, downsample_ratio: Optional[float]) -> Data:
         """Generate a surface with optional downsampling."""
         pass
 
-    def _repose_surface_and_quantities(self, data: Data, normals: torch.Tensor, diff_geom: Dict[str, torch.Tensor]) -> Data:
+    def _repose_surface_and_quantities(self, data: Data, normals: torch.Tensor) -> Data:
         """Apply pose transformation to surface and transform differential quantities accordingly."""
         center = torch.mean(data.pos, dim=0)
         points = data.pos - center
@@ -110,19 +110,126 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             normals_transformed = torch.matmul(normals, rotation_matrix)
             data['normal'] = normals_transformed
 
-        # Transform differential geometry quantities
-        for key, value in diff_geom.items():
-            if key in ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d'] and rotation_matrix is not None:
-                # Transform 3D vector quantities
-                data[key] = torch.matmul(value, rotation_matrix)
-            else:
-                # Keep scalar quantities and 2D quantities unchanged
-                data[key] = value
+        # Transform differential geometry quantities that are already in data
+        if rotation_matrix is not None:
+            vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d']
+            for key in vector_3d_keys:
+                if key in data:
+                    data[key] = torch.matmul(data[key], rotation_matrix)
 
         return data
 
-    def get(self, idx: int) -> List[List[Data]]:
+    def _create_base_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
+                                  dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float) -> Data:
+        """
+        Create base surface data object with positions, mesh, normals, and differential geometry.
+
+        Args:
+            x: Parameter space x coordinates
+            y: Parameter space y coordinates
+            z: Surface heights
+            dz_dx: First derivative of z with respect to x
+            dz_dy: First derivative of z with respect to y
+            points_scale: Scaling factor for positions
+
+        Returns:
+            Data: Base surface data object with positions, faces, normals, and differential geometry
+        """
+        # Create base data object with scaled positions and mesh
+        data = Data()
+        data['pos'] = torch.stack(tensors=[x, y, z], dim=1) * points_scale
+        data['face'] = self._create_surface_mesh(pos=data.pos)
+
+        # Compute and set surface normals before pose transformation
+        data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy)
+
+        # Compute differential geometry quantities and add them to data
+        diff_geom = self._compute_differential_geometry(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
+        for key, value in diff_geom.items():
+            data[key] = value
+
+        return data
+
+    def _add_surface_features(self, data: Data) -> None:
+        """
+        Add appropriate features to the surface data object based on features type.
+
+        Args:
+            data: Surface data object to add features to (modified in place)
+        """
+        # Add appropriate features to the surface
+        if self._features_type == FeaturesType.RISP:
+            data['x'] = utils.compute_risp_features(points=data.pos.detach().cpu().numpy(),
+                                                    normals=data.normal.detach().cpu().numpy())
+            data['x'] = torch.from_numpy(data['x']).float()
+        elif self._features_type == FeaturesType.XYZ:
+            data['x'] = data.pos.unsqueeze(dim=1)
+
+    def _create_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
+                             dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float) -> Data:
+        """
+        Create a complete surface data object with positions, mesh, differential geometry, and features.
+
+        Args:
+            x: Parameter space x coordinates
+            y: Parameter space y coordinates
+            z: Surface heights
+            dz_dx: First derivative of z with respect to x
+            dz_dy: First derivative of z with respect to y
+            points_scale: Scaling factor for positions
+
+        Returns:
+            Data: Complete surface data object with all computed quantities
+        """
+        # Create base surface data with positions, mesh, normals, and differential geometry
+        data = self._create_base_surface_data(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy, points_scale=points_scale)
+
+        # Apply pose transformation to positions and differential quantities (updates normals if needed)
+        data = self._repose_surface_and_quantities(data=data, normals=data['normal'])
+
+        # Add features to the surface
+        self._add_surface_features(data=data)
+
+        return data
+
+    def _generate_surfaces(self, downsample_ratios: List[Optional[float]]) -> List[Data]:
+        """Generate multiple samplings of the same parametric surface."""
+        # Generate surface parameters once (shared across all samplings)
+        surface_params = self._generate_surface_parameters()
+
+        # Sample other parameters once
+        grid_radius = self._sample_parameter(param_range=self._grid_radius_range)
+        points_scale = self._sample_parameter(param_range=self._points_scale_range)
+        grid_offset = self._sample_parameter(param_range=self._grid_offset_range)
+        grid_range = (-grid_radius + grid_offset, grid_radius + grid_offset)
+
         surfaces = []
+        for downsample_ratio in downsample_ratios:
+            # Generate grid for this sampling
+            if downsample_ratio is None:
+                x, y = self._generate_mesh_grid(grid_range=grid_range)
+            else:
+                x, y = self._generate_uniform_grid(grid_range=grid_range, downsample_ratio=downsample_ratio)
+
+            # Convert to float32 and enable gradients
+            x = x.to(dtype=torch.float32).requires_grad_(requires_grad=True)
+            y = y.to(dtype=torch.float32).requires_grad_(requires_grad=True)
+
+            # Evaluate surface using shared parameters
+            z = self._evaluate_surface_with_parameters(x=x, y=y, surface_params=surface_params).to(dtype=torch.float32)
+
+            # Compute first derivatives BEFORE creating surface data
+            dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
+
+            # Create complete surface data object
+            data = self._create_surface_data(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy, points_scale=points_scale)
+
+            surfaces.append(data)
+
+        return surfaces
+
+    def get(self, idx: int) -> List[Data]:
+        # Prepare downsample ratios
         downsample_ratios = list(self._rng.uniform(
             low=self._sampling_ratio_range[0],
             high=self._sampling_ratio_range[1],
@@ -131,18 +238,10 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         if self._add_regularized_surface:
             downsample_ratios = [None] + downsample_ratios
 
-        for i, downsample_ratio in enumerate(downsample_ratios):
-            data = self._generate_surface(downsample_ratio=downsample_ratio)
-            # Note: reposing is now handled inside _generate_surface with proper transformation of differential quantities
+        # Generate multiple samplings of the same surface (with features included)
+        surfaces = self._generate_surfaces(downsample_ratios=downsample_ratios)
 
-            if self._features_type == FeaturesType.RISP:
-                data['x'] = utils.compute_risp_features(points=data.pos, normals=data.normal)
-            elif self._features_type == FeaturesType.XYZ:
-                data['x'] = data.pos.unsqueeze(dim=1)
-
-            surfaces.append(data)
-
-        return [surfaces]
+        return surfaces
 
 
 class ParametricSurfaceDataset(SyntheticSurfaceDataset):
@@ -416,49 +515,14 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         return diff_geom
 
     @abstractmethod
-    def _evaluate_random_surface(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Evaluate surface height at given parameter coordinates."""
+    def _generate_surface_parameters(self) -> Dict[str, Any]:
+        """Generate random parameters for the surface (coefficients, etc.)."""
         pass
 
-    def _generate_surface(self, downsample_ratio: Optional[float]) -> Data:
-        """Generate surface with differential geometry computation."""
-        # Sample parameters
-        grid_radius = self._sample_parameter(param_range=self._grid_radius_range)
-        points_scale = self._sample_parameter(param_range=self._points_scale_range)
-        grid_offset = self._sample_parameter(param_range=self._grid_offset_range)
-
-        # Generate grid
-        grid_range = (-grid_radius + grid_offset, grid_radius + grid_offset)
-        if downsample_ratio is None:
-            x, y = self._generate_mesh_grid(grid_range=grid_range)
-        else:
-            x, y = self._generate_uniform_grid(grid_range=grid_range, downsample_ratio=downsample_ratio)
-
-        # Convert to float32 and enable gradients
-        x = x.to(dtype=torch.float32).requires_grad_(requires_grad=True)
-        y = y.to(dtype=torch.float32).requires_grad_(requires_grad=True)
-
-        # Evaluate surface
-        z = self._evaluate_random_surface(x=x, y=y).to(dtype=torch.float32)
-
-        # Create data object with scaled positions
-        data = Data()
-        data['pos'] = torch.stack(tensors=[x, y, z], dim=1) * points_scale
-        data['face'] = self._create_surface_mesh(pos=data.pos)
-
-        # Compute first derivatives BEFORE reposing (while we still have parametric form)
-        dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
-
-        # Compute normals BEFORE reposing
-        normals_original = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy)
-
-        # Compute differential geometry BEFORE reposing
-        diff_geom = self._compute_differential_geometry(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
-
-        # Now apply pose transformation to positions and differential quantities
-        data = self._repose_surface_and_quantities(data=data, normals=normals_original, diff_geom=diff_geom)
-
-        return data
+    @abstractmethod
+    def _evaluate_surface_with_parameters(self, x: torch.Tensor, y: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
+        """Evaluate surface height at given parameter coordinates using pre-generated parameters."""
+        pass
 
 
 class PolynomialSurfaceDataset(ParametricSurfaceDataset):
@@ -491,8 +555,8 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         """Calculate number of coefficients for polynomial order."""
         return sum(1 for x in range(order + 1) for y in range(order + 1) if 0 < x + y <= order)
 
-    def _generate_coefficients(self) -> Tuple[torch.Tensor, int]:
-        """Generate random polynomial coefficients."""
+    def _generate_surface_parameters(self) -> Dict[str, Any]:
+        """Generate random polynomial coefficients and order."""
         order = int(self._rng.integers(low=self._order_range[0], high=self._order_range[1] + 1))
         num_coeffs = self._get_num_coeffs(order=order)
         coefficient_scale = self._sample_parameter(param_range=self._coefficient_scale_range)
@@ -504,11 +568,16 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         else:
             raise ValueError(f"Invalid coefficient generation method: {self._coeff_generation_method}")
 
-        return coefficients, order
+        return {
+            'coefficients': coefficients,
+            'order': order
+        }
 
-    def _evaluate_random_surface(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Evaluate polynomial surface."""
-        coefficients, order = self._generate_coefficients()
+    def _evaluate_surface_with_parameters(self, x: torch.Tensor, y: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
+        """Evaluate polynomial surface using pre-generated parameters."""
+        coefficients = surface_params['coefficients']
+        order = surface_params['order']
+
         pairs = [(i, j) for i in range(order + 1) for j in range(order + 1) if 0 < i + j <= order]
         z = torch.zeros_like(input=x)
         for c, pair in zip(coefficients, pairs):
