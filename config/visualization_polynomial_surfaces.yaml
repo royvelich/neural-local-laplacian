@@ -1,3 +1,0 @@
-defaults:
-  - data_module: visualization_polynomial_patches
-  - globals: visualization

@@ -29,12 +29,166 @@ import igl
 # neural signatures
 from neural_local_laplacian.utils import utils
 from neural_local_laplacian.datasets.base_datasets import (
-    GridGenerationMethod,
     CoeffGenerationMethod,
     DeformationType,
     PoseType,
     FeaturesType)
+from neural_local_laplacian.utils.features import FeatureExtractor
 
+# trimesh
+import trimesh
+
+# noise
+from noise import snoise3
+
+
+# =============================================
+# Grid Sampler Classes
+# =============================================
+
+class GridSampler(ABC):
+    """Abstract base class for grid sampling strategies."""
+
+    @abstractmethod
+    def sample(self, grid_range: Tuple[float, float], rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample x, y coordinates within the given grid range.
+
+        Args:
+            grid_range: Tuple of (min_val, max_val) defining the sampling range
+            rng: Random number generator for reproducible sampling
+
+        Returns:
+            Tuple of (x, y) tensors containing sampled coordinates
+        """
+        pass
+
+
+class RegularGridSampler(GridSampler):
+    """Samples points on a regular rectangular grid."""
+
+    def __init__(self, num_points: int):
+        """
+        Initialize the regular grid sampler.
+
+        Args:
+            num_points: Total number of points to sample (will be adjusted to nearest perfect square)
+        """
+        self._num_points = num_points
+        # Adjust to nearest perfect square for regular grid
+        self._grid_size = int(np.sqrt(num_points))
+        self._actual_points = self._grid_size ** 2
+
+        if self._actual_points != num_points:
+            print(f"Warning: Adjusted grid points from {num_points} to {self._actual_points} (nearest perfect square)")
+
+    def sample(self, grid_range: Tuple[float, float], rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample points on a regular grid.
+
+        Args:
+            grid_range: Tuple of (min_val, max_val) defining the sampling range
+            rng: Random number generator (not used for regular grid, but kept for interface consistency)
+
+        Returns:
+            Tuple of (x, y) tensors with regularly spaced coordinates
+        """
+        x_linspace = torch.linspace(start=grid_range[0], end=grid_range[1], steps=self._grid_size)
+        y_linspace = torch.linspace(start=grid_range[0], end=grid_range[1], steps=self._grid_size)
+        x, y = torch.meshgrid(x_linspace, y_linspace, indexing='ij')
+        return x.flatten(), y.flatten()
+
+    @property
+    def num_points(self) -> int:
+        """Get the actual number of points that will be sampled."""
+        return self._actual_points
+
+
+class RandomGridSampler(GridSampler):
+    """Samples points uniformly at random within the grid range."""
+
+    def __init__(self, num_points_range: Union[int, Tuple[int, int]]):
+        """
+        Initialize the random grid sampler.
+
+        Args:
+            num_points_range: Either a single integer for fixed number of points,
+                            or a tuple (min_points, max_points) for variable sampling
+        """
+        # Handle OmegaConf objects (common with Hydra)
+        try:
+            from omegaconf import ListConfig, DictConfig
+            if isinstance(num_points_range, (ListConfig, DictConfig)):
+                # Convert OmegaConf to regular Python types
+                num_points_range = list(num_points_range) if isinstance(num_points_range, ListConfig) else num_points_range
+        except ImportError:
+            # OmegaConf not available, continue with regular handling
+            pass
+
+        # Convert different input types and provide better error messages
+        if isinstance(num_points_range, int):
+            self._num_points_range = (num_points_range, num_points_range)
+        elif isinstance(num_points_range, (tuple, list)):
+            if len(num_points_range) == 2:
+                # Convert to integers if they're not already
+                try:
+                    self._num_points_range = (int(num_points_range[0]), int(num_points_range[1]))
+                except (ValueError, TypeError) as e:
+                    raise ValueError(f"num_points_range elements must be convertible to integers, got {num_points_range}: {e}")
+
+                if self._num_points_range[0] > self._num_points_range[1]:
+                    raise ValueError(f"Min points {self._num_points_range[0]} > max points {self._num_points_range[1]}")
+            else:
+                raise ValueError(f"num_points_range tuple/list must have exactly 2 elements, got {len(num_points_range)} elements: {num_points_range}")
+        else:
+            raise ValueError(f"num_points_range must be an integer or a tuple/list of two integers, got {type(num_points_range)}: {num_points_range}")
+
+        # Validate minimum points
+        if self._num_points_range[0] < 3:
+            raise ValueError(f"Minimum number of points must be >= 3, got {self._num_points_range[0]}")
+
+        # Validate that points are positive integers
+        if not all(isinstance(x, int) and x > 0 for x in self._num_points_range):
+            raise ValueError(f"All point counts must be positive integers, got {self._num_points_range}")
+
+    def sample(self, grid_range: Tuple[float, float], rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample points uniformly at random within the grid range.
+
+        Args:
+            grid_range: Tuple of (min_val, max_val) defining the sampling range
+            rng: Random number generator for reproducible sampling
+
+        Returns:
+            Tuple of (x, y) tensors with randomly sampled coordinates
+        """
+        # Sample number of points if range is provided
+        if self._num_points_range[0] == self._num_points_range[1]:
+            num_points = self._num_points_range[0]
+        else:
+            num_points = int(rng.integers(
+                low=self._num_points_range[0],
+                high=self._num_points_range[1] + 1
+            ))
+
+        # Generate random points
+        points = rng.uniform(
+            low=grid_range[0],
+            high=grid_range[1],
+            size=(num_points, 2)
+        )
+
+        return torch.tensor(data=points[:, 0]), torch.tensor(data=points[:, 1])
+
+    @property
+    def num_points_range(self) -> Tuple[int, int]:
+        """Get the range of number of points that can be sampled."""
+        return self._num_points_range
+
+
+# =============================================
+# Differential Geometry and Dataset Classes
+# =============================================
 
 class DifferentialGeometryComponent(Enum):
     MEAN_CURVATURE = 'mean_curvature'
@@ -44,38 +198,23 @@ class DifferentialGeometryComponent(Enum):
     SIGNATURE = 'signature'
 
 
-# trimesh
-import trimesh
-
-# noise
-from noise import snoise3
-
-
 class SyntheticSurfaceDataset(ABC, Dataset):
     """Base class for synthetic surface datasets."""
 
     def __init__(
             self,
             epoch_size: int,
-            grid_points_count: int,
-            sampling_ratio_range: Tuple[float, float],
-            sampled_surfaces: int,
             pose_type: Optional[PoseType],
             seed: int,
-            add_regularized_surface: bool,
-            features_type: FeaturesType,
-            conv_k_nearest: Optional[int],
+            feature_extractor: Optional[FeatureExtractor] = None,
+            conv_k_nearest: Optional[int] = None,
     ):
         super().__init__()
         self._seed = seed
         self._rng = np.random.default_rng(seed)
         self._epoch_size = epoch_size
-        self._grid_points_count = grid_points_count
-        self._sampling_ratio_range = sampling_ratio_range
-        self._sampled_surfaces = sampled_surfaces
         self._pose_type = pose_type
-        self._add_regularized_surface = add_regularized_surface
-        self._features_type = features_type
+        self._feature_extractor = feature_extractor
         self._conv_k_nearest = conv_k_nearest
 
     def reset_rng(self) -> None:
@@ -85,9 +224,38 @@ class SyntheticSurfaceDataset(ABC, Dataset):
     def len(self) -> int:
         return self._epoch_size
 
+    def _generate_surfaces(self) -> List[Data]:
+        """
+        Generate multiple surfaces and add features to them.
+
+        This is the main orchestration method that:
+        1. Calls the derived class implementation to generate raw surface data
+        2. Adds features to each surface using the feature extractor
+
+        Returns:
+            List of Data objects with positions, normals, differential geometry, and features
+        """
+        # Generate raw surfaces using derived class implementation
+        surfaces = self._generate_raw_surfaces()
+
+        # Add features to each surface
+        for surface in surfaces:
+            self._add_surface_features(surface)
+
+        return surfaces
+
     @abstractmethod
-    def _generate_surfaces(self, downsample_ratio: Optional[float]) -> Data:
-        """Generate a surface with optional downsampling."""
+    def _generate_raw_surfaces(self) -> List[Data]:
+        """
+        Generate multiple raw surfaces without features.
+
+        This method should be implemented by derived classes to generate
+        surface data with positions, normals, and differential geometry,
+        but WITHOUT features (the 'x' attribute).
+
+        Returns:
+            List of Data objects with surface geometry but no features
+        """
         pass
 
     def _repose_surface_and_quantities(self, data: Data, normals: torch.Tensor) -> Data:
@@ -119,128 +287,30 @@ class SyntheticSurfaceDataset(ABC, Dataset):
 
         return data
 
-    def _create_base_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
-                                  dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float) -> Data:
-        """
-        Create base surface data object with positions, mesh, normals, and differential geometry.
-
-        Args:
-            x: Parameter space x coordinates
-            y: Parameter space y coordinates
-            z: Surface heights
-            dz_dx: First derivative of z with respect to x
-            dz_dy: First derivative of z with respect to y
-            points_scale: Scaling factor for positions
-
-        Returns:
-            Data: Base surface data object with positions, faces, normals, and differential geometry
-        """
-        # Create base data object with scaled positions and mesh
-        data = Data()
-        data['pos'] = torch.stack(tensors=[x, y, z], dim=1) * points_scale
-        data['face'] = self._create_surface_mesh(pos=data.pos)
-
-        # Compute and set surface normals before pose transformation
-        data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy)
-
-        # Compute differential geometry quantities and add them to data
-        diff_geom = self._compute_differential_geometry(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
-        for key, value in diff_geom.items():
-            data[key] = value
-
-        return data
-
     def _add_surface_features(self, data: Data) -> None:
         """
-        Add appropriate features to the surface data object based on features type.
+        Add appropriate features to the surface data object using the feature extractor.
 
         Args:
             data: Surface data object to add features to (modified in place)
         """
-        # Add appropriate features to the surface
-        if self._features_type == FeaturesType.RISP:
-            data['x'] = utils.compute_risp_features(points=data.pos.detach().cpu().numpy(),
-                                                    normals=data.normal.detach().cpu().numpy())
-            data['x'] = torch.from_numpy(data['x']).float()
-        elif self._features_type == FeaturesType.XYZ:
-            data['x'] = data.pos.unsqueeze(dim=1)
+        if self._feature_extractor is not None:
+            # Extract points and normals as numpy arrays
+            points = data.pos.detach().cpu().numpy()
+            normals = data.normal.detach().cpu().numpy()
 
-    def _create_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
-                             dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float) -> Data:
-        """
-        Create a complete surface data object with positions, mesh, differential geometry, and features.
+            # Use the feature extractor to compute features
+            features = self._feature_extractor.extract_features(points=points, normals=normals)
 
-        Args:
-            x: Parameter space x coordinates
-            y: Parameter space y coordinates
-            z: Surface heights
-            dz_dx: First derivative of z with respect to x
-            dz_dy: First derivative of z with respect to y
-            points_scale: Scaling factor for positions
-
-        Returns:
-            Data: Complete surface data object with all computed quantities
-        """
-        # Create base surface data with positions, mesh, normals, and differential geometry
-        data = self._create_base_surface_data(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy, points_scale=points_scale)
-
-        # Apply pose transformation to positions and differential quantities (updates normals if needed)
-        data = self._repose_surface_and_quantities(data=data, normals=data['normal'])
-
-        # Add features to the surface
-        self._add_surface_features(data=data)
-
-        return data
-
-    def _generate_surfaces(self, downsample_ratios: List[Optional[float]]) -> List[Data]:
-        """Generate multiple samplings of the same parametric surface."""
-        # Generate surface parameters once (shared across all samplings)
-        surface_params = self._generate_surface_parameters()
-
-        # Sample other parameters once
-        grid_radius = self._sample_parameter(param_range=self._grid_radius_range)
-        points_scale = self._sample_parameter(param_range=self._points_scale_range)
-        grid_offset = self._sample_parameter(param_range=self._grid_offset_range)
-        grid_range = (-grid_radius + grid_offset, grid_radius + grid_offset)
-
-        surfaces = []
-        for downsample_ratio in downsample_ratios:
-            # Generate grid for this sampling
-            if downsample_ratio is None:
-                x, y = self._generate_mesh_grid(grid_range=grid_range)
-            else:
-                x, y = self._generate_uniform_grid(grid_range=grid_range, downsample_ratio=downsample_ratio)
-
-            # Convert to float32 and enable gradients
-            x = x.to(dtype=torch.float32).requires_grad_(requires_grad=True)
-            y = y.to(dtype=torch.float32).requires_grad_(requires_grad=True)
-
-            # Evaluate surface using shared parameters
-            z = self._evaluate_surface_with_parameters(x=x, y=y, surface_params=surface_params).to(dtype=torch.float32)
-
-            # Compute first derivatives BEFORE creating surface data
-            dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
-
-            # Create complete surface data object
-            data = self._create_surface_data(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy, points_scale=points_scale)
-
-            surfaces.append(data)
-
-        return surfaces
+            # Convert back to tensor and store
+            data['x'] = torch.from_numpy(features).float()
+        else:
+            # Fallback to using positions as features if no extractor provided
+            data['x'] = data.pos
 
     def get(self, idx: int) -> List[Data]:
-        # Prepare downsample ratios
-        downsample_ratios = list(self._rng.uniform(
-            low=self._sampling_ratio_range[0],
-            high=self._sampling_ratio_range[1],
-            size=self._sampled_surfaces
-        ))
-        if self._add_regularized_surface:
-            downsample_ratios = [None] + downsample_ratios
-
-        # Generate multiple samplings of the same surface (with features included)
-        surfaces = self._generate_surfaces(downsample_ratios=downsample_ratios)
-
+        """Generate multiple samplings of the same surface."""
+        surfaces = self._generate_surfaces()
         return surfaces
 
 
@@ -249,18 +319,20 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
     def __init__(
             self,
-            grid_generation_method: GridGenerationMethod,
+            grid_samplers: List[GridSampler],  # Added grid_samplers parameter here
             grid_radius_range: Tuple[float, float],
             grid_offset_range: Tuple[float, float],
             points_scale_range: Tuple[float, float],
             diff_geom_components: Optional[List[DifferentialGeometryComponent]] = None,
+            diff_geom_at_origin_only: bool = False,
             **kwargs
     ):
         super().__init__(**kwargs)
-        self._grid_generation_method = grid_generation_method
+        self._grid_samplers = grid_samplers  # Store grid samplers here
         self._grid_radius_range = self._validate_range(param_range=grid_radius_range, name="grid_radius_range")
         self._grid_offset_range = self._validate_range(param_range=grid_offset_range, name="grid_offset_range")
         self._points_scale_range = self._validate_range(param_range=points_scale_range, name="points_scale_range")
+        self._diff_geom_at_origin_only = diff_geom_at_origin_only
 
         # Available differential geometry components
         available_components = list(DifferentialGeometryComponent)
@@ -286,52 +358,39 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             return float(self._rng.uniform(low=param_range[0], high=param_range[1]))
         return param_range[0]
 
-    def _compute_surface_normals(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> torch.Tensor:
+    def _compute_surface_normals(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor,
+                                 surface_params: Optional[Dict[str, Any]] = None) -> torch.Tensor:
         """Compute surface normals using precomputed derivatives for a graph z = f(x,y)."""
-        # For a surface z = f(x,y), the normal vector is (-∂z/∂x, -∂z/∂y, 1)
-        normal = torch.stack(tensors=[-dz_dx, -dz_dy, torch.ones_like(input=dz_dx)], dim=1)
-        return F.normalize(input=normal, p=2, dim=1)
+        if self._diff_geom_at_origin_only:
+            # Compute normal ONLY at origin
+            if surface_params is None:
+                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
 
-    def _generate_grid_points(self, grid_range: Tuple[float, float], downsample_ratio: Optional[float]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate grid points based on method and downsampling."""
-        try:
-            if self._grid_generation_method == GridGenerationMethod.MESH:
-                return self._generate_mesh_grid(grid_range=grid_range)
-            elif self._grid_generation_method == GridGenerationMethod.UNIFORM:
-                if downsample_ratio is None:
-                    raise ValueError("Downsample ratio required for uniform grid generation")
-                return self._generate_uniform_grid(grid_range=grid_range, downsample_ratio=downsample_ratio)
-            else:
-                raise ValueError(f"Invalid grid generation method: {self._grid_generation_method}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to generate grid points: {e}")
+            # Evaluate derivatives at (0,0)
+            x_origin = torch.tensor([0.0], requires_grad=True)
+            y_origin = torch.tensor([0.0], requires_grad=True)
+            z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
 
-    def _generate_mesh_grid(self, grid_range: Tuple[float, float]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate regular mesh grid."""
-        grid_points_count_sqrt = int(np.sqrt(self._grid_points_count))
-        if grid_points_count_sqrt ** 2 != self._grid_points_count:
-            # Adjust to nearest perfect square
-            grid_points_count_sqrt = int(np.sqrt(self._grid_points_count))
-            actual_points = grid_points_count_sqrt ** 2
-            if actual_points != self._grid_points_count:
-                print(f"Warning: Adjusted grid points from {self._grid_points_count} to {actual_points}")
+            dz_dx_origin = torch.autograd.grad(
+                outputs=z_origin,
+                inputs=x_origin,
+                create_graph=True,
+                retain_graph=True
+            )[0]
+            dz_dy_origin = torch.autograd.grad(
+                outputs=z_origin,
+                inputs=y_origin,
+                create_graph=True,
+                retain_graph=True
+            )[0]
 
-        x_linspace = torch.linspace(start=grid_range[0], end=grid_range[1], steps=grid_points_count_sqrt)
-        y_linspace = torch.linspace(start=grid_range[0], end=grid_range[1], steps=grid_points_count_sqrt)
-        x, y = torch.meshgrid(x_linspace, y_linspace, indexing='ij')
-        return x.flatten(), y.flatten()
-
-    def _generate_uniform_grid(self, grid_range: Tuple[float, float], downsample_ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate uniform random grid."""
-        if not 0 < downsample_ratio <= 1:
-            raise ValueError(f"Downsample ratio must be in (0, 1], got {downsample_ratio}")
-
-        points_count = int(downsample_ratio * self._grid_points_count)
-        if points_count < 3:
-            raise ValueError(f"Too few points after downsampling: {points_count}")
-
-        points = self._rng.uniform(low=grid_range[0], high=grid_range[1], size=(points_count, 2))
-        return torch.tensor(data=points[:, 0]), torch.tensor(data=points[:, 1])
+            # Compute normal at origin only
+            normal_origin = torch.stack(tensors=[-dz_dx_origin, -dz_dy_origin, torch.ones_like(input=dz_dx_origin)], dim=1)
+            return F.normalize(input=normal_origin, p=2, dim=1)  # Shape: (1, 3)
+        else:
+            # Original behavior: compute normals for all points
+            normal = torch.stack(tensors=[-dz_dx, -dz_dy, torch.ones_like(input=dz_dx)], dim=1)
+            return F.normalize(input=normal, p=2, dim=1)
 
     def _create_surface_mesh(self, pos: torch.Tensor) -> torch.Tensor:
         """Create triangular mesh from 2D positions."""
@@ -470,8 +529,101 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             'signature': signature
         })
 
-    def _compute_differential_geometry(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _compute_differential_geometry_at_origin(self, surface_params: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Compute differential geometry quantities only at the (0,0) point."""
+        if not self._diff_geom_components:
+            return {}
+
+        # Evaluate directly at (0,0)
+        x_origin = torch.tensor([0.0], requires_grad=True)
+        y_origin = torch.tensor([0.0], requires_grad=True)
+        z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
+
+        # Compute derivatives at origin
+        dz_dx_origin = torch.autograd.grad(
+            outputs=z_origin,
+            inputs=x_origin,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        dz_dy_origin = torch.autograd.grad(
+            outputs=z_origin,
+            inputs=y_origin,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+
+        diff_geom = {}
+
+        # Check what computations are needed
+        needs_curvatures = any(comp in self._diff_geom_components for comp in [
+            DifferentialGeometryComponent.MEAN_CURVATURE,
+            DifferentialGeometryComponent.GAUSSIAN_CURVATURE,
+            DifferentialGeometryComponent.PRINCIPAL_CURVATURES
+        ])
+        needs_principal_dirs = DifferentialGeometryComponent.PRINCIPAL_DIRECTIONS in self._diff_geom_components
+        needs_signature = DifferentialGeometryComponent.SIGNATURE in self._diff_geom_components
+
+        if any([needs_curvatures, needs_principal_dirs, needs_signature]):
+            # Compute curvatures at origin
+            H_origin, K_origin, k1_origin, k2_origin, v1_2d_origin, v2_2d_origin = self._compute_curvature_quantities(
+                dz_dx=dz_dx_origin, dz_dy=dz_dy_origin, x=x_origin, y=y_origin
+            )
+
+            # Store only the origin values (single values, not tensors for all points)
+            if DifferentialGeometryComponent.MEAN_CURVATURE in self._diff_geom_components:
+                diff_geom['H'] = H_origin  # Shape: (1,)
+            if DifferentialGeometryComponent.GAUSSIAN_CURVATURE in self._diff_geom_components:
+                diff_geom['K'] = K_origin  # Shape: (1,)
+            if DifferentialGeometryComponent.PRINCIPAL_CURVATURES in self._diff_geom_components:
+                diff_geom.update({
+                    'k1': k1_origin,  # Shape: (1,)
+                    'k2': k2_origin  # Shape: (1,)
+                })
+            if needs_principal_dirs:
+                diff_geom.update({
+                    'v1_2d': v1_2d_origin,  # Shape: (1, 2)
+                    'v2_2d': v2_2d_origin  # Shape: (1, 2)
+                })
+
+            # Signature computation at origin
+            if needs_signature:
+                grad_H_2d_origin, grad_K_2d_origin = self._compute_and_add_gradients(
+                    H=H_origin, K=K_origin, x=x_origin, y=y_origin
+                )
+                jacobian_origin = self._compute_jacobian(dz_dx=dz_dx_origin, dz_dy=dz_dy_origin)
+
+                # Create a temporary dict for signature computation
+                temp_diff_geom = {}
+                self._compute_and_add_signature(
+                    diff_geom=temp_diff_geom, jacobian=jacobian_origin,
+                    v1_2d=v1_2d_origin, v2_2d=v2_2d_origin,
+                    grad_H_2d=grad_H_2d_origin, grad_K_2d=grad_K_2d_origin,
+                    H=H_origin, K=K_origin
+                )
+
+                # Store only origin signature components
+                for key in ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d', 'signature']:
+                    if key in temp_diff_geom:
+                        diff_geom[key] = temp_diff_geom[key]  # Keep original shapes (1, ...)
+
+        return diff_geom
+
+    def _compute_differential_geometry(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
+                                       dz_dx: torch.Tensor, dz_dy: torch.Tensor,
+                                       surface_params: Optional[Dict[str, Any]] = None) -> Dict[str, torch.Tensor]:
         """Compute requested differential geometry quantities using precomputed first derivatives."""
+        if self._diff_geom_at_origin_only:
+            if surface_params is None:
+                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
+            return self._compute_differential_geometry_at_origin(surface_params=surface_params)
+        else:
+            # Original behavior: compute for all points
+            return self._compute_differential_geometry_original(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
+
+    def _compute_differential_geometry_original(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
+                                                dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Original differential geometry computation for all points."""
         if not self._diff_geom_components:
             return {}
 
@@ -513,6 +665,130 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             )
 
         return diff_geom
+
+    def _create_base_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
+                                  dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float,
+                                  surface_params: Optional[Dict[str, Any]] = None) -> Data:
+        """
+        Create base surface data object with positions, mesh, normals, and differential geometry.
+        When diff_geom_at_origin_only=True, computes ALL quantities only at origin.
+        """
+        # Create base data object with scaled positions and mesh
+        data = Data()
+        data['pos'] = torch.stack(tensors=[x, y, z], dim=1) * points_scale
+        data['face'] = self._create_surface_mesh(pos=data.pos)
+
+        if self._diff_geom_at_origin_only:
+            # Compute ALL quantities (normal + differential geometry) ONLY at origin
+            if surface_params is None:
+                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
+
+            # Compute normal at origin only
+            data['normal'] = self._compute_surface_normals(dz_dx=None, dz_dy=None, surface_params=surface_params)
+
+            # Compute differential geometry at origin only
+            diff_geom = self._compute_differential_geometry_at_origin(surface_params=surface_params)
+
+            # Store all quantities with same keys as before (seamless operation)
+            for key, value in diff_geom.items():
+                data[key] = value
+
+        else:
+            # Original behavior: compute for all points
+            data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy, surface_params=surface_params)
+
+            diff_geom = self._compute_differential_geometry_original(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
+            for key, value in diff_geom.items():
+                data[key] = value
+
+        return data
+
+    def _create_raw_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
+                                 dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float,
+                                 surface_params: Optional[Dict[str, Any]] = None) -> Data:
+        """
+        Create raw surface data object with positions, mesh, normals, and differential geometry.
+        Does NOT add features - those are added later by the base class.
+        Modified to handle origin-only computation.
+        """
+        # Create base surface data with positions, mesh, normals, and differential geometry
+        data = self._create_base_surface_data(
+            x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
+            points_scale=points_scale, surface_params=surface_params
+        )
+
+        # Apply pose transformation to positions and differential quantities
+        data = self._repose_surface_and_quantities(data=data, normals=None)
+
+        # NOTE: Features are NOT added here - they're added by the base class
+        # after calling _generate_raw_surfaces()
+
+        return data
+
+    def _repose_surface_and_quantities(self, data: Data, normals: Optional[torch.Tensor] = None) -> Data:
+        """Apply pose transformation to surface and transform differential quantities accordingly."""
+        center = torch.mean(data.pos, dim=0)
+        points = data.pos - center
+
+        rotation_matrix = None
+        if self._pose_type == PoseType.RANDOM_ROTATION:
+            rotation_matrix = utils.random_rotation_matrix()
+            points = torch.matmul(points, rotation_matrix)
+        elif self._pose_type == PoseType.PCA:
+            points_canonical, rotation_matrix, translation = utils.compute_canonical_pose_pca(points=points)
+            points = points_canonical
+
+        data.pos = points
+
+        # Transform normals using rotation matrix (if available)
+        if rotation_matrix is not None and 'normal' in data:
+            normals_transformed = torch.matmul(data['normal'], rotation_matrix)
+            data['normal'] = normals_transformed
+
+        # Transform differential geometry quantities that are already in data
+        if rotation_matrix is not None:
+            vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d']
+            for key in vector_3d_keys:
+                if key in data:
+                    data[key] = torch.matmul(data[key], rotation_matrix)
+
+        return data
+
+    def _generate_raw_surfaces(self) -> List[Data]:
+        """Generate multiple samplings of the same parametric surface using grid samplers."""
+        # Generate surface parameters once (shared across all samplings)
+        surface_params = self._generate_surface_parameters()
+
+        # Sample other parameters once
+        grid_radius = self._sample_parameter(param_range=self._grid_radius_range)
+        points_scale = self._sample_parameter(param_range=self._points_scale_range)
+        grid_offset = self._sample_parameter(param_range=self._grid_offset_range)
+        grid_range = (-grid_radius + grid_offset, grid_radius + grid_offset)
+
+        surfaces = []
+        for grid_sampler in self._grid_samplers:
+            # Generate grid for this sampling using the grid sampler
+            x, y = grid_sampler.sample(grid_range=grid_range, rng=self._rng)
+
+            # Convert to float32 and enable gradients
+            x = x.to(dtype=torch.float32).requires_grad_(requires_grad=True)
+            y = y.to(dtype=torch.float32).requires_grad_(requires_grad=True)
+
+            # Evaluate surface using shared parameters
+            z = self._evaluate_surface_with_parameters(x=x, y=y, surface_params=surface_params).to(dtype=torch.float32)
+
+            # Compute first derivatives BEFORE creating surface data
+            dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
+
+            # Create surface data object WITHOUT features (features added later by base class)
+            data = self._create_raw_surface_data(
+                x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
+                points_scale=points_scale, surface_params=surface_params
+            )
+
+            surfaces.append(data)
+
+        return surfaces
 
     @abstractmethod
     def _generate_surface_parameters(self) -> Dict[str, Any]:

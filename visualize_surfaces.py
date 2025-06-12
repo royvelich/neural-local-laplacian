@@ -181,16 +181,43 @@ class SurfaceVisualizer:
         self.vis_config = vis_config or VisualizationConfig()
         self.color_palette = ColorPalette()
 
+    @property
+    def is_diff_geom_at_origin_only(self) -> bool:
+        """Check if the dataset is configured for origin-only differential geometry computation."""
+        try:
+            dataset_config = self.config.data_module.train_dataset_specification.dataset
+            return getattr(dataset_config, 'diff_geom_at_origin_only', False)
+        except (AttributeError, KeyError):
+            return False
+
     def _get_surface_names(self, surfaces: List) -> List[str]:
-        """Generate surface names based on configuration."""
-        downsampled_count = len(surfaces)
+        """Generate surface names based on the number of surfaces and grid samplers."""
+        num_surfaces = len(surfaces)
         names = []
 
-        if self.config.data_module.train_dataset_specification.dataset.add_regularized_surface:
-            names.append('Full Surface')
-            downsampled_count -= 1
+        try:
+            # Try to get grid sampler information from config if available
+            grid_samplers = self.config.data_module.train_dataset_specification.dataset.grid_samplers
 
-        names.extend([f'Downsampled Surface {i + 1}' for i in range(downsampled_count)])
+            for i, grid_sampler in enumerate(grid_samplers):
+                sampler_type = grid_sampler._target_.split('.')[-1]  # Get class name
+
+                if sampler_type == 'RegularGridSampler':
+                    num_points = grid_sampler.num_points
+                    names.append(f'Regular Grid ({num_points} points)')
+                elif sampler_type == 'RandomGridSampler':
+                    num_points_range = grid_sampler.num_points_range
+                    if isinstance(num_points_range, (list, tuple)) and len(num_points_range) == 2:
+                        names.append(f'Random Grid ({num_points_range[0]}-{num_points_range[1]} points)')
+                    else:
+                        names.append(f'Random Grid ({num_points_range} points)')
+                else:
+                    names.append(f'Surface {i + 1}')
+
+        except (AttributeError, KeyError):
+            # Fallback: generate generic names if config access fails
+            names = [f'Surface {i + 1}' for i in range(num_surfaces)]
+
         return names
 
     def _compute_translation(self, surface_index: int, surfaces: List) -> np.ndarray:
@@ -236,8 +263,58 @@ class SurfaceVisualizer:
         """Extract position, face, and normal data from surface."""
         pos = surface.pos.detach().cpu().numpy()
         face = surface.face.detach().cpu().numpy().T
-        normals = surface.normal.detach().cpu().numpy()
+
+        # Handle origin-only mode: normal might be shape (1, 3) instead of (N, 3)
+        if hasattr(surface, 'normal'):
+            normals = surface.normal.detach().cpu().numpy()
+            if self.is_diff_geom_at_origin_only and normals.shape[0] == 1:
+                # Broadcast single normal to all vertices for visualization
+                normals = np.broadcast_to(normals, (pos.shape[0], 3)).copy()
+        else:
+            # Fallback: compute simple normals if not available
+            normals = np.array([[0.0, 0.0, 1.0]] * pos.shape[0])
+
         return pos, face, normals
+
+    def _extract_differential_geometry(self, surface) -> dict:
+        """Extract differential geometry quantities from surface, handling origin-only mode."""
+
+        def safe_extract_and_broadcast(attr_name):
+            if not hasattr(surface, attr_name):
+                return None
+
+            value = getattr(surface, attr_name).detach().cpu().numpy()
+
+            # If origin-only mode and we have a single value, broadcast to all points
+            if self.is_diff_geom_at_origin_only and value.shape[0] == 1:
+                num_points = surface.pos.shape[0]
+                if value.ndim == 1:
+                    # Scalar quantity: shape (1,) -> (N,)
+                    value = np.broadcast_to(value, (num_points,)).copy()
+                else:
+                    # Vector quantity: shape (1, D) -> (N, D)
+                    value = np.broadcast_to(value, (num_points,) + value.shape[1:]).copy()
+
+            return value
+
+        return {
+            'vectors_3d': {
+                'v1': safe_extract_and_broadcast('v1_3d'),
+                'v2': safe_extract_and_broadcast('v2_3d'),
+                'grad_H': safe_extract_and_broadcast('grad_H_3d'),
+                'grad_K': safe_extract_and_broadcast('grad_K_3d')
+            },
+            'vectors_2d': {
+                'v1_2d': safe_extract_and_broadcast('v1_2d'),
+                'v2_2d': safe_extract_and_broadcast('v2_2d'),
+                'grad_H_2d': safe_extract_and_broadcast('grad_H_2d'),
+                'grad_K_2d': safe_extract_and_broadcast('grad_K_2d')
+            },
+            'scalars': {
+                'Mean Curvature': safe_extract_and_broadcast('H'),
+                'Gaussian Curvature': safe_extract_and_broadcast('K')
+            }
+        }
 
     def _add_vector_quantities(self, structure, surface, structure_type: str = "default") -> None:
         """Add vector quantities to polyscope structure."""
@@ -247,7 +324,7 @@ class SurfaceVisualizer:
         if not hasattr(surface, 'H'):  # Check if differential geometry is available
             return
 
-        # Extract differential geometry quantities
+        # Extract differential geometry quantities with proper broadcasting
         diff_geom = self._extract_differential_geometry(surface)
 
         # Add vector fields with normalized scaling
@@ -273,31 +350,6 @@ class SurfaceVisualizer:
                     enabled=True,
                     cmap=colormap
                 )
-
-    def _extract_differential_geometry(self, surface) -> dict:
-        """Extract differential geometry quantities from surface."""
-
-        def safe_extract(attr_name):
-            return getattr(surface, attr_name, None).detach().cpu().numpy() if hasattr(surface, attr_name) else None
-
-        return {
-            'vectors_3d': {
-                'v1': safe_extract('v1_3d'),
-                'v2': safe_extract('v2_3d'),
-                'grad_H': safe_extract('grad_H_3d'),
-                'grad_K': safe_extract('grad_K_3d')
-            },
-            'vectors_2d': {
-                'v1_2d': safe_extract('v1_2d'),
-                'v2_2d': safe_extract('v2_2d'),
-                'grad_H_2d': safe_extract('grad_H_2d'),
-                'grad_K_2d': safe_extract('grad_K_2d')
-            },
-            'scalars': {
-                'Mean Curvature': safe_extract('H'),
-                'Gaussian Curvature': safe_extract('K')
-            }
-        }
 
     def _get_vector_color(self, vector_name: str) -> Tuple[float, float, float]:
         """Get color for vector visualization (deprecated - use ColorPalette)."""
@@ -331,6 +383,7 @@ class SurfaceVisualizer:
         if not self.vis_config.enable_parametrization:
             return
 
+        # Extract differential geometry with proper broadcasting
         diff_geom = self._extract_differential_geometry(surface)
 
         # Create 2D parametrization points (Z = 0)
@@ -373,8 +426,43 @@ class SurfaceVisualizer:
                     vectortype="ambient"
                 )
 
+    def _add_origin_indicator(self, surface, name: str, translation: np.ndarray) -> None:
+        """Add visual indicator for the origin point when in origin-only mode."""
+        if not self.is_diff_geom_at_origin_only:
+            return
+
+        # Find the origin point (0,0) in the original surface parameter space
+        # For visualization, we'll place it at the translated origin
+        origin_3d = np.array([[translation[0], translation[1], 0.0]])
+
+        try:
+            origin_indicator = ps.register_point_cloud(
+                name=f"{name} - Origin",
+                points=origin_3d,
+                radius=self.vis_config.point_radius * 3,  # Make it larger
+                enabled=True
+            )
+
+            # Color it differently to highlight it's the origin
+            origin_indicator.add_color_quantity(
+                name="origin_color",
+                values=np.array([[1.0, 0.0, 1.0]]),  # Magenta
+                enabled=True
+            )
+
+            # Add text annotation if possible
+            print(f"Origin point for {name} at: {origin_3d[0]}")
+
+        except Exception as e:
+            print(f"Could not add origin indicator: {e}")
+
     def visualize_surface_set(self, surfaces: List, surface_names: List[str]) -> None:
         """Visualize a set of surfaces with their differential geometry."""
+        # Print information about the mode
+        if self.is_diff_geom_at_origin_only:
+            print("Visualizing in origin-only differential geometry mode")
+            print("Note: All differential quantities are computed only at the origin (0,0) and broadcasted for visualization")
+
         for i, (name, surface) in enumerate(zip(surface_names, surfaces)):
             # Extract basic data
             pos, face, normals = self._extract_surface_data(surface)
@@ -408,6 +496,9 @@ class SurfaceVisualizer:
             # Visualize parametrization domain if available and enabled
             if hasattr(surface, 'v1_2d') and self.vis_config.enable_parametrization:
                 self._visualize_parametrization(surface, name, pos_translated)
+
+            # Add origin indicator in origin-only mode
+            self._add_origin_indicator(surface, name, translation)
 
 
 def setup_polyscope() -> None:
