@@ -260,8 +260,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
 
     def _repose_surface_and_quantities(self, data: Data, normals: torch.Tensor) -> Data:
         """Apply pose transformation to surface and transform differential quantities accordingly."""
-        center = torch.mean(data.pos, dim=0)
-        points = data.pos - center
+        points = data.pos
 
         rotation_matrix = None
         if self._pose_type == PoseType.RANDOM_ROTATION:
@@ -270,12 +269,73 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         elif self._pose_type == PoseType.PCA:
             points_canonical, rotation_matrix, translation = utils.compute_canonical_pose_pca(points=points)
             points = points_canonical
+        elif self._pose_type == PoseType.ALIGN_NORMAL_Z:
+            # Align normal at origin with positive z-axis using quaternions
+            if 'normal' not in data:
+                raise ValueError("Normal data required for ALIGN_NORMAL_Z pose type")
+
+            # Import kornia
+            import kornia
+
+            # Get the normal at origin (should be shape (1, 3) when diff_geom_at_origin_only=True)
+            origin_normal = data['normal'][0]  # Shape: (3,)
+            target_normal = torch.tensor([0.0, 0.0, 1.0], dtype=origin_normal.dtype, device=origin_normal.device)
+
+            # Normalize both vectors to ensure they are unit vectors
+            origin_normal = F.normalize(origin_normal, p=2, dim=0)
+            target_normal = F.normalize(target_normal, p=2, dim=0)
+
+            # Check if vectors are already aligned
+            dot_product = torch.dot(origin_normal, target_normal)
+
+            if torch.allclose(dot_product, torch.tensor(1.0), atol=1e-6):
+                # Vectors are already aligned, no rotation needed
+                rotation_matrix = torch.eye(3, dtype=origin_normal.dtype, device=origin_normal.device)
+            elif torch.allclose(dot_product, torch.tensor(-1.0), atol=1e-6):
+                # Vectors are opposite, need 180 degree rotation
+                # Find a perpendicular vector
+                if abs(origin_normal[0]) < 0.9:
+                    perp = torch.cross(origin_normal, torch.tensor([1.0, 0.0, 0.0], dtype=origin_normal.dtype, device=origin_normal.device))
+                else:
+                    perp = torch.cross(origin_normal, torch.tensor([0.0, 1.0, 0.0], dtype=origin_normal.dtype, device=origin_normal.device))
+                perp = F.normalize(perp, p=2, dim=0)
+
+                # Create 180 degree rotation quaternion around perpendicular axis
+                quaternion = torch.tensor([0.0, perp[0], perp[1], perp[2]], dtype=origin_normal.dtype, device=origin_normal.device)
+            else:
+                # General case: compute rotation quaternion
+                # Cross product gives rotation axis
+                rotation_axis = torch.cross(origin_normal, target_normal)
+                rotation_axis = F.normalize(rotation_axis, p=2, dim=0)
+
+                # Angle between vectors
+                angle = torch.acos(torch.clamp(dot_product, -1.0, 1.0))
+
+                # Create quaternion from axis-angle
+                half_angle = angle / 2.0
+                sin_half_angle = torch.sin(half_angle)
+                cos_half_angle = torch.cos(half_angle)
+
+                quaternion = torch.stack([
+                    cos_half_angle,  # w (real part)
+                    rotation_axis[0] * sin_half_angle,  # x
+                    rotation_axis[1] * sin_half_angle,  # y
+                    rotation_axis[2] * sin_half_angle  # z
+                ])
+
+            # Convert quaternion to rotation matrix using kornia
+            # kornia expects quaternion in [w, x, y, z] format and shape (1, 4)
+            quaternion = quaternion.unsqueeze(0)  # Shape: (1, 4)
+            rotation_matrix = kornia.geometry.conversions.quaternion_to_rotation_matrix(quaternion)[0]  # Shape: (3, 3)
+
+            # Apply rotation to points
+            points = torch.matmul(points, rotation_matrix.T)  # Note: transpose for proper rotation
 
         data.pos = points
 
-        # Transform normals using rotation matrix (now available for both pose types)
-        if rotation_matrix is not None:
-            normals_transformed = torch.matmul(normals, rotation_matrix)
+        # Transform normals using rotation matrix (if available)
+        if rotation_matrix is not None and 'normal' in data:
+            normals_transformed = torch.matmul(data['normal'], rotation_matrix.T)  # Note: transpose for proper rotation
             data['normal'] = normals_transformed
 
         # Transform differential geometry quantities that are already in data
@@ -283,7 +343,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d']
             for key in vector_3d_keys:
                 if key in data:
-                    data[key] = torch.matmul(data[key], rotation_matrix)
+                    data[key] = torch.matmul(data[key], rotation_matrix.T)  # Note: transpose for proper rotation
 
         return data
 
@@ -709,13 +769,45 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         """
         Create raw surface data object with positions, mesh, normals, and differential geometry.
         Does NOT add features - those are added later by the base class.
-        Modified to handle origin-only computation.
+        Modified to handle origin-only computation and center the surface at origin.
         """
-        # Create base surface data with positions, mesh, normals, and differential geometry
-        data = self._create_base_surface_data(
-            x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
-            points_scale=points_scale, surface_params=surface_params
-        )
+        # Evaluate the surface at (0,0) to get the center point
+        x_center = torch.tensor([0.0], requires_grad=True)
+        y_center = torch.tensor([0.0], requires_grad=True)
+        z_center = self._evaluate_surface_with_parameters(x=x_center, y=y_center, surface_params=surface_params)
+
+        # Create positions and translate so that (0,0,z_center) becomes (0,0,0)
+        center_point = torch.stack([x_center, y_center, z_center], dim=1) * points_scale  # (1, 3)
+        positions = torch.stack([x, y, z], dim=1) * points_scale  # (N, 3)
+        positions = positions - center_point  # Translate so center is at origin
+
+        # Create base surface data with translated positions
+        data = Data()
+        data['pos'] = positions.detach()
+        data['face'] = self._create_surface_mesh(pos=data.pos).detach()
+
+        if self._diff_geom_at_origin_only:
+            # Compute ALL quantities (normal + differential geometry) ONLY at origin
+            if surface_params is None:
+                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
+
+            # Compute normal at origin only
+            data['normal'] = self._compute_surface_normals(dz_dx=None, dz_dy=None, surface_params=surface_params).detach()
+
+            # Compute differential geometry at origin only
+            diff_geom = self._compute_differential_geometry_at_origin(surface_params=surface_params)
+
+            # Store all quantities with same keys as before (seamless operation)
+            for key, value in diff_geom.items():
+                data[key] = value.detach()
+
+        else:
+            # Original behavior: compute for all points
+            data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy, surface_params=surface_params)
+
+            diff_geom = self._compute_differential_geometry_original(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
+            for key, value in diff_geom.items():
+                data[key] = value.detach()
 
         # Apply pose transformation to positions and differential quantities
         data = self._repose_surface_and_quantities(data=data, normals=None)
@@ -727,8 +819,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
     def _repose_surface_and_quantities(self, data: Data, normals: Optional[torch.Tensor] = None) -> Data:
         """Apply pose transformation to surface and transform differential quantities accordingly."""
-        center = torch.mean(data.pos, dim=0)
-        points = data.pos - center
+        points = data.pos
 
         rotation_matrix = None
         if self._pose_type == PoseType.RANDOM_ROTATION:
@@ -737,12 +828,71 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         elif self._pose_type == PoseType.PCA:
             points_canonical, rotation_matrix, translation = utils.compute_canonical_pose_pca(points=points)
             points = points_canonical
+        elif self._pose_type == PoseType.ALIGN_NORMAL_Z:
+            # Align normal at origin with positive z-axis using quaternions
+            if 'normal' not in data:
+                raise ValueError("Normal data required for ALIGN_NORMAL_Z pose type")
+
+            # Import kornia
+            import kornia
+
+            # Get the normal at origin (should be shape (1, 3) when diff_geom_at_origin_only=True)
+            origin_normal = data['normal'][0]  # Shape: (3,)
+            target_normal = torch.tensor([0.0, 0.0, 1.0], dtype=origin_normal.dtype, device=origin_normal.device)
+
+            # Normalize both vectors to ensure they are unit vectors
+            origin_normal = F.normalize(origin_normal, p=2, dim=0)
+            target_normal = F.normalize(target_normal, p=2, dim=0)
+
+            # Compute dot product
+            dot_product = torch.dot(origin_normal, target_normal)
+
+            # Clamp to handle numerical precision issues
+            dot_product = torch.clamp(dot_product, -1.0, 1.0)
+
+            # Handle the edge case where vectors are opposite (dot product ≈ -1)
+            if torch.allclose(dot_product, torch.tensor(-1.0), atol=1e-6):
+                # Find a perpendicular axis for 180° rotation
+                if abs(origin_normal[0]) < 0.9:
+                    rotation_axis = torch.linalg.cross(origin_normal, torch.tensor([1.0, 0.0, 0.0], dtype=origin_normal.dtype, device=origin_normal.device))
+                else:
+                    rotation_axis = torch.linalg.cross(origin_normal, torch.tensor([0.0, 1.0, 0.0], dtype=origin_normal.dtype, device=origin_normal.device))
+                rotation_axis = F.normalize(rotation_axis, p=2, dim=0)
+                quaternion = torch.tensor([0.0, rotation_axis[0], rotation_axis[1], rotation_axis[2]], dtype=origin_normal.dtype, device=origin_normal.device)
+            else:
+                # General case (including aligned vectors): compute rotation quaternion
+                rotation_axis = torch.linalg.cross(origin_normal, target_normal)
+                axis_length = torch.norm(rotation_axis)
+
+                if axis_length > 1e-6:  # Vectors are not aligned
+                    rotation_axis = rotation_axis / axis_length
+                    angle = torch.acos(dot_product)
+                    half_angle = angle / 2.0
+                    sin_half_angle = torch.sin(half_angle)
+                    cos_half_angle = torch.cos(half_angle)
+
+                    quaternion = torch.stack([
+                        cos_half_angle,  # w (real part)
+                        rotation_axis[0] * sin_half_angle,  # x
+                        rotation_axis[1] * sin_half_angle,  # y
+                        rotation_axis[2] * sin_half_angle  # z
+                    ])
+                else:
+                    # Vectors are already aligned - use identity quaternion
+                    quaternion = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=origin_normal.dtype, device=origin_normal.device)
+
+            # Convert quaternion to rotation matrix using kornia
+            quaternion = quaternion.unsqueeze(0)  # Shape: (1, 4)
+            rotation_matrix = kornia.geometry.conversions.quaternion_to_rotation_matrix(quaternion)[0]  # Shape: (3, 3)
+
+            # Apply rotation to points
+            points = torch.matmul(points, rotation_matrix.T)  # Note: transpose for proper rotation
 
         data.pos = points
 
         # Transform normals using rotation matrix (if available)
         if rotation_matrix is not None and 'normal' in data:
-            normals_transformed = torch.matmul(data['normal'], rotation_matrix)
+            normals_transformed = torch.matmul(data['normal'], rotation_matrix.T)  # Note: transpose for proper rotation
             data['normal'] = normals_transformed
 
         # Transform differential geometry quantities that are already in data
@@ -750,7 +900,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d']
             for key in vector_3d_keys:
                 if key in data:
-                    data[key] = torch.matmul(data[key], rotation_matrix)
+                    data[key] = torch.matmul(data[key], rotation_matrix.T)  # Note: transpose for proper rotation
 
         return data
 
@@ -770,21 +920,22 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             # Generate grid for this sampling using the grid sampler
             x, y = grid_sampler.sample(grid_range=grid_range, rng=self._rng)
 
-            # Convert to float32 and enable gradients
-            x = x.to(dtype=torch.float32).requires_grad_(requires_grad=True)
-            y = y.to(dtype=torch.float32).requires_grad_(requires_grad=True)
+            with torch.enable_grad():
+                # Convert to float32 and enable gradients
+                x = x.to(dtype=torch.float32).requires_grad_(True)
+                y = y.to(dtype=torch.float32).requires_grad_(True)
 
-            # Evaluate surface using shared parameters
-            z = self._evaluate_surface_with_parameters(x=x, y=y, surface_params=surface_params).to(dtype=torch.float32)
+                # Evaluate surface using shared parameters
+                z = self._evaluate_surface_with_parameters(x=x, y=y, surface_params=surface_params).to(dtype=torch.float32)
 
-            # Compute first derivatives BEFORE creating surface data
-            dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
+                # Compute first derivatives BEFORE creating surface data
+                dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
 
-            # Create surface data object WITHOUT features (features added later by base class)
-            data = self._create_raw_surface_data(
-                x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
-                points_scale=points_scale, surface_params=surface_params
-            )
+                # Create surface data object WITHOUT features (features added later by base class)
+                data = self._create_raw_surface_data(
+                    x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
+                    points_scale=points_scale, surface_params=surface_params
+                )
 
             surfaces.append(data)
 

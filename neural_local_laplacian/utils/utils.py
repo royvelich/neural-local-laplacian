@@ -80,96 +80,88 @@ def estimate_normals(points: np.ndarray,
     return np.array(pcd.normals)
 
 
-def compute_risp_features(points: np.ndarray, normals: np.ndarray, k: int = 20) -> np.ndarray:
+def compute_risp_features(points: np.ndarray, normals: np.ndarray) -> np.ndarray:
     """
-    Compute RISP features for each point in the point cloud without loops.
+    Compute RISP features for a single patch centered at the origin.
 
-    :param points: numpy array of shape (N, 3) containing point coordinates
-    :param normals: numpy array of shape (N, 3) containing normal vectors for each point
-    :param k: number of nearest neighbors to consider
-    :return: numpy array of shape (N, 14, k) containing RISP features for each point
+    :param points: numpy array of shape (k, 3) containing k neighbor coordinates
+                   relative to the origin (center point)
+    :param normals: numpy array of shape (1, 3) containing the normal vector at the origin
+    :return: numpy array of shape (k, 14) containing RISP features for each neighbor
     """
-    N = points.shape[0]
-    tree: cKDTree = cKDTree(points)
-    _, indices = tree.query(points, k=k + 1)  # +1 because the first neighbor is the point itself
+    if points.shape[0] < 3:
+        raise ValueError(f"Need at least 3 neighbors for RISP computation, got {points.shape[0]}")
 
-    # Remove the first column (self-distances and self-indices)
-    indices = indices[:, 1:]
+    if normals.shape != (1, 3):
+        raise ValueError(f"Expected normals shape (1, 3), got {normals.shape}")
 
-    # Get neighbors
-    neighbors = points[indices]  # Shape: (N, k, 3)
-    neighbor_normals = normals[indices]
+    # Get the number of neighbors
+    k = points.shape[0]
 
-    # Compute relative positions
-    rel_pos: np.ndarray = neighbors - points[:, np.newaxis, :]  # Shape: (N, k, 3)
+    # The center point is at origin (0, 0, 0)
+    center_point = np.array([0.0, 0.0, 0.0])
 
-    # Project neighbors onto tangent plane
-    # First compute dot product of rel_pos with normals
-    dots = np.sum(rel_pos * normals[:, np.newaxis, :], axis=2)  # Shape: (N, k)
+    # Normal at the center point
+    center_normal = normals[0]  # Shape: (3,)
 
-    # Then subtract the normal component
-    proj_neighbors: np.ndarray = rel_pos - dots[..., np.newaxis] * normals[:, np.newaxis, :]  # Shape: (N, k, 3)
+    # Relative positions (neighbors are already relative to center)
+    rel_pos = points  # Shape: (k, 3)
 
-    # for i in range(100):
-    #     for j in range(k):
-    #         x = np.cross(proj_neighbors[i, 0], proj_neighbors[i, j+1])
-    #         bla1 = x / np.linalg.norm(x)
-    #         bla2 = normals[i]
-    #         pass
+    # Project neighbors onto tangent plane at center
+    # Compute dot product of rel_pos with center normal
+    dots = np.sum(rel_pos * center_normal[np.newaxis, :], axis=1)  # Shape: (k,)
+
+    # Subtract the normal component to get tangent plane projection
+    proj_neighbors = rel_pos - dots[:, np.newaxis] * center_normal[np.newaxis, :]  # Shape: (k, 3)
 
     # Compute angles in tangent plane
-    # Step 1: Get vector perpendicular to normal in tangent plane as reference direction
-    ref_dir_x = np.array([1.0, 0.0, 0.0])  # Can be any vector not parallel to normal
-    ref_dir_x = ref_dir_x - np.sum(ref_dir_x * normals, axis=1, keepdims=True) * normals
-    ref_dir_x = ref_dir_x / (np.linalg.norm(ref_dir_x, axis=1, keepdims=True) + 1e-16)
+    # Create reference direction in tangent plane
+    ref_dir_x = np.array([1.0, 0.0, 0.0])
+    ref_dir_x = ref_dir_x - np.dot(ref_dir_x, center_normal) * center_normal
+    ref_dir_x = ref_dir_x / (np.linalg.norm(ref_dir_x) + 1e-16)
 
-    ref_dir_y = np.cross(ref_dir_x, normals)
-    ref_dir_y = ref_dir_y / (np.linalg.norm(ref_dir_y, axis=1, keepdims=True) + 1e-16)
+    ref_dir_y = np.cross(ref_dir_x, center_normal)
+    ref_dir_y = ref_dir_y / (np.linalg.norm(ref_dir_y) + 1e-16)
 
-    # Step 2: Compute angles relative to this reference direction
-    x_coord = np.sum(proj_neighbors * ref_dir_x[:, np.newaxis, :], axis=2)
-    y_coord = np.sum(proj_neighbors * ref_dir_y[:, np.newaxis, :], axis=2)
+    # Compute angles relative to reference direction
+    x_coord = np.sum(proj_neighbors * ref_dir_x[np.newaxis, :], axis=1)
+    y_coord = np.sum(proj_neighbors * ref_dir_y[np.newaxis, :], axis=1)
     angles = np.arctan2(y_coord, x_coord)
 
     # Sort neighbors by angle
-    sort_idx = np.argsort(angles, axis=1)
+    sort_idx = np.argsort(angles)
+    sorted_neighbors = points[sort_idx]  # Shape: (k, 3)
+    sorted_rel_pos = rel_pos[sort_idx]  # Shape: (k, 3)
 
-    row_idx = np.arange(N)[:, np.newaxis]
-    sorted_neighbors = neighbors[row_idx, sort_idx]
-    sorted_neighbor_normals = neighbor_normals[row_idx, sort_idx]
-    sorted_rel_pos = rel_pos[row_idx, sort_idx]
+    # For single patch, we don't have neighbor normals, so we'll use the center normal
+    # broadcasted to all neighbors (this is a limitation of the single-patch approach)
+    sorted_neighbor_normals = np.broadcast_to(center_normal[np.newaxis, :], (k, 3))
 
     # Compute edge vectors
     e_i = sorted_rel_pos
-    e_i_minus_1 = np.roll(sorted_rel_pos, 1, axis=1)
-    e_i_plus_1 = np.roll(sorted_rel_pos, -1, axis=1)
+    e_i_minus_1 = np.roll(sorted_rel_pos, 1, axis=0)
+    e_i_plus_1 = np.roll(sorted_rel_pos, -1, axis=0)
     n_i = sorted_neighbors
-    n_i_minus_1 = np.roll(sorted_neighbors, 1, axis=1)
-    n_i_plus_1 = np.roll(sorted_neighbors, -1, axis=1)
+    n_i_minus_1 = np.roll(sorted_neighbors, 1, axis=0)
+    n_i_plus_1 = np.roll(sorted_neighbors, -1, axis=0)
 
     # Compute RISP features
-    L_0 = np.linalg.norm(e_i, axis=2)
+    L_0 = np.linalg.norm(e_i, axis=1)  # Shape: (k,)
     phi_1 = compute_angle_between_vectors(e_i_minus_1, e_i)
     phi_2 = compute_angle_between_vectors(e_i_plus_1, e_i)
     phi_3 = compute_angle_between_vectors(e_i_minus_1, n_i - n_i_minus_1)
     phi_4 = compute_angle_between_vectors(e_i_plus_1, n_i_plus_1 - n_i)
     phi_5 = compute_angle_between_vectors(np.cross(e_i_plus_1, e_i), np.cross(e_i_minus_1, e_i))
 
-    alpha_1 = compute_angle_between_vectors(np.broadcast_to(normals[:, np.newaxis, :], e_i.shape), e_i)
-    alpha_2 = compute_angle_between_vectors(np.broadcast_to(normals[:, np.newaxis, :], e_i.shape), e_i_minus_1)
+    alpha_1 = compute_angle_between_vectors(np.broadcast_to(center_normal[np.newaxis, :], e_i.shape), e_i)
+    alpha_2 = compute_angle_between_vectors(np.broadcast_to(center_normal[np.newaxis, :], e_i.shape), e_i_minus_1)
 
     nn_i = sorted_neighbor_normals
-    nn_i_minus_1 = np.roll(sorted_neighbor_normals, 1, axis=1)
-    nn_i_plus_1 = np.roll(sorted_neighbor_normals, -1, axis=1)
-
-    # w_i = np.cross(e_i, e_i_minus_1)
-    # w_i = w_i / (np.linalg.norm(w_i, axis=2, keepdims=True) + 1e-10)
+    nn_i_minus_1 = np.roll(sorted_neighbor_normals, 1, axis=0)
+    nn_i_plus_1 = np.roll(sorted_neighbor_normals, -1, axis=0)
 
     beta_1 = compute_angle_between_vectors(nn_i, e_i)
     beta_2 = compute_angle_between_vectors(nn_i, n_i - n_i_minus_1)
-
-    # n_i_minus_1 = np.cross(e_i_minus_1, e_i_minus_1 - np.roll(sorted_neighbors, 1, axis=1) + points[:, np.newaxis, :])
-    # n_i_minus_1 = n_i_minus_1 / (np.linalg.norm(n_i_minus_1, axis=2, keepdims=True) + 1e-10)
 
     theta_1 = compute_angle_between_vectors(nn_i_minus_1, e_i_minus_1)
     theta_2 = compute_angle_between_vectors(nn_i_minus_1, n_i - n_i_minus_1)
@@ -177,23 +169,20 @@ def compute_risp_features(points: np.ndarray, normals: np.ndarray, k: int = 20) 
     gamma_1 = compute_angle_between_vectors(nn_i_plus_1, n_i_plus_1 - n_i)
     gamma_2 = compute_angle_between_vectors(nn_i_plus_1, e_i_plus_1)
 
+    # Stack features for all neighbors
     risp_features = np.stack([
         L_0, phi_1, phi_2, phi_3, phi_4, phi_5,
         alpha_1, alpha_2, beta_1, beta_2,
-        theta_1, theta_2, gamma_1, gamma_2], axis=-1)
+        theta_1, theta_2, gamma_1, gamma_2], axis=-1)  # Shape: (k, 14)
 
-    risp_features_max = np.max(risp_features, axis=1)
-    # risp_features_min = np.min(risp_features, axis=1)
-    # risp_features_mean = np.mean(risp_features, axis=1)
-    # risp_features_concat = np.concat([risp_features_max, risp_features_min, risp_features_mean], axis=1)
-    return risp_features_max
+    return risp_features
 
 
 def compute_angle_between_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
     """Compute the angle between two sets of vectors."""
-    v1_n = v1 / (np.linalg.norm(v1, axis=2, keepdims=True) + 1e-10)
-    v2_n = v2 / (np.linalg.norm(v2, axis=2, keepdims=True) + 1e-10)
-    return np.arccos(np.clip(np.sum(v1_n * v2_n, axis=2), -1.0, 1.0))
+    v1_n = v1 / (np.linalg.norm(v1, axis=1, keepdims=True) + 1e-10)
+    v2_n = v2 / (np.linalg.norm(v2, axis=1, keepdims=True) + 1e-10)
+    return np.arccos(np.clip(np.sum(v1_n * v2_n, axis=1), -1.0, 1.0))
 
 
 def import_object(full_type_name: str) -> Type:

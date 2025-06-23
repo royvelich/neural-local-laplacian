@@ -136,7 +136,7 @@ class RISPFeatureExtractor(FeatureExtractor):
 
     def _extract_raw_features(self, points: np.ndarray, normals: np.ndarray) -> np.ndarray:
         """Extract RISP features."""
-        return compute_risp_features(points=points, normals=normals, k=self._k)
+        return compute_risp_features(points=points, normals=normals)
 
 
 class XYZFeatureExtractor(FeatureExtractor):

@@ -38,3 +38,4 @@ boost
 pybind11
 pytest
 torch-householder
+kornia

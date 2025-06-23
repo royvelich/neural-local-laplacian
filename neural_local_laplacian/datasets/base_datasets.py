@@ -31,3 +31,4 @@ class PoseType(Enum):
     NONE = 'none'
     PCA = 'pca'
     RANDOM_ROTATION = 'random_rotation'
+    ALIGN_NORMAL_Z = 'align_normal_z'  # New option

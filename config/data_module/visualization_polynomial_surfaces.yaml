@@ -5,11 +5,11 @@ train_dataset_specification:
     _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
     seed: ${globals.seed}
     epoch_size: 1000
-    grid_radius_range: [0.7]
+    grid_radius_range: [1.0]
     grid_offset_range: [-0.01, 0.01]
-    points_scale_range: [1, 1.01]
-    coefficient_scale_range: [0.9, 0.91]
-    order_range: [2, 5]
+    points_scale_range: [1, 1.1]
+    coefficient_scale_range: [0.8, 0.95]
+    order_range: [2, 7]
     grid_samplers:
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.RegularGridSampler
         num_points: 400
@@ -19,11 +19,11 @@ train_dataset_specification:
         _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
         num_fourier_features: 512
         use_fourier: True
-    diff_geom_at_origin_only: False
+    diff_geom_at_origin_only: True
     conv_k_nearest: null
     pose_type:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PoseType
-      _args_: ['random_rotation']
+      _args_: ['align_normal_z']
     coeff_generation_method:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
       _args_: ['uniform']

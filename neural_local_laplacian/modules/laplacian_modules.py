@@ -33,6 +33,7 @@ from torch_geometric.data import Data
 
 # neural laplacian
 from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs
+from neural_local_laplacian.modules.losses import LossConfig
 
 
 class LocalLaplacianModuleBase(pl.LightningModule):
@@ -70,9 +71,9 @@ class LocalLaplacianModuleBase(pl.LightningModule):
         """Training step logic."""
         return self._shared_step(batch, batch_idx, 'train')
 
-    def validation_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """Validation step logic."""
-        return self._shared_step(batch, batch_idx, 'val')
+    # def validation_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
+    #     """Validation step logic."""
+    #     return self._shared_step(batch, batch_idx, 'val')
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         return self._optimizer_cfg(params=self.parameters())
@@ -83,6 +84,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
     def __init__(self,
                  input_dim: int,
+                 loss_configs: List['LossConfig'],
                  d_model: int = 512,
                  nhead: int = 8,
                  num_encoder_layers: int = 6,
@@ -95,8 +97,9 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         if input_dim is None or input_dim <= 0:
             raise ValueError(f"input_dim must be a positive integer, got: {input_dim}")
 
-        self.d_model = d_model
-        self.input_dim = input_dim
+        self._d_model = d_model
+        self._input_dim = input_dim
+        self._loss_configs = loss_configs
 
         # Input projection
         self.input_projection = nn.Linear(input_dim, d_model)
@@ -107,6 +110,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
+            activation='gelu',
             batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(
@@ -143,12 +147,14 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         batch_size = len(batch_sizes)
 
         # Simple reshape - no padding needed!
-        sequences = features.view(batch_size, num_points_per_surface, self.d_model)
+        sequences = features.view(batch_size, num_points_per_surface, self._d_model)
 
-        # Reshape batch.normal, batch.H, and batch.pos as well
-        normals = batch.normal.view(batch_size, num_points_per_surface, 3)  # (batch_size, num_points, 3)
-        mean_curvatures = batch.H.view(batch_size, num_points_per_surface)  # (batch_size, num_points)
+        # Reshape batch.pos
         positions = batch.pos.view(batch_size, num_points_per_surface, 3)  # (batch_size, num_points, 3)
+
+        # In training mode, diff_geom_at_origin_only=True, so normals and H are per-surface
+        normals = batch.normal  # (batch_size, 3) - one normal per surface at origin
+        mean_curvatures = batch.H  # (batch_size,) - one curvature per surface at origin
 
         # Pass through transformer (no masking needed!)
         encoded_features = self.transformer_encoder(sequences)
@@ -160,7 +166,49 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         # Apply softplus to ensure positive weights
         token_weights = F.softplus(token_weights)  # (batch_size, num_points)
 
-        # For now, just return the weights as loss (you'll need to implement actual loss)
-        loss = token_weights.mean()  # Placeholder loss
+        # Compute Laplace-Beltrami operator: Δr = Σᵢ wᵢ * pᵢ
+        # Since center point is at origin, we don't need to subtract center coordinates
+        predicted_laplacian = torch.sum(token_weights.unsqueeze(-1) * positions, dim=1)  # (batch_size, 3)
 
-        return {"loss": loss}
+        # Target: H * n̂ (mean curvature times unit normal at origin)
+        target_laplacian = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
+
+        print('\n')
+        print('-' * 100)
+        print(predicted_laplacian[0])
+        print('-' * 100)
+        print(target_laplacian[0])
+        print('-' * 100)
+        print('\n')
+
+        print('\n')
+        print('Token Weights:')
+        print(token_weights[0])
+        print('-' * 100)
+        print('\n')
+
+        # Compute weighted combination of losses
+        total_loss = 0.0
+        loss_components = {}
+
+        for i, loss_config in enumerate(self._loss_configs):
+            component_loss = loss_config.loss_module(predicted_laplacian, target_laplacian)
+            weighted_loss = loss_config.weight * component_loss
+            total_loss += weighted_loss
+
+            # Store individual loss components for logging
+            loss_name = f"{stage}_{loss_config.loss_module.__class__.__name__}"
+            loss_components[loss_name] = component_loss
+
+        # Log the total loss and all components
+        self.log(f'{stage}_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
+
+        # Log individual loss components
+        for loss_name, loss_value in loss_components.items():
+            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True, batch_size=batch_size)
+
+        # Create return dictionary with all losses
+        result = {"loss": total_loss}
+        result.update(loss_components)
+
+        return result
