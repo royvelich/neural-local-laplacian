@@ -5,11 +5,13 @@ accelerator: 'auto'
 strategy: 'auto'
 num_sanity_val_steps: 1
 log_every_n_steps: 1
-check_val_every_n_epoch: 1
+check_val_every_n_epoch: 100
 enable_progress_bar: True
 sync_batchnorm: True
-#logger:
-# _target_: lightning.pytorch.loggers.WandbLogger
-# project: neural-local-laplacian
-# save_dir: 'wandb'
-# log_model: 'all'
+logger:
+ _target_: lightning.pytorch.loggers.WandbLogger
+ project: neural-local-laplacian
+ save_dir: 'wandb'
+ log_model: 'all'
+callbacks:
+  - _target_: neural_local_laplacian.modules.laplacian_modules.ValidationMeshUploader
