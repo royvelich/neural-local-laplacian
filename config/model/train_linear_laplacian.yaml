@@ -1,17 +1,18 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.SurfaceTransformerModule
-  input_dim: 14
-  d_model: 512
-  nhead: 4
+  input_dim: 3
+  d_model: 128
+  nhead: 8
   num_encoder_layers: 4
-  dim_feedforward: 512
-  dropout: 0.1
+  dim_feedforward: 256
+#  use_permutation_invariant: True
+  dropout: 0.0
   loss_configs:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionMSELoss
-      weight: 1.0
+      weight: 100
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.MagnitudeMSELoss
-      weight: 5.0
+      weight: 1

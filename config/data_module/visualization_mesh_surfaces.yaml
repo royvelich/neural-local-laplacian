@@ -1,0 +1,16 @@
+_target_: neural_local_laplacian.data_modules.common.GenericDataModule
+train_dataset_specification: null
+val_dataset_specifications:
+  - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+      mesh_folder_path: 'F:/input/local_laplacian_test'
+      k: 10
+      feature_extractor:
+        _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
+        num_fourier_features: 128
+        use_fourier: False
+      pose_transformer: null
+    batch_size: 1
+    num_workers: 0
+    shuffle: False

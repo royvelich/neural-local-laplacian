@@ -7,10 +7,6 @@ import pytorch_lightning as pl
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset, Data
 
-# Local imports
-from neural_local_laplacian.datasets.synthetic_datasets import SyntheticSurfaceDataset
-
-
 # neural signatures
 from neural_local_laplacian.utils import utils
 
@@ -23,7 +19,7 @@ class DatasetSpecification:
     shuffle: bool
 
 
-class SyntheticSurfaceDataModule(pl.LightningDataModule):
+class GenericDataModule(pl.LightningDataModule):
     """
     PyTorch Lightning DataModule for handling Polynomial Surface datasets.
 
@@ -79,15 +75,6 @@ class SyntheticSurfaceDataModule(pl.LightningDataModule):
         Returns:
             DataLoader: The dataloader for validation data.
         """
-        # self._val_dataset.reset_rng()
-        # return DataLoader(
-        #         self._val_dataset,
-        #         batch_size=self._batch_size,
-        #         shuffle=False,
-        #         num_workers=self._num_workers,
-        #         persistent_workers=self._num_workers > 0
-        # )
-
         return [
             DataLoader(
                 dataset=val_dataset_specification.dataset,
