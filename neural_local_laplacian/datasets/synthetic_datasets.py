@@ -263,8 +263,21 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         if self._pose_transformer is None:
             return data
 
-        # Get normal from data object (for transformers that need it)
-        normal = data['normal'][0] if 'normal' in data else torch.tensor([0., 0., 1.])
+        # Use passed normals if provided, otherwise get from data object
+        if normals is not None:
+            # Use the explicitly passed normal (e.g., origin normal)
+            if normals.dim() == 2 and normals.shape[0] == 1:
+                # Shape: (1, 3) -> extract to (3,)
+                normal = normals[0]
+            elif normals.dim() == 1:
+                # Shape: (3,) -> use as is
+                normal = normals
+            else:
+                # Handle unexpected shapes - take first normal
+                normal = normals.flatten()[:3]
+        else:
+            # Fallback: get normal from data object (original behavior)
+            normal = data['normal'][0] if 'normal' in data else torch.tensor([0., 0., 1.])
 
         # Use transformer to get translation and rotation
         translation, rotation_matrix = self._pose_transformer.transform(data.pos, normal)
@@ -359,36 +372,47 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
     def _compute_surface_normals(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor,
                                  surface_params: Optional[Dict[str, Any]] = None) -> torch.Tensor:
         """Compute surface normals using precomputed derivatives for a graph z = f(x,y)."""
-        if self._diff_geom_at_origin_only:
-            # Compute normal ONLY at origin
+
+        # Determine if we need to compute normal at origin
+        need_origin_normal = (dz_dx is None or dz_dy is None or self._diff_geom_at_origin_only)
+
+        if need_origin_normal:
             if surface_params is None:
-                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
+                raise ValueError("surface_params required when computing normal at origin")
 
-            # Evaluate derivatives at (0,0)
-            x_origin = torch.tensor([0.0], requires_grad=True)
-            y_origin = torch.tensor([0.0], requires_grad=True)
-            z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
-
-            dz_dx_origin = torch.autograd.grad(
-                outputs=z_origin,
-                inputs=x_origin,
-                create_graph=True,
-                retain_graph=True
-            )[0]
-            dz_dy_origin = torch.autograd.grad(
-                outputs=z_origin,
-                inputs=y_origin,
-                create_graph=True,
-                retain_graph=True
-            )[0]
-
-            # Compute normal at origin only
-            normal_origin = torch.stack(tensors=[-dz_dx_origin, -dz_dy_origin, torch.ones_like(input=dz_dx_origin)], dim=1)
-            return F.normalize(input=normal_origin, p=2, dim=1)  # Shape: (1, 3)
+            # Compute normal at origin using helper method
+            return self._compute_normal_at_origin(surface_params)
         else:
-            # Original behavior: compute normals for all points
-            normal = torch.stack(tensors=[-dz_dx, -dz_dy, torch.ones_like(input=dz_dx)], dim=1)
-            return F.normalize(input=normal, p=2, dim=1)
+            # Compute normals for all points using precomputed derivatives
+            return self._compute_normal_from_derivatives(dz_dx, dz_dy)
+
+    def _compute_normal_at_origin(self, surface_params: Dict[str, Any]) -> torch.Tensor:
+        """Helper method to compute surface normal at origin (0,0)."""
+        # Evaluate derivatives at origin (0,0)
+        x_origin = torch.tensor([0.0], requires_grad=True)
+        y_origin = torch.tensor([0.0], requires_grad=True)
+        z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
+
+        dz_dx_origin = torch.autograd.grad(
+            outputs=z_origin,
+            inputs=x_origin,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        dz_dy_origin = torch.autograd.grad(
+            outputs=z_origin,
+            inputs=y_origin,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+
+        # Compute and return normalized normal at origin
+        return self._compute_normal_from_derivatives(dz_dx_origin, dz_dy_origin)
+
+    def _compute_normal_from_derivatives(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> torch.Tensor:
+        """Helper method to compute normal from partial derivatives."""
+        normal = torch.stack(tensors=[-dz_dx, -dz_dy, torch.ones_like(input=dz_dx)], dim=1)
+        return F.normalize(input=normal, p=2, dim=1)
 
     def _create_surface_mesh(self, pos: torch.Tensor) -> torch.Tensor:
         """Create triangular mesh from 2D positions."""
@@ -724,13 +748,13 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         data['pos'] = positions.detach()
         data['face'] = self._create_surface_mesh(pos=data.pos).detach()
 
-        if self._diff_geom_at_origin_only:
-            # Compute ALL quantities (normal + differential geometry) ONLY at origin
-            if surface_params is None:
-                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
+        # ALWAYS compute normal at origin for pose transformation
+        # This ensures _repose_surface_and_quantities always gets the origin normal
+        origin_normal = self._compute_surface_normals(dz_dx=None, dz_dy=None, surface_params=surface_params)
 
-            # Compute normal at origin only
-            data['normal'] = self._compute_surface_normals(dz_dx=None, dz_dy=None, surface_params=surface_params).detach()
+        if self._diff_geom_at_origin_only:
+            # When origin-only mode: use the origin normal we just computed
+            data['normal'] = origin_normal.detach()
 
             # Compute differential geometry at origin only
             diff_geom = self._compute_differential_geometry_at_origin(surface_params=surface_params)
@@ -740,15 +764,17 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                 data[key] = value.detach()
 
         else:
-            # Original behavior: compute for all points
-            data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy, surface_params=surface_params)
+            # When computing for all points: store normals for all points in data,
+            # but we'll still use origin_normal for pose transformation
+            data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy, surface_params=surface_params).detach()
 
             diff_geom = self._compute_differential_geometry_original(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
             for key, value in diff_geom.items():
                 data[key] = value.detach()
 
         # Apply pose transformation to positions and differential quantities
-        data = self._repose_surface_and_quantities(data=data, normals=None)
+        # ALWAYS pass the origin normal, regardless of the diff_geom_at_origin_only flag
+        data = self._repose_surface_and_quantities(data=data, normals=origin_normal)
 
         # NOTE: Features are NOT added here - they're added by the base class
         # after calling _generate_raw_surfaces()
