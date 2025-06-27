@@ -1,0 +1,48 @@
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericDataModule
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+      seed: ${globals.training_seed}
+      epoch_size: 32000
+      grid_radius_range: [0.1, 1.0]
+      grid_offset_range: [-0.01, 0.01]
+      points_scale_range: [1.0, 1.1]
+      coefficient_scale_range: [0.8, 0.95]
+      order_range: [2, 4]
+      grid_samplers:
+        - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+          num_points_range: 10
+      feature_extractor:
+          _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
+          num_fourier_features: 128
+          use_fourier: False
+      diff_geom_at_origin_only: True
+      conv_k_nearest: null
+      pose_transformer:
+        _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      coeff_generation_method:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+        _args_: ['uniform']
+      diff_geom_components:
+        - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+          _args_: ['mean_curvature']
+    batch_size: 4000
+    num_workers: 5
+    shuffle: True
+  val_dataset_specifications:
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+        mesh_folder_path: '/home/royve/datasets/local-laplacian/'
+        k: 10
+        feature_extractor:
+          _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
+          num_fourier_features: 128
+          use_fourier: False
+        pose_transformer:
+          _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      batch_size: 1
+      num_workers: 0
+      shuffle: False
