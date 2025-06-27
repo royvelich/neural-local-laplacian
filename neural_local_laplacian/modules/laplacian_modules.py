@@ -495,6 +495,8 @@ class ValidationMeshUploader(Callback):
     2. Computes ground-truth Laplacian eigendecomposition using PyFM
     3. Collects eigendecomposition results during validation
     4. Uploads everything as W&B artifacts at the end of each validation epoch
+
+    Fixed for multi-GPU settings to properly handle mesh data per validation result.
     """
 
     def __init__(self, k: int = 50):
@@ -506,11 +508,99 @@ class ValidationMeshUploader(Callback):
         """
         super().__init__()
         self._validation_results = []  # Store results during validation
-        self._mesh_data = None  # Cache mesh data including ground-truth eigendecomposition
+        self._mesh_cache = {}  # Cache mesh data by mesh file path
         self._k = k  # Number of eigenvalues to compute
 
-    def on_validation_start(self, trainer, pl_module):
-        """Extract mesh data and compute ground-truth eigendecomposition at the start of validation."""
+    def _load_and_cache_mesh(self, mesh_file_path: Path) -> Dict[str, Any]:
+        """
+        Load mesh data and cache it by file path.
+
+        Args:
+            mesh_file_path: Path to the mesh file
+
+        Returns:
+            Dictionary containing mesh data and ground-truth eigendecomposition
+        """
+        mesh_file_str = str(mesh_file_path)
+
+        # Return cached data if available
+        if mesh_file_str in self._mesh_cache:
+            return self._mesh_cache[mesh_file_str]
+
+        try:
+            # Load mesh vertices and faces using trimesh
+            mesh = trimesh.load(mesh_file_str)
+            raw_vertices = np.array(mesh.vertices, dtype=np.float32)
+            faces = np.array(mesh.faces, dtype=np.int32)
+
+            # Apply the same normalization as MeshDataset
+            from neural_local_laplacian.utils import utils
+            vertices = utils.normalize_mesh_vertices(raw_vertices)
+
+            # Update mesh with normalized vertices for normal computation
+            mesh.vertices = vertices
+            vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
+
+            print(f"Loading mesh for validation upload: {mesh_file_path}")
+            print(f"Mesh has {len(vertices)} vertices and {len(faces)} faces")
+            print(f"Normalized vertices: center at origin, max distance = {np.linalg.norm(vertices, axis=1).max():.6f}")
+
+            # Compute ground-truth Laplacian eigendecomposition using PyFM
+            print("Computing ground-truth Laplacian eigendecomposition...")
+
+            # Create PyFM TriMesh object
+            pyfm_mesh = TriMesh(vertices, faces)
+
+            # Process the mesh and compute the Laplacian spectrum
+            pyfm_mesh.process(k=self._k, intrinsic=False, verbose=False)
+
+            # Retrieve eigenvalues, eigenfunctions, and vertex areas
+            gt_eigenvalues = pyfm_mesh.eigenvalues  # Shape: (k,)
+            gt_eigenvectors = pyfm_mesh.eigenvectors  # Shape: (num_vertices, k)
+            vertex_areas = pyfm_mesh.vertex_areas  # Shape: (num_vertices,)
+
+            print(f"Computed {len(gt_eigenvalues)} ground-truth eigenvalues")
+            print(f"Ground-truth eigenvalue range: [{gt_eigenvalues[0]:.2e}, {gt_eigenvalues[-1]:.6f}]")
+
+            mesh_data = {
+                'vertices': vertices,
+                'vertex_normals': vertex_normals,
+                'faces': faces,
+                'mesh_file_path': mesh_file_str,
+                'num_vertices': len(vertices),
+                'num_faces': len(faces),
+
+                # Ground-truth Laplacian eigendecomposition
+                'gt_eigenvalues': gt_eigenvalues,
+                'gt_eigenvectors': gt_eigenvectors,
+                'vertex_areas': vertex_areas,
+                'gt_num_eigenvalues': len(gt_eigenvalues)
+            }
+
+            # Cache the mesh data
+            self._mesh_cache[mesh_file_str] = mesh_data
+            print(f"Successfully computed and cached ground-truth eigendecomposition for {mesh_file_str}")
+
+            return mesh_data
+
+        except Exception as e:
+            print(f"Warning: Failed to load mesh or compute eigendecomposition for {mesh_file_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _get_mesh_file_path_for_batch(self, trainer, batch, batch_idx: int) -> Optional[Path]:
+        """
+        Get the mesh file path corresponding to the current validation batch.
+
+        Args:
+            trainer: PyTorch Lightning trainer
+            batch: Current validation batch
+            batch_idx: Batch index
+
+        Returns:
+            Path to the mesh file or None if not available
+        """
         # Get the validation dataloader
         val_dataloaders = trainer.datamodule.val_dataloader()
         val_dataloader = val_dataloaders[0] if isinstance(val_dataloaders, list) else val_dataloaders
@@ -519,110 +609,86 @@ class ValidationMeshUploader(Callback):
         if hasattr(val_dataloader.dataset, 'mesh_file_paths'):
             mesh_dataset = val_dataloader.dataset
 
-            # For simplicity, use the first mesh file (you can extend this for multiple meshes)
-            if len(mesh_dataset.mesh_file_paths) > 0:
-                mesh_file_path = mesh_dataset.mesh_file_paths[0]
+            # For MeshDataset, batch_idx corresponds to mesh index
+            if batch_idx < len(mesh_dataset.mesh_file_paths):
+                return mesh_dataset.mesh_file_paths[batch_idx]
+            else:
+                # Handle case where batch_idx might wrap around due to epoch size
+                mesh_idx = batch_idx % len(mesh_dataset.mesh_file_paths)
+                return mesh_dataset.mesh_file_paths[mesh_idx]
 
-                try:
-                    # Load mesh vertices and faces using trimesh
-                    mesh = trimesh.load(str(mesh_file_path))
-                    raw_vertices = np.array(mesh.vertices, dtype=np.float32)
-                    faces = np.array(mesh.faces, dtype=np.int32)
+        return None
 
-                    # Apply the same normalization as MeshDataset
-                    # Import utils with proper path
-                    from neural_local_laplacian.utils import utils
-                    vertices = utils.normalize_mesh_vertices(raw_vertices)
-
-                    # Update mesh with normalized vertices for normal computation
-                    mesh.vertices = vertices
-                    vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
-
-                    print(f"Loaded mesh for validation upload: {mesh_file_path}")
-                    print(f"Mesh has {len(vertices)} vertices and {len(faces)} faces")
-                    print(f"Normalized vertices: center at origin, max distance = {np.linalg.norm(vertices, axis=1).max():.6f}")
-
-                    # Compute ground-truth Laplacian eigendecomposition using PyFM
-                    print("Computing ground-truth Laplacian eigendecomposition...")
-
-                    # Create PyFM TriMesh object
-                    pyfm_mesh = TriMesh(vertices, faces)
-
-                    # Process the mesh and compute the Laplacian spectrum
-                    # Set intrinsic=False for using standard cotangent Laplacian
-                    pyfm_mesh.process(k=self._k, intrinsic=False, verbose=False)
-
-                    # Retrieve eigenvalues, eigenfunctions, and vertex areas
-                    gt_eigenvalues = pyfm_mesh.eigenvalues  # Shape: (k,)
-                    gt_eigenvectors = pyfm_mesh.eigenvectors  # Shape: (num_vertices, k)
-                    vertex_areas = pyfm_mesh.vertex_areas  # Shape: (num_vertices,)
-
-                    print(f"Computed {len(gt_eigenvalues)} ground-truth eigenvalues")
-                    print(f"Ground-truth eigenvalue range: [{gt_eigenvalues[0]:.2e}, {gt_eigenvalues[-1]:.6f}]")
-                    print(f"First eigenvalue (should be ~0): {gt_eigenvalues[0]:.2e}")
-                    if len(gt_eigenvalues) > 1:
-                        print(f"Second eigenvalue (Fiedler): {gt_eigenvalues[1]:.6f}")
-
-                    self._mesh_data = {
-                        'vertices': vertices,
-                        'vertex_normals': vertex_normals,
-                        'faces': faces,
-                        'mesh_file_path': str(mesh_file_path),
-                        'num_vertices': len(vertices),
-                        'num_faces': len(faces),
-
-                        # Ground-truth Laplacian eigendecomposition
-                        'gt_eigenvalues': gt_eigenvalues,
-                        'gt_eigenvectors': gt_eigenvectors,
-                        'vertex_areas': vertex_areas,
-                        'gt_num_eigenvalues': len(gt_eigenvalues)
-                    }
-
-                    print("Successfully computed and cached ground-truth eigendecomposition")
-
-                except Exception as e:
-                    print(f"Warning: Failed to load mesh or compute eigendecomposition for validation upload: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    self._mesh_data = None
-        else:
-            print("Validation dataset is not a MeshDataset - no mesh data to upload")
-            self._mesh_data = None
+    def on_validation_start(self, trainer, pl_module):
+        """Clear validation results at the start of validation epoch."""
+        self._validation_results = []
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        """Collect validation results after each batch."""
-        if outputs is not None and self._mesh_data is not None:
-            # Store the validation results from this batch
-            # outputs should contain the eigendecomposition metrics
-            batch_results = {
-                'batch_idx': batch_idx,
-                'epoch': pl_module.current_epoch,
-                'metrics': {},
-                'eigendata': {}
+        """Collect validation results after each batch with corresponding mesh data."""
+        if outputs is None:
+            return
+
+        # Get the mesh file path for this specific batch
+        mesh_file_path = self._get_mesh_file_path_for_batch(trainer, batch, batch_idx)
+
+        if mesh_file_path is None:
+            print(f"Warning: Could not determine mesh file for batch {batch_idx}")
+            return
+
+        # Load and cache mesh data for this specific batch
+        mesh_data = self._load_and_cache_mesh(mesh_file_path)
+
+        if mesh_data is None:
+            print(f"Warning: Could not load mesh data for batch {batch_idx}")
+            return
+
+        # Store the validation results from this batch with associated mesh data
+        batch_results = {
+            'batch_idx': batch_idx,
+            'epoch': pl_module.current_epoch,
+            'rank': trainer.global_rank,
+            'metrics': {},
+            'eigendata': {},
+
+            # Store mesh data specific to this batch/result
+            'mesh_data': {
+                'mesh_file_path': mesh_data['mesh_file_path'],
+                'num_vertices': mesh_data['num_vertices'],
+                'num_faces': mesh_data['num_faces'],
+                'vertices': torch.from_numpy(mesh_data['vertices']).float(),
+                'vertex_normals': torch.from_numpy(mesh_data['vertex_normals']).float(),
+                'faces': torch.from_numpy(mesh_data['faces']).long(),
+
+                # Ground-truth eigendecomposition for this specific mesh
+                'gt_eigenvalues': torch.from_numpy(mesh_data['gt_eigenvalues']).float(),
+                'gt_eigenvectors': torch.from_numpy(mesh_data['gt_eigenvectors']).float(),
+                'vertex_areas': torch.from_numpy(mesh_data['vertex_areas']).float(),
+                'gt_num_eigenvalues': mesh_data['gt_num_eigenvalues']
+            }
+        }
+
+        # Extract metrics from outputs
+        for key, value in outputs.items():
+            if isinstance(value, torch.Tensor):
+                batch_results['metrics'][key] = value.detach().cpu().numpy()
+            else:
+                batch_results['metrics'][key] = value
+
+        # If the module stores eigendecomposition data, extract it
+        if hasattr(pl_module, '_last_eigenvalues') and hasattr(pl_module, '_last_eigenvectors'):
+            batch_results['eigendata'] = {
+                'predicted_eigenvalues': pl_module._last_eigenvalues,
+                'predicted_eigenvectors': pl_module._last_eigenvectors,
+                'num_eigenvalues': len(pl_module._last_eigenvalues),
+                'matrix_size': pl_module._last_eigenvectors.shape[0] if pl_module._last_eigenvectors is not None else 0
             }
 
-            # Extract metrics from outputs
-            for key, value in outputs.items():
-                if isinstance(value, torch.Tensor):
-                    batch_results['metrics'][key] = value.detach().cpu().numpy()
-                else:
-                    batch_results['metrics'][key] = value
-
-            # If the module stores eigendecomposition data, extract it
-            if hasattr(pl_module, '_last_eigenvalues') and hasattr(pl_module, '_last_eigenvectors'):
-                batch_results['eigendata'] = {
-                    'predicted_eigenvalues': pl_module._last_eigenvalues,
-                    'predicted_eigenvectors': pl_module._last_eigenvectors,
-                    'num_eigenvalues': len(pl_module._last_eigenvalues),
-                    'matrix_size': pl_module._last_eigenvectors.shape[0] if pl_module._last_eigenvectors is not None else 0
-                }
-
-            self._validation_results.append(batch_results)
+        self._validation_results.append(batch_results)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         """Upload validation data as W&B artifacts at the end of validation epoch."""
-        if not self._validation_results or self._mesh_data is None:
-            print("No validation results or mesh data to upload")
+        if not self._validation_results:
+            print("No validation results to upload")
             return
 
         # Create directory for artifacts
@@ -635,37 +701,16 @@ class ValidationMeshUploader(Callback):
 
         rank = trainer.global_rank
 
-        # Combine everything into a single data structure with PyTorch tensors
-        combined_data = {
-            'epoch': epoch,
-            'rank': rank,
-            'num_batches': len(self._validation_results),
-
-            # Mesh data as PyTorch tensors
-            'mesh_vertices': torch.from_numpy(self._mesh_data['vertices']).float(),
-            'mesh_vertex_normals': torch.from_numpy(self._mesh_data['vertex_normals']).float(),
-            'mesh_faces': torch.from_numpy(self._mesh_data['faces']).long(),
-            'mesh_file_path': self._mesh_data['mesh_file_path'],
-            'num_vertices': self._mesh_data['num_vertices'],
-            'num_faces': self._mesh_data['num_faces'],
-
-            # Ground-truth Laplacian eigendecomposition
-            'gt_eigenvalues': torch.from_numpy(self._mesh_data['gt_eigenvalues']).float(),
-            'gt_eigenvectors': torch.from_numpy(self._mesh_data['gt_eigenvectors']).float(),
-            'vertex_areas': torch.from_numpy(self._mesh_data['vertex_areas']).float(),
-            'gt_num_eigenvalues': self._mesh_data['gt_num_eigenvalues'],
-
-            # Validation results with tensors
-            'validation_results': []
-        }
-
-        # Convert all validation results to PyTorch tensors
+        # Convert validation results to use PyTorch tensors
+        converted_results = []
         for batch_result in self._validation_results:
             converted_result = {
                 'batch_idx': batch_result['batch_idx'],
                 'epoch': batch_result['epoch'],
+                'rank': batch_result['rank'],
                 'metrics': {},
-                'eigendata': {}
+                'eigendata': {},
+                'mesh_data': batch_result['mesh_data']  # Already converted to tensors above
             }
 
             # Convert metrics to PyTorch tensors
@@ -687,7 +732,16 @@ class ValidationMeshUploader(Callback):
                 converted_result['eigendata']['num_eigenvalues'] = eigendata.get('num_eigenvalues', 0)
                 converted_result['eigendata']['matrix_size'] = eigendata.get('matrix_size', 0)
 
-            combined_data['validation_results'].append(converted_result)
+            converted_results.append(converted_result)
+
+        # Create the final data structure
+        combined_data = {
+            'epoch': epoch,
+            'rank': rank,
+            'num_batches': len(converted_results),
+            'validation_results': converted_results,
+            # Note: mesh data is now stored per validation result, not globally
+        }
 
         # Save everything in a single pickle file
         combined_pickle_name = f"rank_{rank}_validation_data.pkl"
@@ -697,10 +751,7 @@ class ValidationMeshUploader(Callback):
             pickle.dump(combined_data, f)
 
         print(f"Saved validation data to {combined_pickle_path}")
-        print(f"Data includes:")
-        print(f"  - Mesh: {combined_data['num_vertices']} vertices, {combined_data['num_faces']} faces")
-        print(f"  - Ground-truth: {combined_data['gt_num_eigenvalues']} eigenvalues")
-        print(f"  - Validation results: {len(combined_data['validation_results'])} batches")
+        print(f"Data includes {len(converted_results)} validation results, each with its own mesh data")
 
         # Synchronize all processes if using distributed training
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -708,12 +759,12 @@ class ValidationMeshUploader(Callback):
 
         # Only rank 0 uploads to W&B
         if trainer.global_rank == 0 and wandb.run is not None:
-            self._upload_to_wandb(epoch, epoch_dir, artifacts_dir)
+            self._upload_to_wandb(epoch, epoch_dir, artifacts_dir, len(converted_results))
 
         # Clear results for next epoch
         self._validation_results = []
 
-    def _upload_to_wandb(self, epoch: int, epoch_dir: Path, artifacts_dir: Path):
+    def _upload_to_wandb(self, epoch: int, epoch_dir: Path, artifacts_dir: Path, num_results: int):
         """Upload artifacts to Weights & Biases."""
         try:
             # Create zip file with all validation data
@@ -735,12 +786,10 @@ class ValidationMeshUploader(Callback):
             # Add metadata
             artifact.metadata = {
                 'epoch': epoch,
-                'num_validation_batches': len(self._validation_results),
-                'mesh_file': self._mesh_data['mesh_file_path'] if self._mesh_data else None,
-                'num_vertices': self._mesh_data['num_vertices'] if self._mesh_data else 0,
-                'num_faces': self._mesh_data['num_faces'] if self._mesh_data else 0,
-                'gt_num_eigenvalues': self._mesh_data['gt_num_eigenvalues'] if self._mesh_data else 0,
-                'eigenvalue_computation_k': self._k
+                'num_validation_results': num_results,
+                'eigenvalue_computation_k': self._k,
+                'mesh_data_per_result': True,  # Flag indicating new format
+                'description': 'Each validation result contains its own mesh data and eigendecomposition'
             }
 
             wandb.log_artifact(artifact)
