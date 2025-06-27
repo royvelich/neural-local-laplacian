@@ -122,7 +122,12 @@ class MeshDataset(Dataset):
             else:
                 raise ValueError(f"Loaded mesh has no vertices: {mesh_file_path}")
 
-            # Calculate vertex normals using trimesh
+            # Normalize mesh vertices: center at origin and fit in unit sphere
+            vertices = utils.normalize_mesh_vertices(vertices)
+
+            # Calculate vertex normals using trimesh with normalized vertices
+            # Update the mesh with normalized vertices for normal computation
+            mesh.vertices = vertices
             if hasattr(mesh, 'vertex_normals'):
                 vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
             else:

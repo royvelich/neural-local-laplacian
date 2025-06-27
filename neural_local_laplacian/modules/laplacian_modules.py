@@ -526,12 +526,21 @@ class ValidationMeshUploader(Callback):
                 try:
                     # Load mesh vertices and faces using trimesh
                     mesh = trimesh.load(str(mesh_file_path))
-                    vertices = np.array(mesh.vertices, dtype=np.float32)
-                    vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
+                    raw_vertices = np.array(mesh.vertices, dtype=np.float32)
                     faces = np.array(mesh.faces, dtype=np.int32)
+
+                    # Apply the same normalization as MeshDataset
+                    # Import utils with proper path
+                    from neural_local_laplacian.utils import utils
+                    vertices = utils.normalize_mesh_vertices(raw_vertices)
+
+                    # Update mesh with normalized vertices for normal computation
+                    mesh.vertices = vertices
+                    vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
 
                     print(f"Loaded mesh for validation upload: {mesh_file_path}")
                     print(f"Mesh has {len(vertices)} vertices and {len(faces)} faces")
+                    print(f"Normalized vertices: center at origin, max distance = {np.linalg.norm(vertices, axis=1).max():.6f}")
 
                     # Compute ground-truth Laplacian eigendecomposition using PyFM
                     print("Computing ground-truth Laplacian eigendecomposition...")
