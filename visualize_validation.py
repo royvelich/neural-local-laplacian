@@ -9,6 +9,8 @@ and visualizes:
 3. Predicted Laplacian eigenvectors as scalar fields on the mesh
 4. Eigenvalue comparison and analysis
 5. Eigenvector correlation analysis
+
+Updated to handle both old format (global mesh data) and new format (mesh data per result).
 """
 
 import argparse
@@ -98,22 +100,30 @@ class EigenanalysisVisualizer:
         print(f"Epoch: {data['epoch']}")
         print(f"Rank: {data['rank']}")
         print(f"Number of validation batches: {data['num_batches']}")
-        print(f"Mesh file: {data['mesh_file_path']}")
-        print(f"Number of vertices: {data['num_vertices']}")
-        print(f"Number of faces: {data['num_faces']}")
-        print(f"Mesh vertices shape: {data['mesh_vertices'].shape}")
-        print(f"Mesh faces shape: {data['mesh_faces'].shape}")
-        print(f"Mesh normals shape: {data['mesh_vertex_normals'].shape}")
-
-        # Ground-truth eigendecomposition info
-        if 'gt_eigenvalues' in data:
-            print(f"\nGround-truth eigendecomposition:")
-            print(f"  GT eigenvalues shape: {data['gt_eigenvalues'].shape}")
-            print(f"  GT eigenvectors shape: {data['gt_eigenvectors'].shape}")
-            print(f"  Vertex areas shape: {data['vertex_areas'].shape}")
-            print(f"  Number of GT eigenvalues: {data['gt_num_eigenvalues']}")
+        print(f"Validation results: {len(data['validation_results'])}")
 
         if data['validation_results']:
+            # Show summary of first result's mesh data
+            first_result = data['validation_results'][0]
+            if 'mesh_data' in first_result:
+                mesh_data = first_result['mesh_data']
+                print(f"First result mesh file: {mesh_data.get('mesh_file_path', 'Unknown')}")
+                print(f"First result mesh vertices: {mesh_data['vertices'].shape if 'vertices' in mesh_data else 'N/A'}")
+                print(f"First result mesh faces: {mesh_data['faces'].shape if 'faces' in mesh_data else 'N/A'}")
+                if 'gt_eigenvalues' in mesh_data:
+                    print(f"First result GT eigenvalues: {mesh_data['gt_eigenvalues'].shape}")
+
+            # Check if multiple different meshes are used
+            mesh_files = set()
+            for result in data['validation_results']:
+                if 'mesh_data' in result and 'mesh_file_path' in result['mesh_data']:
+                    mesh_files.add(result['mesh_data']['mesh_file_path'])
+
+            print(f"Unique mesh files used: {len(mesh_files)}")
+            if len(mesh_files) <= 3:  # Show mesh files if not too many
+                for i, mesh_file in enumerate(sorted(mesh_files)):
+                    print(f"  {i + 1}. {mesh_file}")
+
             first_result = data['validation_results'][0]
             print(f"\nFirst batch metrics: {list(first_result['metrics'].keys())}")
 
@@ -124,6 +134,36 @@ class EigenanalysisVisualizer:
                 print(f"Matrix size: {eigendata.get('matrix_size', 'N/A')}")
 
         print("=" * 60)
+
+    def _get_mesh_data_for_batch(self, batch_idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get mesh data for a specific batch.
+
+        Args:
+            batch_idx: Index of the batch
+
+        Returns:
+            Dictionary containing mesh vertices, faces, normals, and ground-truth eigendecomposition
+        """
+        if batch_idx >= len(self.validation_data['validation_results']):
+            raise IndexError(f"Batch index {batch_idx} out of range")
+
+        batch_result = self.validation_data['validation_results'][batch_idx]
+        if 'mesh_data' not in batch_result:
+            raise ValueError(f"No mesh data found for batch {batch_idx}")
+
+        mesh_data = batch_result['mesh_data']
+
+        return {
+            'vertices': mesh_data['vertices'],
+            'vertex_normals': mesh_data['vertex_normals'],
+            'faces': mesh_data['faces'],
+            'gt_eigenvalues': mesh_data['gt_eigenvalues'],
+            'gt_eigenvectors': mesh_data['gt_eigenvectors'],
+            'mesh_file_path': mesh_data.get('mesh_file_path', 'Unknown'),
+            'num_vertices': mesh_data.get('num_vertices', len(mesh_data['vertices'])),
+            'num_faces': mesh_data.get('num_faces', len(mesh_data['faces']))
+        }
 
     def print_eigenvalue_analysis(self, gt_eigenvalues: torch.Tensor, pred_eigenvalues: torch.Tensor, batch_idx: int):
         """Print detailed eigenvalue comparison analysis."""
@@ -356,12 +396,21 @@ class EigenanalysisVisualizer:
         # Clear previous visualization
         ps.remove_all_structures()
 
-        # Get mesh data
-        vertices = self.validation_data['mesh_vertices']
-        vertex_normals = self.validation_data['mesh_vertex_normals']
-        faces = self.validation_data['mesh_faces']
-        gt_eigenvalues = self.validation_data['gt_eigenvalues']
-        gt_eigenvectors = self.validation_data['gt_eigenvectors']
+        # Get mesh data for this specific batch
+        try:
+            mesh_data = self._get_mesh_data_for_batch(batch_idx)
+        except Exception as e:
+            print(f"Error getting mesh data for batch {batch_idx}: {e}")
+            return
+
+        vertices = mesh_data['vertices']
+        vertex_normals = mesh_data['vertex_normals']
+        faces = mesh_data['faces']
+        gt_eigenvalues = mesh_data['gt_eigenvalues']
+        gt_eigenvectors = mesh_data['gt_eigenvectors']
+
+        print(f"Mesh file: {mesh_data['mesh_file_path']}")
+        print(f"Mesh has {mesh_data['num_vertices']} vertices and {mesh_data['num_faces']} faces")
 
         # Visualize base mesh
         mesh_structure = self.visualize_mesh(vertices, vertex_normals, faces)
@@ -427,6 +476,7 @@ class EigenanalysisVisualizer:
         print("  - Predicted eigenvectors: PRED Eigenvector X")
         print("  - Both use the same colormap for easy comparison")
         print("  - Eigenvalue comparison and correlation analysis in terminal")
+        print("  - Each result shows its own mesh data")
         print("=" * 60)
 
         # Iterate through all validation results
