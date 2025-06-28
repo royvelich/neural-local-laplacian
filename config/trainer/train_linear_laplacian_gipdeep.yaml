@@ -3,9 +3,9 @@ max_epochs: -1
 devices: -1
 accelerator: 'auto'
 strategy: 'auto'
-num_sanity_val_steps: 1
+num_sanity_val_steps: 0
 log_every_n_steps: 1
-check_val_every_n_epoch: 1
+check_val_every_n_epoch: 50
 enable_progress_bar: True
 sync_batchnorm: True
 logger:
