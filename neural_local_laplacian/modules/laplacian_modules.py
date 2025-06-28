@@ -589,35 +589,155 @@ class ValidationMeshUploader(Callback):
             traceback.print_exc()
             return None
 
-    def _get_mesh_file_path_for_batch(self, trainer, batch, batch_idx: int) -> Optional[Path]:
+    def _extract_mesh_info_from_batch(self, batch) -> Dict[str, Any]:
         """
-        Get the mesh file path corresponding to the current validation batch.
+        Extract mesh information directly from the validation batch.
 
         Args:
-            trainer: PyTorch Lightning trainer
-            batch: Current validation batch
-            batch_idx: Batch index
+            batch: Current validation batch (list containing Data objects)
 
         Returns:
-            Path to the mesh file or None if not available
+            Dictionary containing mesh metadata extracted from batch
         """
-        # Get the validation dataloader
-        val_dataloaders = trainer.datamodule.val_dataloader()
-        val_dataloader = val_dataloaders[0] if isinstance(val_dataloaders, list) else val_dataloaders
+        # Get the batch data (list containing single Data object for MeshDataset)
+        batch_data = batch[0] if isinstance(batch, list) else batch
 
-        # Check if this is a MeshDataset
-        if hasattr(val_dataloader.dataset, 'mesh_file_paths'):
-            mesh_dataset = val_dataloader.dataset
+        print(f"  Debug: batch_data type = {type(batch_data)}")
 
-            # For MeshDataset, batch_idx corresponds to mesh index
-            if batch_idx < len(mesh_dataset.mesh_file_paths):
-                return mesh_dataset.mesh_file_paths[batch_idx]
+        def _extract_value_from_batched_attribute(attr_value):
+            """Extract single value from potentially batched attribute."""
+            if isinstance(attr_value, list):
+                if len(attr_value) == 0:
+                    return None
+                return attr_value[0]  # Take first element
+            elif torch.is_tensor(attr_value):
+                if attr_value.numel() == 1:
+                    return attr_value.item()  # Extract scalar from tensor
+                elif attr_value.numel() > 1:
+                    return attr_value[0].item()  # Take first element and extract scalar
+                else:
+                    return None
             else:
-                # Handle case where batch_idx might wrap around due to epoch size
-                mesh_idx = batch_idx % len(mesh_dataset.mesh_file_paths)
-                return mesh_dataset.mesh_file_paths[mesh_idx]
+                return attr_value
 
-        return None
+        # Try to extract metadata using individual attributes (primary method)
+        try:
+            mesh_file_path_raw = getattr(batch_data, 'mesh_file_path', None)
+            original_num_vertices_raw = getattr(batch_data, 'original_num_vertices', None)
+            original_num_faces_raw = getattr(batch_data, 'original_num_faces', None)
+            mesh_idx_raw = getattr(batch_data, 'mesh_idx', None)
+            k_neighbors_raw = getattr(batch_data, 'k_neighbors', 0)
+
+            if mesh_file_path_raw is not None:
+                # Extract values from batched attributes
+                mesh_file_path = _extract_value_from_batched_attribute(mesh_file_path_raw)
+                original_num_vertices = _extract_value_from_batched_attribute(original_num_vertices_raw)
+                original_num_faces = _extract_value_from_batched_attribute(original_num_faces_raw)
+                mesh_idx = _extract_value_from_batched_attribute(mesh_idx_raw)
+                k_neighbors = _extract_value_from_batched_attribute(k_neighbors_raw)
+
+                print(f"  ✅ Found mesh metadata as individual attributes")
+                print(f"    mesh_file_path: {mesh_file_path}")
+                print(f"    original_num_vertices: {original_num_vertices}")
+
+                # Calculate processed vertices from the actual batch data
+                processed_num_vertices = len(torch.unique(batch_data.center_indices)) if hasattr(batch_data, 'center_indices') else 0
+                total_points = len(batch_data.pos) if hasattr(batch_data, 'pos') else 0
+
+                return {
+                    'mesh_file_path': Path(mesh_file_path),
+                    'original_num_vertices': original_num_vertices,
+                    'original_num_faces': original_num_faces,
+                    'mesh_idx': mesh_idx,
+                    'processed_num_vertices': processed_num_vertices,
+                    'total_points': total_points,
+                    'k_neighbors': k_neighbors or 0
+                }
+        except Exception as e:
+            print(f"  ⚠️  Failed to extract via individual attributes: {e}")
+
+        # Fallback: Try mesh_metadata dict approach
+        if hasattr(batch_data, 'mesh_metadata'):
+            mesh_metadata = batch_data.mesh_metadata
+            print(f"  Fallback: mesh_metadata type = {type(mesh_metadata)}")
+
+            # Handle case where mesh_metadata might be a list due to batching
+            if isinstance(mesh_metadata, list):
+                if len(mesh_metadata) == 0:
+                    raise ValueError("mesh_metadata list is empty")
+                # Take the first metadata (assuming all patches from same mesh)
+                mesh_metadata = mesh_metadata[0]
+                print(f"  Note: mesh_metadata was a list, using first element")
+
+            # Ensure mesh_metadata is a dictionary
+            if not isinstance(mesh_metadata, dict):
+                raise ValueError(f"mesh_metadata should be a dict, got {type(mesh_metadata)}: {mesh_metadata}")
+
+            # Extract and clean values from metadata dict
+            mesh_file_path = _extract_value_from_batched_attribute(mesh_metadata['mesh_file_path'])
+            original_num_vertices = _extract_value_from_batched_attribute(mesh_metadata['original_num_vertices'])
+            original_num_faces = _extract_value_from_batched_attribute(mesh_metadata['original_num_faces'])
+            mesh_idx = _extract_value_from_batched_attribute(mesh_metadata['mesh_idx'])
+            k_neighbors = _extract_value_from_batched_attribute(mesh_metadata.get('k_neighbors', 0))
+
+            # Calculate processed vertices from the actual batch data
+            processed_num_vertices = len(torch.unique(batch_data.center_indices)) if hasattr(batch_data, 'center_indices') else 0
+            total_points = len(batch_data.pos) if hasattr(batch_data, 'pos') else 0
+
+            print(f"  ✅ Using mesh_metadata dict fallback")
+            print(f"    mesh_file_path: {mesh_file_path}")
+            print(f"    original_num_vertices: {original_num_vertices}")
+
+            return {
+                'mesh_file_path': Path(mesh_file_path),
+                'original_num_vertices': original_num_vertices,
+                'original_num_faces': original_num_faces,
+                'mesh_idx': mesh_idx,
+                'processed_num_vertices': processed_num_vertices,
+                'total_points': total_points,
+                'k_neighbors': k_neighbors or 0
+            }
+
+        # If we get here, no metadata was found
+        raise ValueError("No mesh metadata found in batch data. MeshDataset needs to be updated to include metadata.")
+
+    def _validate_mesh_eigendata_consistency(self, mesh_info: Dict, eigendata: Dict) -> bool:
+        """
+        Validate that mesh and eigendata are consistent.
+
+        Args:
+            mesh_info: Mesh information extracted from batch
+            eigendata: Eigendecomposition data from model
+
+        Returns:
+            True if consistent, False otherwise
+        """
+        if not eigendata:
+            return True  # No eigendata to validate
+
+        expected_vertices = mesh_info['original_num_vertices']
+
+        if 'predicted_eigenvectors' in eigendata and eigendata['predicted_eigenvectors'] is not None:
+            actual_vertices = eigendata['predicted_eigenvectors'].shape[0]
+
+            if expected_vertices != actual_vertices:
+                print(f"❌ ERROR: Mesh-eigendata mismatch detected!")
+                print(f"  Expected vertices (from mesh): {expected_vertices}")
+                print(f"  Actual vertices (from eigendata): {actual_vertices}")
+                print(f"  Mesh file: {mesh_info['mesh_file_path']}")
+                print(f"  Mesh index: {mesh_info['mesh_idx']}")
+                print(f"  Processed vertices: {mesh_info['processed_num_vertices']}")
+                return False
+
+        if 'predicted_eigenvalues' in eigendata and eigendata['predicted_eigenvalues'] is not None:
+            num_eigenvals = len(eigendata['predicted_eigenvalues'])
+            print(f"✅ Consistency check passed:")
+            print(f"  Mesh vertices: {expected_vertices}")
+            print(f"  Eigendata vertices: {eigendata.get('matrix_size', 'unknown')}")
+            print(f"  Eigenvalues computed: {num_eigenvals}")
+            print(f"  Mesh file: {mesh_info['mesh_file_path']}")
+
+        return True
 
     def on_validation_start(self, trainer, pl_module):
         """Clear validation results at the start of validation epoch."""
@@ -628,31 +748,51 @@ class ValidationMeshUploader(Callback):
         if outputs is None:
             return
 
-        # Get the mesh file path for this specific batch
-        mesh_file_path = self._get_mesh_file_path_for_batch(trainer, batch, batch_idx)
+        try:
+            # STEP 1: Extract mesh info directly from batch data (CRITICAL FIX)
+            mesh_info = self._extract_mesh_info_from_batch(batch)
+            mesh_file_path = mesh_info['mesh_file_path']
 
-        if mesh_file_path is None:
-            print(f"Warning: Could not determine mesh file for batch {batch_idx}")
+            print(f"Processing batch {batch_idx}: {mesh_file_path.name}")
+            print(f"  Original vertices: {mesh_info['original_num_vertices']}")
+            print(f"  Processed vertices: {mesh_info['processed_num_vertices']}")
+
+        except Exception as e:
+            print(f"❌ Error extracting mesh info from batch {batch_idx}: {e}")
             return
 
-        # Load and cache mesh data for this specific batch
+        # STEP 2: Load and cache mesh data
         mesh_data = self._load_and_cache_mesh(mesh_file_path)
-
         if mesh_data is None:
-            print(f"Warning: Could not load mesh data for batch {batch_idx}")
+            print(f"❌ Could not load mesh data for batch {batch_idx}")
             return
 
-        # Store the validation results from this batch with associated mesh data
+        # STEP 3: Extract eigendata from model
+        eigendata = {}
+        if hasattr(pl_module, '_last_eigenvalues') and hasattr(pl_module, '_last_eigenvectors'):
+            eigendata = {
+                'predicted_eigenvalues': pl_module._last_eigenvalues,
+                'predicted_eigenvectors': pl_module._last_eigenvectors,
+                'num_eigenvalues': len(pl_module._last_eigenvalues) if pl_module._last_eigenvalues is not None else 0,
+                'matrix_size': pl_module._last_eigenvectors.shape[0] if pl_module._last_eigenvectors is not None else 0
+            }
+
+        # STEP 4: CRITICAL VALIDATION - Check mesh-eigendata consistency
+        if not self._validate_mesh_eigendata_consistency(mesh_info, eigendata):
+            print(f"⚠️  Skipping validation result for batch {batch_idx} due to mesh-eigendata inconsistency")
+            return
+
+        # STEP 5: Store validated result with enhanced metadata
         batch_results = {
             'batch_idx': batch_idx,
             'epoch': pl_module.current_epoch,
             'rank': trainer.global_rank,
             'metrics': {},
-            'eigendata': {},
+            'eigendata': eigendata,
 
-            # Store mesh data specific to this batch/result
+            # Enhanced mesh data with validation metadata
             'mesh_data': {
-                'mesh_file_path': mesh_data['mesh_file_path'],
+                'mesh_file_path': str(mesh_file_path),
                 'num_vertices': mesh_data['num_vertices'],
                 'num_faces': mesh_data['num_faces'],
                 'vertices': torch.from_numpy(mesh_data['vertices']).float(),
@@ -663,7 +803,14 @@ class ValidationMeshUploader(Callback):
                 'gt_eigenvalues': torch.from_numpy(mesh_data['gt_eigenvalues']).float(),
                 'gt_eigenvectors': torch.from_numpy(mesh_data['gt_eigenvectors']).float(),
                 'vertex_areas': torch.from_numpy(mesh_data['vertex_areas']).float(),
-                'gt_num_eigenvalues': mesh_data['gt_num_eigenvalues']
+                'gt_num_eigenvalues': mesh_data['gt_num_eigenvalues'],
+
+                # VALIDATION METADATA (NEW)
+                'mesh_idx': mesh_info['mesh_idx'],
+                'processed_vertices': mesh_info['processed_num_vertices'],
+                'k_neighbors': mesh_info['k_neighbors'],
+                'validation_status': 'consistent',
+                'batch_total_points': mesh_info['total_points']
             }
         }
 
@@ -674,16 +821,17 @@ class ValidationMeshUploader(Callback):
             else:
                 batch_results['metrics'][key] = value
 
-        # If the module stores eigendecomposition data, extract it
-        if hasattr(pl_module, '_last_eigenvalues') and hasattr(pl_module, '_last_eigenvectors'):
-            batch_results['eigendata'] = {
-                'predicted_eigenvalues': pl_module._last_eigenvalues,
-                'predicted_eigenvectors': pl_module._last_eigenvectors,
-                'num_eigenvalues': len(pl_module._last_eigenvalues),
-                'matrix_size': pl_module._last_eigenvectors.shape[0] if pl_module._last_eigenvectors is not None else 0
-            }
+        # Convert eigendata to PyTorch tensors if needed
+        if eigendata:
+            if 'predicted_eigenvalues' in eigendata and eigendata['predicted_eigenvalues'] is not None:
+                if isinstance(eigendata['predicted_eigenvalues'], np.ndarray):
+                    batch_results['eigendata']['predicted_eigenvalues'] = torch.from_numpy(eigendata['predicted_eigenvalues']).float()
+            if 'predicted_eigenvectors' in eigendata and eigendata['predicted_eigenvectors'] is not None:
+                if isinstance(eigendata['predicted_eigenvectors'], np.ndarray):
+                    batch_results['eigendata']['predicted_eigenvectors'] = torch.from_numpy(eigendata['predicted_eigenvectors']).float()
 
         self._validation_results.append(batch_results)
+        print(f"✅ Successfully stored validation result for batch {batch_idx}")
 
     def on_validation_epoch_end(self, trainer, pl_module):
         """Upload validation data as W&B artifacts at the end of validation epoch."""
@@ -710,7 +858,7 @@ class ValidationMeshUploader(Callback):
                 'rank': batch_result['rank'],
                 'metrics': {},
                 'eigendata': {},
-                'mesh_data': batch_result['mesh_data']  # Already converted to tensors above
+                'mesh_data': batch_result['mesh_data']  # Already converted to tensors in on_validation_batch_end
             }
 
             # Convert metrics to PyTorch tensors
@@ -722,13 +870,33 @@ class ValidationMeshUploader(Callback):
                 else:
                     converted_result['metrics'][key] = value
 
-            # Convert eigendata to PyTorch tensors
+            # Convert eigendata to PyTorch tensors (with proper type checking)
             if 'eigendata' in batch_result and batch_result['eigendata']:
                 eigendata = batch_result['eigendata']
+
+                # Handle predicted_eigenvalues
                 if 'predicted_eigenvalues' in eigendata and eigendata['predicted_eigenvalues'] is not None:
-                    converted_result['eigendata']['predicted_eigenvalues'] = torch.from_numpy(eigendata['predicted_eigenvalues']).float()
+                    pred_eigenvals = eigendata['predicted_eigenvalues']
+                    if isinstance(pred_eigenvals, np.ndarray):
+                        converted_result['eigendata']['predicted_eigenvalues'] = torch.from_numpy(pred_eigenvals).float()
+                    elif torch.is_tensor(pred_eigenvals):
+                        converted_result['eigendata']['predicted_eigenvalues'] = pred_eigenvals.float()
+                    else:
+                        print(f"Warning: Unexpected type for predicted_eigenvalues: {type(pred_eigenvals)}")
+                        converted_result['eigendata']['predicted_eigenvalues'] = pred_eigenvals
+
+                # Handle predicted_eigenvectors
                 if 'predicted_eigenvectors' in eigendata and eigendata['predicted_eigenvectors'] is not None:
-                    converted_result['eigendata']['predicted_eigenvectors'] = torch.from_numpy(eigendata['predicted_eigenvectors']).float()
+                    pred_eigenvecs = eigendata['predicted_eigenvectors']
+                    if isinstance(pred_eigenvecs, np.ndarray):
+                        converted_result['eigendata']['predicted_eigenvectors'] = torch.from_numpy(pred_eigenvecs).float()
+                    elif torch.is_tensor(pred_eigenvecs):
+                        converted_result['eigendata']['predicted_eigenvectors'] = pred_eigenvecs.float()
+                    else:
+                        print(f"Warning: Unexpected type for predicted_eigenvectors: {type(pred_eigenvecs)}")
+                        converted_result['eigendata']['predicted_eigenvectors'] = pred_eigenvecs
+
+                # Copy other eigendata fields
                 converted_result['eigendata']['num_eigenvalues'] = eigendata.get('num_eigenvalues', 0)
                 converted_result['eigendata']['matrix_size'] = eigendata.get('matrix_size', 0)
 

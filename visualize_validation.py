@@ -92,8 +92,48 @@ class EigenanalysisVisualizer:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
 
+    def _validate_batch_consistency(self, batch_result: Dict) -> bool:
+        """
+        Validate that batch result has consistent mesh and eigendata.
+
+        Args:
+            batch_result: Single validation batch result
+
+        Returns:
+            True if consistent, False otherwise
+        """
+        if 'mesh_data' not in batch_result:
+            print("❌ Error: No mesh_data in batch result")
+            return False
+
+        mesh_data = batch_result['mesh_data']
+        eigendata = batch_result.get('eigendata', {})
+
+        # Check validation status from ValidationMeshUploader
+        validation_status = mesh_data.get('validation_status', 'unknown')
+        if validation_status != 'consistent':
+            print(f"⚠️  Warning: Batch marked as '{validation_status}' during validation")
+            return False
+
+        # Double-check dimensions if eigendata is present
+        if eigendata and 'predicted_eigenvectors' in eigendata and eigendata['predicted_eigenvectors'] is not None:
+            mesh_vertices = len(mesh_data['vertices'])
+            eigen_vertices = eigendata['predicted_eigenvectors'].shape[0]
+
+            if mesh_vertices != eigen_vertices:
+                print(f"❌ ERROR: Dimension mismatch detected in visualization!")
+                print(f"  Mesh vertices: {mesh_vertices}")
+                print(f"  Eigendata vertices: {eigen_vertices}")
+                print(f"  Mesh file: {mesh_data.get('mesh_file_path', 'Unknown')}")
+                print(f"  Validation status: {validation_status}")
+                return False
+
+            print(f"✅ Consistency validated: {mesh_vertices} vertices match between mesh and eigendata")
+
+        return True
+
     def print_data_summary(self, data: Dict[str, Any]):
-        """Print summary of loaded validation data."""
+        """Print summary of loaded validation data with consistency information."""
         print("\n" + "=" * 60)
         print("VALIDATION DATA SUMMARY")
         print("=" * 60)
@@ -103,6 +143,37 @@ class EigenanalysisVisualizer:
         print(f"Validation results: {len(data['validation_results'])}")
 
         if data['validation_results']:
+            # Analyze consistency status across all results
+            consistent_count = 0
+            inconsistent_count = 0
+            mesh_files = set()
+            dimension_mismatches = []
+
+            for i, result in enumerate(data['validation_results']):
+                if 'mesh_data' in result:
+                    mesh_data = result['mesh_data']
+                    mesh_files.add(mesh_data.get('mesh_file_path', 'Unknown'))
+
+                    # Check validation status
+                    status = mesh_data.get('validation_status', 'unknown')
+                    if status == 'consistent':
+                        consistent_count += 1
+                    else:
+                        inconsistent_count += 1
+
+                    # Check for dimension mismatches
+                    eigendata = result.get('eigendata', {})
+                    if eigendata and 'predicted_eigenvectors' in eigendata:
+                        mesh_vertices = len(mesh_data['vertices'])
+                        eigen_vertices = eigendata['predicted_eigenvectors'].shape[0]
+                        if mesh_vertices != eigen_vertices:
+                            dimension_mismatches.append({
+                                'batch_idx': i,
+                                'mesh_vertices': mesh_vertices,
+                                'eigen_vertices': eigen_vertices,
+                                'mesh_file': mesh_data.get('mesh_file_path', 'Unknown')
+                            })
+
             # Show summary of first result's mesh data
             first_result = data['validation_results'][0]
             if 'mesh_data' in first_result:
@@ -113,16 +184,29 @@ class EigenanalysisVisualizer:
                 if 'gt_eigenvalues' in mesh_data:
                     print(f"First result GT eigenvalues: {mesh_data['gt_eigenvalues'].shape}")
 
-            # Check if multiple different meshes are used
-            mesh_files = set()
-            for result in data['validation_results']:
-                if 'mesh_data' in result and 'mesh_file_path' in result['mesh_data']:
-                    mesh_files.add(result['mesh_data']['mesh_file_path'])
+                # Show validation metadata if available
+                if 'validation_status' in mesh_data:
+                    print(f"First result validation status: {mesh_data['validation_status']}")
+                if 'processed_vertices' in mesh_data:
+                    print(f"First result processed vertices: {mesh_data['processed_vertices']}")
 
-            print(f"Unique mesh files used: {len(mesh_files)}")
+            print(f"\nConsistency Analysis:")
+            print(f"  Consistent results: {consistent_count}")
+            print(f"  Inconsistent results: {inconsistent_count}")
+            print(f"  Unique mesh files used: {len(mesh_files)}")
+
+            if dimension_mismatches:
+                print(f"  ❌ DIMENSION MISMATCHES DETECTED: {len(dimension_mismatches)}")
+                for mismatch in dimension_mismatches[:3]:  # Show first 3
+                    print(f"    Batch {mismatch['batch_idx']}: {mismatch['mesh_vertices']} mesh vs {mismatch['eigen_vertices']} eigen vertices")
+                if len(dimension_mismatches) > 3:
+                    print(f"    ... and {len(dimension_mismatches) - 3} more")
+            else:
+                print(f"  ✅ No dimension mismatches detected")
+
             if len(mesh_files) <= 3:  # Show mesh files if not too many
                 for i, mesh_file in enumerate(sorted(mesh_files)):
-                    print(f"  {i + 1}. {mesh_file}")
+                    print(f"  {i + 1}. {Path(mesh_file).name}")
 
             first_result = data['validation_results'][0]
             print(f"\nFirst batch metrics: {list(first_result['metrics'].keys())}")
@@ -393,6 +477,13 @@ class EigenanalysisVisualizer:
 
         print(f"\nVisualizing batch {batch_idx} with ground-truth comparison...")
 
+        # CRITICAL: Validate consistency before visualization
+        if not self._validate_batch_consistency(batch_result):
+            print(f"❌ Skipping visualization for batch {batch_idx} due to inconsistency")
+            print("   This batch has mismatched mesh and eigendata dimensions.")
+            print("   Check ValidationMeshUploader logs for details.")
+            return
+
         # Clear previous visualization
         ps.remove_all_structures()
 
@@ -412,6 +503,14 @@ class EigenanalysisVisualizer:
         print(f"Mesh file: {mesh_data['mesh_file_path']}")
         print(f"Mesh has {mesh_data['num_vertices']} vertices and {mesh_data['num_faces']} faces")
 
+        # Show validation metadata if available
+        if 'validation_status' in mesh_data:
+            print(f"Validation status: {mesh_data['validation_status']}")
+        if 'processed_vertices' in mesh_data:
+            print(f"Processed vertices: {mesh_data['processed_vertices']}")
+        if 'mesh_idx' in mesh_data:
+            print(f"Original mesh index: {mesh_data['mesh_idx']}")
+
         # Visualize base mesh
         mesh_structure = self.visualize_mesh(vertices, vertex_normals, faces)
 
@@ -424,6 +523,12 @@ class EigenanalysisVisualizer:
             if 'predicted_eigenvalues' in eigendata and 'predicted_eigenvectors' in eigendata:
                 pred_eigenvalues = eigendata['predicted_eigenvalues']
                 pred_eigenvectors = eigendata['predicted_eigenvectors']
+
+                # Additional consistency check during visualization
+                if pred_eigenvectors is not None:
+                    eigen_vertices = pred_eigenvectors.shape[0]
+                    mesh_vertices = len(vertices)
+                    print(f"Final consistency check: Mesh({mesh_vertices}) == Eigen({eigen_vertices}) -> {mesh_vertices == eigen_vertices}")
 
         # Print eigenvalue analysis
         if self.config.enable_eigenvalue_info and pred_eigenvalues is not None:

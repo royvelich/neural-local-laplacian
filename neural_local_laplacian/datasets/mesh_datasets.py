@@ -118,12 +118,23 @@ class MeshDataset(Dataset):
 
             # Extract vertices as numpy array
             if hasattr(mesh, 'vertices'):
-                vertices = np.array(mesh.vertices, dtype=np.float32)
+                raw_vertices = np.array(mesh.vertices, dtype=np.float32)
             else:
                 raise ValueError(f"Loaded mesh has no vertices: {mesh_file_path}")
 
+            # Store original mesh dimensions before normalization
+            original_num_vertices = len(raw_vertices)
+
+            # Extract faces before normalization
+            if hasattr(mesh, 'faces'):
+                faces = np.array(mesh.faces, dtype=np.int32)
+                original_num_faces = len(faces)
+            else:
+                faces = np.array([])
+                original_num_faces = 0
+
             # Normalize mesh vertices: center at origin and fit in unit sphere
-            vertices = utils.normalize_mesh_vertices(vertices)
+            vertices = utils.normalize_mesh_vertices(raw_vertices)
 
             # Calculate vertex normals using trimesh with normalized vertices
             # Update the mesh with normalized vertices for normal computation
@@ -142,6 +153,25 @@ class MeshDataset(Dataset):
 
         # Extract local patches for all vertices
         patches_data = self._extract_all_patches(vertices, vertex_normals)
+
+        # CRITICAL ADDITION: Add mesh metadata as individual attributes (more robust for PyTorch Geometric)
+        # Store metadata as individual attributes rather than nested dict to avoid batching issues
+        patches_data.mesh_file_path = str(mesh_file_path)
+        patches_data.original_num_vertices = original_num_vertices
+        patches_data.original_num_faces = original_num_faces
+        patches_data.mesh_idx = idx
+        patches_data.normalized_num_vertices = len(vertices)
+        patches_data.k_neighbors = self._k
+
+        # Also store as dict for backward compatibility (but individual attributes are primary)
+        patches_data['mesh_metadata'] = {
+            'mesh_file_path': str(mesh_file_path),
+            'original_num_vertices': original_num_vertices,
+            'original_num_faces': original_num_faces,
+            'mesh_idx': idx,
+            'normalized_num_vertices': len(vertices),  # After normalization (should be same as original)
+            'k_neighbors': self._k
+        }
 
         return [patches_data]  # Return as list to match synthetic dataset interface
 
