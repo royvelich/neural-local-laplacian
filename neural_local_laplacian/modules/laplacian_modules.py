@@ -332,6 +332,10 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             batch_indices=batch_data.batch
         )
 
+        # CRITICAL ADDITION: Store Laplacian matrix for ValidationMeshUploader
+        self._last_laplacian_matrix = laplacian_matrix
+        print(f"📊 Stored predicted Laplacian matrix for validation: {laplacian_matrix.shape}")
+
         # Print first 5 rows of Laplacian matrix (non-zero elements only)
         print("\n" + "=" * 80)
         print("LAPLACIAN MATRIX - FIRST 5 ROWS (NON-ZERO ELEMENTS)")
@@ -767,8 +771,10 @@ class ValidationMeshUploader(Callback):
             print(f"❌ Could not load mesh data for batch {batch_idx}")
             return
 
-        # STEP 3: Extract eigendata from model
+        # STEP 3: Extract eigendata AND predicted Laplacian matrix from model
         eigendata = {}
+        predicted_laplacian = None
+
         if hasattr(pl_module, '_last_eigenvalues') and hasattr(pl_module, '_last_eigenvectors'):
             eigendata = {
                 'predicted_eigenvalues': pl_module._last_eigenvalues,
@@ -776,6 +782,15 @@ class ValidationMeshUploader(Callback):
                 'num_eigenvalues': len(pl_module._last_eigenvalues) if pl_module._last_eigenvalues is not None else 0,
                 'matrix_size': pl_module._last_eigenvectors.shape[0] if pl_module._last_eigenvectors is not None else 0
             }
+
+        # CRITICAL ADDITION: Extract predicted Laplacian matrix
+        if hasattr(pl_module, '_last_laplacian_matrix'):
+            predicted_laplacian = pl_module._last_laplacian_matrix
+            print(f"  📊 Found predicted Laplacian matrix: {predicted_laplacian.shape} sparse matrix")
+            print(f"      Non-zero entries: {predicted_laplacian.nnz}")
+            print(f"      Sparsity: {(1 - predicted_laplacian.nnz / (predicted_laplacian.shape[0] * predicted_laplacian.shape[1])) * 100:.2f}%")
+        else:
+            print(f"  ⚠️  No predicted Laplacian matrix found in model")
 
         # STEP 4: CRITICAL VALIDATION - Check mesh-eigendata consistency
         if not self._validate_mesh_eigendata_consistency(mesh_info, eigendata):
@@ -830,6 +845,24 @@ class ValidationMeshUploader(Callback):
                 if isinstance(eigendata['predicted_eigenvectors'], np.ndarray):
                     batch_results['eigendata']['predicted_eigenvectors'] = torch.from_numpy(eigendata['predicted_eigenvectors']).float()
 
+        # CRITICAL ADDITION: Store predicted Laplacian matrix
+        if predicted_laplacian is not None:
+            # Convert scipy sparse matrix to a serializable format
+            laplacian_data = {
+                'matrix_format': 'csr',  # Compressed Sparse Row format
+                'shape': predicted_laplacian.shape,
+                'data': predicted_laplacian.data.copy(),  # Non-zero values
+                'indices': predicted_laplacian.indices.copy(),  # Column indices
+                'indptr': predicted_laplacian.indptr.copy(),  # Row pointers
+                'nnz': predicted_laplacian.nnz,  # Number of non-zero entries
+                'dtype': str(predicted_laplacian.dtype)
+            }
+            batch_results['predicted_laplacian'] = laplacian_data
+            print(f"  💾 Stored predicted Laplacian matrix ({predicted_laplacian.shape[0]}x{predicted_laplacian.shape[1]}, {predicted_laplacian.nnz} non-zeros)")
+        else:
+            batch_results['predicted_laplacian'] = None
+            print(f"  📋 No predicted Laplacian matrix to store")
+
         self._validation_results.append(batch_results)
         print(f"✅ Successfully stored validation result for batch {batch_idx}")
 
@@ -858,7 +891,8 @@ class ValidationMeshUploader(Callback):
                 'rank': batch_result['rank'],
                 'metrics': {},
                 'eigendata': {},
-                'mesh_data': batch_result['mesh_data']  # Already converted to tensors in on_validation_batch_end
+                'mesh_data': batch_result['mesh_data'],  # Already converted to tensors in on_validation_batch_end
+                'predicted_laplacian': batch_result.get('predicted_laplacian', None)  # Add Laplacian data
             }
 
             # Convert metrics to PyTorch tensors
@@ -957,7 +991,8 @@ class ValidationMeshUploader(Callback):
                 'num_validation_results': num_results,
                 'eigenvalue_computation_k': self._k,
                 'mesh_data_per_result': True,  # Flag indicating new format
-                'description': 'Each validation result contains its own mesh data and eigendecomposition'
+                'includes_predicted_laplacian': True,  # New flag for Laplacian matrices
+                'description': 'Each validation result contains its own mesh data, eigendecomposition, and predicted Laplacian matrix'
             }
 
             wandb.log_artifact(artifact)

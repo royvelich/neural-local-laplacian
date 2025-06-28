@@ -9,8 +9,9 @@ and visualizes:
 3. Predicted Laplacian eigenvectors as scalar fields on the mesh
 4. Eigenvalue comparison and analysis
 5. Eigenvector correlation analysis
+6. Predicted Laplacian matrix analysis
 
-Updated to handle both old format (global mesh data) and new format (mesh data per result).
+Updated to handle mesh data per result format with predicted Laplacian matrices.
 """
 
 import argparse
@@ -92,6 +93,41 @@ class EigenanalysisVisualizer:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
 
+    def _reconstruct_laplacian_matrix(self, laplacian_data: Dict) -> Optional[Any]:
+        """
+        Reconstruct scipy sparse matrix from saved Laplacian data.
+
+        Args:
+            laplacian_data: Dictionary containing sparse matrix data
+
+        Returns:
+            Reconstructed scipy sparse matrix or None if data is invalid
+        """
+        if laplacian_data is None:
+            return None
+
+        try:
+            import scipy.sparse
+
+            # Reconstruct CSR matrix from saved components
+            matrix = scipy.sparse.csr_matrix(
+                (laplacian_data['data'],
+                 laplacian_data['indices'],
+                 laplacian_data['indptr']),
+                shape=laplacian_data['shape'],
+                dtype=laplacian_data['dtype']
+            )
+
+            print(f"  📊 Reconstructed Laplacian matrix: {matrix.shape}")
+            print(f"      Non-zero entries: {matrix.nnz}")
+            print(f"      Matrix format: {laplacian_data.get('matrix_format', 'unknown')}")
+
+            return matrix
+
+        except Exception as e:
+            print(f"❌ Error reconstructing Laplacian matrix: {e}")
+            return None
+
     def _validate_batch_consistency(self, batch_result: Dict) -> bool:
         """
         Validate that batch result has consistent mesh and eigendata.
@@ -148,6 +184,7 @@ class EigenanalysisVisualizer:
             inconsistent_count = 0
             mesh_files = set()
             dimension_mismatches = []
+            laplacian_count = 0
 
             for i, result in enumerate(data['validation_results']):
                 if 'mesh_data' in result:
@@ -174,6 +211,10 @@ class EigenanalysisVisualizer:
                                 'mesh_file': mesh_data.get('mesh_file_path', 'Unknown')
                             })
 
+                # Check for predicted Laplacian matrices
+                if 'predicted_laplacian' in result and result['predicted_laplacian'] is not None:
+                    laplacian_count += 1
+
             # Show summary of first result's mesh data
             first_result = data['validation_results'][0]
             if 'mesh_data' in first_result:
@@ -190,10 +231,19 @@ class EigenanalysisVisualizer:
                 if 'processed_vertices' in mesh_data:
                     print(f"First result processed vertices: {mesh_data['processed_vertices']}")
 
+            # Check for predicted Laplacian in first result
+            if 'predicted_laplacian' in first_result:
+                laplacian_data = first_result['predicted_laplacian']
+                if laplacian_data is not None:
+                    print(f"First result predicted Laplacian: {laplacian_data['shape']} ({laplacian_data['nnz']} non-zeros)")
+                else:
+                    print(f"First result predicted Laplacian: None")
+
             print(f"\nConsistency Analysis:")
             print(f"  Consistent results: {consistent_count}")
             print(f"  Inconsistent results: {inconsistent_count}")
             print(f"  Unique mesh files used: {len(mesh_files)}")
+            print(f"  Results with predicted Laplacians: {laplacian_count}/{len(data['validation_results'])}")
 
             if dimension_mismatches:
                 print(f"  ❌ DIMENSION MISMATCHES DETECTED: {len(dimension_mismatches)}")
@@ -511,6 +561,26 @@ class EigenanalysisVisualizer:
         if 'mesh_idx' in mesh_data:
             print(f"Original mesh index: {mesh_data['mesh_idx']}")
 
+        # Show predicted Laplacian matrix info if available
+        if 'predicted_laplacian' in batch_result:
+            laplacian_data = batch_result['predicted_laplacian']
+            if laplacian_data is not None:
+                print(f"Predicted Laplacian: {laplacian_data['shape']} ({laplacian_data['nnz']} non-zeros)")
+
+                # Optionally reconstruct and analyze the matrix
+                laplacian_matrix = self._reconstruct_laplacian_matrix(laplacian_data)
+                if laplacian_matrix is not None:
+                    # Show some basic matrix properties
+                    print(f"  Matrix properties:")
+                    print(f"    Symmetry check: {abs(laplacian_matrix - laplacian_matrix.T).max():.2e}")
+
+                    # Check row sums (should be close to zero for Laplacian)
+                    row_sums = np.array(laplacian_matrix.sum(axis=1)).flatten()
+                    print(f"    Row sum range: [{row_sums.min():.2e}, {row_sums.max():.2e}]")
+                    print(f"    Row sum mean: {row_sums.mean():.2e}")
+            else:
+                print(f"Predicted Laplacian: None")
+
         # Visualize base mesh
         mesh_structure = self.visualize_mesh(vertices, vertex_normals, faces)
 
@@ -582,6 +652,7 @@ class EigenanalysisVisualizer:
         print("  - Both use the same colormap for easy comparison")
         print("  - Eigenvalue comparison and correlation analysis in terminal")
         print("  - Each result shows its own mesh data")
+        print("  - Predicted Laplacian matrix analysis included")
         print("=" * 60)
 
         # Iterate through all validation results
