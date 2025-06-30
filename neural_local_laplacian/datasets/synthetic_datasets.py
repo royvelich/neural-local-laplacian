@@ -435,9 +435,6 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         if mean_curvature_value < 0:
             # Flip the normal(s)
             normal = -normal
-            print(f"Flipped normal due to negative mean curvature at origin: H = {mean_curvature_value:.6f}")
-        else:
-            print(f"Normal not flipped - mean curvature at origin: H = {mean_curvature_value:.6f}")
 
         return normal
 
