@@ -336,6 +336,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             points_scale_range: Tuple[float, float],
             diff_geom_components: Optional[List[DifferentialGeometryComponent]] = None,
             diff_geom_at_origin_only: bool = False,
+            flip_normal_if_negative_curvature: bool = False,  # NEW FLAG
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -344,6 +345,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         self._grid_offset_range = self._validate_range(param_range=grid_offset_range, name="grid_offset_range")
         self._points_scale_range = self._validate_range(param_range=points_scale_range, name="points_scale_range")
         self._diff_geom_at_origin_only = diff_geom_at_origin_only
+        self._flip_normal_if_negative_curvature = flip_normal_if_negative_curvature  # NEW PARAMETER
 
         # Available differential geometry components
         available_components = list(DifferentialGeometryComponent)
@@ -381,10 +383,63 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                 raise ValueError("surface_params required when computing normal at origin")
 
             # Compute normal at origin using helper method
-            return self._compute_normal_at_origin(surface_params)
+            normal = self._compute_normal_at_origin(surface_params)
         else:
             # Compute normals for all points using precomputed derivatives
-            return self._compute_normal_from_derivatives(dz_dx, dz_dy)
+            normal = self._compute_normal_from_derivatives(dz_dx, dz_dy)
+
+        # NEW: Apply normal flipping logic if flag is set
+        if self._flip_normal_if_negative_curvature:
+            normal = self._apply_normal_flipping(normal, surface_params)
+
+        return normal
+
+    def _apply_normal_flipping(self, normal: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
+        """
+        Apply normal flipping logic based on mean curvature at center.
+
+        Args:
+            normal: Computed surface normal(s) - shape (1, 3) or (N, 3)
+            surface_params: Surface parameters for evaluating curvature at origin
+
+        Returns:
+            Potentially flipped normal(s) with same shape as input
+        """
+        # Compute mean curvature at the origin (0, 0)
+        x_origin = torch.tensor([0.0], requires_grad=True)
+        y_origin = torch.tensor([0.0], requires_grad=True)
+        z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
+
+        # Compute first derivatives at origin
+        dz_dx_origin = torch.autograd.grad(
+            outputs=z_origin,
+            inputs=x_origin,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        dz_dy_origin = torch.autograd.grad(
+            outputs=z_origin,
+            inputs=y_origin,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+
+        # Compute curvature quantities at origin
+        H_origin, _, _, _, _, _ = self._compute_curvature_quantities(
+            dz_dx=dz_dx_origin, dz_dy=dz_dy_origin, x=x_origin, y=y_origin
+        )
+
+        # Check if mean curvature is negative
+        mean_curvature_value = H_origin.item()  # Extract scalar value
+
+        if mean_curvature_value < 0:
+            # Flip the normal(s)
+            normal = -normal
+            print(f"Flipped normal due to negative mean curvature at origin: H = {mean_curvature_value:.6f}")
+        else:
+            print(f"Normal not flipped - mean curvature at origin: H = {mean_curvature_value:.6f}")
+
+        return normal
 
     def _compute_normal_at_origin(self, surface_params: Dict[str, Any]) -> torch.Tensor:
         """Helper method to compute surface normal at origin (0,0)."""

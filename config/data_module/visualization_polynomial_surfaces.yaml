@@ -37,6 +37,7 @@ train_dataset_specification:
         _args_: ['principal_directions']
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
         _args_: ['mean_curvature']
+    flip_normal_if_negative_curvature: True
   batch_size: 1
   num_workers: 0
   shuffle: True

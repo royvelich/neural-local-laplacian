@@ -182,67 +182,84 @@ class EigenanalysisVisualizer:
             return None
 
     def _add_curvature_visualizations(self, mesh_structure, curvature_data: Dict[str, np.ndarray],
-                                      gt_normals: np.ndarray = None):
+                                      gt_normals: np.ndarray = None, gt_mean_curvature: np.ndarray = None):
         """
-        Add predicted curvature and normal visualizations to the mesh.
+        Add predicted curvature and normal visualizations to the mesh with controlled ordering.
 
         Args:
             mesh_structure: Polyscope mesh structure
             curvature_data: Dictionary from _compute_mean_curvature_from_laplacian
             gt_normals: Ground-truth normals for comparison (optional)
+            gt_mean_curvature: Ground-truth mean curvature for comparison (optional)
         """
         if curvature_data is None:
             return
 
         print(f"  🎨 Adding curvature visualizations...")
 
-        # Add predicted mean curvature as scalar field
+        # Use alphabetical prefixes to control ordering in polyscope UI
+
+        # === MEAN CURVATURE (grouped together) ===
+        # Add GT mean curvature first (if available) with 'A' prefix
+        if gt_mean_curvature is not None:
+            mesh_structure.add_scalar_quantity(
+                name="A Mean Curvature - GT",
+                values=gt_mean_curvature,
+                enabled=False,
+                cmap='plasma'  # Same colormap as predicted for comparison
+            )
+
+        # Add predicted mean curvature with 'B' prefix to come after GT
         mesh_structure.add_scalar_quantity(
-            name="PRED Mean Curvature",
+            name="B Mean Curvature - PRED",
             values=curvature_data['predicted_mean_curvature'],
             enabled=False,
             cmap='plasma'  # Different colormap to distinguish from eigenvectors
         )
 
-        # Add predicted normals as vector field
-        mesh_structure.add_vector_quantity(
-            name="PRED Normals",
-            values=curvature_data['predicted_normals'] * 0.05,  # Scale for visibility
-            enabled=False,
-            color=(1.0, 0.5, 0.0),  # Orange color for predicted normals
-            vectortype="ambient"
-        )
-
-        # Add mean curvature vector field (before normalization)
-        mesh_structure.add_vector_quantity(
-            name="PRED Mean Curvature Vector",
-            values=curvature_data['mean_curvature_vector'] * 0.1,  # Scale for visibility
-            enabled=False,
-            color=(1.0, 0.0, 0.5),  # Pink color for curvature vectors
-            vectortype="ambient"
-        )
-
-        # If ground-truth normals are available, add comparison
+        # === NORMALS (grouped together) ===
+        # Add GT normals first (if available) with 'C' prefix
         if gt_normals is not None:
-            # Add GT normals for comparison
             mesh_structure.add_vector_quantity(
-                name="GT Normals",
+                name="C Normals - GT",
                 values=gt_normals * 0.05,  # Scale for visibility
                 enabled=False,
                 color=(0.0, 1.0, 1.0),  # Cyan color for GT normals
                 vectortype="ambient"
             )
 
+        # Add predicted normals with 'D' prefix to come after GT normals
+        mesh_structure.add_vector_quantity(
+            name="D Normals - PRED",
+            values=curvature_data['predicted_normals'] * 0.05,  # Scale for visibility
+            enabled=False,
+            color=(1.0, 0.5, 0.0),  # Orange color for predicted normals
+            vectortype="ambient"
+        )
+
+        # === OTHER QUANTITIES ===
+        # Add mean curvature vector field with 'E' prefix
+        mesh_structure.add_vector_quantity(
+            name="E Mean Curvature Vector - PRED",
+            values=curvature_data['mean_curvature_vector'] * 0.1,  # Scale for visibility
+            enabled=False,
+            color=(1.0, 0.0, 0.5),  # Pink color for curvature vectors
+            vectortype="ambient"
+        )
+
+        # === COMPARISON METRICS ===
+        # If ground-truth normals are available, add comparison metrics with 'F' prefix
+        if gt_normals is not None:
             # Compute normal alignment (dot product)
             normal_alignment = np.sum(
                 curvature_data['predicted_normals'] * gt_normals, axis=1
             )
 
             mesh_structure.add_scalar_quantity(
-                name="Normal Alignment (PRED vs GT)",
+                name="F Normal Alignment (PRED vs GT)",
                 values=normal_alignment,
                 enabled=False,
-                cmap='RdBu'  # Red-Blue colormap: blue=aligned, red=opposite
+                cmap='coolwarm'  # MODIFIED: Changed from 'RdBu' to 'coolwarm'
             )
 
             # Compute angular differences
@@ -251,17 +268,22 @@ class EigenanalysisVisualizer:
             angular_differences = np.arccos(np.abs(normal_alignment_clamped)) * 180 / np.pi
 
             mesh_structure.add_scalar_quantity(
-                name="Normal Angular Error (degrees)",
+                name="G Normal Angular Error (degrees)",
                 values=angular_differences,
                 enabled=False,
-                cmap='hot'  # Hot colormap: black=good, red/yellow=bad
+                cmap='coolwarm'  # MODIFIED: Changed from 'hot' to 'coolwarm'
             )
 
             print(f"      Normal alignment mean: {normal_alignment.mean():.4f}")
             print(f"      Angular error mean: {angular_differences.mean():.2f}°")
             print(f"      Angular error std: {angular_differences.std():.2f}°")
 
+        # Print summary
+        if gt_mean_curvature is not None:
+            print(f"      Added GT mean curvature scalar field")
         print(f"      Added predicted mean curvature scalar field")
+        if gt_normals is not None:
+            print(f"      Added GT normals vector field")
         print(f"      Added predicted normals vector field")
         print(f"      Added mean curvature vector field")
 
@@ -587,67 +609,69 @@ class EigenanalysisVisualizer:
 
     def visualize_eigenvectors(self, mesh_structure, gt_eigenvectors: torch.Tensor, gt_eigenvalues: torch.Tensor,
                                pred_eigenvectors: Optional[torch.Tensor] = None, pred_eigenvalues: Optional[torch.Tensor] = None):
-        """Add both ground-truth and predicted eigenvector scalar fields to the mesh."""
+        """Add both ground-truth and predicted eigenvector scalar fields to the mesh, organized for easy comparison."""
         gt_eigenvecs_np = gt_eigenvectors.cpu().numpy()
         gt_eigenvals_np = gt_eigenvalues.cpu().numpy()
 
         num_to_show = min(self.config.num_eigenvectors_to_show, gt_eigenvecs_np.shape[1])
 
-        print(f"Adding {num_to_show} ground-truth eigenvector scalar fields...")
+        # Check if we have predicted data
+        has_predicted = pred_eigenvectors is not None and pred_eigenvalues is not None
 
-        # Add ground-truth eigenvectors
+        if has_predicted:
+            pred_eigenvecs_np = pred_eigenvectors.cpu().numpy()
+            pred_eigenvals_np = pred_eigenvalues.cpu().numpy()
+            num_pred_to_show = min(num_to_show, pred_eigenvecs_np.shape[1])
+            print(f"Adding {num_to_show} GT and {num_pred_to_show} predicted eigenvector pairs...")
+        else:
+            print(f"Adding {num_to_show} ground-truth eigenvector scalar fields...")
+
+        # Add eigenvectors in pairs using numerical prefixes to control alphabetical ordering
         for i in range(num_to_show):
-            eigenvector = gt_eigenvecs_np[:, i]
-            eigenvalue = gt_eigenvals_np[i]
+            # Add GT eigenvector with numerical prefix
+            gt_eigenvector = gt_eigenvecs_np[:, i]
+            gt_eigenvalue = gt_eigenvals_np[i]
 
-            # Create descriptive name for GT with zero-padded numbering
+            # Create descriptive name for GT with zero-padded numbering and prefix for ordering
             if i == 0:
-                name = f"GT Eigenvector {i:02d} (λ={eigenvalue:.2e}, constant)"
+                gt_name = f"Eigenvector {i:02d}a GT (λ={gt_eigenvalue:.2e}, constant)"
             elif i == 1:
-                name = f"GT Eigenvector {i:02d} (λ={eigenvalue:.6f}, Fiedler)"
+                gt_name = f"Eigenvector {i:02d}a GT (λ={gt_eigenvalue:.6f}, Fiedler)"
             else:
-                name = f"GT Eigenvector {i:02d} (λ={eigenvalue:.6f})"
+                gt_name = f"Eigenvector {i:02d}a GT (λ={gt_eigenvalue:.6f})"
 
-            # Add as scalar quantity
+            # Add GT as scalar quantity
             mesh_structure.add_scalar_quantity(
-                name=name,
-                values=eigenvector,
+                name=gt_name,
+                values=gt_eigenvector,
                 enabled=(i == 1),  # Enable GT Fiedler vector by default
                 cmap=self.config.colormap
             )
 
-            print(f"  {name}: range=[{eigenvector.min():.4f}, {eigenvector.max():.4f}]")
+            print(f"  {gt_name}: range=[{gt_eigenvector.min():.4f}, {gt_eigenvector.max():.4f}]")
 
-        # Add predicted eigenvectors if available
-        if pred_eigenvectors is not None and pred_eigenvalues is not None:
-            pred_eigenvecs_np = pred_eigenvectors.cpu().numpy()
-            pred_eigenvals_np = pred_eigenvalues.cpu().numpy()
+            # Add corresponding predicted eigenvector if available
+            if has_predicted and i < num_pred_to_show:
+                pred_eigenvector = pred_eigenvecs_np[:, i]
+                pred_eigenvalue = pred_eigenvals_np[i]
 
-            num_pred_to_show = min(num_to_show, pred_eigenvecs_np.shape[1])
-
-            print(f"Adding {num_pred_to_show} predicted eigenvector scalar fields...")
-
-            for i in range(num_pred_to_show):
-                eigenvector = pred_eigenvecs_np[:, i]
-                eigenvalue = pred_eigenvals_np[i]
-
-                # Create descriptive name for predictions with zero-padded numbering
+                # Create descriptive name for predictions with 'b' suffix to come after GT
                 if i == 0:
-                    name = f"PRED Eigenvector {i:02d} (λ={eigenvalue:.2e}, constant)"
+                    pred_name = f"Eigenvector {i:02d}b PRED (λ={pred_eigenvalue:.2e}, constant)"
                 elif i == 1:
-                    name = f"PRED Eigenvector {i:02d} (λ={eigenvalue:.6f}, Fiedler)"
+                    pred_name = f"Eigenvector {i:02d}b PRED (λ={pred_eigenvalue:.6f}, Fiedler)"
                 else:
-                    name = f"PRED Eigenvector {i:02d} (λ={eigenvalue:.6f})"
+                    pred_name = f"Eigenvector {i:02d}b PRED (λ={pred_eigenvalue:.6f})"
 
-                # Add as scalar quantity
+                # Add PRED as scalar quantity (will be placed right after corresponding GT due to alphabetical sorting)
                 mesh_structure.add_scalar_quantity(
-                    name=name,
-                    values=eigenvector,
+                    name=pred_name,
+                    values=pred_eigenvector,
                     enabled=False,  # Disabled by default
-                    cmap=self.config.colormap  # Same colormap as GT
+                    cmap=self.config.colormap  # Same colormap as GT for easy comparison
                 )
 
-                print(f"  {name}: range=[{eigenvector.min():.4f}, {eigenvector.max():.4f}]")
+                print(f"  {pred_name}: range=[{pred_eigenvector.min():.4f}, {pred_eigenvector.max():.4f}]")
 
     def visualize_batch(self, batch_idx: int = 0):
         """Visualize eigenanalysis results for a specific batch with ground-truth comparison."""
@@ -768,7 +792,23 @@ class EigenanalysisVisualizer:
         # CRITICAL ADDITION: Add curvature visualizations from predicted Laplacian
         if curvature_data is not None:
             gt_normals_np = vertex_normals.cpu().numpy()
-            self._add_curvature_visualizations(mesh_structure, curvature_data, gt_normals_np)
+
+            # Extract GT mean curvature from mesh data (computed during mesh loading with libigl)
+            gt_mean_curvature_np = None
+            if 'mesh_data' in batch_result:
+                mesh_data_batch = batch_result['mesh_data']
+                if 'gt_mean_curvature' in mesh_data_batch and mesh_data_batch['gt_mean_curvature'] is not None:
+                    gt_mean_curvature_np = mesh_data_batch['gt_mean_curvature'].cpu().numpy()
+                    print(f"  📐 Using cached GT mean curvature: range=[{gt_mean_curvature_np.min():.6f}, {gt_mean_curvature_np.max():.6f}]")
+                else:
+                    print(f"  ⚠️  GT mean curvature not available (libigl might not be installed or computation failed)")
+
+            self._add_curvature_visualizations(
+                mesh_structure,
+                curvature_data,
+                gt_normals_np,
+                gt_mean_curvature_np
+            )
             print(f"✅ Added predicted curvature and normal visualizations")
 
         # Print batch metrics
@@ -800,8 +840,10 @@ class EigenanalysisVisualizer:
         print(f"Will iterate through {num_batches} validation results")
         print("Close each window to proceed to the next result")
         print("Features:")
-        print("  - Ground-truth eigenvectors: GT Eigenvector X")
-        print("  - Predicted eigenvectors: PRED Eigenvector X")
+        print("  - Ground-truth eigenvectors: Eigenvector XXa GT")
+        print("  - Predicted eigenvectors: Eigenvector XXb PRED")
+        print("  - GT and PRED mean curvature side-by-side")
+        print("  - GT and PRED normals side-by-side")
         print("  - Both use the same colormap for easy comparison")
         print("  - Eigenvalue comparison and correlation analysis in terminal")
         print("  - Each result shows its own mesh data")

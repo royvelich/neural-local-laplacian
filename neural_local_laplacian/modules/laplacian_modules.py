@@ -497,8 +497,9 @@ class ValidationMeshUploader(Callback):
     This callback:
     1. Extracts mesh vertices and faces from the validation dataset
     2. Computes ground-truth Laplacian eigendecomposition using PyFM
-    3. Collects eigendecomposition results during validation
-    4. Uploads everything as W&B artifacts at the end of each validation epoch
+    3. Computes ground-truth mean curvature using libigl
+    4. Collects eigendecomposition results during validation
+    5. Uploads everything as W&B artifacts at the end of each validation epoch
 
     Fixed for multi-GPU settings to properly handle mesh data per validation result.
     """
@@ -549,6 +550,37 @@ class ValidationMeshUploader(Callback):
             print(f"Mesh has {len(vertices)} vertices and {len(faces)} faces")
             print(f"Normalized vertices: center at origin, max distance = {np.linalg.norm(vertices, axis=1).max():.6f}")
 
+            # Compute GT mean curvature using libigl
+            print("Computing GT mean curvature using libigl...")
+            try:
+                import igl
+
+                # Convert to float64 for libigl (it's more stable with double precision)
+                vertices_igl = vertices.astype(np.float64)
+                faces_igl = faces.astype(np.int32)
+
+                # Compute principal curvatures using libigl
+                _, _, principal_curvature1, principal_curvature2, _ = igl.principal_curvature(
+                    vertices_igl, faces_igl
+                )
+
+                # Mean curvature is the average of principal curvatures: H = (k1 + k2) / 2
+                gt_mean_curvature = (principal_curvature1 + principal_curvature2) / 2.0
+
+                # Convert back to float32 for consistency
+                gt_mean_curvature = gt_mean_curvature.astype(np.float32)
+
+                print(f"Computed GT mean curvature using libigl")
+                print(f"Mean curvature range: [{gt_mean_curvature.min():.6f}, {gt_mean_curvature.max():.6f}]")
+                print(f"Mean curvature mean: {gt_mean_curvature.mean():.6f}")
+
+            except ImportError:
+                print("Warning: libigl not available, GT mean curvature will not be computed")
+                gt_mean_curvature = None
+            except Exception as e:
+                print(f"Warning: Failed to compute GT mean curvature with libigl: {e}")
+                gt_mean_curvature = None
+
             # Compute ground-truth Laplacian eigendecomposition using PyFM
             print("Computing ground-truth Laplacian eigendecomposition...")
 
@@ -578,12 +610,15 @@ class ValidationMeshUploader(Callback):
                 'gt_eigenvalues': gt_eigenvalues,
                 'gt_eigenvectors': gt_eigenvectors,
                 'vertex_areas': vertex_areas,
-                'gt_num_eigenvalues': len(gt_eigenvalues)
+                'gt_num_eigenvalues': len(gt_eigenvalues),
+
+                # Ground-truth mean curvature computed with libigl
+                'gt_mean_curvature': gt_mean_curvature
             }
 
             # Cache the mesh data
             self._mesh_cache[mesh_file_str] = mesh_data
-            print(f"Successfully computed and cached ground-truth eigendecomposition for {mesh_file_str}")
+            print(f"Successfully computed and cached ground-truth eigendecomposition and mean curvature for {mesh_file_str}")
 
             return mesh_data
 
@@ -820,6 +855,9 @@ class ValidationMeshUploader(Callback):
                 'vertex_areas': torch.from_numpy(mesh_data['vertex_areas']).float(),
                 'gt_num_eigenvalues': mesh_data['gt_num_eigenvalues'],
 
+                # Ground-truth mean curvature computed with libigl
+                'gt_mean_curvature': torch.from_numpy(mesh_data['gt_mean_curvature']).float() if mesh_data['gt_mean_curvature'] is not None else None,
+
                 # VALIDATION METADATA (NEW)
                 'mesh_idx': mesh_info['mesh_idx'],
                 'processed_vertices': mesh_info['processed_num_vertices'],
@@ -992,7 +1030,8 @@ class ValidationMeshUploader(Callback):
                 'eigenvalue_computation_k': self._k,
                 'mesh_data_per_result': True,  # Flag indicating new format
                 'includes_predicted_laplacian': True,  # New flag for Laplacian matrices
-                'description': 'Each validation result contains its own mesh data, eigendecomposition, and predicted Laplacian matrix'
+                'includes_gt_mean_curvature': True,  # New flag for GT mean curvature
+                'description': 'Each validation result contains its own mesh data, eigendecomposition, predicted Laplacian matrix, and GT mean curvature'
             }
 
             wandb.log_artifact(artifact)
