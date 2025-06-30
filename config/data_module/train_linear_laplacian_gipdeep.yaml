@@ -28,7 +28,7 @@ module:
       diff_geom_components:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
           _args_: ['mean_curvature']
-      flip_normal_if_negative_curvature: True
+      flip_normal_if_negative_curvature: False
     batch_size: 4000
     num_workers: 5
     shuffle: True
