@@ -36,7 +36,7 @@ module:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        mesh_folder_path: '/home/royve/datasets/local-laplacian/'
+        mesh_folder_path: '/workspace/datasets/local-laplacian'
         k: 10
         feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
