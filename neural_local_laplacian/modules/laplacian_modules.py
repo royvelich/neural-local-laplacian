@@ -292,15 +292,15 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             loss_components_unweighted[f"train_{loss_name}"] = unweighted_loss
 
         # Log the total loss
-        self.log('train_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log('train_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
         for loss_name, loss_value in loss_components_unweighted.items():
-            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True, batch_size=batch_size)
+            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual weighted loss components (for debugging the weighting)
         for loss_name, loss_value in loss_components_weighted.items():
-            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True, batch_size=batch_size)
+            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Create return dictionary with all losses
         result = {"loss": total_loss}
@@ -380,7 +380,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
         # Log validation metrics
         for metric_name, metric_value in metrics.items():
-            self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True, logger=True, batch_size=1)
+            self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True, logger=True, batch_size=1, sync_dist=True)
 
         return metrics
 
