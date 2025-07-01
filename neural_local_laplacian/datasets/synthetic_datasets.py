@@ -392,7 +392,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         if self._flip_normal_if_negative_curvature:
             normal = self._apply_normal_flipping(normal, surface_params)
 
-        return normal
+        return -normal
 
     def _apply_normal_flipping(self, normal: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
         """
