@@ -257,7 +257,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         predicted_laplacian = torch.sum(token_weights.unsqueeze(-1) * positions, dim=1)  # (batch_size, 3)
 
         # Target: H * n̂ (mean curvature times unit normal at origin)
-        target_laplacian = torch.abs(mean_curvatures.unsqueeze(-1)) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
+        target_laplacian = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         print('\n')
         print('-' * 100)

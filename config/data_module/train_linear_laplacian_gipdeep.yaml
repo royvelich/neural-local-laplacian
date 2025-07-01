@@ -8,7 +8,7 @@ module:
       epoch_size: 64000
       grid_radius_range: [0.3]
       grid_offset_range: [-0.01, 0.01]
-      points_scale_range: [1.0, 1.1]
+      points_scale_range: [1.0, 1.01]
       coefficient_scale_range: [0.8, 0.95]
       order_range: [2, 3]
       grid_samplers:
