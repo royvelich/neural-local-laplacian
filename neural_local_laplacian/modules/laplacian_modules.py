@@ -380,7 +380,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
         # Log validation metrics
         for metric_name, metric_value in metrics.items():
-            self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True, logger=True, batch_size=1, sync_dist=True)
+            self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True, logger=True, batch_size=1)
 
         return metrics
 
