@@ -740,43 +740,6 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
         return diff_geom
 
-    def _create_base_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
-                                  dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float,
-                                  surface_params: Optional[Dict[str, Any]] = None) -> Data:
-        """
-        Create base surface data object with positions, mesh, normals, and differential geometry.
-        When diff_geom_at_origin_only=True, computes ALL quantities only at origin.
-        """
-        # Create base data object with scaled positions and mesh
-        data = Data()
-        data['pos'] = torch.stack(tensors=[x, y, z], dim=1) * points_scale
-        data['face'] = self._create_surface_mesh(pos=data.pos)
-
-        if self._diff_geom_at_origin_only:
-            # Compute ALL quantities (normal + differential geometry) ONLY at origin
-            if surface_params is None:
-                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
-
-            # Compute normal at origin only
-            data['normal'] = self._compute_surface_normals(dz_dx=None, dz_dy=None, surface_params=surface_params)
-
-            # Compute differential geometry at origin only
-            diff_geom = self._compute_differential_geometry_at_origin(surface_params=surface_params)
-
-            # Store all quantities with same keys as before (seamless operation)
-            for key, value in diff_geom.items():
-                data[key] = value
-
-        else:
-            # Original behavior: compute for all points
-            data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy, surface_params=surface_params)
-
-            diff_geom = self._compute_differential_geometry_original(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
-            for key, value in diff_geom.items():
-                data[key] = value
-
-        return data
-
     def _create_raw_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
                                  dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float,
                                  surface_params: Optional[Dict[str, Any]] = None) -> Data:
