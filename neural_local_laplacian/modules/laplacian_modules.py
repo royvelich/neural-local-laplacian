@@ -217,7 +217,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         token_weights = token_weights.squeeze(-1)  # (batch_size, num_points)
 
         # Apply softplus to ensure positive weights
-        token_weights = F.softplus(token_weights)  # (batch_size, num_points)
+        token_weights = torch.exp(token_weights)  # (batch_size, num_points)
 
         return {
             'token_weights': token_weights,
