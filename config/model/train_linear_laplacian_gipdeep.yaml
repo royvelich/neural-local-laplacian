@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.SurfaceTransformerModule
-  input_dim: 3
-  d_model: 256
+  input_dim: 128
+  d_model: 512
   nhead: 8
   num_encoder_layers: 4
-  dim_feedforward: 256
+  dim_feedforward: 512
   num_eigenvalues: 50
 #  use_permutation_invariant: True
   dropout: 0.0
