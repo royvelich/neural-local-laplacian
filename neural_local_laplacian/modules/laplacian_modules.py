@@ -84,7 +84,8 @@ class LocalLaplacianModuleBase(pl.LightningModule):
     #     return self._shared_step(batch, batch_idx, 'val')
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        return self._optimizer_cfg(params=self.parameters())
+        if self._optimizer_cfg is not None:
+            return self._optimizer_cfg(params=self.parameters())
 
 
 class SurfaceTransformerModule(LocalLaplacianModuleBase):

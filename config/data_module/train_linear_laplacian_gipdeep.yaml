@@ -5,11 +5,11 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
       seed: ${globals.training_seed}
-      epoch_size: 1000
+      epoch_size: 32000
       grid_radius_range: [0.1, 1.0]
-      grid_offset_range: [0.0]
-      points_scale_range: [1.0]
-      coefficient_scale_range: [0.8, 1.25]
+      grid_offset_range: [-0.01, 0.01]
+      points_scale_range: [1.0, 1.1]
+      coefficient_scale_range: [0.8, 0.95]
       order_range: [2, 4]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
@@ -29,14 +29,14 @@ module:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
           _args_: ['mean_curvature']
       flip_normal_if_negative_curvature: False
-    batch_size: 250
-    num_workers: 0
+    batch_size: 4000
+    num_workers: 5
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        mesh_folder_path: '/home/royve/datasets/local-laplacian/'
+        mesh_folder_path: './assets/meshes'
         k: 10
         feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor

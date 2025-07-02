@@ -9,14 +9,10 @@ module:
 #  use_permutation_invariant: True
   dropout: 0.0
   loss_configs:
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.VectorMSELoss
-#      weight: 1
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionMSELoss
-      weight: 20
+      weight: 10
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.MagnitudeMSELoss
