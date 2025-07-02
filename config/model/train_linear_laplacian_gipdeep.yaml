@@ -3,7 +3,7 @@ module:
   input_dim: 128
   d_model: 512
   nhead: 8
-  num_encoder_layers: 4
+  num_encoder_layers: 6
   dim_feedforward: 512
   num_eigenvalues: 50
 #  use_permutation_invariant: True
