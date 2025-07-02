@@ -16,8 +16,8 @@ module:
           num_points_range: 10
       feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
-          num_fourier_features: 64
-          use_fourier: True
+          num_fourier_features: 128
+          use_fourier: False
       diff_geom_at_origin_only: True
       conv_k_nearest: null
       pose_transformer:
