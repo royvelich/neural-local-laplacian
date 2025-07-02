@@ -14,7 +14,7 @@
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/visualize_validation.py" />
-    <option name="PARAMETERS" value="C:\Users\Roy\Downloads\validation_mesh_data_epoch_2499" />
+    <option name="PARAMETERS" value="C:\Users\Roy\Downloads\validation_mesh_data_epoch_1099" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />
