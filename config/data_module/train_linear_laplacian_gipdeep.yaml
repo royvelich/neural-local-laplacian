@@ -5,11 +5,11 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
       seed: ${globals.training_seed}
-      epoch_size: 32000
+      epoch_size: 8000
       grid_radius_range: [0.1, 1.0]
-      grid_offset_range: [-0.05, 0.05]
+      grid_offset_range: [0.0]
       points_scale_range: [1.0]
-      coefficient_scale_range: [0.8, 1.25]
+      coefficient_scale_range: [0.05, 0.2]
       order_range: [2, 4]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
@@ -29,7 +29,7 @@ module:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
           _args_: ['mean_curvature']
       flip_normal_if_negative_curvature: False
-    batch_size: 4000
+    batch_size: 2000
     num_workers: 5
     shuffle: True
   val_dataset_specifications:

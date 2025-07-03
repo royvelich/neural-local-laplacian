@@ -15,8 +15,8 @@ module:
 #      weight: 1
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.DirectionMSELoss
-      weight: 10
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 5
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.MagnitudeMSELoss
