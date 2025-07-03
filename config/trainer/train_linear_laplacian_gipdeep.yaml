@@ -13,5 +13,5 @@ logger:
  project: neural-local-laplacian
  save_dir: 'wandb'
  log_model: 'all'
-callbacks:
-  - _target_: neural_local_laplacian.modules.laplacian_modules.ValidationMeshUploader
+#callbacks:
+#  - _target_: neural_local_laplacian.modules.laplacian_modules.ValidationMeshUploader

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Enhanced Surface Visualization with Model Prediction
+Enhanced Surface Visualization with Model Prediction and Mean Curvature Display
 
 This script visualizes synthetic surface datasets and optionally compares:
 1. Ground-truth analytic normals at surface centers
 2. Predicted normals from trained SurfaceTransformerModule models
+3. Mean curvature values at the origin (now printed to screen)
 
 Usage:
     python visualize_surfaces.py                    # Original functionality
@@ -321,6 +322,9 @@ class SurfaceVisualizer:
         self.trained_model = trained_model
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        # NEW: Storage for surface metrics to display in UI
+        self.surface_metrics = []  # List of dicts with surface info and metrics
+
     @property
     def is_diff_geom_at_origin_only(self) -> bool:
         """Check if the dataset is configured for origin-only differential geometry computation."""
@@ -588,13 +592,109 @@ class SurfaceVisualizer:
         except Exception as e:
             print(f"Could not add origin indicator: {e}")
 
+    def _add_surface_metrics_ui_callback(self) -> None:
+        """Add ImGui callback to display surface metrics in a floating window."""
+
+        def surface_metrics_callback():
+            import polyscope.imgui as psim
+
+            # Simple test - just display basic info
+            psim.Text("Surface Metrics Window")
+            psim.Text(f"Number of surfaces: {len(self.surface_metrics)}")
+
+            # Simple loop through metrics
+            for i, metrics in enumerate(self.surface_metrics):
+                surface_name = metrics.get('name', f'Surface {i + 1}')
+                mean_curvature = metrics.get('mean_curvature_at_origin')
+
+                psim.Text(f"Surface: {surface_name}")
+                if mean_curvature is not None:
+                    psim.Text(f"  GT Mean Curvature: {mean_curvature:.6f}")
+                else:
+                    psim.Text(f"  GT Mean Curvature: Not available")
+
+                # NEW: Display predicted mean curvature if available
+                prediction_metrics = metrics.get('prediction_metrics')
+                if prediction_metrics:
+                    predicted_mean_curvature = prediction_metrics.get('predicted_mean_curvature')
+                    if predicted_mean_curvature is not None:
+                        psim.Text(f"  Predicted Mean Curvature: {predicted_mean_curvature:.6f}")
+
+                        # Show the difference if both are available
+                        if mean_curvature is not None:
+                            error = abs(predicted_mean_curvature - mean_curvature)
+                            psim.Text(f"  Curvature Error: {error:.6f}")
+                    else:
+                        psim.Text(f"  Predicted Mean Curvature: Not available")
+                else:
+                    psim.Text(f"  Predicted Mean Curvature: No model prediction")
+
+                psim.Text("")  # Empty line for spacing
+
+        # Register the callback with polyscope
+        ps.set_user_callback(surface_metrics_callback)
+
+    def _extract_mean_curvature_at_origin(self, surface) -> Optional[float]:
+        """
+        Extract the mean curvature value at the origin from the surface data.
+
+        Args:
+            surface: Surface data object
+
+        Returns:
+            Mean curvature value at origin, or None if not available
+        """
+        if not hasattr(surface, 'H'):
+            return None
+
+        H_tensor = surface.H.detach().cpu()
+
+        if self.is_diff_geom_at_origin_only:
+            # In origin-only mode, H should be a single value (or shape (1,))
+            if H_tensor.numel() == 1:
+                return H_tensor.item()
+            else:
+                # Take the first value if somehow there are multiple
+                return H_tensor.flatten()[0].item()
+        else:
+            # In all-points mode, we need to find the point closest to origin
+            # This is more complex, but we can approximate by taking the center point
+            # For now, we'll take the mean as an approximation
+            return H_tensor.mean().item()
+        """
+        Extract the mean curvature value at the origin from the surface data.
+
+        Args:
+            surface: Surface data object
+
+        Returns:
+            Mean curvature value at origin, or None if not available
+        """
+        if not hasattr(surface, 'H'):
+            return None
+
+        H_tensor = surface.H.detach().cpu()
+
+        if self.is_diff_geom_at_origin_only:
+            # In origin-only mode, H should be a single value (or shape (1,))
+            if H_tensor.numel() == 1:
+                return H_tensor.item()
+            else:
+                # Take the first value if somehow there are multiple
+                return H_tensor.flatten()[0].item()
+        else:
+            # In all-points mode, we need to find the point closest to origin
+            # This is more complex, but we can approximate by taking the center point
+            # For now, we'll take the mean as an approximation
+            return H_tensor.mean().item()
+
     def _add_normal_comparison_visualization(self, surface, surface_name: str,
                                              gt_normal: np.ndarray,
                                              predicted_normal: Optional[torch.Tensor],
                                              predicted_weights: Optional[torch.Tensor],
                                              translation: np.ndarray) -> None:
         """
-        Add GT vs Predicted normal visualization with comparison metrics.
+        Add GT vs Predicted normal visualization with comparison metrics and mean curvature display.
 
         Args:
             surface: Surface data object
@@ -622,6 +722,12 @@ class SurfaceVisualizer:
 
         # Convert predicted normal to numpy
         pred_normal_np = predicted_normal.cpu().numpy()  # Shape: (3,)
+
+        # NEW: Compute predicted mean curvature from model
+        # Get the predicted Laplacian vector (mean curvature vector)
+        positions = surface.pos.view(1, -1, 3)  # Shape: (1, num_points, 3)
+        predicted_laplacian = torch.sum(predicted_weights.unsqueeze(-1) * positions, dim=1)  # Shape: (1, 3)
+        predicted_mean_curvature = torch.norm(predicted_laplacian, p=2, dim=1).item()  # Magnitude
 
         # Origin point (translated)
         origin_3d = translation.reshape(1, 3)
@@ -667,11 +773,29 @@ class SurfaceVisualizer:
             cosine_similarity_clamped = np.clip(cosine_similarity, -1.0, 1.0)
             angular_error = np.arccos(np.abs(cosine_similarity_clamped)) * 180 / np.pi
 
+            # NEW: Extract and display mean curvature at origin
+            mean_curvature_at_origin = self._extract_mean_curvature_at_origin(surface)
+
             print(f"\n  📊 Normal Comparison for {surface_name}:")
             print(f"    GT Normal (at origin):    [{gt_normal_at_origin[0]:7.4f}, {gt_normal_at_origin[1]:7.4f}, {gt_normal_at_origin[2]:7.4f}]")
             print(f"    Predicted Normal:         [{pred_normal_np[0]:7.4f}, {pred_normal_np[1]:7.4f}, {pred_normal_np[2]:7.4f}]")
             print(f"    Cosine Similarity:        {cosine_similarity:7.4f}")
             print(f"    Angular Error:            {angular_error:7.2f}°")
+
+            # NEW: Display both GT and predicted mean curvature values
+            if mean_curvature_at_origin is not None:
+                print(f"    📐 GT Mean Curvature at Origin:     {mean_curvature_at_origin:7.4f}")
+            else:
+                print(f"    📐 GT Mean Curvature at Origin:     Not available")
+
+            print(f"    🤖 Predicted Mean Curvature:       {predicted_mean_curvature:7.4f}")
+
+            # Curvature comparison if both available
+            if mean_curvature_at_origin is not None:
+                curvature_error = abs(predicted_mean_curvature - mean_curvature_at_origin)
+                curvature_relative_error = curvature_error / (abs(mean_curvature_at_origin) + 1e-10) * 100
+                print(f"    📏 Curvature Error:                {curvature_error:7.4f}")
+                print(f"    📏 Curvature Relative Error:       {curvature_relative_error:7.2f}%")
 
             # Add weight statistics if available
             if predicted_weights is not None:
@@ -719,7 +843,9 @@ class SurfaceVisualizer:
                 'cosine_similarity': cosine_similarity,
                 'angular_error': angular_error,
                 'gt_normal': gt_normal_at_origin,
-                'predicted_normal': pred_normal_np
+                'predicted_normal': pred_normal_np,
+                'mean_curvature_at_origin': mean_curvature_at_origin,
+                'predicted_mean_curvature': predicted_mean_curvature  # NEW
             })
 
         except Exception as e:
@@ -729,6 +855,9 @@ class SurfaceVisualizer:
 
     def visualize_surface_set(self, surfaces: List, surface_names: List[str]) -> None:
         """Visualize a set of surfaces with their differential geometry and optional model predictions."""
+        # Clear previous metrics
+        self.surface_metrics = []
+
         # Print information about the mode
         if self.is_diff_geom_at_origin_only:
             print("Visualizing in origin-only differential geometry mode")
@@ -743,6 +872,21 @@ class SurfaceVisualizer:
 
         for i, (name, surface) in enumerate(zip(surface_names, surfaces)):
             print(f"\n🔄 Processing {name}...")
+
+            # NEW: Extract metrics for UI display
+            surface_metric = {
+                'name': name,
+                'num_points': surface.pos.shape[0] if hasattr(surface, 'pos') else None
+            }
+
+            # NEW: Print mean curvature at origin for each surface
+            mean_curvature_at_origin = self._extract_mean_curvature_at_origin(surface)
+            surface_metric['mean_curvature_at_origin'] = mean_curvature_at_origin
+
+            if mean_curvature_at_origin is not None:
+                print(f"   📐 Mean Curvature at Origin: {mean_curvature_at_origin:.6f}")
+            else:
+                print(f"   📐 Mean Curvature at Origin: Not available")
 
             # Extract basic data
             pos, face, normals = self._extract_surface_data(surface)
@@ -808,12 +952,22 @@ class SurfaceVisualizer:
                         translation=translation
                     )
 
+                    # Store prediction metrics for UI
+                    if hasattr(surface, 'prediction_metrics'):
+                        surface_metric['prediction_metrics'] = surface.prediction_metrics
+
                     print(f"   ✅ Normal prediction completed for {name}")
 
                 except Exception as e:
                     print(f"   ⚠️  Failed to predict normal for {name}: {e}")
                     import traceback
                     traceback.print_exc()
+
+            # Add the surface metrics to our list
+            self.surface_metrics.append(surface_metric)
+
+        # NEW: Setup UI callback to display metrics
+        self._add_surface_metrics_ui_callback()
 
 
 def setup_polyscope() -> None:
@@ -866,7 +1020,7 @@ def create_custom_visualization_config(
 
 @hydra.main(version_base="1.2", config_path="config")
 def main(cfg: DictConfig) -> None:
-    """Main visualization function with optional model prediction."""
+    """Main visualization function with optional model prediction and mean curvature display."""
 
     # Get checkpoint path from config if specified
     ckpt_path = getattr(cfg, 'ckpt_path', None)
@@ -926,10 +1080,13 @@ def main(cfg: DictConfig) -> None:
         print("🤖 MODE: Model prediction comparison enabled")
         print("   - Cyan arrows: Ground truth analytic normals")
         print("   - Orange arrows: Predicted normals from trained model")
-        print("   - Console output: Angular errors and similarity metrics")
+        print("   - Console output: Angular errors, similarity metrics, and mean curvature values")
+        print("   - UI window: Real-time surface metrics display")
     else:
         print("📝 MODE: Visualization only")
         print("   - Use ckpt_path=path/to/model.ckpt to enable model predictions")
+        print("   - Console output: Mean curvature values at origin")
+        print("   - UI window: Real-time mean curvature display")
     print('=' * 80)
 
     # Process batches
@@ -946,7 +1103,10 @@ def main(cfg: DictConfig) -> None:
 
         print(f"\n✅ Batch {batch_idx + 1} visualization complete!")
         if trained_model is not None:
-            print("   Check the console output above for normal comparison metrics")
+            print("   Check the console output above for normal comparison metrics and mean curvature values")
+        else:
+            print("   Check the console output above for mean curvature values at origin")
+        print("   Check the 'Surface Metrics' window in the UI for real-time display")
         print("   Close the window to proceed to the next batch, or Ctrl+C to exit")
 
         # Show visualization
