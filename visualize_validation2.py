@@ -86,12 +86,40 @@ class ColorPalette:
         return color_map.get(vector_name, cls.DEFAULT_VECTOR)
 
 
+class VectorScales:
+    """Scale factors for different vector visualizations."""
+
+    # Mean curvature vector scales
+    GT_MEAN_CURVATURE_VECTOR = 0.005
+    PREDICTED_MEAN_CURVATURE_VECTOR = 0.005
+
+    # Normal vector scales
+    GT_NORMALS = 0.05
+    PREDICTED_NORMALS = 0.05
+
+    # Default scale
+    DEFAULT_VECTOR = 0.05
+
+    @classmethod
+    def get_vector_scale(cls, vector_name: str) -> float:
+        """Get scale factor for vector visualization."""
+        scale_map = {
+            'gt_mean_curvature_vector': cls.GT_MEAN_CURVATURE_VECTOR,
+            'predicted_mean_curvature_vector': cls.PREDICTED_MEAN_CURVATURE_VECTOR,
+            'gt_normals': cls.GT_NORMALS,
+            'predicted_normals': cls.PREDICTED_NORMALS
+        }
+        return scale_map.get(vector_name, cls.DEFAULT_VECTOR)
+
+
 class RealTimeEigenanalysisVisualizer:
     """Real-time eigenanalysis visualizer using MeshDataset and model inference."""
 
     def __init__(self, config: VisualizationConfig = None):
         self.config = config or VisualizationConfig()
         self.color_palette = ColorPalette()
+        self.vector_scales = VectorScales()
+        self.training_k = None  # Will be set from command line argument
 
     def setup_polyscope(self):
         """Initialize and configure polyscope."""
@@ -294,6 +322,7 @@ class RealTimeEigenanalysisVisualizer:
 
         # Compute GT mean curvature using libigl if available
         gt_mean_curvature = None
+        gt_mean_curvature_vector = None
         if HAS_IGL:
             try:
                 print("Computing GT mean curvature using libigl...")
@@ -310,11 +339,15 @@ class RealTimeEigenanalysisVisualizer:
                 gt_mean_curvature = (principal_curvature1 + principal_curvature2) / 2.0
                 gt_mean_curvature = gt_mean_curvature.astype(np.float32)
 
+                # GT mean curvature vector = GT normal * GT mean curvature
+                gt_mean_curvature_vector = gt_vertex_normals * gt_mean_curvature[:, np.newaxis]
+
                 print(f"GT mean curvature range: [{gt_mean_curvature.min():.6f}, {gt_mean_curvature.max():.6f}]")
 
             except Exception as e:
                 print(f"Warning: Failed to compute GT mean curvature with libigl: {e}")
                 gt_mean_curvature = None
+                gt_mean_curvature_vector = None
 
         # Compute GT Laplacian eigendecomposition using PyFM
         print("Computing GT Laplacian eigendecomposition using PyFM...")
@@ -330,6 +363,16 @@ class RealTimeEigenanalysisVisualizer:
             gt_eigenvectors = pyfm_mesh.eigenvectors
             vertex_areas = pyfm_mesh.vertex_areas
 
+            # Ensure GT eigenvectors are normalized
+            if gt_eigenvectors is not None:
+                # Normalize each eigenvector to unit length
+                gt_eigenvectors_norms = np.linalg.norm(gt_eigenvectors, axis=0, keepdims=True)
+                # Avoid division by zero
+                gt_eigenvectors_norms = np.where(gt_eigenvectors_norms > 1e-10, gt_eigenvectors_norms, 1.0)
+                gt_eigenvectors = gt_eigenvectors / gt_eigenvectors_norms
+
+                print(f"GT eigenvectors normalized to unit length")
+
             print(f"Computed {len(gt_eigenvalues)} GT eigenvalues")
             print(f"GT eigenvalue range: [{gt_eigenvalues[0]:.2e}, {gt_eigenvalues[-1]:.6f}]")
 
@@ -344,6 +387,7 @@ class RealTimeEigenanalysisVisualizer:
             'faces': faces,
             'gt_vertex_normals': gt_vertex_normals,
             'gt_mean_curvature': gt_mean_curvature,
+            'gt_mean_curvature_vector': gt_mean_curvature_vector,  # New: GT mean curvature vector
             'gt_eigenvalues': gt_eigenvalues,
             'gt_eigenvectors': gt_eigenvectors,
             'vertex_areas': vertex_areas
@@ -372,6 +416,14 @@ class RealTimeEigenanalysisVisualizer:
             token_weights = forward_result['token_weights']
 
             print(f"Got token weights shape: {token_weights.shape}")
+
+            # Apply k-ratio correction if training k differs from inference k
+            if self.training_k is not None:
+                inference_k = token_weights.shape[1]  # Number of points per patch
+                if inference_k != self.training_k:
+                    k_ratio = inference_k / self.training_k
+                    token_weights = token_weights / k_ratio
+                    print(f"Applied k-ratio correction: inference_k={inference_k}, training_k={self.training_k}, ratio={k_ratio:.3f}")
 
             # Assemble sparse Laplacian matrix
             laplacian_matrix = self.assemble_sparse_laplacian(
@@ -436,7 +488,7 @@ class RealTimeEigenanalysisVisualizer:
             print(f"Zero curvature points: {(~non_zero_mask).sum()}/{len(predicted_mean_curvature)}")
 
             return {
-                'predicted_mean_curvature_vector': predicted_mean_curvature_vector,
+                'predicted_mean_curvature_vector': predicted_mean_curvature_vector,  # Raw, unnormalized vectors
                 'predicted_normals': predicted_normals,
                 'predicted_mean_curvature': predicted_mean_curvature
             }
@@ -536,15 +588,6 @@ class RealTimeEigenanalysisVisualizer:
                 enabled=True
             )
 
-            # Add vertex normals
-            mesh_surface.add_vector_quantity(
-                name="normals",
-                values=vertex_normals * 0.05,
-                enabled=False,
-                color=(0.0, 1.0, 1.0),
-                vectortype="ambient"
-            )
-
             print(f"Registered mesh surface with {len(vertices)} vertices and {len(faces)} faces")
             return mesh_surface
         else:
@@ -554,14 +597,6 @@ class RealTimeEigenanalysisVisualizer:
                 points=vertices,
                 radius=self.config.point_radius,
                 enabled=True
-            )
-
-            mesh_cloud.add_vector_quantity(
-                name="normals",
-                values=vertex_normals * 0.05,
-                enabled=False,
-                color=(0.0, 1.0, 1.0),
-                vectortype="ambient"
             )
 
             print(f"Registered mesh point cloud with {len(vertices)} vertices")
@@ -590,43 +625,43 @@ class RealTimeEigenanalysisVisualizer:
                 cmap='plasma'
             )
 
-        # === NORMALS ===
-        if gt_data.get('gt_vertex_normals') is not None:
+        # === MEAN CURVATURE VECTORS (RAW, UNNORMALIZED) ===
+        if gt_data.get('gt_mean_curvature_vector') is not None:
             mesh_structure.add_vector_quantity(
-                name="C Normals - GT",
-                values=gt_data['gt_vertex_normals'] * 0.05,
+                name="C Mean Curvature Vector - GT",
+                values=gt_data['gt_mean_curvature_vector'] * self.vector_scales.get_vector_scale('gt_mean_curvature_vector'),
                 enabled=False,
-                color=(0.0, 1.0, 1.0),
+                color=(0.0, 1.0, 1.0),  # Cyan
                 vectortype="ambient"
             )
 
-        if predicted_data.get('predicted_normals') is not None:
+        if predicted_data.get('predicted_mean_curvature_vector') is not None:
             mesh_structure.add_vector_quantity(
-                name="D Normals - PRED",
-                values=predicted_data['predicted_normals'] * 0.05,
+                name="D Mean Curvature Vector - PRED",
+                values=predicted_data['predicted_mean_curvature_vector'] * self.vector_scales.get_vector_scale('predicted_mean_curvature_vector'),
                 enabled=False,
-                color=(1.0, 0.5, 0.0),
+                color=(1.0, 0.5, 0.0),  # Orange
                 vectortype="ambient"
             )
 
-        # === COMPARISON METRICS ===
-        gt_normals = gt_data.get('gt_vertex_normals')
-        predicted_normals = predicted_data.get('predicted_normals')
+        # === COMPARISON METRICS FOR MEAN CURVATURE VECTORS ===
+        gt_mean_curv_vector = gt_data.get('gt_mean_curvature_vector')
+        pred_mean_curv_vector = predicted_data.get('predicted_mean_curvature_vector')
 
-        # Predicted vs GT comparison
-        if gt_normals is not None and predicted_normals is not None:
-            normal_alignment = np.sum(predicted_normals * gt_normals, axis=1)
-            mesh_structure.add_scalar_quantity(
-                name="E Normal Alignment (Predicted vs GT)",
-                values=normal_alignment,
-                enabled=False,
-                cmap='coolwarm'
-            )
+        # Mean curvature vector alignment comparison
+        if gt_mean_curv_vector is not None and pred_mean_curv_vector is not None:
+            # Normalize both vectors for alignment comparison
+            gt_norm = np.linalg.norm(gt_mean_curv_vector, axis=1, keepdims=True)
+            pred_norm = np.linalg.norm(pred_mean_curv_vector, axis=1, keepdims=True)
 
-            angular_differences = np.arccos(np.clip(np.abs(normal_alignment), 0, 1)) * 180 / np.pi
+            # Avoid division by zero
+            gt_normalized = np.where(gt_norm > 1e-10, gt_mean_curv_vector / gt_norm, 0)
+            pred_normalized = np.where(pred_norm > 1e-10, pred_mean_curv_vector / pred_norm, 0)
+
+            vector_alignment = np.sum(pred_normalized * gt_normalized, axis=1)
             mesh_structure.add_scalar_quantity(
-                name="F Normal Angular Error (degrees)",
-                values=angular_differences,
+                name="E Mean Curvature Vector Alignment",
+                values=vector_alignment,
                 enabled=False,
                 cmap='coolwarm'
             )
@@ -772,13 +807,34 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"\n✅ Comprehensive visualization completed for {Path(mesh_file_path).name}")
 
-    def run_dataset_iteration(self, cfg: DictConfig, ckpt_path: Path):
+    def run_dataset_iteration(self, cfg: DictConfig):
         """Run visualization on all meshes in the dataset."""
         print(f"\n{'=' * 80}")
         print("REAL-TIME EIGENANALYSIS VISUALIZATION")
         print("=" * 80)
+
+        # Get and validate checkpoint path from config
+        if not hasattr(cfg, 'ckpt_path') or cfg.ckpt_path is None:
+            raise ValueError("ckpt_path parameter is required. Please specify the path to the model checkpoint.")
+
+        ckpt_path = Path(cfg.ckpt_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+
+        # Get and validate training k from config
+        if not hasattr(cfg, 'training_k') or cfg.training_k is None:
+            raise ValueError("training_k parameter is required. Please specify the k value used during training.")
+
+        training_k = int(cfg.training_k)
+        if training_k <= 0:
+            raise ValueError(f"training_k must be positive, got {training_k}")
+
         print(f"Checkpoint: {ckpt_path}")
+        print(f"Training k: {training_k}")
         print("=" * 80)
+
+        # Store training k for k-ratio correction
+        self.training_k = training_k
 
         # Setup device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -829,15 +885,10 @@ class RealTimeEigenanalysisVisualizer:
 def main(cfg: DictConfig) -> None:
     """Main function with Hydra configuration."""
 
-    # Get checkpoint path from config
-    ckpt_path = Path(cfg.ckpt_path)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
-
     # Create visualization config
     vis_config = VisualizationConfig(
         point_radius=0.005,
-        num_eigenvectors_to_show=8,
+        num_eigenvectors_to_show=40,
         colormap='coolwarm',
         enable_eigenvalue_info=True,
         enable_correlation_analysis=True
@@ -858,7 +909,7 @@ def main(cfg: DictConfig) -> None:
 
     # Create visualizer and run
     visualizer = RealTimeEigenanalysisVisualizer(config=vis_config)
-    visualizer.run_dataset_iteration(cfg, ckpt_path)
+    visualizer.run_dataset_iteration(cfg)
 
 
 if __name__ == "__main__":

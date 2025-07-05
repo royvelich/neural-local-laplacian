@@ -14,7 +14,7 @@
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/visualize_validation2.py" />
-    <option name="PARAMETERS" value="+ckpt_path=&quot;C:\Users\Roy\Downloads\model2.ckpt&quot; +data_module=visualize_validation2 +globals=visualize_validation2 +model=visualize_validation2" />
+    <option name="PARAMETERS" value="+ckpt_path=&quot;C:\Users\Roy\Downloads\model2.ckpt&quot; +training_k=10 +data_module=visualize_validation2 +globals=visualize_validation2 +model=visualize_validation2" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />
