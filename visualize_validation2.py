@@ -283,6 +283,16 @@ class RealTimeEigenanalysisVisualizer:
             eigenvalues = eigenvalues[sort_indices]
             eigenvectors = eigenvectors[:, sort_indices]
 
+            # Ensure predicted eigenvectors are normalized
+            if eigenvectors is not None:
+                # Normalize each eigenvector to unit length
+                eigenvectors_norms = np.linalg.norm(eigenvectors, axis=0, keepdims=True)
+                # Avoid division by zero
+                eigenvectors_norms = np.where(eigenvectors_norms > 1e-10, eigenvectors_norms, 1.0)
+                eigenvectors = eigenvectors / eigenvectors_norms
+
+                print(f"Predicted eigenvectors normalized to unit length")
+
             return eigenvalues, eigenvectors
 
         except Exception as e:
@@ -497,6 +507,121 @@ class RealTimeEigenanalysisVisualizer:
             print(f"Error computing predicted quantities from Laplacian: {e}")
             return {}
 
+    def compute_mesh_reconstruction(self, original_vertices: np.ndarray, eigenvectors: np.ndarray,
+                                    eigenvalues: np.ndarray, max_eigenvectors: int,
+                                    vertex_areas: Optional[np.ndarray] = None) -> List[np.ndarray]:
+        """
+        Reconstruct mesh geometry using progressive number of eigenvectors.
+
+        Args:
+            original_vertices: Original mesh vertices of shape (N, 3)
+            eigenvectors: Eigenvectors of shape (N, k)
+            eigenvalues: Eigenvalues of shape (k,)
+            max_eigenvectors: Maximum number of eigenvectors to use
+            vertex_areas: Optional vertex areas for area-weighted computation (GT case)
+
+        Returns:
+            List of reconstructed vertex arrays, one for each number of eigenvectors (1, 2, ..., max_eigenvectors)
+        """
+        if eigenvectors is None or eigenvalues is None:
+            return []
+
+        num_available = min(eigenvectors.shape[1], max_eigenvectors)
+        reconstructed_meshes = []
+
+        if vertex_areas is not None:
+            print(f"Computing area-weighted mesh reconstruction (GT) with up to {num_available} eigenvectors...")
+            reconstructed_meshes = self._compute_area_weighted_reconstruction(
+                original_vertices, eigenvectors, num_available, vertex_areas
+            )
+        else:
+            print(f"Computing standard mesh reconstruction (PRED) with up to {num_available} eigenvectors...")
+            reconstructed_meshes = self._compute_standard_reconstruction(
+                original_vertices, eigenvectors, num_available
+            )
+
+        print(f"Generated {len(reconstructed_meshes)} reconstructed meshes")
+        return reconstructed_meshes
+
+    def _compute_area_weighted_reconstruction(self, original_vertices: np.ndarray, eigenvectors: np.ndarray,
+                                              num_available: int, vertex_areas: np.ndarray) -> List[np.ndarray]:
+        """
+        Compute mesh reconstruction using area-weighted least squares (for GT case).
+
+        Solves the weighted least squares problem:
+        min_c ||f - A_ℓ c||_M^2
+        where M = diag(vertex_areas) is the mass matrix.
+
+        Args:
+            original_vertices: Original mesh vertices f ∈ R^{n×3}
+            eigenvectors: Eigenvectors Φ ∈ R^{n×k}
+            num_available: Number of available eigenvectors to use
+            vertex_areas: Vertex areas a ∈ R^n
+
+        Returns:
+            List of reconstructed vertex arrays
+        """
+        reconstructed_meshes = []
+
+        # Create mass matrix M = diag(vertex_areas)
+        M = np.diag(vertex_areas)  # Shape: (n, n)
+        f = original_vertices  # Shape: (n, 3)
+
+        for num_eigenvecs in range(1, num_available + 1):
+            # Step 1: Extract basis A_ℓ = Φ[:, 1:ℓ] (first ℓ eigenvectors)
+            A_l = eigenvectors[:, :num_eigenvecs]  # Shape: (n, ℓ)
+
+            # Step 2: Compute Gram matrix G = A_ℓ^T M A_ℓ
+            G = A_l.T @ M @ A_l  # Shape: (ℓ, ℓ)
+
+            # Step 3: Compute projection target b = A_ℓ^T M f
+            b = A_l.T @ M @ f  # Shape: (ℓ, 3)
+
+            # Step 4: Solve for coefficients G c = b
+            try:
+                c = np.linalg.solve(G, b)  # Shape: (ℓ, 3)
+            except np.linalg.LinAlgError:
+                # Fallback to pseudoinverse if G is singular
+                print(f"Warning: Gram matrix singular for {num_eigenvecs} eigenvectors, using pseudoinverse")
+                c = np.linalg.pinv(G) @ b  # Shape: (ℓ, 3)
+
+            # Step 5: Reconstruct f̂_ℓ = A_ℓ c
+            reconstructed_vertices = A_l @ c  # Shape: (n, 3)
+
+            reconstructed_meshes.append(reconstructed_vertices)
+
+        return reconstructed_meshes
+
+    def _compute_standard_reconstruction(self, original_vertices: np.ndarray, eigenvectors: np.ndarray,
+                                         num_available: int) -> List[np.ndarray]:
+        """
+        Compute mesh reconstruction using standard Euclidean inner products (for PRED case).
+
+        Args:
+            original_vertices: Original mesh vertices of shape (N, 3)
+            eigenvectors: Eigenvectors of shape (N, k)
+            num_available: Number of available eigenvectors to use
+
+        Returns:
+            List of reconstructed vertex arrays
+        """
+        reconstructed_meshes = []
+
+        for num_eigenvecs in range(1, num_available + 1):
+            # Use first num_eigenvecs eigenvectors
+            current_eigenvectors = eigenvectors[:, :num_eigenvecs]  # Shape: (N, num_eigenvecs)
+
+            # Compute standard projection coefficients
+            # c_i = ⟨coords, φ_i⟩ = Σ coords_j * φ_i_j
+            coefficients = np.dot(original_vertices.T, current_eigenvectors)  # Shape: (3, num_eigenvecs)
+
+            # Reconstruct coordinates: coords = Σ c_i * φ_i
+            reconstructed_vertices = np.dot(current_eigenvectors, coefficients.T)  # Shape: (N, 3)
+
+            reconstructed_meshes.append(reconstructed_vertices)
+
+        return reconstructed_meshes
+
     def compute_eigenvector_correlations(self, gt_eigenvectors: np.ndarray, pred_eigenvectors: np.ndarray) -> np.ndarray:
         """Compute correlation matrix between ground-truth and predicted eigenvectors."""
         min_cols = min(gt_eigenvectors.shape[1], pred_eigenvectors.shape[1])
@@ -509,6 +634,91 @@ class RealTimeEigenanalysisVisualizer:
                 correlation_matrix[i, j] = corr
 
         return correlation_matrix
+
+    def visualize_mesh_reconstructions(self, original_faces: np.ndarray, gt_reconstructions: List[np.ndarray],
+                                       pred_reconstructions: List[np.ndarray], gt_eigenvalues: Optional[np.ndarray],
+                                       pred_eigenvalues: Optional[np.ndarray]):
+        """
+        Visualize progressive mesh reconstructions using eigenvectors.
+        All GT reconstructions are overlaid on the right, all PRED reconstructions on the left.
+
+        Args:
+            original_faces: Mesh faces for topology
+            gt_reconstructions: List of GT reconstructed vertices
+            pred_reconstructions: List of predicted reconstructed vertices
+            gt_eigenvalues: GT eigenvalues for labeling
+            pred_eigenvalues: Predicted eigenvalues for labeling
+        """
+        print("Adding mesh reconstruction visualizations...")
+
+        # Fixed positions for overlaid reconstructions
+        gt_offset = np.array([3.0, 0.0, 0.0])  # GT reconstructions on the right
+        pred_offset = np.array([-3.0, 0.0, 0.0])  # PRED reconstructions on the left
+
+        # Visualize GT reconstructions (all overlaid on the right)
+        for i, gt_vertices in enumerate(gt_reconstructions):
+            num_eigenvecs = i + 1
+            gt_eigenval = gt_eigenvalues[i] if gt_eigenvalues is not None else 0.0
+
+            # Position all GT reconstructions at the same location (right side)
+            offset_vertices = gt_vertices + gt_offset
+
+            mesh_name = f"GT Recon {num_eigenvecs:02d} eigenvec (λ={gt_eigenval:.3f})"
+
+            try:
+                gt_mesh = ps.register_surface_mesh(
+                    name=mesh_name,
+                    vertices=offset_vertices,
+                    faces=original_faces,
+                    enabled=(i == 0)  # Only enable the first one by default
+                )
+
+                # Color GT reconstructions in blue tones with slight variation
+                blue_intensity = 0.5 + 0.5 * (i / max(1, len(gt_reconstructions) - 1))
+                mesh_color = np.array([0.2, 0.4, blue_intensity])
+                vertex_colors = np.tile(mesh_color, (len(offset_vertices), 1))
+                gt_mesh.add_color_quantity(
+                    name="gt_color",
+                    values=vertex_colors,
+                    enabled=True
+                )
+
+            except Exception as e:
+                print(f"Warning: Failed to visualize GT reconstruction {num_eigenvecs}: {e}")
+
+        # Visualize predicted reconstructions (all overlaid on the left)
+        for i, pred_vertices in enumerate(pred_reconstructions):
+            num_eigenvecs = i + 1
+            pred_eigenval = pred_eigenvalues[i] if pred_eigenvalues is not None else 0.0
+
+            # Position all PRED reconstructions at the same location (left side)
+            offset_vertices = pred_vertices + pred_offset
+
+            mesh_name = f"PRED Recon {num_eigenvecs:02d} eigenvec (λ={pred_eigenval:.3f})"
+
+            try:
+                pred_mesh = ps.register_surface_mesh(
+                    name=mesh_name,
+                    vertices=offset_vertices,
+                    faces=original_faces,
+                    enabled=(i == 0)  # Only enable the first one by default
+                )
+
+                # Color predicted reconstructions in orange tones with slight variation
+                orange_intensity = 0.5 + 0.5 * (i / max(1, len(pred_reconstructions) - 1))
+                mesh_color = np.array([orange_intensity, 0.4, 0.2])
+                vertex_colors = np.tile(mesh_color, (len(offset_vertices), 1))
+                pred_mesh.add_color_quantity(
+                    name="pred_color",
+                    values=vertex_colors,
+                    enabled=True
+                )
+
+            except Exception as e:
+                print(f"Warning: Failed to visualize predicted reconstruction {num_eigenvecs}: {e}")
+
+        print(f"Added {len(gt_reconstructions)} GT and {len(pred_reconstructions)} predicted mesh reconstructions")
+        print("Toggle visibility to compare different numbers of eigenvectors")
 
     def print_eigenvalue_analysis(self, gt_eigenvalues: Optional[np.ndarray],
                                   predicted_eigenvalues: Optional[np.ndarray],
@@ -805,6 +1015,41 @@ class RealTimeEigenanalysisVisualizer:
 
         self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data)
 
+        # Add mesh reconstructions using eigenvectors
+        print(f"\nSTEP 6: Computing and visualizing mesh reconstructions")
+        gt_reconstructions = []
+        pred_reconstructions = []
+
+        # Compute GT reconstructions (with area weighting)
+        if gt_data.get('gt_eigenvectors') is not None:
+            gt_reconstructions = self.compute_mesh_reconstruction(
+                gt_data['vertices'],
+                gt_data['gt_eigenvectors'],
+                gt_data.get('gt_eigenvalues'),
+                self.config.num_eigenvectors_to_show,
+                vertex_areas=gt_data.get('vertex_areas')  # Pass vertex areas for GT case
+            )
+
+        # Compute predicted reconstructions (standard, no area weighting)
+        if inference_result['predicted_eigenvectors'] is not None:
+            pred_reconstructions = self.compute_mesh_reconstruction(
+                gt_data['vertices'],  # Use original vertices as reference
+                inference_result['predicted_eigenvectors'],
+                inference_result['predicted_eigenvalues'],
+                self.config.num_eigenvectors_to_show,
+                vertex_areas=None  # No area weighting for PRED case
+            )
+
+        # Visualize reconstructions
+        if gt_reconstructions or pred_reconstructions:
+            self.visualize_mesh_reconstructions(
+                gt_data['faces'],
+                gt_reconstructions,
+                pred_reconstructions,
+                gt_data.get('gt_eigenvalues'),
+                inference_result['predicted_eigenvalues']
+            )
+
         print(f"\n✅ Comprehensive visualization completed for {Path(mesh_file_path).name}")
 
     def run_dataset_iteration(self, cfg: DictConfig):
@@ -888,7 +1133,7 @@ def main(cfg: DictConfig) -> None:
     # Create visualization config
     vis_config = VisualizationConfig(
         point_radius=0.005,
-        num_eigenvectors_to_show=40,
+        num_eigenvectors_to_show=60,
         colormap='coolwarm',
         enable_eigenvalue_info=True,
         enable_correlation_analysis=True
