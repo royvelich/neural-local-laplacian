@@ -5,7 +5,7 @@ val_dataset_specifications:
     dataset:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
       mesh_folder_path: './assets/meshes'
-      k: 30
+      k: 6
       feature_extractor:
         _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
         num_fourier_features: 128

@@ -530,12 +530,12 @@ class RealTimeEigenanalysisVisualizer:
         reconstructed_meshes = []
 
         if vertex_areas is not None:
-            print(f"Computing area-weighted mesh reconstruction (GT) with up to {num_available} eigenvectors...")
+            print(f"Computing area-weighted mesh reconstruction with up to {num_available} eigenvectors...")
             reconstructed_meshes = self._compute_area_weighted_reconstruction(
                 original_vertices, eigenvectors, num_available, vertex_areas
             )
         else:
-            print(f"Computing standard mesh reconstruction (PRED) with up to {num_available} eigenvectors...")
+            print(f"Computing standard mesh reconstruction with up to {num_available} eigenvectors...")
             reconstructed_meshes = self._compute_standard_reconstruction(
                 original_vertices, eigenvectors, num_available
             )
@@ -1030,14 +1030,33 @@ class RealTimeEigenanalysisVisualizer:
                 vertex_areas=gt_data.get('vertex_areas')  # Pass vertex areas for GT case
             )
 
-        # Compute predicted reconstructions (standard, no area weighting)
+        # Compute predicted reconstructions (using predicted mean curvature as vertex areas)
         if inference_result['predicted_eigenvectors'] is not None:
+            # Use predicted mean curvature as pseudo vertex areas for PRED case
+            predicted_vertex_areas = None
+            if predicted_data.get('predicted_mean_curvature') is not None:
+                predicted_mean_curvature = predicted_data['predicted_mean_curvature']
+
+                # Convert mean curvature to pseudo areas
+                # Use absolute values and add small epsilon to avoid zeros
+                predicted_vertex_areas = np.abs(predicted_mean_curvature) + 1e-7
+
+                # Optionally normalize to have similar scale as GT areas
+                if gt_data.get('vertex_areas') is not None:
+                    gt_area_scale = np.mean(gt_data['vertex_areas'])
+                    pred_area_scale = np.mean(predicted_vertex_areas)
+                    if pred_area_scale > 1e-10:
+                        predicted_vertex_areas = predicted_vertex_areas * (gt_area_scale / pred_area_scale)
+
+                print(f"Using predicted mean curvature as vertex areas for PRED reconstruction")
+                print(f"Predicted area range: [{predicted_vertex_areas.min():.6f}, {predicted_vertex_areas.max():.6f}]")
+
             pred_reconstructions = self.compute_mesh_reconstruction(
                 gt_data['vertices'],  # Use original vertices as reference
                 inference_result['predicted_eigenvectors'],
                 inference_result['predicted_eigenvalues'],
                 self.config.num_eigenvectors_to_show,
-                vertex_areas=None  # No area weighting for PRED case
+                vertex_areas=predicted_vertex_areas  # Use predicted mean curvature as areas
             )
 
         # Visualize reconstructions
