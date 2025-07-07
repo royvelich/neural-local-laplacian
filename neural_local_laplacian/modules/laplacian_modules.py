@@ -46,10 +46,12 @@ from neural_local_laplacian.modules.losses import LossConfig
 
 class LocalLaplacianModuleBase(pl.LightningModule):
     def __init__(self,
-                 optimizer_cfg: DictConfig
+                 optimizer_cfg: DictConfig,
+                 scheduler_cfg: Optional[DictConfig] = None
                  ):
         super().__init__()
         self._optimizer_cfg = optimizer_cfg
+        self._scheduler_cfg = scheduler_cfg
 
     def setup(self, stage):
         def exclude_fn(path: str):
@@ -83,9 +85,39 @@ class LocalLaplacianModuleBase(pl.LightningModule):
     #     """Validation step logic."""
     #     return self._shared_step(batch, batch_idx, 'val')
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        if self._optimizer_cfg is not None:
-            return self._optimizer_cfg(params=self.parameters())
+    def configure_optimizers(self):
+        """Configure optimizer and optionally scheduler."""
+        if self._optimizer_cfg is None:
+            raise ValueError("optimizer_cfg is required but was None")
+
+        # Create optimizer
+        optimizer = self._optimizer_cfg(params=self.parameters())
+
+        # If no scheduler config, return just the optimizer
+        if self._scheduler_cfg is None:
+            return optimizer
+
+        # Create scheduler
+        scheduler = self._scheduler_cfg(optimizer=optimizer)
+
+        # Return optimizer and scheduler configuration
+        # The format depends on what scheduler monitoring you want
+        scheduler_config = {
+            "scheduler": scheduler,
+            "interval": getattr(self._scheduler_cfg, 'interval', 'epoch'),  # 'epoch' or 'step'
+            "frequency": getattr(self._scheduler_cfg, 'frequency', 1),
+            "monitor": getattr(self._scheduler_cfg, 'monitor', None),  # metric to monitor for ReduceLROnPlateau
+            "strict": getattr(self._scheduler_cfg, 'strict', True),
+            "name": getattr(self._scheduler_cfg, 'name', None),  # for logging
+        }
+
+        # Remove None values to avoid issues
+        scheduler_config = {k: v for k, v in scheduler_config.items() if v is not None}
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler_config
+        }
 
 
 class SurfaceTransformerModule(LocalLaplacianModuleBase):
