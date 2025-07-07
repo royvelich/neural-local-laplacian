@@ -66,6 +66,13 @@ class VisualizationConfig:
     enable_correlation_analysis: bool = True
 
 
+@dataclass
+class ReconstructionSettings:
+    """Settings for mesh reconstruction visualization."""
+    use_pred_mean_curvature_as_areas: bool = False
+    current_pred_k: int = 20  # Will be updated with actual k from dataset
+
+
 class ColorPalette:
     """Color palette for different visualization elements."""
 
@@ -121,13 +128,356 @@ class RealTimeEigenanalysisVisualizer:
         self.vector_scales = VectorScales()
         self.training_k = None  # Will be set from command line argument
 
+        # NEW: Reconstruction settings with UI control
+        self.reconstruction_settings = ReconstructionSettings()
+
+        # Store current batch data for re-computation
+        self.current_gt_data = None
+        self.current_inference_result = None
+        self.current_predicted_data = None
+        self.current_mesh_structure = None
+
+        # NEW: Store raw data for k-NN slider updates
+        self.current_token_weights = None
+        self.current_original_vertices = None
+        self.original_k = None
+        self.current_vertex_indices = None
+        self.current_center_indices = None
+        self.current_batch_indices = None
+
+        # NEW: Track reconstruction structure names for removal
+        self.reconstruction_structure_names = []
+
     def setup_polyscope(self):
-        """Initialize and configure polyscope."""
+        """Initialize and configure polyscope with UI callback."""
         ps.init()
         ps.set_up_dir("z_up")
         ps.look_at(camera_location=[2.0, 2.0, 2.0], target=[0, 0, 0])
         ps.set_ground_plane_mode("none")
         ps.set_background_color((0.05, 0.05, 0.05))  # Dark background
+
+        # Set up UI callback for reconstruction settings
+        ps.set_user_callback(self._reconstruction_settings_ui_callback)
+
+    def _reconstruction_settings_ui_callback(self):
+        """ImGui callback for reconstruction settings window."""
+        import polyscope.imgui as psim
+
+        # Checkbox for using predicted mean curvature as vertex areas
+        psim.Text("PRED Mesh Reconstruction Options:")
+        psim.Separator()
+
+        changed, new_setting = psim.Checkbox(
+            "Use Predicted Mean Curvature as Vertex Areas",
+            self.reconstruction_settings.use_pred_mean_curvature_as_areas
+        )
+
+        if changed:
+            self.reconstruction_settings.use_pred_mean_curvature_as_areas = new_setting
+            print(f"🔄 Reconstruction setting changed: use_pred_mean_curvature_as_areas = {new_setting}")
+
+            # Re-compute and update reconstructions if we have current data
+            if self._has_current_batch_data():
+                self._recompute_and_update_reconstructions()
+
+        psim.Text("")
+
+        # k-NN input field for PRED reconstructions
+        if self.original_k is not None:
+            # Use EnterReturnsTrue flag to only trigger on Enter press
+            k_changed, new_k = psim.InputInt(
+                "PRED k-NN neighbors",
+                self.reconstruction_settings.current_pred_k,
+                flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+            )
+
+            # Clamp the value to valid range
+            new_k = max(5, min(100, new_k))
+
+            if k_changed and new_k != self.reconstruction_settings.current_pred_k:
+                self.reconstruction_settings.current_pred_k = new_k
+                print(f"🔄 PRED k changed: {new_k}")
+
+                # Re-compute PRED with new k if we have current data
+                if self._has_current_batch_data():
+                    self._update_pred_with_new_k(new_k)
+        else:
+            psim.Text("k-NN input: (no data loaded)")
+
+        psim.Text("(Press Enter to apply changes)")
+
+        psim.Text("")
+        psim.Text("Current Settings:")
+        if self.reconstruction_settings.use_pred_mean_curvature_as_areas:
+            psim.TextColored((0.0, 1.0, 0.0, 1.0), "✓ Using predicted mean curvature as areas")
+            psim.Text("  (Area-weighted reconstruction for PRED)")
+        else:
+            psim.TextColored((1.0, 0.5, 0.0, 1.0), "○ Using standard Euclidean reconstruction")
+            psim.Text("  (Standard L2 projection for PRED)")
+
+        if self.original_k is not None:
+            psim.Text(f"Original k: {self.original_k}, Current PRED k: {self.reconstruction_settings.current_pred_k}")
+
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Note: GT always uses PyFM vertex areas and original mesh connectivity")
+
+    def _has_current_batch_data(self) -> bool:
+        """Check if we have current batch data available for re-computation."""
+        return (self.current_gt_data is not None and
+                self.current_inference_result is not None and
+                self.current_predicted_data is not None and
+                self.current_token_weights is not None and
+                self.current_original_vertices is not None)
+
+    def _compute_predicted_vertex_areas(self, predicted_data: Dict) -> Optional[np.ndarray]:
+        """Compute predicted vertex areas based on current settings."""
+        if not self.reconstruction_settings.use_pred_mean_curvature_as_areas:
+            return None
+
+        if predicted_data.get('predicted_mean_curvature') is not None:
+            predicted_mean_curvature = predicted_data['predicted_mean_curvature']
+            predicted_vertex_areas = np.abs(predicted_mean_curvature) + 1e-7
+            print(f"Using predicted mean curvature as vertex areas (range: [{predicted_vertex_areas.min():.6f}, {predicted_vertex_areas.max():.6f}])")
+            return predicted_vertex_areas
+        else:
+            print(f"⚠️  No predicted mean curvature available, falling back to standard reconstruction")
+            return None
+
+    def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict, predicted_data: Dict) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """Compute both GT and predicted reconstructions."""
+        gt_reconstructions = []
+        pred_reconstructions = []
+
+        # Compute GT reconstructions (always use area weighting)
+        if gt_data.get('gt_eigenvectors') is not None:
+            gt_reconstructions = self.compute_mesh_reconstruction(
+                gt_data['vertices'],
+                gt_data['gt_eigenvectors'],
+                gt_data.get('gt_eigenvalues'),
+                self.config.num_eigenvectors_to_show,
+                vertex_areas=gt_data.get('vertex_areas')  # Always use GT areas
+            )
+
+        # Compute predicted reconstructions (respecting current setting)
+        if inference_result['predicted_eigenvectors'] is not None:
+            predicted_vertex_areas = self._compute_predicted_vertex_areas(predicted_data)
+            pred_reconstructions = self.compute_mesh_reconstruction(
+                gt_data['vertices'],  # Use original vertices as reference
+                inference_result['predicted_eigenvectors'],
+                inference_result['predicted_eigenvalues'],
+                self.config.num_eigenvectors_to_show,
+                vertex_areas=predicted_vertex_areas  # None for standard, or predicted areas
+            )
+
+        return gt_reconstructions, pred_reconstructions
+
+    def _update_mesh_reconstructions(self, gt_data: Dict, inference_result: Dict, predicted_data: Dict):
+        """Complete pipeline for computing and visualizing mesh reconstructions."""
+        print(f"Computing and visualizing mesh reconstructions...")
+
+        # Compute reconstructions
+        gt_reconstructions, pred_reconstructions = self._compute_all_reconstructions(
+            gt_data, inference_result, predicted_data
+        )
+
+        # Visualize reconstructions
+        if gt_reconstructions or pred_reconstructions:
+            self.visualize_mesh_reconstructions(
+                gt_data['faces'],
+                gt_reconstructions,
+                pred_reconstructions,
+                gt_data.get('gt_eigenvalues'),
+                inference_result['predicted_eigenvalues']
+            )
+            print("✅ Mesh reconstructions completed")
+        else:
+            print("⚠️  No reconstructions to visualize")
+
+    def _recompute_knn_connectivity_for_k(self, new_k: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Recompute k-NN connectivity for new k value.
+
+        Args:
+            new_k: New number of neighbors per patch
+
+        Returns:
+            Tuple of (vertex_indices, center_indices, batch_indices) for new k
+        """
+        print(f"  Recomputing k-NN connectivity for k={new_k}...")
+
+        vertices = self.current_original_vertices
+        num_vertices = len(vertices)
+
+        # Build k-NN index for the entire mesh
+        from sklearn.neighbors import NearestNeighbors
+        nbrs = NearestNeighbors(n_neighbors=new_k + 1, algorithm='auto').fit(vertices)
+
+        # Get k+1 nearest neighbors for ALL vertices at once
+        distances, neighbor_indices = nbrs.kneighbors(vertices)  # Shape: (N, k+1)
+
+        # Vectorized removal of center point from neighbors
+        center_positions = np.arange(num_vertices)[:, np.newaxis]  # Shape: (N, 1)
+        is_center_mask = neighbor_indices == center_positions  # Shape: (N, k+1)
+
+        # Create mask to keep only non-center neighbors
+        keep_mask = ~is_center_mask  # Shape: (N, k+1)
+
+        # For each row, we want to keep the first k True values in keep_mask
+        keep_positions = np.cumsum(keep_mask, axis=1)  # Shape: (N, k+1)
+        final_mask = (keep_positions <= new_k) & keep_mask  # Shape: (N, k+1)
+
+        # Extract neighbor indices using the mask
+        neighbor_indices_flat = neighbor_indices[final_mask]  # Shape: (N*k,)
+        neighbor_indices_filtered = neighbor_indices_flat.reshape(num_vertices, new_k)  # Shape: (N, k)
+
+        # Create new connectivity tensors
+        vertex_indices = torch.from_numpy(neighbor_indices_filtered.flatten()).long()  # Shape: (N*k,)
+        center_indices = torch.from_numpy(np.arange(num_vertices)).long()  # Shape: (N,)
+        batch_indices = torch.from_numpy(np.repeat(range(num_vertices), new_k)).long()  # Shape: (N*k,)
+
+        print(f"  Created connectivity: {len(vertex_indices)} total points for {num_vertices} patches")
+        return vertex_indices, center_indices, batch_indices
+
+    def _recompute_pred_laplacian_with_k(self, new_k: int):
+        """
+        Recompute PRED Laplacian and eigendata with new k.
+
+        Args:
+            new_k: New number of neighbors per patch
+        """
+        print(f"  Recomputing PRED Laplacian with k={new_k}...")
+
+        # Get new k-NN connectivity
+        new_vertex_indices, new_center_indices, new_batch_indices = self._recompute_knn_connectivity_for_k(new_k)
+
+        # Apply k-ratio correction to token weights if needed
+        corrected_weights = self.current_token_weights.clone()
+        if self.training_k is not None and new_k != self.training_k:
+            k_ratio = new_k / self.training_k
+            corrected_weights = corrected_weights / k_ratio
+            print(f"  Applied k-ratio correction: new_k={new_k}, training_k={self.training_k}, ratio={k_ratio:.3f}")
+
+        # Resize token weights to match new k if necessary
+        current_k = corrected_weights.shape[1]
+        if new_k != current_k:
+            if new_k < current_k:
+                # Truncate to new_k
+                corrected_weights = corrected_weights[:, :new_k]
+                print(f"  Truncated token weights from {current_k} to {new_k}")
+            else:
+                # Pad with zeros or repeat existing weights
+                num_patches = corrected_weights.shape[0]
+                padding_size = new_k - current_k
+                # Use mean of existing weights for padding
+                mean_weights = corrected_weights.mean(dim=1, keepdim=True)
+                padding = mean_weights.expand(-1, padding_size)
+                corrected_weights = torch.cat([corrected_weights, padding], dim=1)
+                print(f"  Padded token weights from {current_k} to {new_k} using mean weights")
+
+        # Assemble new sparse Laplacian matrix
+        new_laplacian_matrix = self.assemble_sparse_laplacian(
+            weights=corrected_weights,
+            vertex_indices=new_vertex_indices,
+            center_indices=new_center_indices,
+            batch_indices=new_batch_indices
+        )
+
+        print(f"  Assembled new Laplacian matrix: {new_laplacian_matrix.shape} ({new_laplacian_matrix.nnz} non-zeros)")
+
+        # Compute new eigendecomposition
+        new_eigenvalues, new_eigenvectors = self.compute_eigendecomposition(
+            new_laplacian_matrix, k=self.config.num_eigenvectors_to_show
+        )
+
+        if new_eigenvalues is not None:
+            print(f"  Computed {len(new_eigenvalues)} new eigenvalues")
+            print(f"  New eigenvalue range: [{new_eigenvalues[0]:.2e}, {new_eigenvalues[-1]:.6f}]")
+
+            # Update current inference result
+            self.current_inference_result['laplacian_matrix'] = new_laplacian_matrix
+            self.current_inference_result['predicted_eigenvalues'] = new_eigenvalues
+            self.current_inference_result['predicted_eigenvectors'] = new_eigenvectors
+        else:
+            print(f"  ❌ Failed to compute eigendecomposition for k={new_k}")
+
+    def _update_pred_with_new_k(self, new_k: int):
+        """
+        Complete pipeline for updating PRED with new k.
+
+        Args:
+            new_k: New number of neighbors per patch
+        """
+        print(f"🔄 Updating PRED reconstructions with k={new_k}...")
+
+        # Recompute PRED Laplacian and eigendata
+        self._recompute_pred_laplacian_with_k(new_k)
+
+        # Recompute predicted quantities from new Laplacian
+        if self.current_inference_result['laplacian_matrix'] is not None:
+            new_predicted_data = self.compute_predicted_quantities_from_laplacian(
+                self.current_inference_result['laplacian_matrix'],
+                self.current_gt_data['vertices']
+            )
+            self.current_predicted_data = new_predicted_data
+            print(f"  Updated predicted quantities")
+
+        # Recompute and update reconstructions (reuses existing pipeline!)
+        self._recompute_and_update_reconstructions()
+
+        print(f"✅ PRED updated with k={new_k}")
+
+    def _recompute_and_update_reconstructions(self):
+        """Re-compute and update mesh reconstructions with new settings."""
+        if not self._has_current_batch_data():
+            print("⚠️  No current batch data available for re-computation")
+            return
+
+        print("🔄 Re-computing mesh reconstructions with new settings...")
+
+        # Remove existing reconstruction structures
+        self._remove_existing_reconstructions()
+
+        # Re-compute and visualize with new settings
+        self._update_mesh_reconstructions(
+            self.current_gt_data, self.current_inference_result, self.current_predicted_data
+        )
+
+        print("✅ Mesh reconstructions updated with new settings")
+        """Re-compute and update mesh reconstructions with new settings."""
+        if not self._has_current_batch_data():
+            print("⚠️  No current batch data available for re-computation")
+            return
+
+        print("🔄 Re-computing mesh reconstructions with new settings...")
+
+        # Remove existing reconstruction structures
+        self._remove_existing_reconstructions()
+
+        # Re-compute and visualize with new settings
+        self._update_mesh_reconstructions(
+            self.current_gt_data, self.current_inference_result, self.current_predicted_data
+        )
+
+        print("✅ Mesh reconstructions updated with new settings")
+
+    def _remove_existing_reconstructions(self):
+        """Remove existing reconstruction structures from polyscope."""
+        try:
+            # Remove tracked reconstruction structures
+            for struct_name in self.reconstruction_structure_names:
+                try:
+                    ps.remove_surface_mesh(struct_name)
+                    print(f"  Removed reconstruction structure: {struct_name}")
+                except Exception as e:
+                    print(f"  Warning: Could not remove structure {struct_name}: {e}")
+
+            # Clear the tracking list
+            self.reconstruction_structure_names.clear()
+            print(f"  Cleared reconstruction structure tracking list")
+
+        except Exception as e:
+            print(f"  Warning: Failed to remove some reconstruction structures: {e}")
 
     def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig) -> SurfaceTransformerModule:
         """
@@ -458,7 +808,8 @@ class RealTimeEigenanalysisVisualizer:
             'laplacian_matrix': laplacian_matrix,
             'predicted_eigenvalues': predicted_eigenvalues,
             'predicted_eigenvectors': predicted_eigenvectors,
-            'token_weights': token_weights.cpu().numpy()
+            'token_weights': token_weights.cpu().numpy(),
+            'forward_result': forward_result  # NEW: Include forward result for token weights storage
         }
 
     def compute_predicted_quantities_from_laplacian(self, laplacian_matrix: scipy.sparse.csr_matrix,
@@ -673,6 +1024,9 @@ class RealTimeEigenanalysisVisualizer:
                     enabled=(i == 0)  # Only enable the first one by default
                 )
 
+                # Track this structure for later removal
+                self.reconstruction_structure_names.append(mesh_name)
+
                 # Color GT reconstructions in blue tones with slight variation
                 blue_intensity = 0.5 + 0.5 * (i / max(1, len(gt_reconstructions) - 1))
                 mesh_color = np.array([0.2, 0.4, blue_intensity])
@@ -694,7 +1048,9 @@ class RealTimeEigenanalysisVisualizer:
             # Position all PRED reconstructions at the same location (left side)
             offset_vertices = pred_vertices + pred_offset
 
-            mesh_name = f"PRED Recon {num_eigenvecs:02d} eigenvec (λ={pred_eigenval:.3f})"
+            # Include reconstruction method in name
+            method_suffix = " (Mean Curv Areas)" if self.reconstruction_settings.use_pred_mean_curvature_as_areas else " (Standard)"
+            mesh_name = f"PRED Recon {num_eigenvecs:02d} eigenvec (λ={pred_eigenval:.3f}){method_suffix}"
 
             try:
                 pred_mesh = ps.register_surface_mesh(
@@ -703,6 +1059,9 @@ class RealTimeEigenanalysisVisualizer:
                     faces=original_faces,
                     enabled=(i == 0)  # Only enable the first one by default
                 )
+
+                # Track this structure for later removal
+                self.reconstruction_structure_names.append(mesh_name)
 
                 # Color predicted reconstructions in orange tones with slight variation
                 orange_intensity = 0.5 + 0.5 * (i / max(1, len(pred_reconstructions) - 1))
@@ -940,8 +1299,9 @@ class RealTimeEigenanalysisVisualizer:
         print(f"PROCESSING BATCH {batch_idx + 1}")
         print('=' * 80)
 
-        # Clear previous visualization
+        # Clear previous visualization and tracking
         ps.remove_all_structures()
+        self.reconstruction_structure_names.clear()  # Clear reconstruction tracking
 
         # STEP 1: Extract mesh data from batch
         print("STEP 1: Extracting mesh data from batch")
@@ -985,9 +1345,27 @@ class RealTimeEigenanalysisVisualizer:
             inference_result['laplacian_matrix'], gt_data['vertices']
         )
 
+        # STEP 5: Store current batch data for UI-driven re-computation
+        self.current_gt_data = gt_data
+        self.current_inference_result = inference_result
+        self.current_predicted_data = predicted_data
+
+        # NEW: Store raw data for k-NN slider updates
+        self.current_token_weights = inference_result['forward_result']['token_weights']
+        self.current_original_vertices = gt_data['vertices']
+        self.original_k = len(data.pos) // len(data.center_indices)  # Calculate original k
+        self.current_vertex_indices = data.vertex_indices
+        self.current_center_indices = data.center_indices
+        self.current_batch_indices = data.batch
+
+        # Initialize PRED k slider with original k
+        self.reconstruction_settings.current_pred_k = self.original_k
+        print(f"Initialized PRED k slider with original k={self.original_k}")
+
         # STEP 5: Visualization
         print(f"\nSTEP 5: Creating comprehensive visualization")
         mesh_structure = self.visualize_mesh(gt_data['vertices'], gt_data['gt_vertex_normals'], gt_data['faces'])
+        self.current_mesh_structure = mesh_structure
 
         # Print analysis
         if self.config.enable_eigenvalue_info:
@@ -1017,57 +1395,7 @@ class RealTimeEigenanalysisVisualizer:
 
         # Add mesh reconstructions using eigenvectors
         print(f"\nSTEP 6: Computing and visualizing mesh reconstructions")
-        gt_reconstructions = []
-        pred_reconstructions = []
-
-        # Compute GT reconstructions (with area weighting)
-        if gt_data.get('gt_eigenvectors') is not None:
-            gt_reconstructions = self.compute_mesh_reconstruction(
-                gt_data['vertices'],
-                gt_data['gt_eigenvectors'],
-                gt_data.get('gt_eigenvalues'),
-                self.config.num_eigenvectors_to_show,
-                vertex_areas=gt_data.get('vertex_areas')  # Pass vertex areas for GT case
-            )
-
-        # Compute predicted reconstructions (using predicted mean curvature as vertex areas)
-        if inference_result['predicted_eigenvectors'] is not None:
-            # Use predicted mean curvature as pseudo vertex areas for PRED case
-            predicted_vertex_areas = None
-            if predicted_data.get('predicted_mean_curvature') is not None:
-                predicted_mean_curvature = predicted_data['predicted_mean_curvature']
-
-                # Convert mean curvature to pseudo areas
-                # Use absolute values and add small epsilon to avoid zeros
-                predicted_vertex_areas = np.abs(predicted_mean_curvature) + 1e-7
-
-                # Optionally normalize to have similar scale as GT areas
-                if gt_data.get('vertex_areas') is not None:
-                    gt_area_scale = np.mean(gt_data['vertex_areas'])
-                    pred_area_scale = np.mean(predicted_vertex_areas)
-                    if pred_area_scale > 1e-10:
-                        predicted_vertex_areas = predicted_vertex_areas * (gt_area_scale / pred_area_scale)
-
-                print(f"Using predicted mean curvature as vertex areas for PRED reconstruction")
-                print(f"Predicted area range: [{predicted_vertex_areas.min():.6f}, {predicted_vertex_areas.max():.6f}]")
-
-            pred_reconstructions = self.compute_mesh_reconstruction(
-                gt_data['vertices'],  # Use original vertices as reference
-                inference_result['predicted_eigenvectors'],
-                inference_result['predicted_eigenvalues'],
-                self.config.num_eigenvectors_to_show,
-                vertex_areas=predicted_vertex_areas  # Use predicted mean curvature as areas
-            )
-
-        # Visualize reconstructions
-        if gt_reconstructions or pred_reconstructions:
-            self.visualize_mesh_reconstructions(
-                gt_data['faces'],
-                gt_reconstructions,
-                pred_reconstructions,
-                gt_data.get('gt_eigenvalues'),
-                inference_result['predicted_eigenvalues']
-            )
+        self._update_mesh_reconstructions(gt_data, inference_result, predicted_data)
 
         print(f"\n✅ Comprehensive visualization completed for {Path(mesh_file_path).name}")
 
@@ -1120,7 +1448,7 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"DataLoader ready with batch size: {data_loader.batch_size}")
 
-        # Setup polyscope
+        # Setup polyscope with UI callback
         self.setup_polyscope()
 
         # Process all batches
@@ -1130,7 +1458,8 @@ class RealTimeEigenanalysisVisualizer:
             try:
                 self.process_batch(model, batch_data, batch_idx, device)
 
-                print(f"\nVisualization ready for batch {batch_idx + 1}. Close window to continue to next batch.")
+                print(f"\nVisualization ready for batch {batch_idx + 1}. Use the 'Reconstruction Settings' window to control PRED reconstruction method.")
+                print("Close window to continue to next batch.")
                 ps.show()
 
             except Exception as e:
