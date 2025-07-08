@@ -1,0 +1,53 @@
+# ARAP GT vs PRED Configuration
+defaults:
+  - _self_
+
+# Model and data paths
+mesh_path: "./assets/arap/mickey_low.obj"  # Path to mesh file
+ckpt_path: "C:/Users/Roy/Downloads/model2.ckpt"  # Path to trained model checkpoint
+training_k: 10  # k value used during model training
+
+# Constraint vertices configuration
+constraints:
+  # Manual vertex indices (used if auto_select.enabled = False)
+  fixed_indices: [1,2,6,7]  # Red vertices that stay fixed
+  handle_indices: [0,3,5,4]  # Blue vertices that get moved
+
+  # Fallback ratios if indices are out of bounds
+  fixed_fallback_ratio: 0.1   # 10% of mesh
+  handle_fallback_ratio: 0.9  # 90% of mesh
+
+  # Auto-selection based on vertex positions
+  auto_select:
+    enabled: true  # If true, overrides manual indices
+    axis: "y"      # "x", "y", or "z" - axis for selection
+    k_fixed: 5    # Number of most negative vertices as fixed
+    k_handle: 5   # Number of most positive vertices as handles
+
+# Animation configuration
+animation:
+  n_frames: 120
+  initial_mode: "rotation"  # "rotation" or "translation"
+  initial_axis: "z"         # "x", "y", or "z"
+  max_angle: 0.785          # ~45 degrees in radians
+  max_displacement: 0.2
+
+# ARAP deformation configuration
+arap:
+  max_iterations: 10
+  tolerance: 1e-6
+
+# Visualization configuration
+visualization:
+  up_dir: "z_up"  # "z_up", "y_up", "x_up"
+  ground_plane_mode: "none"  # "none", "shadow", "tile"
+  background_color: [0.1, 0.1, 0.1]  # Dark gray background
+
+  # Constraint vertex visualization
+  fixed_vertex_color: [1.0, 0.0, 0.0]   # Red for fixed
+  handle_vertex_color: [0.0, 0.0, 1.0]  # Blue for handles
+  constraint_vertex_radius: 0.015
+
+  # Mesh visualization
+  edge_width: 1.0
+  edge_color: [0.2, 0.2, 0.2]  # Dark gray edges
