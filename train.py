@@ -40,7 +40,7 @@ def main(cfg: DictConfig) -> None:
     torch.set_float32_matmul_precision(precision='medium')
     pl.seed_everything(seed=cfg.globals.training_seed)
     data_module = hydra.utils.instantiate(config=cfg.data_module.module)
-    model = hydra.utils.instantiate(config=cfg.model.module, optimizer_cfg=cfg.optimizer, scheduler_cfg=cfg.scheduler)
+    model = hydra.utils.instantiate(config=cfg.model.module, optimizer_cfg=cfg.optimizer, scheduler_cfg=cfg.scheduler if 'scheduler' in cfg else None)
     trainer = hydra.utils.instantiate(config=cfg.trainer)
     trainer.cfg = cfg
     trainer.fit(model=model, datamodule=data_module, ckpt_path=cfg.globals.ckpt_path)
