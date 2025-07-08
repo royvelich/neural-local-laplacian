@@ -104,15 +104,8 @@ class LocalLaplacianModuleBase(pl.LightningModule):
         # The format depends on what scheduler monitoring you want
         scheduler_config = {
             "scheduler": scheduler,
-            "interval": getattr(self._scheduler_cfg, 'interval', 'epoch'),  # 'epoch' or 'step'
-            "frequency": getattr(self._scheduler_cfg, 'frequency', 1),
-            "monitor": getattr(self._scheduler_cfg, 'monitor', None),  # metric to monitor for ReduceLROnPlateau
-            "strict": getattr(self._scheduler_cfg, 'strict', True),
-            "name": getattr(self._scheduler_cfg, 'name', None),  # for logging
+            "interval": 'epoch'
         }
-
-        # Remove None values to avoid issues
-        scheduler_config = {k: v for k, v in scheduler_config.items() if v is not None}
 
         return {
             "optimizer": optimizer,
