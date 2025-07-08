@@ -26,7 +26,7 @@ import scipy.sparse
 import scipy.sparse.linalg
 
 # lightning
-import pytorch_lightning as pl
+import lightning
 from pytorch_lightning.callbacks import Callback
 
 # torch_geometric
@@ -44,7 +44,7 @@ from neural_local_laplacian.utils.utils import split_results_by_nodes, split_res
 from neural_local_laplacian.modules.losses import LossConfig
 
 
-class LocalLaplacianModuleBase(pl.LightningModule):
+class LocalLaplacianModuleBase(lightning.pytorch.LightningModule):
     def __init__(self,
                  optimizer_cfg: DictConfig,
                  scheduler_cfg: Optional[DictConfig] = None
