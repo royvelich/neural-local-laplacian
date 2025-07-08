@@ -18,8 +18,9 @@ logger:
 callbacks:
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     monitor: 'train_loss'
-    mode: min
+    mode: 'min'
     save_top_k: 5
     save_last: false
-    filename: train_loss_{epoch}_{train_loss:.4f}
+    dirpath: './checkpoints'
+    filename: 'train_loss_{epoch}_{train_loss:.4f}'
     auto_insert_metric_name: false
