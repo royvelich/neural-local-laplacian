@@ -285,19 +285,19 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         # Target: H * n̂ (mean curvature times unit normal at origin)
         target_laplacian = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
-        print('\n')
-        print('-' * 100)
-        print(predicted_laplacian[0])
-        print('-' * 100)
-        print(target_laplacian[0])
-        print('-' * 100)
-        print('\n')
-
-        print('\n')
-        print('Token Weights:')
-        print(token_weights[0])
-        print('-' * 100)
-        print('\n')
+        # print('\n')
+        # print('-' * 100)
+        # print(predicted_laplacian[0])
+        # print('-' * 100)
+        # print(target_laplacian[0])
+        # print('-' * 100)
+        # print('\n')
+        #
+        # print('\n')
+        # print('Token Weights:')
+        # print(token_weights[0])
+        # print('-' * 100)
+        # print('\n')
 
         # Compute weighted combination of losses
         total_loss = 0.0
@@ -318,7 +318,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             loss_components_unweighted[f"train_{loss_name}"] = unweighted_loss
 
         # Log the total loss
-        self.log('train_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train_loss', float(total_loss.item()), on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
         for loss_name, loss_value in loss_components_unweighted.items():
@@ -358,37 +358,37 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             batch_indices=batch_data.batch
         )
 
-        # CRITICAL ADDITION: Store Laplacian matrix for ValidationMeshUploader
-        self._last_laplacian_matrix = laplacian_matrix
-        print(f"📊 Stored predicted Laplacian matrix for validation: {laplacian_matrix.shape}")
-
-        # Print first 5 rows of Laplacian matrix (non-zero elements only)
-        print("\n" + "=" * 80)
-        print("LAPLACIAN MATRIX - FIRST 5 ROWS (NON-ZERO ELEMENTS)")
-        print("=" * 80)
-        num_rows_to_show = min(5, laplacian_matrix.shape[0])
-        for row_idx in range(num_rows_to_show):
-            # Get the row as a sparse vector
-            row = laplacian_matrix.getrow(row_idx)
-
-            # Find non-zero elements
-            row_coo = row.tocoo()
-            col_indices = row_coo.col
-            values = row_coo.data
-
-            if len(col_indices) > 0:
-                print(f"Row {row_idx:3d}: ", end="")
-                for col_idx, value in zip(col_indices, values):
-                    print(f"({row_idx},{col_idx:3d})={value:8.4f} ", end="")
-                print()  # New line
-
-                # Also show row sum to verify it's close to zero
-                row_sum = values.sum()
-                print(f"         Row sum = {row_sum:.6f}")
-            else:
-                print(f"Row {row_idx:3d}: (no non-zero elements)")
-            print()
-        print("=" * 80)
+        # # CRITICAL ADDITION: Store Laplacian matrix for ValidationMeshUploader
+        # self._last_laplacian_matrix = laplacian_matrix
+        # print(f"📊 Stored predicted Laplacian matrix for validation: {laplacian_matrix.shape}")
+        #
+        # # Print first 5 rows of Laplacian matrix (non-zero elements only)
+        # print("\n" + "=" * 80)
+        # print("LAPLACIAN MATRIX - FIRST 5 ROWS (NON-ZERO ELEMENTS)")
+        # print("=" * 80)
+        # num_rows_to_show = min(5, laplacian_matrix.shape[0])
+        # for row_idx in range(num_rows_to_show):
+        #     # Get the row as a sparse vector
+        #     row = laplacian_matrix.getrow(row_idx)
+        #
+        #     # Find non-zero elements
+        #     row_coo = row.tocoo()
+        #     col_indices = row_coo.col
+        #     values = row_coo.data
+        #
+        #     if len(col_indices) > 0:
+        #         print(f"Row {row_idx:3d}: ", end="")
+        #         for col_idx, value in zip(col_indices, values):
+        #             print(f"({row_idx},{col_idx:3d})={value:8.4f} ", end="")
+        #         print()  # New line
+        #
+        #         # Also show row sum to verify it's close to zero
+        #         row_sum = values.sum()
+        #         print(f"         Row sum = {row_sum:.6f}")
+        #     else:
+        #         print(f"Row {row_idx:3d}: (no non-zero elements)")
+        #     print()
+        # print("=" * 80)
 
         # Compute eigendecomposition and validation metrics
         eigenvalues, eigenvectors = self._compute_eigendecomposition(laplacian_matrix)
