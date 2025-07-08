@@ -12,7 +12,7 @@ logger:
  _target_: lightning.pytorch.loggers.WandbLogger
  project: neural-local-laplacian
  save_dir: 'wandb'
- log_model: 'all'
+ log_model: True
 #callbacks:
 #  - _target_: neural_local_laplacian.modules.laplacian_modules.ValidationMeshUploader
 callbacks:
