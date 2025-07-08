@@ -128,6 +128,9 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
                  **kwargs):
         super().__init__(**kwargs)
 
+        # This saves all the __init__ arguments automatically
+        self.save_hyperparameters()
+
         # Validate input_dim
         if input_dim is None or input_dim <= 0:
             raise ValueError(f"input_dim must be a positive integer, got: {input_dim}")

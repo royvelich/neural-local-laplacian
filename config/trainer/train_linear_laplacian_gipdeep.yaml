@@ -16,7 +16,6 @@ logger:
 #callbacks:
 #  - _target_: neural_local_laplacian.modules.laplacian_modules.ValidationMeshUploader
 callbacks:
-  - _target_: neural_local_laplacian.modules.laplacian_modules.DebugCallback
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: "./checkpoints"
     filename: "model-{epoch:010d}-{train_loss:.4f}"
