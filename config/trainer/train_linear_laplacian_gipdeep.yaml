@@ -22,6 +22,6 @@ callbacks:
     monitor: "train_loss"
     mode: "min"
     save_top_k: 1
-    save_last: true
-    verbose: true
+    save_last: false
+    verbose: false
     save_on_train_epoch_end: true
