@@ -114,7 +114,7 @@ class LocalLaplacianModuleBase(lightning.pytorch.LightningModule):
 
 
 class SurfaceTransformerModule(LocalLaplacianModuleBase):
-    """Simple transformer module for processing surface point clouds."""
+    """Surface transformer module with support for variable-sized patches."""
 
     def __init__(self,
                  input_dim: int,
@@ -129,7 +129,16 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         super().__init__(**kwargs)
 
         # This saves all the __init__ arguments automatically
-        self.save_hyperparameters()
+        # Exclude loss_configs from hyperparameters since they contain non-serializable PyTorch modules
+        self.save_hyperparameters(ignore=['loss_configs'])
+
+        # Manually save loss configuration info for logging (serializable version)
+        self.hparams['loss_info'] = {
+            'num_losses': len(loss_configs),
+            'loss_types': [type(config.loss_module).__name__ for config in loss_configs],
+            'loss_weights': [config.weight for config in loss_configs],
+            'normalized_weights': [config.weight for config in self._normalize_loss_weights(loss_configs)]
+        }
 
         # Validate input_dim
         if input_dim is None or input_dim <= 0:
@@ -150,7 +159,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            dropout=0.0,
+            dropout=dropout,
             activation='gelu',
             batch_first=True
         )
@@ -198,64 +207,328 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
         return normalized_configs
 
+    def _pad_sequences_vectorized(self, features: torch.Tensor, batch_indices: torch.Tensor,
+                                  batch_size: int, max_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Vectorized padding of variable-length sequences to max_k length using scatter operations.
+
+        Args:
+            features: (total_points, d_model)
+            batch_indices: (total_points,) - which batch each point belongs to
+            batch_size: number of sequences
+            max_k: maximum sequence length
+
+        Returns:
+            sequences: (batch_size, max_k, d_model) - padded sequences
+            attention_mask: (batch_size, max_k) - True for real tokens, False for padding
+        """
+        device = features.device
+        d_model = features.shape[1]
+
+        # Sort indices to group by batch
+        sorted_indices = torch.argsort(batch_indices)
+        sorted_batch = batch_indices[sorted_indices]
+
+        # Get batch sizes
+        batch_sizes = torch.bincount(batch_indices, minlength=batch_size)
+
+        # Calculate positions within each batch using fully vectorized operations
+        positions = torch.zeros_like(batch_indices, dtype=torch.long)
+
+        # Create cumulative positions for sorted indices
+        # This replaces the loop with a vectorized operation
+        cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
+        starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
+
+        # Create position indices for each batch
+        total_points = batch_indices.shape[0]
+        arange_full = torch.arange(total_points, device=device)
+
+        # Calculate relative positions within each batch
+        batch_starts = starts[sorted_batch]
+        relative_positions = arange_full[sorted_indices] - batch_starts
+
+        # Assign positions back to original order
+        positions[sorted_indices] = relative_positions
+
+        # Filter out positions >= max_k (in case some patches are larger than max_k)
+        valid_mask = positions < max_k
+        valid_batch_indices = batch_indices[valid_mask]
+        valid_positions = positions[valid_mask]
+        valid_features = features[valid_mask]
+
+        # Create flat indices for scatter
+        flat_indices = valid_batch_indices * max_k + valid_positions
+
+        # Create output tensors
+        sequences = torch.zeros(batch_size * max_k, d_model, device=device, dtype=features.dtype)
+        attention_mask = torch.zeros(batch_size * max_k, dtype=torch.bool, device=device)
+
+        # Scatter features and create mask
+        sequences.scatter_(0, flat_indices.unsqueeze(1).expand(-1, d_model), valid_features)
+        attention_mask.scatter_(0, flat_indices, True)
+
+        # Reshape to (batch_size, max_k, d_model) and (batch_size, max_k)
+        sequences = sequences.view(batch_size, max_k, d_model)
+        attention_mask = attention_mask.view(batch_size, max_k)
+
+        return sequences, attention_mask
+
+    def _assemble_sparse_laplacian_variable(self, weights: torch.Tensor, attention_mask: torch.Tensor,
+                                            vertex_indices: torch.Tensor, center_indices: torch.Tensor,
+                                            batch_indices: torch.Tensor) -> scipy.sparse.csr_matrix:
+        """
+        Assemble sparse Laplacian matrix from variable-sized patch weights using fully vectorized operations.
+
+        Args:
+            weights: Token weights of shape (batch_size, max_k)
+            attention_mask: Mask of shape (batch_size, max_k) - True for real tokens
+            vertex_indices: Neighbor vertex indices of shape (total_points,)
+            center_indices: Center vertex index for each patch, shape (num_patches,)
+            batch_indices: Batch indices of shape (total_points,)
+
+        Returns:
+            Sparse Laplacian matrix
+        """
+        # Get dimensions
+        num_patches = weights.shape[0]
+        max_k = weights.shape[1]
+        device = weights.device
+
+        # Get number of vertices
+        num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
+
+        # Flatten weights and attention mask
+        weights_flat = weights.flatten()  # (batch_size * max_k,)
+        attention_mask_flat = attention_mask.flatten()  # (batch_size * max_k,)
+
+        # Create batch indices for the flattened weights (which patch each weight belongs to)
+        patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)  # (batch_size * max_k,)
+
+        # Filter out padded positions
+        valid_mask = attention_mask_flat  # Only keep valid (non-padded) entries
+        valid_weights = weights_flat[valid_mask]  # (num_valid,)
+        valid_patch_indices = patch_indices_flat[valid_mask]  # (num_valid,)
+
+        # Get center vertex for each valid weight
+        valid_center_vertices = center_indices[valid_patch_indices]  # (num_valid,)
+
+        # For variable-sized patches, we need to map from flattened valid indices back to vertex_indices
+        # Create a mapping from valid positions to their corresponding vertex indices
+
+        # Get cumulative sizes to find the start position of each patch in vertex_indices
+        batch_sizes = batch_indices.bincount(minlength=num_patches)  # (num_patches,)
+        cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
+        starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
+
+        # For each valid weight, find its position within its patch
+        # Count how many valid weights we've seen for each patch so far
+        patch_counts = torch.zeros(num_patches, device=device, dtype=torch.long)
+        positions_in_patch = torch.zeros_like(valid_patch_indices, dtype=torch.long)
+
+        # Vectorized position calculation
+        unique_patches, counts = torch.unique_consecutive(valid_patch_indices, return_counts=True)
+        positions_in_patch = torch.cat([torch.arange(count, device=device) for count in counts])
+
+        # Get the actual vertex indices for valid weights
+        valid_neighbor_vertices = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
+
+        # Create all off-diagonal entries vectorized
+        # Each valid weight creates two entries: center->neighbor and neighbor->center
+        num_valid = len(valid_weights)
+
+        # Center -> neighbor entries
+        center_to_neighbor_rows = valid_center_vertices  # (num_valid,)
+        center_to_neighbor_cols = valid_neighbor_vertices  # (num_valid,)
+        center_to_neighbor_weights = -valid_weights  # (num_valid,)
+
+        # Neighbor -> center entries (symmetric)
+        neighbor_to_center_rows = valid_neighbor_vertices  # (num_valid,)
+        neighbor_to_center_cols = valid_center_vertices  # (num_valid,)
+        neighbor_to_center_weights = -valid_weights  # (num_valid,)
+
+        # Combine all entries
+        all_row_indices = torch.cat([center_to_neighbor_rows, neighbor_to_center_rows])  # (2 * num_valid,)
+        all_col_indices = torch.cat([center_to_neighbor_cols, neighbor_to_center_cols])  # (2 * num_valid,)
+        all_weights = torch.cat([center_to_neighbor_weights, neighbor_to_center_weights])  # (2 * num_valid,)
+
+        # Convert to numpy for scipy operations
+        all_row_indices_np = all_row_indices.detach().cpu().numpy()
+        all_col_indices_np = all_col_indices.detach().cpu().numpy()
+        all_weights_np = all_weights.detach().cpu().numpy()
+
+        # Create sparse matrix from coordinates (off-diagonal entries only)
+        laplacian_coo = scipy.sparse.coo_matrix(
+            (all_weights_np, (all_row_indices_np, all_col_indices_np)),
+            shape=(num_vertices, num_vertices)
+        )
+
+        # Sum duplicate entries and convert to CSR
+        laplacian_csr = laplacian_coo.tocsr()
+        laplacian_csr.sum_duplicates()
+
+        # Vectorized diagonal computation: each diagonal entry = -sum of off-diagonal entries in that row
+        row_sums = np.array(laplacian_csr.sum(axis=1)).flatten()
+        diagonal_values = -row_sums
+
+        # Set diagonal entries
+        laplacian_csr.setdiag(diagonal_values)
+
+        # Ensure numerical symmetry
+        laplacian_csr = 0.5 * (laplacian_csr + laplacian_csr.T)
+
+        return laplacian_csr
+
+    def _compute_mean_curvature_vectors_vectorized(self, forward_result: Dict[str, torch.Tensor],
+                                                   batch_data: Batch) -> torch.Tensor:
+        """
+        Compute predicted mean curvature vectors from token weights using fully vectorized operations.
+
+        This method computes Δr = Σᵢ wᵢ * pᵢ for each patch, where:
+        - wᵢ are the learned token weights
+        - pᵢ are the patch positions (centered at origin)
+
+        Args:
+            forward_result: Dictionary containing token_weights, attention_mask, and batch_sizes
+            batch_data: PyTorch Geometric batch containing positions and batch indices
+
+        Returns:
+            predicted_mean_curvature_vectors: (batch_size, 3) tensor of predicted mean curvature vectors
+        """
+        # Extract results
+        token_weights = forward_result['token_weights']  # (batch_size, max_k)
+        attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
+        batch_sizes = forward_result['batch_sizes']  # (batch_size,)
+        batch_size = len(batch_sizes)
+
+        # Get positions and flatten token weights with attention mask
+        positions = batch_data.pos  # (total_points, 3)
+
+        # Apply attention mask to token weights (zero out padded positions)
+        masked_weights = token_weights.masked_fill(~attention_mask, 0.0)  # (batch_size, max_k)
+
+        # Flatten masked weights to match positions structure
+        weights_flat = masked_weights.flatten()  # (batch_size * max_k,)
+
+        # Create batch indices for flattened weights
+        batch_indices_weights = torch.arange(batch_size, device=token_weights.device).repeat_interleave(token_weights.shape[1])
+
+        # Create position indices within each batch for mapping
+        # This maps from flattened weight indices to actual position indices
+        batch_cumsum = torch.cumsum(batch_sizes, dim=0)
+        batch_starts = torch.cat([torch.zeros(1, device=batch_cumsum.device, dtype=batch_cumsum.dtype), batch_cumsum[:-1]])
+
+        # Create position indices for each weight
+        position_indices = torch.arange(token_weights.shape[1], device=token_weights.device).repeat(batch_size)
+
+        # Filter out indices that exceed actual batch sizes
+        valid_mask = position_indices < batch_sizes.repeat_interleave(token_weights.shape[1])
+
+        # Get valid weights and their corresponding batch indices
+        valid_weights = weights_flat[valid_mask]  # (num_valid,)
+        valid_batch_indices = batch_indices_weights[valid_mask]  # (num_valid,)
+        valid_position_indices = position_indices[valid_mask]  # (num_valid,)
+
+        # Calculate actual position indices in the flattened positions array
+        actual_position_indices = batch_starts[valid_batch_indices] + valid_position_indices
+
+        # Get valid positions
+        valid_positions = positions[actual_position_indices]  # (num_valid, 3)
+
+        # Compute weighted positions: wᵢ * pᵢ
+        weighted_positions = valid_weights.unsqueeze(-1) * valid_positions  # (num_valid, 3)
+
+        # Sum weighted positions for each batch using scatter_add
+        predicted_mean_curvature_vectors = torch.zeros(batch_size, 3, device=token_weights.device)
+        predicted_mean_curvature_vectors.scatter_add_(0,
+                                                      valid_batch_indices.unsqueeze(-1).expand(-1, 3),
+                                                      weighted_positions)
+
+        return predicted_mean_curvature_vectors
+
     def _forward_pass(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """
-        Shared forward pass logic for both training and validation.
-        Only contains the transformer processing, no task-specific computations.
+        Internal forward pass method that can be called from both forward() and validation_step().
+
+        Args:
+            batch: PyTorch Geometric batch
+
+        Returns:
+            Dictionary containing forward pass results
+        """
+        return self.forward(batch)
+
+    def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass supporting variable-sized patches.
 
         Args:
             batch: PyTorch Geometric batch
 
         Returns:
             Dict containing:
-            - token_weights: (batch_size, num_points) - learned Laplacian weights
-            - batch_size: int
-            - num_points_per_surface: int
+            - token_weights: (batch_size, max_k) - learned Laplacian weights (padded)
+            - attention_mask: (batch_size, max_k) - True for real tokens, False for padding
+            - batch_sizes: (batch_size,) - actual number of points per patch
         """
         features = batch.x  # Shape: (total_points, feature_dim)
 
-        # Fix batch indices for MeshDataset validation
-        # When DataLoader processes a single MeshDataset Data object, it resets all batch indices to 0
-        # We need to restore the proper batch indices to separate patches
+        # Fix batch indices for MeshDataset validation if needed
         if hasattr(batch, 'center_indices') and torch.all(batch.batch == 0):
             # This is likely MeshDataset where DataLoader reset batch indices
             num_patches = len(batch.center_indices)
-            k = len(batch.pos) // num_patches
-            # Recreate proper batch indices: [0,0,0,...,1,1,1,...,2,2,2,...]
-            proper_batch_indices = torch.repeat_interleave(torch.arange(num_patches, device=batch.batch.device), k)
-            batch.batch = proper_batch_indices
-            print(f"Fixed batch indices for MeshDataset: {num_patches} patches with {k} points each")
+            total_points = len(batch.pos)
+
+            # Create proper batch indices based on center_indices
+            batch_indices = torch.zeros(total_points, dtype=torch.long, device=batch.batch.device)
+
+            # For MeshDataset, we need to reconstruct batch indices from center_indices
+            # This assumes points are grouped by patch
+            points_per_patch = total_points // num_patches
+            for i in range(num_patches):
+                start_idx = i * points_per_patch
+                end_idx = (i + 1) * points_per_patch
+                batch_indices[start_idx:end_idx] = i
+
+            batch.batch = batch_indices
+            print(f"Fixed batch indices for MeshDataset: {num_patches} patches")
+
+        # Get batch sizes (number of points per patch)
+        batch_sizes = batch.batch.bincount()
+        batch_size = len(batch_sizes)
+        max_k = batch_sizes.max().item()
 
         # Project to model dimension
         features = self.input_projection(features)  # (total_points, d_model)
 
-        # Reshape to sequences per graph (all surfaces have same number of points)
-        batch_sizes = batch.batch.bincount()
-        num_points_per_surface = batch_sizes[0].item()  # All surfaces have same size
-        batch_size = len(batch_sizes)
+        # Pad sequences to max_k and create attention masks
+        sequences, attention_mask = self._pad_sequences_vectorized(
+            features, batch.batch, batch_size, max_k
+        )
 
-        # Simple reshape - no padding needed!
-        sequences = features.view(batch_size, num_points_per_surface, self._d_model)
-
-        # Pass through transformer (no masking needed!)
-        encoded_features = self.transformer_encoder(sequences)
+        # Pass through transformer with attention mask
+        # Note: src_key_padding_mask expects True for positions to IGNORE
+        encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=~attention_mask)
 
         # Output projection to get scalar weights per token
-        token_weights = self.output_projection(encoded_features)  # (batch_size, num_points, 1)
-        token_weights = token_weights.squeeze(-1)  # (batch_size, num_points)
+        token_weights = self.output_projection(encoded_features)  # (batch_size, max_k, 1)
+        token_weights = token_weights.squeeze(-1)  # (batch_size, max_k)
 
         # Apply softplus to ensure positive weights
-        token_weights = torch.exp(token_weights)  # (batch_size, num_points)
+        token_weights = torch.exp(token_weights)
+
+        # Mask out padded positions
+        token_weights = token_weights.masked_fill(~attention_mask, 0.0)
 
         return {
             'token_weights': token_weights,
-            'batch_size': batch_size,
-            'num_points_per_surface': num_points_per_surface
+            'attention_mask': attention_mask,
+            'batch_sizes': batch_sizes
         }
 
     def training_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
         """
-        Training step - compute Laplacian prediction and losses.
+        Training step with variable-sized patch support.
 
         Args:
             batch: List of PyTorch Geometric batches (synthetic data)
@@ -266,41 +539,20 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         """
         # Take the first batch from the list
         batch_data = batch[0]
-        forward_result = self._forward_pass(batch_data)
+        forward_result = self.forward(batch_data)
 
-        # Extract results
-        token_weights = forward_result['token_weights']
-        batch_size = forward_result['batch_size']
-        num_points_per_surface = forward_result['num_points_per_surface']
+        # Compute mean curvature vectors using vectorized method
+        predicted_mean_curvature_vectors = self._compute_mean_curvature_vectors_vectorized(forward_result, batch_data)
 
-        # Synthetic-specific computations for loss calculation
-        # Reshape batch.pos
-        positions = batch_data.pos.view(batch_size, num_points_per_surface, 3)  # (batch_size, num_points, 3)
+        # Get batch size for logging
+        batch_size = len(forward_result['batch_sizes'])
 
         # In training mode, diff_geom_at_origin_only=True, so normals and H are per-surface
         normals = batch_data.normal  # (batch_size, 3) - one normal per surface at origin
         mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
-        # Compute Laplace-Beltrami operator: Δr = Σᵢ wᵢ * pᵢ
-        # Since center point is at origin, we don't need to subtract center coordinates
-        predicted_laplacian = torch.sum(token_weights.unsqueeze(-1) * positions, dim=1)  # (batch_size, 3)
-
         # Target: H * n̂ (mean curvature times unit normal at origin)
-        target_laplacian = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
-
-        # print('\n')
-        # print('-' * 100)
-        # print(predicted_laplacian[0])
-        # print('-' * 100)
-        # print(target_laplacian[0])
-        # print('-' * 100)
-        # print('\n')
-        #
-        # print('\n')
-        # print('Token Weights:')
-        # print(token_weights[0])
-        # print('-' * 100)
-        # print('\n')
+        target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
         total_loss = 0.0
@@ -309,7 +561,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
         for i, loss_config in enumerate(self._loss_configs):
             # Compute unweighted loss
-            unweighted_loss = loss_config.loss_module(predicted_laplacian, target_laplacian)
+            unweighted_loss = loss_config.loss_module(predicted_mean_curvature_vectors, target_mean_curvature_vectors)
 
             # Compute weighted loss
             weighted_loss = loss_config.weight * unweighted_loss
@@ -321,15 +573,18 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             loss_components_unweighted[f"train_{loss_name}"] = unweighted_loss
 
         # Log the total loss
-        self.log('train_loss', float(total_loss.item()), on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train_loss', float(total_loss.item()), on_step=False, on_epoch=True, prog_bar=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
         for loss_name, loss_value in loss_components_unweighted.items():
-            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True,
+                     batch_size=batch_size, sync_dist=True)
 
         # Log individual weighted loss components (for debugging the weighting)
         for loss_name, loss_value in loss_components_weighted.items():
-            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True,
+                     batch_size=batch_size, sync_dist=True)
 
         # Create return dictionary with all losses
         result = {"loss": total_loss}
@@ -340,7 +595,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
     def validation_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
         """
-        Validation step - eigenanalysis on mesh data.
+        Validation step with variable-sized patch support - eigenanalysis on mesh data.
 
         Args:
             batch: List of PyTorch Geometric batches (mesh data)
@@ -351,47 +606,20 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         """
         # Take the first batch from the list
         batch_data = batch[0]
-        forward_result = self._forward_pass(batch_data)
+        forward_result = self.forward(batch_data)
 
-        # Assemble sparse Laplacian matrix from learned weights
-        laplacian_matrix = self._assemble_sparse_laplacian(
+        # Assemble sparse Laplacian matrix from variable-sized learned weights
+        laplacian_matrix = self._assemble_sparse_laplacian_variable(
             weights=forward_result['token_weights'],
+            attention_mask=forward_result['attention_mask'],
             vertex_indices=batch_data.vertex_indices,
             center_indices=batch_data.center_indices,
             batch_indices=batch_data.batch
         )
 
-        # # CRITICAL ADDITION: Store Laplacian matrix for ValidationMeshUploader
-        # self._last_laplacian_matrix = laplacian_matrix
-        # print(f"📊 Stored predicted Laplacian matrix for validation: {laplacian_matrix.shape}")
-        #
-        # # Print first 5 rows of Laplacian matrix (non-zero elements only)
-        # print("\n" + "=" * 80)
-        # print("LAPLACIAN MATRIX - FIRST 5 ROWS (NON-ZERO ELEMENTS)")
-        # print("=" * 80)
-        # num_rows_to_show = min(5, laplacian_matrix.shape[0])
-        # for row_idx in range(num_rows_to_show):
-        #     # Get the row as a sparse vector
-        #     row = laplacian_matrix.getrow(row_idx)
-        #
-        #     # Find non-zero elements
-        #     row_coo = row.tocoo()
-        #     col_indices = row_coo.col
-        #     values = row_coo.data
-        #
-        #     if len(col_indices) > 0:
-        #         print(f"Row {row_idx:3d}: ", end="")
-        #         for col_idx, value in zip(col_indices, values):
-        #             print(f"({row_idx},{col_idx:3d})={value:8.4f} ", end="")
-        #         print()  # New line
-        #
-        #         # Also show row sum to verify it's close to zero
-        #         row_sum = values.sum()
-        #         print(f"         Row sum = {row_sum:.6f}")
-        #     else:
-        #         print(f"Row {row_idx:3d}: (no non-zero elements)")
-        #     print()
-        # print("=" * 80)
+        # CRITICAL ADDITION: Store Laplacian matrix for ValidationMeshUploader
+        self._last_laplacian_matrix = laplacian_matrix
+        print(f"📊 Stored predicted Laplacian matrix for validation: {laplacian_matrix.shape}")
 
         # Compute eigendecomposition and validation metrics
         eigenvalues, eigenvectors = self._compute_eigendecomposition(laplacian_matrix)
@@ -412,84 +640,6 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
             self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True, logger=True, batch_size=1)
 
         return metrics
-
-    def _assemble_sparse_laplacian(self, weights: torch.Tensor, vertex_indices: torch.Tensor, center_indices: torch.Tensor, batch_indices: torch.Tensor) -> scipy.sparse.csr_matrix:
-        """
-        Assemble sparse Laplacian matrix from patch weights using vectorized operations.
-
-        Args:
-            weights: Token weights of shape (batch_size, num_points)
-            vertex_indices: Neighbor vertex indices of shape (total_points,)
-            center_indices: Center vertex index for each patch, shape (num_patches,)
-            batch_indices: Batch indices of shape (total_points,)
-
-        Returns:
-            Sparse Laplacian matrix
-        """
-        # Convert to numpy for scipy operations
-        weights_np = weights.detach().cpu().numpy()
-        vertex_indices_np = vertex_indices.detach().cpu().numpy()
-        center_indices_np = center_indices.detach().cpu().numpy()
-        batch_indices_np = batch_indices.detach().cpu().numpy()
-
-        # Get dimensions
-        num_patches = weights.shape[0]
-        num_points_per_patch = weights.shape[1]
-        num_vertices = max(vertex_indices_np.max(), center_indices_np.max()) + 1
-
-        # Flatten weights to match vertex_indices structure
-        weights_flat = weights_np.flatten()  # Shape: (total_points,)
-
-        # Expand center indices to match the structure of vertex_indices
-        # Each center index should be repeated k times (once per neighbor)
-        center_vertices_expanded = np.repeat(center_indices_np, num_points_per_patch)
-
-        # Now we have:
-        # center_vertices_expanded[i] = center vertex for the i-th neighbor point
-        # vertex_indices_np[i] = neighbor vertex index for the i-th neighbor point
-        # weights_flat[i] = weight for connection from center to neighbor
-
-        # Create off-diagonal entries (negative weights)
-        # Connection: center[i] -> neighbor[i] with -weight[i]
-        row_indices = center_vertices_expanded  # From center
-        col_indices = vertex_indices_np  # To neighbor
-        data_values = -weights_flat  # Negative weights for off-diagonal
-
-        # Create symmetric connections: neighbor[i] -> center[i] with same weight
-        row_indices_sym = vertex_indices_np  # From neighbor
-        col_indices_sym = center_vertices_expanded  # To center
-        data_values_sym = -weights_flat  # Same negative weights
-
-        # Combine all off-diagonal connections
-        all_row_indices = np.concatenate([row_indices, row_indices_sym])
-        all_col_indices = np.concatenate([col_indices, col_indices_sym])
-        all_data_values = np.concatenate([data_values, data_values_sym])
-
-        # Create sparse matrix from coordinates (off-diagonal entries only)
-        laplacian_coo = scipy.sparse.coo_matrix(
-            (all_data_values, (all_row_indices, all_col_indices)),
-            shape=(num_vertices, num_vertices)
-        )
-
-        # Sum duplicate entries and convert to CSR
-        laplacian_csr = laplacian_coo.tocsr()
-        laplacian_csr.sum_duplicates()
-
-        # Vectorized diagonal computation: each diagonal entry = -sum of off-diagonal entries in that row
-        # This ensures each row sums to zero (discrete Laplacian property)
-        # Get the sum of each row (which currently contains only off-diagonal entries)
-        row_sums = np.array(laplacian_csr.sum(axis=1)).flatten()  # Shape: (num_vertices,)
-
-        # Diagonal entries should be the negative of the row sums
-        diagonal_values = -row_sums  # Shape: (num_vertices,)
-
-        # Set diagonal entries
-        laplacian_csr.setdiag(diagonal_values)
-
-        # Ensure numerical symmetry (should already be symmetric, but for safety)
-        laplacian_csr = 0.5 * (laplacian_csr + laplacian_csr.T)
-
-        return laplacian_csr
 
     def _compute_eigendecomposition(self, laplacian_matrix: scipy.sparse.csr_matrix) -> Tuple[np.ndarray, np.ndarray]:
         """
