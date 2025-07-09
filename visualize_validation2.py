@@ -375,9 +375,14 @@ class RealTimeEigenanalysisVisualizer:
                 corrected_weights = torch.cat([corrected_weights, padding], dim=1)
                 print(f"  Padded token weights from {current_k} to {new_k} using mean weights")
 
-        # Assemble new sparse Laplacian matrix
-        new_laplacian_matrix = self.assemble_sparse_laplacian(
+        # Create attention mask (all True for uniform k)
+        num_patches = corrected_weights.shape[0]
+        attention_mask = torch.ones(num_patches, new_k, dtype=torch.bool, device=corrected_weights.device)
+
+        # Assemble new sparse Laplacian matrix using the updated utils function
+        new_laplacian_matrix = utils.assemble_sparse_laplacian_variable(
             weights=corrected_weights,
+            attention_mask=attention_mask,
             vertex_indices=new_vertex_indices,
             center_indices=new_center_indices,
             batch_indices=new_batch_indices
@@ -428,22 +433,6 @@ class RealTimeEigenanalysisVisualizer:
         print(f"✅ PRED updated with k={new_k}")
 
     def _recompute_and_update_reconstructions(self):
-        """Re-compute and update mesh reconstructions with new settings."""
-        if not self._has_current_batch_data():
-            print("⚠️  No current batch data available for re-computation")
-            return
-
-        print("🔄 Re-computing mesh reconstructions with new settings...")
-
-        # Remove existing reconstruction structures
-        self._remove_existing_reconstructions()
-
-        # Re-compute and visualize with new settings
-        self._update_mesh_reconstructions(
-            self.current_gt_data, self.current_inference_result, self.current_predicted_data
-        )
-
-        print("✅ Mesh reconstructions updated with new settings")
         """Re-compute and update mesh reconstructions with new settings."""
         if not self._has_current_batch_data():
             print("⚠️  No current batch data available for re-computation")
@@ -528,86 +517,6 @@ class RealTimeEigenanalysisVisualizer:
 
         except Exception as e:
             raise RuntimeError(f"Failed to load model from {ckpt_path}: {e}")
-
-    def assemble_sparse_laplacian(self, weights: torch.Tensor, vertex_indices: torch.Tensor,
-                                  center_indices: torch.Tensor, batch_indices: torch.Tensor) -> scipy.sparse.csr_matrix:
-        """
-        Assemble sparse Laplacian matrix from patch weights using vectorized operations.
-        Copied from SurfaceTransformerModule._assemble_sparse_laplacian().
-
-        Args:
-            weights: Token weights of shape (batch_size, num_points)
-            vertex_indices: Neighbor vertex indices of shape (total_points,)
-            center_indices: Center vertex index for each patch, shape (num_patches,)
-            batch_indices: Batch indices of shape (total_points,)
-
-        Returns:
-            Sparse Laplacian matrix
-        """
-        # Convert to numpy for scipy operations
-        weights_np = weights.detach().cpu().numpy()
-        vertex_indices_np = vertex_indices.detach().cpu().numpy()
-        center_indices_np = center_indices.detach().cpu().numpy()
-        batch_indices_np = batch_indices.detach().cpu().numpy()
-
-        # Get dimensions
-        num_patches = weights.shape[0]
-        num_points_per_patch = weights.shape[1]
-        num_vertices = max(vertex_indices_np.max(), center_indices_np.max()) + 1
-
-        # Flatten weights to match vertex_indices structure
-        weights_flat = weights_np.flatten()  # Shape: (total_points,)
-
-        # Expand center indices to match the structure of vertex_indices
-        # Each center index should be repeated k times (once per neighbor)
-        center_vertices_expanded = np.repeat(center_indices_np, num_points_per_patch)
-
-        # Now we have:
-        # center_vertices_expanded[i] = center vertex for the i-th neighbor point
-        # vertex_indices_np[i] = neighbor vertex index for the i-th neighbor point
-        # weights_flat[i] = weight for connection from center to neighbor
-
-        # Create off-diagonal entries (negative weights)
-        # Connection: center[i] -> neighbor[i] with -weight[i]
-        row_indices = center_vertices_expanded  # From center
-        col_indices = vertex_indices_np  # To neighbor
-        data_values = -weights_flat  # Negative weights for off-diagonal
-
-        # Create symmetric connections: neighbor[i] -> center[i] with same weight
-        row_indices_sym = vertex_indices_np  # From neighbor
-        col_indices_sym = center_vertices_expanded  # To center
-        data_values_sym = -weights_flat  # Same negative weights
-
-        # Combine all off-diagonal connections
-        all_row_indices = np.concatenate([row_indices, row_indices_sym])
-        all_col_indices = np.concatenate([col_indices, col_indices_sym])
-        all_data_values = np.concatenate([data_values, data_values_sym])
-
-        # Create sparse matrix from coordinates (off-diagonal entries only)
-        laplacian_coo = scipy.sparse.coo_matrix(
-            (all_data_values, (all_row_indices, all_col_indices)),
-            shape=(num_vertices, num_vertices)
-        )
-
-        # Sum duplicate entries and convert to CSR
-        laplacian_csr = laplacian_coo.tocsr()
-        laplacian_csr.sum_duplicates()
-
-        # Vectorized diagonal computation: each diagonal entry = -sum of off-diagonal entries in that row
-        # This ensures each row sums to zero (discrete Laplacian property)
-        # Get the sum of each row (which currently contains only off-diagonal entries)
-        row_sums = np.array(laplacian_csr.sum(axis=1)).flatten()  # Shape: (num_vertices,)
-
-        # Diagonal entries should be the negative of the row sums
-        diagonal_values = -row_sums  # Shape: (num_vertices,)
-
-        # Set diagonal entries
-        laplacian_csr.setdiag(diagonal_values)
-
-        # Ensure numerical symmetry (should already be symmetric, but for safety)
-        laplacian_csr = 0.5 * (laplacian_csr + laplacian_csr.T)
-
-        return laplacian_csr
 
     def compute_eigendecomposition(self, laplacian_matrix: scipy.sparse.csr_matrix, k: int = 50) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -771,11 +680,17 @@ class RealTimeEigenanalysisVisualizer:
         batch_data = batch_data.to(device)
 
         with torch.no_grad():
-            # Forward pass to get token weights
+            # Forward pass to get new result structure with attention mask
             forward_result = model._forward_pass(batch_data)
-            token_weights = forward_result['token_weights']
+
+            # Extract components from new forward result structure
+            token_weights = forward_result['token_weights']  # Shape: (batch_size, max_k)
+            attention_mask = forward_result['attention_mask']  # Shape: (batch_size, max_k)
+            batch_sizes = forward_result['batch_sizes']  # Shape: (batch_size,)
 
             print(f"Got token weights shape: {token_weights.shape}")
+            print(f"Got attention mask shape: {attention_mask.shape}")
+            print(f"Got batch sizes: {batch_sizes}")
 
             # Apply k-ratio correction if training k differs from inference k
             if self.training_k is not None:
@@ -785,9 +700,10 @@ class RealTimeEigenanalysisVisualizer:
                     token_weights = token_weights / k_ratio
                     print(f"Applied k-ratio correction: inference_k={inference_k}, training_k={self.training_k}, ratio={k_ratio:.3f}")
 
-            # Assemble sparse Laplacian matrix
-            laplacian_matrix = self.assemble_sparse_laplacian(
+            # Assemble sparse Laplacian matrix using the new utils function
+            laplacian_matrix = utils.assemble_sparse_laplacian_variable(
                 weights=token_weights,
+                attention_mask=attention_mask,
                 vertex_indices=batch_data.vertex_indices,
                 center_indices=batch_data.center_indices,
                 batch_indices=batch_data.batch
@@ -809,7 +725,9 @@ class RealTimeEigenanalysisVisualizer:
             'predicted_eigenvalues': predicted_eigenvalues,
             'predicted_eigenvectors': predicted_eigenvectors,
             'token_weights': token_weights.cpu().numpy(),
-            'forward_result': forward_result  # NEW: Include forward result for token weights storage
+            'attention_mask': attention_mask.cpu().numpy(),
+            'batch_sizes': batch_sizes.cpu().numpy(),
+            'forward_result': forward_result  # Store complete forward result
         }
 
     def compute_predicted_quantities_from_laplacian(self, laplacian_matrix: scipy.sparse.csr_matrix,
@@ -1350,8 +1268,8 @@ class RealTimeEigenanalysisVisualizer:
         self.current_inference_result = inference_result
         self.current_predicted_data = predicted_data
 
-        # NEW: Store raw data for k-NN slider updates
-        self.current_token_weights = inference_result['forward_result']['token_weights']
+        # Store raw data for k-NN slider updates
+        self.current_token_weights = torch.from_numpy(inference_result['token_weights'])
         self.current_original_vertices = gt_data['vertices']
         self.original_k = len(data.pos) // len(data.center_indices)  # Calculate original k
         self.current_vertex_indices = data.vertex_indices
@@ -1362,8 +1280,8 @@ class RealTimeEigenanalysisVisualizer:
         self.reconstruction_settings.current_pred_k = self.original_k
         print(f"Initialized PRED k slider with original k={self.original_k}")
 
-        # STEP 5: Visualization
-        print(f"\nSTEP 5: Creating comprehensive visualization")
+        # STEP 6: Visualization
+        print(f"\nSTEP 6: Creating comprehensive visualization")
         mesh_structure = self.visualize_mesh(gt_data['vertices'], gt_data['gt_vertex_normals'], gt_data['faces'])
         self.current_mesh_structure = mesh_structure
 
@@ -1394,7 +1312,7 @@ class RealTimeEigenanalysisVisualizer:
         self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data)
 
         # Add mesh reconstructions using eigenvectors
-        print(f"\nSTEP 6: Computing and visualizing mesh reconstructions")
+        print(f"\nSTEP 7: Computing and visualizing mesh reconstructions")
         self._update_mesh_reconstructions(gt_data, inference_result, predicted_data)
 
         print(f"\n✅ Comprehensive visualization completed for {Path(mesh_file_path).name}")
@@ -1474,7 +1392,7 @@ class RealTimeEigenanalysisVisualizer:
         print(f"\n✅ Completed processing all batches!")
 
 
-@hydra.main(version_base="1.2", config_path='./config')
+@hydra.main(version_base="1.2", config_path='./training_config')
 def main(cfg: DictConfig) -> None:
     """Main function with Hydra configuration."""
 

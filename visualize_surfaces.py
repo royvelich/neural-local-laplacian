@@ -127,7 +127,7 @@ def load_trained_model(ckpt_path: Path, device: torch.device) -> SurfaceTransfor
             num_eigenvalues=50,
             dropout=0,
             optimizer_cfg=None,
-            loss_configs=None)
+            loss_configs=[])
 
         model.eval()
         model.to(device)
@@ -185,9 +185,13 @@ def predict_normal_from_patch(model: SurfaceTransformerModule,
         # Prepare batch for model
         batch = prepare_surface_for_model(surface_data, device)
 
-        # Forward pass to get token weights (similar to validation_step)
-        forward_result = model._forward_pass(batch)
+        # Forward pass to get token weights (NEW: returns dict with attention_mask)
+        forward_result = model.forward(batch)
         token_weights = forward_result['token_weights']  # Shape: (1, num_points)
+        attention_mask = forward_result['attention_mask']  # Shape: (1, num_points)
+
+        # Apply attention mask (for synthetic surfaces, should be all True anyway)
+        token_weights = token_weights.masked_fill(~attention_mask, 0.0)
 
         # Extract positions and reshape for computation
         positions = batch.pos.view(1, -1, 3)  # Shape: (1, num_points, 3)
@@ -661,32 +665,6 @@ class SurfaceVisualizer:
             # This is more complex, but we can approximate by taking the center point
             # For now, we'll take the mean as an approximation
             return H_tensor.mean().item()
-        """
-        Extract the mean curvature value at the origin from the surface data.
-
-        Args:
-            surface: Surface data object
-
-        Returns:
-            Mean curvature value at origin, or None if not available
-        """
-        if not hasattr(surface, 'H'):
-            return None
-
-        H_tensor = surface.H.detach().cpu()
-
-        if self.is_diff_geom_at_origin_only:
-            # In origin-only mode, H should be a single value (or shape (1,))
-            if H_tensor.numel() == 1:
-                return H_tensor.item()
-            else:
-                # Take the first value if somehow there are multiple
-                return H_tensor.flatten()[0].item()
-        else:
-            # In all-points mode, we need to find the point closest to origin
-            # This is more complex, but we can approximate by taking the center point
-            # For now, we'll take the mean as an approximation
-            return H_tensor.mean().item()
 
     def _add_normal_comparison_visualization(self, surface, surface_name: str,
                                              gt_normal: np.ndarray,
@@ -1018,7 +996,7 @@ def create_custom_visualization_config(
     )
 
 
-@hydra.main(version_base="1.2", config_path="config")
+@hydra.main(version_base="1.2", config_path="training_config")
 def main(cfg: DictConfig) -> None:
     """Main visualization function with optional model prediction and mean curvature display."""
 
@@ -1114,6 +1092,9 @@ def main(cfg: DictConfig) -> None:
 
         # Clear for next batch
         ps.remove_all_structures()
+
+        # For this example, just process the first batch
+        break
 
 
 if __name__ == "__main__":

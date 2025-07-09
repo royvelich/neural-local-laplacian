@@ -40,7 +40,7 @@ import trimesh
 from pyFM.mesh import TriMesh
 
 # neural laplacian
-from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs
+from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable
 from neural_local_laplacian.modules.losses import LossConfig
 
 
@@ -274,111 +274,6 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
         return sequences, attention_mask
 
-    def _assemble_sparse_laplacian_variable(self, weights: torch.Tensor, attention_mask: torch.Tensor,
-                                            vertex_indices: torch.Tensor, center_indices: torch.Tensor,
-                                            batch_indices: torch.Tensor) -> scipy.sparse.csr_matrix:
-        """
-        Assemble sparse Laplacian matrix from variable-sized patch weights using fully vectorized operations.
-
-        Args:
-            weights: Token weights of shape (batch_size, max_k)
-            attention_mask: Mask of shape (batch_size, max_k) - True for real tokens
-            vertex_indices: Neighbor vertex indices of shape (total_points,)
-            center_indices: Center vertex index for each patch, shape (num_patches,)
-            batch_indices: Batch indices of shape (total_points,)
-
-        Returns:
-            Sparse Laplacian matrix
-        """
-        # Get dimensions
-        num_patches = weights.shape[0]
-        max_k = weights.shape[1]
-        device = weights.device
-
-        # Get number of vertices
-        num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
-
-        # Flatten weights and attention mask
-        weights_flat = weights.flatten()  # (batch_size * max_k,)
-        attention_mask_flat = attention_mask.flatten()  # (batch_size * max_k,)
-
-        # Create batch indices for the flattened weights (which patch each weight belongs to)
-        patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)  # (batch_size * max_k,)
-
-        # Filter out padded positions
-        valid_mask = attention_mask_flat  # Only keep valid (non-padded) entries
-        valid_weights = weights_flat[valid_mask]  # (num_valid,)
-        valid_patch_indices = patch_indices_flat[valid_mask]  # (num_valid,)
-
-        # Get center vertex for each valid weight
-        valid_center_vertices = center_indices[valid_patch_indices]  # (num_valid,)
-
-        # For variable-sized patches, we need to map from flattened valid indices back to vertex_indices
-        # Create a mapping from valid positions to their corresponding vertex indices
-
-        # Get cumulative sizes to find the start position of each patch in vertex_indices
-        batch_sizes = batch_indices.bincount(minlength=num_patches)  # (num_patches,)
-        cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
-        starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
-
-        # For each valid weight, find its position within its patch
-        # Count how many valid weights we've seen for each patch so far
-        patch_counts = torch.zeros(num_patches, device=device, dtype=torch.long)
-        positions_in_patch = torch.zeros_like(valid_patch_indices, dtype=torch.long)
-
-        # Vectorized position calculation
-        unique_patches, counts = torch.unique_consecutive(valid_patch_indices, return_counts=True)
-        positions_in_patch = torch.cat([torch.arange(count, device=device) for count in counts])
-
-        # Get the actual vertex indices for valid weights
-        valid_neighbor_vertices = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
-
-        # Create all off-diagonal entries vectorized
-        # Each valid weight creates two entries: center->neighbor and neighbor->center
-        num_valid = len(valid_weights)
-
-        # Center -> neighbor entries
-        center_to_neighbor_rows = valid_center_vertices  # (num_valid,)
-        center_to_neighbor_cols = valid_neighbor_vertices  # (num_valid,)
-        center_to_neighbor_weights = -valid_weights  # (num_valid,)
-
-        # Neighbor -> center entries (symmetric)
-        neighbor_to_center_rows = valid_neighbor_vertices  # (num_valid,)
-        neighbor_to_center_cols = valid_center_vertices  # (num_valid,)
-        neighbor_to_center_weights = -valid_weights  # (num_valid,)
-
-        # Combine all entries
-        all_row_indices = torch.cat([center_to_neighbor_rows, neighbor_to_center_rows])  # (2 * num_valid,)
-        all_col_indices = torch.cat([center_to_neighbor_cols, neighbor_to_center_cols])  # (2 * num_valid,)
-        all_weights = torch.cat([center_to_neighbor_weights, neighbor_to_center_weights])  # (2 * num_valid,)
-
-        # Convert to numpy for scipy operations
-        all_row_indices_np = all_row_indices.detach().cpu().numpy()
-        all_col_indices_np = all_col_indices.detach().cpu().numpy()
-        all_weights_np = all_weights.detach().cpu().numpy()
-
-        # Create sparse matrix from coordinates (off-diagonal entries only)
-        laplacian_coo = scipy.sparse.coo_matrix(
-            (all_weights_np, (all_row_indices_np, all_col_indices_np)),
-            shape=(num_vertices, num_vertices)
-        )
-
-        # Sum duplicate entries and convert to CSR
-        laplacian_csr = laplacian_coo.tocsr()
-        laplacian_csr.sum_duplicates()
-
-        # Vectorized diagonal computation: each diagonal entry = -sum of off-diagonal entries in that row
-        row_sums = np.array(laplacian_csr.sum(axis=1)).flatten()
-        diagonal_values = -row_sums
-
-        # Set diagonal entries
-        laplacian_csr.setdiag(diagonal_values)
-
-        # Ensure numerical symmetry
-        laplacian_csr = 0.5 * (laplacian_csr + laplacian_csr.T)
-
-        return laplacian_csr
-
     def _compute_mean_curvature_vectors_vectorized(self, forward_result: Dict[str, torch.Tensor],
                                                    batch_data: Batch) -> torch.Tensor:
         """
@@ -609,7 +504,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         forward_result = self.forward(batch_data)
 
         # Assemble sparse Laplacian matrix from variable-sized learned weights
-        laplacian_matrix = self._assemble_sparse_laplacian_variable(
+        laplacian_matrix = assemble_sparse_laplacian_variable(
             weights=forward_result['token_weights'],
             attention_mask=forward_result['attention_mask'],
             vertex_indices=batch_data.vertex_indices,
