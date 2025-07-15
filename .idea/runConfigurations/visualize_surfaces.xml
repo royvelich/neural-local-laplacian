@@ -15,7 +15,7 @@
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/visualize_surfaces.py" />
-    <option name="PARAMETERS" value="+data_module=visualization_polynomial_surfaces +globals=visualization_polynomial_surfaces" />
+    <option name="PARAMETERS" value="+ckpt_path=&quot;C:\Users\Roy\Downloads\model2.ckpt&quot; +data_module=visualization_polynomial_surfaces +globals=visualization_polynomial_surfaces" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />

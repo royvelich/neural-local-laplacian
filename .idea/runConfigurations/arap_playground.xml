@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="train_linear_laplacian" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="arap_playground" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
     <module name="neural-local-laplacian" />
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />
@@ -14,8 +14,8 @@
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-    <option name="SCRIPT_NAME" value="$PROJECT_DIR$/train.py" />
-    <option name="PARAMETERS" value="+data_module=train_linear_laplacian +globals=train_linear_laplacian +model=train_linear_laplacian +optimizer=train_linear_laplacian +trainer=train_linear_laplacian +scheduler=train_linear_laplacian" />
+    <option name="SCRIPT_NAME" value="$PROJECT_DIR$/arap_playground.py" />
+    <option name="PARAMETERS" value="--config-name=arap" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />

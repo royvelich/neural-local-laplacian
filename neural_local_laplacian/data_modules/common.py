@@ -3,7 +3,7 @@ from typing import Optional, List
 from dataclasses import dataclass
 
 # Third-party library imports
-import pytorch_lightning as pl
+import lightning
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset, Data
 
@@ -19,7 +19,7 @@ class DatasetSpecification:
     shuffle: bool
 
 
-class GenericDataModule(pl.LightningDataModule):
+class GenericDataModule(lightning.pytorch.LightningDataModule):
     """
     PyTorch Lightning DataModule for handling Polynomial Surface datasets.
 

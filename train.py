@@ -34,13 +34,13 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 import pytorch_lightning as pl
 
 
-@hydra.main(version_base="1.2", config_path="config")
+@hydra.main(version_base="1.2", config_path="training_config")
 def main(cfg: DictConfig) -> None:
     # print(cfg)
     torch.set_float32_matmul_precision(precision='medium')
     pl.seed_everything(seed=cfg.globals.training_seed)
     data_module = hydra.utils.instantiate(config=cfg.data_module.module)
-    model = hydra.utils.instantiate(config=cfg.model.module, optimizer_cfg=cfg.optimizer)
+    model = hydra.utils.instantiate(config=cfg.model.module, optimizer_cfg=cfg.optimizer, scheduler_cfg=cfg.scheduler if 'scheduler' in cfg else None)
     trainer = hydra.utils.instantiate(config=cfg.trainer)
     trainer.cfg = cfg
     trainer.fit(model=model, datamodule=data_module, ckpt_path=cfg.globals.ckpt_path)
