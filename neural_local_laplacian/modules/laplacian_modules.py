@@ -47,7 +47,8 @@ from neural_local_laplacian.modules.losses import LossConfig
 class LocalLaplacianModuleBase(lightning.pytorch.LightningModule):
     def __init__(self,
                  optimizer_cfg: DictConfig,
-                 scheduler_cfg: Optional[DictConfig] = None
+                 scheduler_cfg: Optional[DictConfig] = None,
+                 **kwargs
                  ):
         super().__init__()
         self._optimizer_cfg = optimizer_cfg
@@ -118,7 +119,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
     def __init__(self,
                  input_dim: int,
-                 loss_configs: List['LossConfig'],
+                 loss_configs: Optional[List[LossConfig]] = None,
                  d_model: int = 512,
                  nhead: int = 8,
                  num_encoder_layers: int = 6,
@@ -133,12 +134,13 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         self.save_hyperparameters(ignore=['loss_configs'])
 
         # Manually save loss configuration info for logging (serializable version)
-        self.hparams['loss_info'] = {
-            'num_losses': len(loss_configs),
-            'loss_types': [type(config.loss_module).__name__ for config in loss_configs],
-            'loss_weights': [config.weight for config in loss_configs],
-            'normalized_weights': [config.weight for config in self._normalize_loss_weights(loss_configs)]
-        }
+        if loss_configs is not None:
+            self.hparams['loss_info'] = {
+                'num_losses': len(loss_configs),
+                'loss_types': [type(config.loss_module).__name__ for config in loss_configs],
+                'loss_weights': [config.weight for config in loss_configs],
+                'normalized_weights': [config.weight for config in self._normalize_loss_weights(loss_configs)]
+            }
 
         # Validate input_dim
         if input_dim is None or input_dim <= 0:

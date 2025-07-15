@@ -493,15 +493,6 @@ class RealTimeEigenanalysisVisualizer:
             model = SurfaceTransformerModule.load_from_checkpoint(
                 str(ckpt_path),
                 map_location=device,
-                input_dim=model_cfg.input_dim,
-                d_model=model_cfg.d_model,
-                nhead=model_cfg.nhead,
-                num_encoder_layers=model_cfg.num_encoder_layers,
-                dim_feedforward=model_cfg.dim_feedforward,
-                num_eigenvalues=model_cfg.num_eigenvalues,
-                dropout=model_cfg.dropout,
-                loss_configs=hydra.utils.instantiate(model_cfg.loss_configs) if hasattr(model_cfg, 'loss_configs') else None,
-                optimizer_cfg=None  # Not needed for inference
             )
 
             model.eval()
