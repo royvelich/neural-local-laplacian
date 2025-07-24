@@ -711,33 +711,43 @@ class SurfaceVisualizer:
         origin_3d = translation.reshape(1, 3)
 
         # Scale factor for normal visualization
-        normal_scale = self.vis_config.vector_scale * 4.0  # Make normals longer and more visible
+        normal_scale = self.vis_config.vector_scale * 8.0  # Make normals longer and more visible
 
         try:
-            # GT Normal (Cyan) - single arrow at origin
-            gt_normal_scaled = gt_normal_at_origin * normal_scale
-            gt_line_end = origin_3d + gt_normal_scaled.reshape(1, 3)
-
-            ps.register_curve_network(
-                name=f"{surface_name} - GT Normal",
-                nodes=np.vstack([origin_3d, gt_line_end]),
-                edges=np.array([[0, 1]]),
-                color=self.color_palette.GT_NORMALS,
-                radius=0.005,  # Thinner arrows
+            # GT Normal (Cyan) - single point cloud with vector
+            gt_origin_cloud = ps.register_point_cloud(
+                name=f"{surface_name} - GT Normal Origin",
+                points=origin_3d,
+                radius=0.01,  # Small radius for the origin point
                 enabled=True
             )
 
-            # Predicted Normal (Orange) - single arrow at origin
-            pred_normal_scaled = pred_normal_np * normal_scale
-            pred_line_end = origin_3d + pred_normal_scaled.reshape(1, 3)
+            # Add GT normal as vector quantity
+            gt_origin_cloud.add_vector_quantity(
+                name="GT Normal",
+                values=gt_normal_at_origin.reshape(1, 3) * normal_scale,
+                enabled=True,
+                color=self.color_palette.GT_NORMALS,
+                radius=0.01,
+                vectortype="ambient"
+            )
 
-            ps.register_curve_network(
-                name=f"{surface_name} - Predicted Normal",
-                nodes=np.vstack([origin_3d, pred_line_end]),
-                edges=np.array([[0, 1]]),
-                color=self.color_palette.PREDICTED_NORMALS,
-                radius=0.005,  # Thinner arrows
+            # Predicted Normal (Orange) - single point cloud with vector
+            pred_origin_cloud = ps.register_point_cloud(
+                name=f"{surface_name} - Predicted Normal Origin",
+                points=origin_3d,
+                radius=0.01,  # Small radius for the origin point
                 enabled=True
+            )
+
+            # Add predicted normal as vector quantity
+            pred_origin_cloud.add_vector_quantity(
+                name="Predicted Normal",
+                values=pred_normal_np.reshape(1, 3) * normal_scale,
+                enabled=True,
+                color=self.color_palette.PREDICTED_NORMALS,
+                radius=0.01,
+                vectortype="ambient"
             )
 
             # Compute and display comparison metrics (compare the single vectors)
@@ -1092,9 +1102,6 @@ def main(cfg: DictConfig) -> None:
 
         # Clear for next batch
         ps.remove_all_structures()
-
-        # For this example, just process the first batch
-        break
 
 
 if __name__ == "__main__":
