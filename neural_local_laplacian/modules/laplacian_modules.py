@@ -422,7 +422,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
         # Target: H * nÌ‚ (mean curvature times unit normal at origin)
-        target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
+        target_mean_curvature_vectors = 2 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
         total_loss = 0.0
@@ -622,7 +622,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             metrics['eigenvector_similarity_mean_skip0'] = float(cos_similarities[1:].mean())
 
         # Individual eigenvector similarities for first few
-        for i in range(min(k, 5)):
+        for i in range(k):
             metrics[f'eigenvector_{i}_similarity'] = float(cos_similarities[i])
 
         # Overall spectral distance (combines eigenvalue and eigenvector differences)

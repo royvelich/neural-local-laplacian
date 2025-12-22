@@ -1,11 +1,10 @@
 # standard library
 import os
-
-os.environ["WANDB_DIR"] = "F:/wandb/WANDB_DIR"
-os.environ["WANDB_ARTIFACT_DIR"] = "F:/wandb/WANDB_ARTIFACT_DIR"
-os.environ["WANDB_CACHE_DIR"] = "F:/wandb/WANDB_CACHE_DIR"
-os.environ["WANDB_CONFIG_DIR"] = "F:/wandb/WANDB_CONFIG_DIR"
-os.environ["WANDB_DATA_DIR"] = "F:/wandb/WANDB_DATA_DIR"
+# os.environ["WANDB_DIR"] = "F:/wandb/WANDB_DIR"
+# os.environ["WANDB_ARTIFACT_DIR"] = "F:/wandb/WANDB_ARTIFACT_DIR"
+# os.environ["WANDB_CACHE_DIR"] = "F:/wandb/WANDB_CACHE_DIR"
+# os.environ["WANDB_CONFIG_DIR"] = "F:/wandb/WANDB_CONFIG_DIR"
+# os.environ["WANDB_DATA_DIR"] = "F:/wandb/WANDB_DATA_DIR"
 
 # hydra
 import hydra
