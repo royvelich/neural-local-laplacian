@@ -20,7 +20,7 @@ import hydra
 from omegaconf import DictConfig
 
 # Local imports - reuse from visualize_validation2.py
-from neural_local_laplacian.modules.laplacian_modules import SurfaceTransformerModule
+from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
 from neural_local_laplacian.utils import utils
 from torch_geometric.data import Data
 from neural_local_laplacian.arap import ARAPDeformer
@@ -116,7 +116,7 @@ class ARAPController:
         except Exception as e:
             raise RuntimeError(f"Failed to load mesh {self.mesh_file_path}: {e}")
 
-    def _load_trained_model(self) -> SurfaceTransformerModule:
+    def _load_trained_model(self) -> LaplacianTransformerModule:
         """Load trained model (same as visualize_validation2.py)."""
         if not self.model_ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint file not found: {self.model_ckpt_path}")
@@ -125,7 +125,7 @@ class ARAPController:
             print(f"Loading model checkpoint from: {self.model_ckpt_path}")
 
             # Load model from checkpoint with default parameters
-            model = SurfaceTransformerModule.load_from_checkpoint(
+            model = LaplacianTransformerModule.load_from_checkpoint(
                 str(self.model_ckpt_path),
                 map_location=self.device,
                 input_dim=3,  # XYZ coordinates

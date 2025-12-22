@@ -17,12 +17,12 @@ train_dataset_specification:
         num_points_range: 10
     feature_extractor:
         _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
-        num_fourier_features: 512
-        use_fourier: False
-    diff_geom_at_origin_only: True
+    diff_geom_at_origin_only: False
+    include_origin_in_grid: True
     conv_k_nearest: null
-    pose_transformer:
-        _target_: neural_local_laplacian.utils.pose_transformers.AlignNormalZTransformer
+    pose_transformers:
+      - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      - _target_: neural_local_laplacian.utils.pose_transformers.AlignNormalZTransformer
     coeff_generation_method:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
       _args_: ['uniform']
@@ -34,9 +34,9 @@ train_dataset_specification:
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
         _args_: ['principal_curvatures']
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
-        _args_: ['principal_directions']
+        _args_: ['principal_directions_2d']
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
-        _args_: ['mean_curvature']
+        _args_: ['principal_directions_3d']
     flip_normal_if_negative_curvature: False
   batch_size: 1
   num_workers: 0

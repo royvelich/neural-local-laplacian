@@ -1,6 +1,6 @@
 # standard library
-from typing import Dict
 import os
+
 os.environ["WANDB_DIR"] = "F:/wandb/WANDB_DIR"
 os.environ["WANDB_ARTIFACT_DIR"] = "F:/wandb/WANDB_ARTIFACT_DIR"
 os.environ["WANDB_CACHE_DIR"] = "F:/wandb/WANDB_CACHE_DIR"
@@ -11,24 +11,11 @@ os.environ["WANDB_DATA_DIR"] = "F:/wandb/WANDB_DATA_DIR"
 import hydra
 
 # omegaconf
-from omegaconf import OmegaConf
 from omegaconf import DictConfig
 
 # torch
 import torch
-
-# # Store the original repr method
-# original_repr = torch.Tensor.__repr__
-
-# # Define a custom repr that shows shape information first
-# def custom_repr(self):
-#     return f'{{Tensor:{tuple(self.shape)}}} {original_repr(self)}'
-
-# # Replace the default repr with our custom version
-# torch.Tensor.__repr__ = custom_repr
-
 torch.multiprocessing.set_sharing_strategy('file_system')
-# torch.autograd.set_detect_anomaly(True)
 
 # lightning
 import pytorch_lightning as pl

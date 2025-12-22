@@ -13,8 +13,10 @@ from omegaconf import DictConfig
 import pytorch_lightning as pl
 import polyscope as ps
 import numpy as np
+import trimesh
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Optional, Tuple, List
 
 
 @dataclass
@@ -28,6 +30,10 @@ class VisualizationConfig:
     num_patches_to_show: int = 8
     enable_mesh_normals: bool = True
     enable_patch_normals: bool = True
+    # Display constants
+    center_point_scale: float = 1.5  # Multiplier for center point radius
+    camera_distance: float = 2.0
+    background_color: Tuple[float, float, float] = (0.05, 0.05, 0.05)
 
 
 class ColorPalette:
@@ -60,14 +66,12 @@ class ColorPalette:
 class MeshDatasetVisualizer:
     """Handles mesh dataset visualization with polyscope."""
 
-    def __init__(self, config: VisualizationConfig = None):
+    def __init__(self, config: Optional[VisualizationConfig] = None):
         self.config = config or VisualizationConfig()
         self.color_palette = ColorPalette()
 
-    def load_mesh_vertices_and_normals(self, mesh_file_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    def load_mesh_vertices_and_normals(self, mesh_file_path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """Load mesh vertices and normals directly using trimesh."""
-        import trimesh
-
         try:
             mesh = trimesh.load(str(mesh_file_path))
             vertices = np.array(mesh.vertices, dtype=np.float32)
@@ -104,7 +108,7 @@ class MeshDatasetVisualizer:
                 vectortype="ambient"
             )
 
-    def extract_random_patches_from_data(self, data, num_patches: int) -> tuple[list, list]:
+    def extract_random_patches_from_data(self, data, num_patches: int) -> Tuple[List, List]:
         """Extract random patches from the processed mesh data."""
         # Extract patch information
         positions = data.pos.numpy()  # Shape: (N*k, 3) - flattened patch positions
@@ -148,37 +152,7 @@ class MeshDatasetVisualizer:
 
         return selected_patches, selected_centers
 
-    def compute_patch_layout_positions(self, num_patches: int, mesh_bounds: tuple) -> np.ndarray:
-        """Compute layout positions for patches to avoid overlap."""
-        min_bound, max_bound = mesh_bounds
-        mesh_size = np.linalg.norm(max_bound - min_bound)
-
-        # Arrange patches in a grid layout to the side of the mesh
-        patches_per_row = min(self.config.max_patches_per_row, num_patches)
-        num_rows = (num_patches + patches_per_row - 1) // patches_per_row
-
-        # Calculate spacing
-        spacing = mesh_size * self.config.patch_spacing
-
-        # Starting position (to the right of the mesh)
-        start_x = max_bound[0] + spacing
-        start_y = min_bound[1]
-        start_z = (min_bound[2] + max_bound[2]) / 2
-
-        layout_positions = []
-        for i in range(num_patches):
-            row = i // patches_per_row
-            col = i % patches_per_row
-
-            x = start_x + col * spacing
-            y = start_y + row * spacing
-            z = start_z
-
-            layout_positions.append([x, y, z])
-
-        return np.array(layout_positions)
-
-    def visualize_patches(self, patches: list, center_indices: list, vertices: np.ndarray,
+    def visualize_patches(self, patches: List, center_indices: List, vertices: np.ndarray,
                           vertex_normals: np.ndarray) -> None:
         """Visualize individual patches at their original positions on the mesh."""
 
@@ -213,7 +187,7 @@ class MeshDatasetVisualizer:
             center_cloud = ps.register_point_cloud(
                 name=f"Center {i + 1}",
                 points=center_pos.reshape(1, 3),
-                radius=self.config.patch_point_radius * 1.5,  # Smaller than before
+                radius=self.config.patch_point_radius * self.config.center_point_scale,
                 enabled=True
             )
             center_cloud.add_color_quantity(
@@ -234,13 +208,16 @@ class MeshDatasetVisualizer:
                 )
 
 
-def setup_polyscope() -> None:
+def setup_polyscope(config: Optional[VisualizationConfig] = None) -> None:
     """Initialize and configure polyscope."""
+    camera_dist = config.camera_distance if config else 2.0
+    bg_color = config.background_color if config else (0.05, 0.05, 0.05)
+
     ps.init()
     ps.set_up_dir("z_up")
-    ps.look_at(camera_location=[2.0, 2.0, 2.0], target=[0, 0, 0])
+    ps.look_at(camera_location=[camera_dist, camera_dist, camera_dist], target=[0, 0, 0])
     ps.set_ground_plane_mode("none")
-    ps.set_background_color((0.05, 0.05, 0.05))  # Dark background
+    ps.set_background_color(bg_color)
 
 
 def create_custom_visualization_config(
@@ -262,7 +239,7 @@ def create_custom_visualization_config(
     )
 
 
-@hydra.main(version_base="1.2", config_path="config")
+@hydra.main(version_base="1.2", config_path="visualization_config")
 def main(cfg: DictConfig) -> None:
     """Main visualization function."""
     # Set random seed for reproducibility
@@ -275,9 +252,6 @@ def main(cfg: DictConfig) -> None:
     # Use the first validation dataloader (assuming it's a mesh dataset)
     val_data_loader = val_data_loaders[0] if isinstance(val_data_loaders, list) else val_data_loaders
 
-    # Setup visualization
-    setup_polyscope()
-
     # Create custom visualization config if needed
     vis_config = create_custom_visualization_config(
         point_radius=0.005,
@@ -286,6 +260,9 @@ def main(cfg: DictConfig) -> None:
         patch_spacing=0.6,
         num_patches_to_show=10
     )
+
+    # Setup visualization with config
+    setup_polyscope(vis_config)
 
     visualizer = MeshDatasetVisualizer(config=vis_config)
 
@@ -310,11 +287,6 @@ def main(cfg: DictConfig) -> None:
         # Load original mesh vertices and normals
         vertices, vertex_normals = visualizer.load_mesh_vertices_and_normals(mesh_file_path)
         print(f"Loaded mesh with {len(vertices)} vertices")
-
-        # Compute mesh bounds for layout
-        min_bound = vertices.min(axis=0)
-        max_bound = vertices.max(axis=0)
-        mesh_bounds = (min_bound, max_bound)
 
         # Visualize full mesh
         visualizer.visualize_full_mesh(vertices, vertex_normals)

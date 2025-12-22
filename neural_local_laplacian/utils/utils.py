@@ -1,37 +1,15 @@
 # standard library
-import importlib
-from typing import Type, Callable, List, Tuple, Optional, Union, Optional, Literal, Dict
-import inspect
+from typing import List, Dict, Tuple
 
+# scipy
 import scipy.sparse
+import scipy.sparse.linalg
+
 # torch
 import torch
-import torch.nn.functional as F
 
 # numpy
 import numpy as np
-from scipy import sparse
-
-# scipy
-from scipy.spatial import cKDTree
-
-# open3d
-import open3d as o3d
-
-# python-shot
-# import handcrafted_descriptor as hd
-
-# sklearn
-from sklearn.neighbors import NearestNeighbors
-
-# igl
-import igl
-
-# delta-conv
-from deltaconv.geometry import build_tangent_basis, build_grad_div, estimate_basis
-
-# pyfm
-from pyFM.mesh import TriMesh
 
 # torch geometric
 from torch_geometric.data import Batch
@@ -241,3 +219,44 @@ def rebuild_batch_from_dictionary_of_lists(batch: Batch, property_dict: Dict[str
     for property_name, property_tensor_list in property_dict.items():
         batch = rebuild_batch_from_list(batch=batch, property_name=property_name, property_tensor_list=property_tensor_list)
     return batch
+
+def compute_laplacian_eigendecomposition(
+        laplacian_matrix: scipy.sparse.spmatrix,
+        num_eigenvalues: int,
+        mass_matrix: scipy.sparse.spmatrix = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute eigendecomposition of a Laplacian matrix.
+
+    Uses shift-invert mode with sigma close to 0 to find the smallest eigenvalues,
+    which encode the most important spectral properties.
+
+    Args:
+        laplacian_matrix: Sparse Laplacian matrix (N, N)
+        num_eigenvalues: Number of eigenvalues/eigenvectors to compute
+        mass_matrix: Optional mass matrix for generalized eigenvalue problem.
+                     If provided, solves L @ v = lambda * M @ v
+
+    Returns:
+        Tuple of (eigenvalues, eigenvectors):
+        - eigenvalues: Array of shape (num_eigenvalues,) sorted ascending
+        - eigenvectors: Array of shape (N, num_eigenvalues)
+    """
+    # Use shift-invert mode with sigma close to 0 to find smallest eigenvalues
+    if mass_matrix is not None:
+        # Generalized eigenvalue problem: L @ v = lambda * M @ v
+        eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
+            laplacian_matrix, k=num_eigenvalues, M=mass_matrix, sigma=1e-8, which='LM'
+        )
+    else:
+        # Standard eigenvalue problem
+        eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
+            laplacian_matrix, k=num_eigenvalues, sigma=-0.01, which='LM'
+        )
+
+    # Sort by eigenvalue (ascending)
+    sort_idx = np.argsort(eigenvalues)
+    eigenvalues = eigenvalues[sort_idx]
+    eigenvectors = eigenvectors[:, sort_idx]
+
+    return eigenvalues, eigenvectors

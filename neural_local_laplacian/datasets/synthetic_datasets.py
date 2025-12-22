@@ -8,38 +8,16 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Dataset, Data
 
-# torch geometric
-from torch_geometric.nn import knn_graph
-from torch_geometric.nn import fps
-
 # numpy
 import numpy as np
 
 # scipy
 from scipy.spatial import Delaunay
-from scipy.spatial.transform import Rotation
-from scipy.interpolate import Rbf
-
-# triangle
-import triangle
-
-# igl
-import igl
 
 # neural signatures
-from neural_local_laplacian.utils import utils
-from neural_local_laplacian.datasets.base_datasets import (
-    CoeffGenerationMethod,
-    DeformationType,
-    FeaturesType)
+from neural_local_laplacian.datasets.base_datasets import CoeffGenerationMethod
 from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
-
-# trimesh
-import trimesh
-
-# noise
-from noise import snoise3
 
 
 # =============================================
@@ -178,7 +156,7 @@ class RandomGridSampler(GridSampler):
             size=(num_points, 2)
         )
 
-        return torch.tensor(data=points[:, 0]), torch.tensor(data=points[:, 1])
+        return torch.tensor(points[:, 0]), torch.tensor(points[:, 1])
 
     @property
     def num_points_range(self) -> Tuple[int, int]:
@@ -194,8 +172,26 @@ class DifferentialGeometryComponent(Enum):
     MEAN_CURVATURE = 'mean_curvature'
     GAUSSIAN_CURVATURE = 'gaussian_curvature'
     PRINCIPAL_CURVATURES = 'principal_curvatures'
-    PRINCIPAL_DIRECTIONS = 'principal_directions'
+    PRINCIPAL_DIRECTIONS_2D = 'principal_directions_2d'
+    PRINCIPAL_DIRECTIONS_3D = 'principal_directions_3d'
+    PRINCIPAL_DIRECTIONS = 'principal_directions'  # Legacy alias for both 2D and 3D
+    CURVATURE_GRADIENTS_2D = 'curvature_gradients_2d'
+    CURVATURE_GRADIENTS_3D = 'curvature_gradients_3d'
     SIGNATURE = 'signature'
+
+
+# Mapping from enum components to output dictionary keys
+DIFF_GEOM_COMPONENT_KEYS = {
+    DifferentialGeometryComponent.MEAN_CURVATURE: ['H'],
+    DifferentialGeometryComponent.GAUSSIAN_CURVATURE: ['K'],
+    DifferentialGeometryComponent.PRINCIPAL_CURVATURES: ['k1', 'k2'],
+    DifferentialGeometryComponent.PRINCIPAL_DIRECTIONS_2D: ['v1_2d', 'v2_2d'],
+    DifferentialGeometryComponent.PRINCIPAL_DIRECTIONS_3D: ['v1_3d', 'v2_3d'],
+    DifferentialGeometryComponent.PRINCIPAL_DIRECTIONS: ['v1_2d', 'v2_2d', 'v1_3d', 'v2_3d'],  # Both
+    DifferentialGeometryComponent.CURVATURE_GRADIENTS_2D: ['grad_H_2d', 'grad_K_2d'],
+    DifferentialGeometryComponent.CURVATURE_GRADIENTS_3D: ['grad_H_3d', 'grad_K_3d'],
+    DifferentialGeometryComponent.SIGNATURE: ['signature'],
+}
 
 
 class SyntheticSurfaceDataset(ABC, Dataset):
@@ -204,8 +200,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
     def __init__(
             self,
             epoch_size: int,
-            pose_transformer: Optional[PoseTransformer],
-            seed: int,
+            pose_transformers: Optional[List[PoseTransformer]] = None,
+            seed: int = 0,
             feature_extractor: Optional[FeatureExtractor] = None,
             conv_k_nearest: Optional[int] = None,
     ):
@@ -213,7 +209,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         self._seed = seed
         self._rng = np.random.default_rng(seed)
         self._epoch_size = epoch_size
-        self._pose_transformer = pose_transformer
+        self._pose_transformers = pose_transformers if pose_transformers is not None else []
         self._feature_extractor = feature_extractor
         self._conv_k_nearest = conv_k_nearest
 
@@ -259,8 +255,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         pass
 
     def _repose_surface_and_quantities(self, data: Data, normals: Optional[torch.Tensor] = None) -> Data:
-        """Apply pose transformation to surface and transform differential quantities accordingly."""
-        if self._pose_transformer is None:
+        """Apply pose transformations sequentially to surface and transform differential quantities accordingly."""
+        if not self._pose_transformers:
             return data
 
         # Use passed normals if provided, otherwise get from data object
@@ -279,22 +275,32 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             # Fallback: get normal from data object (original behavior)
             normal = data['normal'][0] if 'normal' in data else torch.tensor([0., 0., 1.])
 
-        # Use transformer to get translation and rotation
-        translation, rotation_matrix = self._pose_transformer.transform(data.pos, normal)
+        # Apply each transformer sequentially
+        for pose_transformer in self._pose_transformers:
+            # Get translation and rotation from this transformer
+            translation, rotation_matrix = pose_transformer.transform(data.pos, normal)
 
-        # Apply translation and rotation to positions
-        data.pos = data.pos + translation
-        data.pos = torch.matmul(data.pos, rotation_matrix.T)
+            # Apply translation and rotation to positions
+            data.pos = data.pos + translation
+            data.pos = torch.matmul(data.pos, rotation_matrix.T)
 
-        # Transform normals using rotation matrix
-        if 'normal' in data:
-            data['normal'] = torch.matmul(data['normal'], rotation_matrix.T)
+            # Transform origin position if present
+            if 'origin_pos' in data:
+                data['origin_pos'] = data['origin_pos'] + translation
+                data['origin_pos'] = torch.matmul(data['origin_pos'], rotation_matrix.T)
 
-        # Transform differential geometry quantities
-        vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d']
-        for key in vector_3d_keys:
-            if key in data:
-                data[key] = torch.matmul(data[key], rotation_matrix.T)
+            # Transform normals using rotation matrix
+            if 'normal' in data:
+                data['normal'] = torch.matmul(data['normal'], rotation_matrix.T)
+
+            # Transform differential geometry quantities
+            vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d']
+            for key in vector_3d_keys:
+                if key in data:
+                    data[key] = torch.matmul(data[key], rotation_matrix.T)
+
+            # Transform the origin normal for the next transformer
+            normal = torch.matmul(normal.unsqueeze(0), rotation_matrix.T).squeeze(0)
 
         return data
 
@@ -337,6 +343,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             diff_geom_components: Optional[List[DifferentialGeometryComponent]] = None,
             diff_geom_at_origin_only: bool = False,
             flip_normal_if_negative_curvature: bool = False,  # NEW FLAG
+            include_origin_in_grid: bool = False,  # NEW FLAG: ensure (0,0) is in sampled points
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -346,6 +353,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         self._points_scale_range = self._validate_range(param_range=points_scale_range, name="points_scale_range")
         self._diff_geom_at_origin_only = diff_geom_at_origin_only
         self._flip_normal_if_negative_curvature = flip_normal_if_negative_curvature  # NEW PARAMETER
+        self._include_origin_in_grid = include_origin_in_grid  # NEW PARAMETER
 
         # Available differential geometry components
         available_components = list(DifferentialGeometryComponent)
@@ -371,100 +379,62 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             return float(self._rng.uniform(low=param_range[0], high=param_range[1]))
         return param_range[0]
 
-    def _compute_surface_normals(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor,
-                                 surface_params: Optional[Dict[str, Any]] = None) -> torch.Tensor:
-        """Compute surface normals using precomputed derivatives for a graph z = f(x,y)."""
-
-        # Determine if we need to compute normal at origin
-        need_origin_normal = (dz_dx is None or dz_dy is None or self._diff_geom_at_origin_only)
-
-        if need_origin_normal:
-            if surface_params is None:
-                raise ValueError("surface_params required when computing normal at origin")
-
-            # Compute normal at origin using helper method
-            normal = self._compute_normal_at_origin(surface_params)
-        else:
-            # Compute normals for all points using precomputed derivatives
-            normal = self._compute_normal_from_derivatives(dz_dx, dz_dy)
-
-        # NEW: Apply normal flipping logic if flag is set
-        if self._flip_normal_if_negative_curvature:
-            normal = self._apply_normal_flipping(normal, surface_params)
-
-        return normal
-
-    def _apply_normal_flipping(self, normal: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
+    def _compute_origin_data(self, surface_params: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
-        Apply normal flipping logic based on mean curvature at center.
+        Compute all data at origin (0,0) in a single pass.
 
-        Args:
-            normal: Computed surface normal(s) - shape (1, 3) or (N, 3)
-            surface_params: Surface parameters for evaluating curvature at origin
-
-        Returns:
-            Potentially flipped normal(s) with same shape as input
+        Returns dict with: x, y, z, dz_dx, dz_dy, normal, H (mean curvature)
         """
-        # Compute mean curvature at the origin (0, 0)
         x_origin = torch.tensor([0.0], requires_grad=True)
         y_origin = torch.tensor([0.0], requires_grad=True)
         z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
 
-        # Compute first derivatives at origin
-        dz_dx_origin = torch.autograd.grad(
-            outputs=z_origin,
-            inputs=x_origin,
-            create_graph=True,
-            retain_graph=True
-        )[0]
-        dz_dy_origin = torch.autograd.grad(
-            outputs=z_origin,
-            inputs=y_origin,
-            create_graph=True,
-            retain_graph=True
-        )[0]
+        dz_dx = torch.autograd.grad(outputs=z_origin, inputs=x_origin, create_graph=True, retain_graph=True)[0]
+        dz_dy = torch.autograd.grad(outputs=z_origin, inputs=y_origin, create_graph=True, retain_graph=True)[0]
 
-        # Compute curvature quantities at origin
-        H_origin, _, _, _, _, _ = self._compute_curvature_quantities(
-            dz_dx=dz_dx_origin, dz_dy=dz_dy_origin, x=x_origin, y=y_origin
-        )
+        # Compute normal (without flipping - flipping uses H which we compute next)
+        normal = self._compute_normal_from_derivatives(dz_dx, dz_dy)
 
-        # Check if mean curvature is negative
-        mean_curvature_value = H_origin.item()  # Extract scalar value
+        # Compute H for potential normal flipping
+        H, _, _, _, _, _ = self._compute_curvature_quantities(dz_dx=dz_dx, dz_dy=dz_dy, x=x_origin, y=y_origin)
 
-        if mean_curvature_value < 0:
-            # Flip the normal(s)
-            normal = -normal
-
-        return normal
-
-    def _compute_normal_at_origin(self, surface_params: Dict[str, Any]) -> torch.Tensor:
-        """Helper method to compute surface normal at origin (0,0)."""
-        # Evaluate derivatives at origin (0,0)
-        x_origin = torch.tensor([0.0], requires_grad=True)
-        y_origin = torch.tensor([0.0], requires_grad=True)
-        z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
-
-        dz_dx_origin = torch.autograd.grad(
-            outputs=z_origin,
-            inputs=x_origin,
-            create_graph=True,
-            retain_graph=True
-        )[0]
-        dz_dy_origin = torch.autograd.grad(
-            outputs=z_origin,
-            inputs=y_origin,
-            create_graph=True,
-            retain_graph=True
-        )[0]
-
-        # Compute and return normalized normal at origin
-        return self._compute_normal_from_derivatives(dz_dx_origin, dz_dy_origin)
+        return {
+            'x': x_origin,
+            'y': y_origin,
+            'z': z_origin,
+            'dz_dx': dz_dx,
+            'dz_dy': dz_dy,
+            'normal': normal,
+            'H': H
+        }
 
     def _compute_normal_from_derivatives(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> torch.Tensor:
-        """Helper method to compute normal from partial derivatives."""
-        normal = torch.stack(tensors=[-dz_dx, -dz_dy, torch.ones_like(input=dz_dx)], dim=1)
-        return F.normalize(input=normal, p=2, dim=1)
+        """Compute normalized surface normal from partial derivatives."""
+        normal = torch.stack([-dz_dx, -dz_dy, torch.ones_like(dz_dx)], dim=1)
+        return F.normalize(normal, p=2, dim=1)
+
+    def _compute_surface_normals(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor,
+                                 H_at_origin: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute surface normals from derivatives.
+
+        Args:
+            dz_dx, dz_dy: Precomputed derivatives
+            H_at_origin: Mean curvature at origin (for flipping, if enabled)
+        """
+        normal = self._compute_normal_from_derivatives(dz_dx, dz_dy)
+
+        # Apply normal flipping logic if flag is set
+        if self._flip_normal_if_negative_curvature and H_at_origin is not None:
+            normal = self._apply_normal_flipping(normal, H_at_origin)
+
+        return normal
+
+    def _apply_normal_flipping(self, normal: torch.Tensor, H_at_origin: torch.Tensor) -> torch.Tensor:
+        """Flip normal if mean curvature at origin is negative."""
+        if H_at_origin.item() < 0:
+            return -normal
+        return normal
 
     def _create_surface_mesh(self, pos: torch.Tensor) -> torch.Tensor:
         """Create triangular mesh from 2D positions."""
@@ -477,7 +447,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             raise RuntimeError(f"Failed to create surface mesh: {e}")
 
     def _compute_first_derivatives(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute first partial derivatives ∂z/∂x and ∂z/∂y."""
+        """Compute first partial derivatives âˆ‚z/âˆ‚x and âˆ‚z/âˆ‚y."""
         dz_dx = torch.autograd.grad(
             outputs=z.sum(),
             inputs=x,
@@ -535,8 +505,8 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
     def _compute_jacobian(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> torch.Tensor:
         """Compute Jacobian of surface parameterization."""
         return torch.stack([
-            torch.stack([torch.ones_like(input=dz_dx), torch.zeros_like(input=dz_dx)], dim=-1),
-            torch.stack([torch.zeros_like(input=dz_dy), torch.ones_like(input=dz_dy)], dim=-1),
+            torch.stack([torch.ones_like(dz_dx), torch.zeros_like(dz_dx)], dim=-1),
+            torch.stack([torch.zeros_like(dz_dy), torch.ones_like(dz_dy)], dim=-1),
             torch.stack([dz_dx, dz_dy], dim=-1)
         ], dim=-2)
 
@@ -551,17 +521,17 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
     def _compute_3d_euclidean_signatures(self, H: torch.Tensor, K: torch.Tensor, grad_H_3d: torch.Tensor, grad_K_3d: torch.Tensor, v1_3d: torch.Tensor, v2_3d: torch.Tensor) -> torch.Tensor:
         """Compute invariant 3D Euclidean signatures."""
         # Normalize principal directions
-        v1_3d_norm = v1_3d / torch.norm(input=v1_3d, dim=1, keepdim=True)
-        v2_3d_norm = v2_3d / torch.norm(input=v2_3d, dim=1, keepdim=True)
+        v1_3d_norm = v1_3d / torch.norm(v1_3d, dim=1, keepdim=True)
+        v2_3d_norm = v2_3d / torch.norm(v2_3d, dim=1, keepdim=True)
 
         # Compute directional derivatives
-        H_1 = torch.sum(input=grad_H_3d * v1_3d_norm, dim=1)
-        H_2 = torch.sum(input=grad_H_3d * v2_3d_norm, dim=1)
-        K_1 = torch.sum(input=grad_K_3d * v1_3d_norm, dim=1)
-        K_2 = torch.sum(input=grad_K_3d * v2_3d_norm, dim=1)
+        H_1 = torch.sum(grad_H_3d * v1_3d_norm, dim=1)
+        H_2 = torch.sum(grad_H_3d * v2_3d_norm, dim=1)
+        K_1 = torch.sum(grad_K_3d * v1_3d_norm, dim=1)
+        K_2 = torch.sum(grad_K_3d * v2_3d_norm, dim=1)
 
         # Stack signature components
-        signature = torch.stack(tensors=[H, K, H_1, H_2, K_1, K_2], dim=1)
+        signature = torch.stack([H, K, H_1, H_2, K_1, K_2], dim=1)
         return signature
 
     def _compute_curvature_quantities(self, dz_dx: torch.Tensor, dz_dy: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -579,15 +549,17 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
         return H, K, k1, k2, v1_2d, v2_2d
 
-    def _compute_and_add_gradients(self, H: torch.Tensor, K: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute gradient components for internal use (signature computation)."""
+    def _compute_gradients_2d(self, H: torch.Tensor, K: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute curvature gradients in 2D parameter space."""
         grad_H_2d, grad_K_2d = self._compute_curvature_gradients(H=H, K=K, x=x, y=y)
-        grad_H_2d = torch.stack(tensors=grad_H_2d, dim=-1)
-        grad_K_2d = torch.stack(tensors=grad_K_2d, dim=-1)
+        grad_H_2d = torch.stack(grad_H_2d, dim=-1)
+        grad_K_2d = torch.stack(grad_K_2d, dim=-1)
         return grad_H_2d, grad_K_2d
 
-    def _compute_and_add_signature(self, diff_geom: Dict[str, torch.Tensor], jacobian: torch.Tensor, v1_2d: torch.Tensor, v2_2d: torch.Tensor, grad_H_2d: torch.Tensor, grad_K_2d: torch.Tensor, H: torch.Tensor, K: torch.Tensor) -> None:
-        """Compute and add signature components."""
+    def _compute_3d_quantities(self, jacobian: torch.Tensor, v1_2d: torch.Tensor, v2_2d: torch.Tensor,
+                               grad_H_2d: torch.Tensor, grad_K_2d: torch.Tensor,
+                               H: torch.Tensor, K: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute all 3D quantities (principal directions, gradients, signature)."""
         v1_3d, v2_3d, grad_H_3d, grad_K_3d = self._map_to_3d(
             jacobian=jacobian, v1=v1_2d, v2=v2_2d,
             grad_H=grad_H_2d, grad_K=grad_K_2d
@@ -596,149 +568,73 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             H=H, K=K, grad_H_3d=grad_H_3d, grad_K_3d=grad_K_3d,
             v1_3d=v1_3d, v2_3d=v2_3d
         )
-
-        diff_geom.update({
-            'v1_3d': v1_3d, 'v2_3d': v2_3d,
-            'grad_H_3d': grad_H_3d, 'grad_K_3d': grad_K_3d,
+        return {
+            'v1_3d': v1_3d,
+            'v2_3d': v2_3d,
+            'grad_H_3d': grad_H_3d,
+            'grad_K_3d': grad_K_3d,
             'signature': signature
-        })
+        }
 
-    def _compute_differential_geometry_at_origin(self, surface_params: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """Compute differential geometry quantities only at the (0,0) point."""
-        if not self._diff_geom_components:
-            return {}
+    def _compute_all_differential_geometry(self, x: torch.Tensor, y: torch.Tensor,
+                                           dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute ALL differential geometry quantities unconditionally."""
+        # Curvature quantities
+        H, K, k1, k2, v1_2d, v2_2d = self._compute_curvature_quantities(
+            dz_dx=dz_dx, dz_dy=dz_dy, x=x, y=y
+        )
 
-        # Evaluate directly at (0,0)
-        x_origin = torch.tensor([0.0], requires_grad=True)
-        y_origin = torch.tensor([0.0], requires_grad=True)
-        z_origin = self._evaluate_surface_with_parameters(x=x_origin, y=y_origin, surface_params=surface_params)
+        # Gradients in 2D
+        grad_H_2d, grad_K_2d = self._compute_gradients_2d(H=H, K=K, x=x, y=y)
 
-        # Compute derivatives at origin
-        dz_dx_origin = torch.autograd.grad(
-            outputs=z_origin,
-            inputs=x_origin,
-            create_graph=True,
-            retain_graph=True
-        )[0]
-        dz_dy_origin = torch.autograd.grad(
-            outputs=z_origin,
-            inputs=y_origin,
-            create_graph=True,
-            retain_graph=True
-        )[0]
+        # Jacobian and 3D quantities
+        jacobian = self._compute_jacobian(dz_dx=dz_dx, dz_dy=dz_dy)
+        quantities_3d = self._compute_3d_quantities(
+            jacobian=jacobian, v1_2d=v1_2d, v2_2d=v2_2d,
+            grad_H_2d=grad_H_2d, grad_K_2d=grad_K_2d, H=H, K=K
+        )
 
-        diff_geom = {}
+        # Combine all quantities
+        return {
+            'H': H,
+            'K': K,
+            'k1': k1,
+            'k2': k2,
+            'v1_2d': v1_2d,
+            'v2_2d': v2_2d,
+            'grad_H_2d': grad_H_2d,
+            'grad_K_2d': grad_K_2d,
+            **quantities_3d
+        }
 
-        # Check what computations are needed
-        needs_curvatures = any(comp in self._diff_geom_components for comp in [
-            DifferentialGeometryComponent.MEAN_CURVATURE,
-            DifferentialGeometryComponent.GAUSSIAN_CURVATURE,
-            DifferentialGeometryComponent.PRINCIPAL_CURVATURES
-        ])
-        needs_principal_dirs = DifferentialGeometryComponent.PRINCIPAL_DIRECTIONS in self._diff_geom_components
-        needs_signature = DifferentialGeometryComponent.SIGNATURE in self._diff_geom_components
-
-        if any([needs_curvatures, needs_principal_dirs, needs_signature]):
-            # Compute curvatures at origin
-            H_origin, K_origin, k1_origin, k2_origin, v1_2d_origin, v2_2d_origin = self._compute_curvature_quantities(
-                dz_dx=dz_dx_origin, dz_dy=dz_dy_origin, x=x_origin, y=y_origin
-            )
-
-            # Store only the origin values (single values, not tensors for all points)
-            if DifferentialGeometryComponent.MEAN_CURVATURE in self._diff_geom_components:
-                diff_geom['H'] = H_origin  # Shape: (1,)
-            if DifferentialGeometryComponent.GAUSSIAN_CURVATURE in self._diff_geom_components:
-                diff_geom['K'] = K_origin  # Shape: (1,)
-            if DifferentialGeometryComponent.PRINCIPAL_CURVATURES in self._diff_geom_components:
-                diff_geom.update({
-                    'k1': k1_origin,  # Shape: (1,)
-                    'k2': k2_origin  # Shape: (1,)
-                })
-            if needs_principal_dirs:
-                diff_geom.update({
-                    'v1_2d': v1_2d_origin,  # Shape: (1, 2)
-                    'v2_2d': v2_2d_origin  # Shape: (1, 2)
-                })
-
-            # Signature computation at origin
-            if needs_signature:
-                grad_H_2d_origin, grad_K_2d_origin = self._compute_and_add_gradients(
-                    H=H_origin, K=K_origin, x=x_origin, y=y_origin
-                )
-                jacobian_origin = self._compute_jacobian(dz_dx=dz_dx_origin, dz_dy=dz_dy_origin)
-
-                # Create a temporary dict for signature computation
-                temp_diff_geom = {}
-                self._compute_and_add_signature(
-                    diff_geom=temp_diff_geom, jacobian=jacobian_origin,
-                    v1_2d=v1_2d_origin, v2_2d=v2_2d_origin,
-                    grad_H_2d=grad_H_2d_origin, grad_K_2d=grad_K_2d_origin,
-                    H=H_origin, K=K_origin
-                )
-
-                # Store only origin signature components
-                for key in ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d', 'signature']:
-                    if key in temp_diff_geom:
-                        diff_geom[key] = temp_diff_geom[key]  # Keep original shapes (1, ...)
-
-        return diff_geom
+    def _filter_differential_geometry(self, all_diff_geom: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Filter to only keep quantities specified in _diff_geom_components."""
+        result = {}
+        for component in self._diff_geom_components:
+            for key in DIFF_GEOM_COMPONENT_KEYS.get(component, []):
+                if key in all_diff_geom:
+                    result[key] = all_diff_geom[key]
+        return result
 
     def _compute_differential_geometry(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
                                        dz_dx: torch.Tensor, dz_dy: torch.Tensor,
-                                       surface_params: Optional[Dict[str, Any]] = None) -> Dict[str, torch.Tensor]:
+                                       origin_data: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
         """Compute requested differential geometry quantities using precomputed first derivatives."""
-        if self._diff_geom_at_origin_only:
-            if surface_params is None:
-                raise ValueError("surface_params required when diff_geom_at_origin_only=True")
-            return self._compute_differential_geometry_at_origin(surface_params=surface_params)
-        else:
-            # Original behavior: compute for all points
-            return self._compute_differential_geometry_original(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
-
-    def _compute_differential_geometry_original(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
-                                                dz_dx: torch.Tensor, dz_dy: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Original differential geometry computation for all points."""
         if not self._diff_geom_components:
             return {}
 
-        diff_geom = {}
+        if self._diff_geom_at_origin_only:
+            if origin_data is None:
+                raise ValueError("origin_data required when diff_geom_at_origin_only=True")
+            x_eval = origin_data['x']
+            y_eval = origin_data['y']
+            dz_dx_eval = origin_data['dz_dx']
+            dz_dy_eval = origin_data['dz_dy']
+        else:
+            x_eval, y_eval, dz_dx_eval, dz_dy_eval = x, y, dz_dx, dz_dy
 
-        # Check what computations are needed
-        needs_curvatures = any(comp in self._diff_geom_components for comp in [
-            DifferentialGeometryComponent.MEAN_CURVATURE,
-            DifferentialGeometryComponent.GAUSSIAN_CURVATURE,
-            DifferentialGeometryComponent.PRINCIPAL_CURVATURES
-        ])
-        needs_principal_dirs = DifferentialGeometryComponent.PRINCIPAL_DIRECTIONS in self._diff_geom_components
-        needs_signature = DifferentialGeometryComponent.SIGNATURE in self._diff_geom_components
-
-        # Curvature computations
-        if any([needs_curvatures, needs_principal_dirs, needs_signature]):
-            H, K, k1, k2, v1_2d, v2_2d = self._compute_curvature_quantities(dz_dx=dz_dx, dz_dy=dz_dy, x=x, y=y)
-
-            # Store individual curvature components
-            if DifferentialGeometryComponent.MEAN_CURVATURE in self._diff_geom_components:
-                diff_geom['H'] = H
-            if DifferentialGeometryComponent.GAUSSIAN_CURVATURE in self._diff_geom_components:
-                diff_geom['K'] = K
-            if DifferentialGeometryComponent.PRINCIPAL_CURVATURES in self._diff_geom_components:
-                diff_geom.update({'k1': k1, 'k2': k2})
-            if needs_principal_dirs:
-                diff_geom.update({'v1_2d': v1_2d, 'v2_2d': v2_2d})
-
-        # Signature computation (computes gradients and jacobian internally)
-        if needs_signature:
-            # Compute gradients internally for signature (not stored)
-            grad_H_2d, grad_K_2d = self._compute_and_add_gradients(H=H, K=K, x=x, y=y)
-
-            # Compute jacobian internally for signature (not stored)
-            jacobian = self._compute_jacobian(dz_dx=dz_dx, dz_dy=dz_dy)
-            self._compute_and_add_signature(
-                diff_geom=diff_geom, jacobian=jacobian, v1_2d=v1_2d, v2_2d=v2_2d,
-                grad_H_2d=grad_H_2d, grad_K_2d=grad_K_2d, H=H, K=K
-            )
-
-        return diff_geom
+        all_diff_geom = self._compute_all_differential_geometry(x=x_eval, y=y_eval, dz_dx=dz_dx_eval, dz_dy=dz_dy_eval)
+        return self._filter_differential_geometry(all_diff_geom)
 
     def _create_raw_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
                                  dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float,
@@ -748,13 +644,11 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         Does NOT add features - those are added later by the base class.
         Modified to handle origin-only computation and center the surface at origin.
         """
-        # Evaluate the surface at (0,0) to get the center point
-        x_center = torch.tensor([0.0], requires_grad=True)
-        y_center = torch.tensor([0.0], requires_grad=True)
-        z_center = self._evaluate_surface_with_parameters(x=x_center, y=y_center, surface_params=surface_params)
+        # Compute all origin data once (derivatives, normal, H for flipping)
+        origin_data = self._compute_origin_data(surface_params)
 
         # Create positions and translate so that (0,0,z_center) becomes (0,0,0)
-        center_point = torch.stack([x_center, y_center, z_center], dim=1) * points_scale  # (1, 3)
+        center_point = torch.stack([origin_data['x'], origin_data['y'], origin_data['z']], dim=1) * points_scale  # (1, 3)
         positions = torch.stack([x, y, z], dim=1) * points_scale  # (N, 3)
         positions = positions - center_point  # Translate so center is at origin
 
@@ -763,29 +657,32 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         data['pos'] = positions.detach()
         data['face'] = self._create_surface_mesh(pos=data.pos).detach()
 
-        # ALWAYS compute normal at origin for pose transformation
-        # This ensures _repose_surface_and_quantities always gets the origin normal
-        origin_normal = self._compute_surface_normals(dz_dx=None, dz_dy=None, surface_params=surface_params)
+        # Store the origin position (0,0,0) after centering - will be transformed with pose
+        data['origin_pos'] = torch.zeros(1, 3)
 
+        # Compute origin normal (with potential flipping based on H)
+        origin_normal = self._compute_surface_normals(
+            dz_dx=origin_data['dz_dx'],
+            dz_dy=origin_data['dz_dy'],
+            H_at_origin=origin_data['H']
+        )
+
+        # Compute normals: origin-only or all points
         if self._diff_geom_at_origin_only:
-            # When origin-only mode: use the origin normal we just computed
             data['normal'] = origin_normal.detach()
-
-            # Compute differential geometry at origin only
-            diff_geom = self._compute_differential_geometry_at_origin(surface_params=surface_params)
-
-            # Store all quantities with same keys as before (seamless operation)
-            for key, value in diff_geom.items():
-                data[key] = value.detach()
-
         else:
-            # When computing for all points: store normals for all points in data,
-            # but we'll still use origin_normal for pose transformation
-            data['normal'] = self._compute_surface_normals(dz_dx=dz_dx, dz_dy=dz_dy, surface_params=surface_params).detach()
+            data['normal'] = self._compute_surface_normals(
+                dz_dx=dz_dx,
+                dz_dy=dz_dy,
+                H_at_origin=origin_data['H']
+            ).detach()
 
-            diff_geom = self._compute_differential_geometry_original(x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy)
-            for key, value in diff_geom.items():
-                data[key] = value.detach()
+        # Compute differential geometry (unified method handles origin-only vs all points)
+        diff_geom = self._compute_differential_geometry(
+            x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy, origin_data=origin_data
+        )
+        for key, value in diff_geom.items():
+            data[key] = value.detach()
 
         # Apply pose transformation to positions and differential quantities
         # ALWAYS pass the origin normal, regardless of the diff_geom_at_origin_only flag
@@ -795,6 +692,40 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         # after calling _generate_raw_surfaces()
 
         return data
+
+    def _ensure_origin_in_grid(self, x: torch.Tensor, y: torch.Tensor,
+                               grid_range: Tuple[float, float]) -> Tuple[torch.Tensor, torch.Tensor, Optional[int]]:
+        """
+        Ensure the origin (0,0) is included in the grid points.
+
+        Args:
+            x, y: Grid point coordinates
+            grid_range: The (min, max) range of the grid
+
+        Returns:
+            x, y: Updated coordinates (with origin added if needed)
+            origin_idx: Index of the origin point in the grid, or None if origin is outside grid range
+        """
+        # Check if origin is within the grid range
+        if not (grid_range[0] <= 0.0 <= grid_range[1]):
+            return x, y, None
+
+        # Check if origin already exists in the grid (within tolerance)
+        tolerance = 1e-6
+        distances_sq = x ** 2 + y ** 2
+        min_dist_sq = distances_sq.min().item()
+
+        if min_dist_sq < tolerance ** 2:
+            # Origin already exists, find its index
+            origin_idx = distances_sq.argmin().item()
+            return x, y, origin_idx
+
+        # Add origin to the grid
+        x = torch.cat([x, torch.tensor([0.0])])
+        y = torch.cat([y, torch.tensor([0.0])])
+        origin_idx = len(x) - 1
+
+        return x, y, origin_idx
 
     def _generate_raw_surfaces(self) -> List[Data]:
         """Generate multiple samplings of the same parametric surface using grid samplers."""
@@ -812,6 +743,11 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             # Generate grid for this sampling using the grid sampler
             x, y = grid_sampler.sample(grid_range=grid_range, rng=self._rng)
 
+            # Optionally ensure origin is in the grid
+            origin_idx = None
+            if self._include_origin_in_grid:
+                x, y, origin_idx = self._ensure_origin_in_grid(x, y, grid_range)
+
             with torch.enable_grad():
                 # Convert to float32 and enable gradients
                 x = x.to(dtype=torch.float32).requires_grad_(True)
@@ -828,6 +764,10 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                     x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
                     points_scale=points_scale, surface_params=surface_params
                 )
+
+            # Store origin index if we added/found one
+            if origin_idx is not None:
+                data['origin_idx'] = torch.tensor([origin_idx])
 
             surfaces.append(data)
 
@@ -870,35 +810,36 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         return order_range
 
     @staticmethod
-    def _get_num_coeffs(order: int) -> int:
-        """Calculate number of coefficients for polynomial order."""
-        return sum(1 for x in range(order + 1) for y in range(order + 1) if 0 < x + y <= order)
+    def _get_polynomial_pairs(order: int) -> List[Tuple[int, int]]:
+        """Get list of (i, j) exponent pairs for polynomial of given order."""
+        return [(i, j) for i in range(order + 1) for j in range(order + 1) if 0 < i + j <= order]
 
     def _generate_surface_parameters(self) -> Dict[str, Any]:
         """Generate random polynomial coefficients and order."""
         order = int(self._rng.integers(low=self._order_range[0], high=self._order_range[1] + 1))
-        num_coeffs = self._get_num_coeffs(order=order)
+        pairs = self._get_polynomial_pairs(order)
+        num_coeffs = len(pairs)
         coefficient_scale = self._sample_parameter(param_range=self._coefficient_scale_range)
 
         if self._coeff_generation_method == CoeffGenerationMethod.UNIFORM:
-            coefficients = torch.tensor(data=2 * (self._rng.uniform(size=num_coeffs) - 0.5) * coefficient_scale)
+            coefficients = torch.tensor(2 * (self._rng.uniform(size=num_coeffs) - 0.5) * coefficient_scale)
         elif self._coeff_generation_method == CoeffGenerationMethod.NORMAL:
-            coefficients = torch.tensor(data=self._rng.normal(size=num_coeffs) * coefficient_scale)
+            coefficients = torch.tensor(self._rng.normal(size=num_coeffs) * coefficient_scale)
         else:
             raise ValueError(f"Invalid coefficient generation method: {self._coeff_generation_method}")
 
         return {
             'coefficients': coefficients,
-            'order': order
+            'order': order,
+            'pairs': pairs  # Cache pairs for evaluation
         }
 
     def _evaluate_surface_with_parameters(self, x: torch.Tensor, y: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
         """Evaluate polynomial surface using pre-generated parameters."""
         coefficients = surface_params['coefficients']
-        order = surface_params['order']
+        pairs = surface_params['pairs']
 
-        pairs = [(i, j) for i in range(order + 1) for j in range(order + 1) if 0 < i + j <= order]
-        z = torch.zeros_like(input=x)
-        for c, pair in zip(coefficients, pairs):
-            z += c * (x ** pair[0]) * (y ** pair[1])
+        z = torch.zeros_like(x)
+        for c, (i, j) in zip(coefficients, pairs):
+            z += c * (x ** i) * (y ** j)
         return z

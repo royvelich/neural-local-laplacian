@@ -50,7 +50,7 @@ from omegaconf import DictConfig
 import pytorch_lightning as pl
 
 # Local imports
-from neural_local_laplacian.modules.laplacian_modules import SurfaceTransformerModule
+from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
 from neural_local_laplacian.utils import utils
 from torch_geometric.data import Data, Batch
 
@@ -468,7 +468,7 @@ class RealTimeEigenanalysisVisualizer:
         except Exception as e:
             print(f"  Warning: Failed to remove some reconstruction structures: {e}")
 
-    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig) -> SurfaceTransformerModule:
+    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig) -> LaplacianTransformerModule:
         """
         Load trained SurfaceTransformerModule from checkpoint.
 
@@ -490,7 +490,7 @@ class RealTimeEigenanalysisVisualizer:
             model_cfg = cfg.model.module
 
             # Load model from checkpoint with model arguments from config
-            model = SurfaceTransformerModule.load_from_checkpoint(
+            model = LaplacianTransformerModule.load_from_checkpoint(
                 str(ckpt_path),
                 map_location=device,
             )
@@ -653,7 +653,7 @@ class RealTimeEigenanalysisVisualizer:
             'vertex_areas': vertex_areas
         }
 
-    def perform_model_inference(self, model: SurfaceTransformerModule, batch_data: Data, device: torch.device) -> Dict[str, Any]:
+    def perform_model_inference(self, model: LaplacianTransformerModule, batch_data: Data, device: torch.device) -> Dict[str, Any]:
         """
         Perform model inference and compute predicted quantities.
 
@@ -1202,7 +1202,7 @@ class RealTimeEigenanalysisVisualizer:
                     cmap=self.config.colormap
                 )
 
-    def process_batch(self, model: SurfaceTransformerModule, batch_data, batch_idx: int, device: torch.device):
+    def process_batch(self, model: LaplacianTransformerModule, batch_data, batch_idx: int, device: torch.device):
         """Process a single batch through the complete pipeline."""
         print(f"\n{'=' * 80}")
         print(f"PROCESSING BATCH {batch_idx + 1}")

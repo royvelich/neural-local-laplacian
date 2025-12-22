@@ -44,6 +44,6 @@ module:
           use_fourier: False
         pose_transformer:
           _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
-      batch_size: 1
+      batch_size: 2
       num_workers: 0
       shuffle: False

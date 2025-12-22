@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch, Data
 
 import os
 import pickle
@@ -32,6 +32,7 @@ from pytorch_lightning.callbacks import Callback
 # torch_geometric
 from torch_geometric.data import Batch
 from torch_geometric.data import Data
+from torch_geometric.data.data import BaseData
 
 # trimesh for loading mesh vertices
 import trimesh
@@ -40,11 +41,11 @@ import trimesh
 from pyFM.mesh import TriMesh
 
 # neural laplacian
-from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable
+from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, compute_laplacian_eigendecomposition
 from neural_local_laplacian.modules.losses import LossConfig
 
 
-class LocalLaplacianModuleBase(lightning.pytorch.LightningModule):
+class LaplacianModuleBase(lightning.pytorch.LightningModule):
     def __init__(self,
                  optimizer_cfg: DictConfig,
                  scheduler_cfg: Optional[DictConfig] = None,
@@ -75,17 +76,6 @@ class LocalLaplacianModuleBase(lightning.pytorch.LightningModule):
             dict_cfg = OmegaConf.to_container(self.trainer.cfg, resolve=True)
             self.logger.experiment.config.update(dict_cfg)
 
-    def _shared_step(self, batch: Batch, batch_idx: int, stage: str) -> Dict[str, torch.Tensor]:
-        pass
-
-    def training_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """Training step logic."""
-        return self._shared_step(batch, batch_idx, 'train')
-
-    # def validation_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
-    #     """Validation step logic."""
-    #     return self._shared_step(batch, batch_idx, 'val')
-
     def configure_optimizers(self):
         """Configure optimizer and optionally scheduler."""
         if self._optimizer_cfg is None:
@@ -114,7 +104,7 @@ class LocalLaplacianModuleBase(lightning.pytorch.LightningModule):
         }
 
 
-class SurfaceTransformerModule(LocalLaplacianModuleBase):
+class LaplacianTransformerModule(LaplacianModuleBase):
     """Surface transformer module with support for variable-sized patches."""
 
     def __init__(self,
@@ -281,9 +271,9 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         """
         Compute predicted mean curvature vectors from token weights using fully vectorized operations.
 
-        This method computes Δr = Σᵢ wᵢ * pᵢ for each patch, where:
-        - wᵢ are the learned token weights
-        - pᵢ are the patch positions (centered at origin)
+        This method computes Î”r = Î£áµ¢ wáµ¢ * páµ¢ for each patch, where:
+        - wáµ¢ are the learned token weights
+        - páµ¢ are the patch positions (centered at origin)
 
         Args:
             forward_result: Dictionary containing token_weights, attention_mask, and batch_sizes
@@ -332,7 +322,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         # Get valid positions
         valid_positions = positions[actual_position_indices]  # (num_valid, 3)
 
-        # Compute weighted positions: wᵢ * pᵢ
+        # Compute weighted positions: wáµ¢ * páµ¢
         weighted_positions = valid_weights.unsqueeze(-1) * valid_positions  # (num_valid, 3)
 
         # Sum weighted positions for each batch using scatter_add
@@ -370,28 +360,11 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         """
         features = batch.x  # Shape: (total_points, feature_dim)
 
-        # Fix batch indices for MeshDataset validation if needed
-        if hasattr(batch, 'center_indices') and torch.all(batch.batch == 0):
-            # This is likely MeshDataset where DataLoader reset batch indices
-            num_patches = len(batch.center_indices)
-            total_points = len(batch.pos)
-
-            # Create proper batch indices based on center_indices
-            batch_indices = torch.zeros(total_points, dtype=torch.long, device=batch.batch.device)
-
-            # For MeshDataset, we need to reconstruct batch indices from center_indices
-            # This assumes points are grouped by patch
-            points_per_patch = total_points // num_patches
-            for i in range(num_patches):
-                start_idx = i * points_per_patch
-                end_idx = (i + 1) * points_per_patch
-                batch_indices[start_idx:end_idx] = i
-
-            batch.batch = batch_indices
-            print(f"Fixed batch indices for MeshDataset: {num_patches} patches")
+        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
+        batch_indices = getattr(batch, 'patch_idx', batch.batch)
 
         # Get batch sizes (number of points per patch)
-        batch_sizes = batch.batch.bincount()
+        batch_sizes = batch_indices.bincount()
         batch_size = len(batch_sizes)
         max_k = batch_sizes.max().item()
 
@@ -400,7 +373,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
         # Pad sequences to max_k and create attention masks
         sequences, attention_mask = self._pad_sequences_vectorized(
-            features, batch.batch, batch_size, max_k
+            features, batch_indices, batch_size, max_k
         )
 
         # Pass through transformer with attention mask
@@ -448,7 +421,7 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
         normals = batch_data.normal  # (batch_size, 3) - one normal per surface at origin
         mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
-        # Target: H * n̂ (mean curvature times unit normal at origin)
+        # Target: H * nÌ‚ (mean curvature times unit normal at origin)
         target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
@@ -490,77 +463,172 @@ class SurfaceTransformerModule(LocalLaplacianModuleBase):
 
         return result
 
-    def validation_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
+    def validation_step(self, batch: Batch, batch_idx: int) -> Dict[str, float]:
         """
-        Validation step with variable-sized patch support - eigenanalysis on mesh data.
+        Validation step - compare predicted Laplacian eigendecomposition with ground truth.
+
+        Handles PyG batching by splitting combined Batch back into individual meshes.
 
         Args:
-            batch: List of PyTorch Geometric batches (mesh data)
+            batch: PyG Batch object (combined meshes)
             batch_idx: Batch index
 
         Returns:
-            Dictionary with validation metrics
+            Dictionary with averaged validation metrics
         """
-        # Take the first batch from the list
-        batch_data = batch[0]
-        forward_result = self.forward(batch_data)
+        # Split batch back into individual Data objects
+        mesh_list = batch.to_data_list()
 
-        # Assemble sparse Laplacian matrix from variable-sized learned weights
+        # Validate each mesh and collect metrics
+        all_metrics = []
+        for mesh_data in mesh_list:
+            mesh_metrics = self._validate_single_mesh(mesh_data)
+            all_metrics.append(mesh_metrics)
+
+        # Average metrics across batch
+        averaged_metrics = {}
+        if all_metrics:
+            metric_names = all_metrics[0].keys()
+            for name in metric_names:
+                values = [m[name] for m in all_metrics if name in m]
+                if values:
+                    averaged_metrics[name] = sum(values) / len(values)
+
+        # Log validation metrics
+        for metric_name, metric_value in averaged_metrics.items():
+            self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True,
+                     logger=True, batch_size=len(mesh_list))
+
+        return averaged_metrics
+
+    def _validate_single_mesh(self, mesh_data: BaseData) -> Dict[str, float]:
+        """
+        Validate a single mesh by comparing predicted vs ground-truth eigendecomposition.
+
+        Args:
+            mesh_data: PyTorch Geometric Data object for a single mesh
+
+        Returns:
+            Dictionary with validation metrics for this mesh
+        """
+        # Convert single Data to Batch for forward pass
+        mesh_batch = Batch.from_data_list([mesh_data])
+        forward_result = self.forward(mesh_batch)
+
+        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
+        batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
+
+        # Assemble sparse Laplacian matrix from learned weights
         laplacian_matrix = assemble_sparse_laplacian_variable(
             weights=forward_result['token_weights'],
             attention_mask=forward_result['attention_mask'],
-            vertex_indices=batch_data.vertex_indices,
-            center_indices=batch_data.center_indices,
-            batch_indices=batch_data.batch
+            vertex_indices=mesh_batch.vertex_indices,
+            center_indices=mesh_batch.center_indices,
+            batch_indices=batch_indices
         )
 
-        # CRITICAL ADDITION: Store Laplacian matrix for ValidationMeshUploader
+        # Store Laplacian matrix for callback (last mesh in batch)
         self._last_laplacian_matrix = laplacian_matrix
-        print(f"📊 Stored predicted Laplacian matrix for validation: {laplacian_matrix.shape}")
 
-        # Compute eigendecomposition and validation metrics
-        eigenvalues, eigenvectors = self._compute_eigendecomposition(laplacian_matrix)
+        # Compute predicted eigendecomposition
+        pred_eigenvalues, pred_eigenvectors = compute_laplacian_eigendecomposition(
+            laplacian_matrix, self._num_eigenvalues
+        )
 
-        # Store eigendecomposition results for callback
-        self._last_eigenvalues = eigenvalues
-        self._last_eigenvectors = eigenvectors
+        # Get ground-truth eigendecomposition (stored as tuple to avoid PyG batching issues)
+        gt_eigenvalues, gt_eigenvectors = mesh_data.gt_eigen
 
-        # Simple validation metrics
-        metrics = {
-            'first_eigenvalue': torch.tensor(eigenvalues[0]),
-            'spectral_gap': torch.tensor(eigenvalues[1] - eigenvalues[0]) if len(eigenvalues) > 1 else torch.tensor(0.0),
-            'eigenvalue_mean': torch.tensor(eigenvalues.mean())
-        }
+        # Compute comparison metrics
+        return self._compute_spectral_comparison_metrics(
+            pred_eigenvalues, pred_eigenvectors,
+            gt_eigenvalues, gt_eigenvectors
+        )
 
-        # Log validation metrics
-        for metric_name, metric_value in metrics.items():
-            self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True, logger=True, batch_size=1)
-
-        return metrics
-
-    def _compute_eigendecomposition(self, laplacian_matrix: scipy.sparse.csr_matrix) -> Tuple[np.ndarray, np.ndarray]:
+    def _compute_spectral_comparison_metrics(
+            self,
+            pred_eigenvalues: np.ndarray,
+            pred_eigenvectors: np.ndarray,
+            gt_eigenvalues: np.ndarray,
+            gt_eigenvectors: np.ndarray
+    ) -> Dict[str, float]:
         """
-        Compute eigendecomposition of the Laplacian matrix using shift-invert mode.
+        Compute metrics comparing predicted vs ground-truth eigendecomposition.
 
-        Uses shift-invert mode with sigma=-0.01 to find eigenvalues closest to zero.
-        This is efficient for Laplacian matrices since we're interested in the smallest
-        eigenvalues, which encode the most important spectral properties of the graph.
+        All computations done in numpy to avoid GPU memory usage.
 
         Args:
-            laplacian_matrix: Sparse positive semi-definite Laplacian matrix
+            pred_eigenvalues: Predicted eigenvalues (k,)
+            pred_eigenvectors: Predicted eigenvectors (N, k)
+            gt_eigenvalues: Ground-truth eigenvalues (k,)
+            gt_eigenvectors: Ground-truth eigenvectors (N, k)
 
         Returns:
-            Tuple of (eigenvalues, eigenvectors) sorted in ascending order by eigenvalue.
-            - eigenvalues: Array of shape (k,) with smallest k eigenvalues
-            - eigenvectors: Array of shape (n, k) with corresponding eigenvectors
+            Dictionary of comparison metrics (float values)
         """
-        # Use shift-invert mode with sigma=-0.01 to find eigenvalues closest to 0
-        # This is robust for positive semi-definite Laplacian matrices
-        eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(laplacian_matrix, k=self._num_eigenvalues, sigma=-0.01)
+        # Ensure we compare same number of eigenvalues
+        k = min(len(pred_eigenvalues), len(gt_eigenvalues))
+        pred_eig = pred_eigenvalues[:k]
+        gt_eig = gt_eigenvalues[:k]
+        pred_vec = pred_eigenvectors[:, :k]
+        gt_vec = gt_eigenvectors[:, :k]
 
-        # Sort eigenvalues and eigenvectors in ascending order
-        sort_indices = np.argsort(eigenvalues)
-        eigenvalues = eigenvalues[sort_indices]
-        eigenvectors = eigenvectors[:, sort_indices]
+        metrics = {}
 
-        return eigenvalues, eigenvectors
+        # === Eigenvalue metrics ===
+
+        # 1. Relative MSE (skip first eigenvalue since it's ~0)
+        if k > 1:
+            eps = 1e-6
+            rel_errors_sq = ((pred_eig[1:] - gt_eig[1:]) / (gt_eig[1:] + eps)) ** 2
+            metrics['eigenvalue_rel_mse'] = float(rel_errors_sq.mean())
+
+        # 2. Spectral gap ratio (lambda_1 - lambda_0)
+        pred_gap = pred_eig[1] - pred_eig[0] if k > 1 else 0.0
+        gt_gap = gt_eig[1] - gt_eig[0] if k > 1 else 1.0
+        metrics['spectral_gap_ratio'] = float(pred_gap / (gt_gap + 1e-6))
+
+        # 3. Eigenvalue correlation
+        if k > 2:
+            correlation = np.corrcoef(pred_eig, gt_eig)[0, 1]
+            metrics['eigenvalue_correlation'] = float(correlation) if not np.isnan(correlation) else 0.0
+
+        # 4. First non-zero eigenvalue ratio
+        if k > 1:
+            metrics['lambda1_ratio'] = float(pred_eig[1] / (gt_eig[1] + 1e-6))
+
+        # === Eigenvector metrics ===
+
+        # Compute cosine similarity for each eigenvector pair (handle sign ambiguity)
+        cos_similarities = []
+        for i in range(k):
+            pred_v = pred_vec[:, i]
+            gt_v = gt_vec[:, i]
+
+            # Normalize vectors
+            pred_v_norm = pred_v / (np.linalg.norm(pred_v) + 1e-8)
+            gt_v_norm = gt_v / (np.linalg.norm(gt_v) + 1e-8)
+
+            # Cosine similarity (absolute value due to sign ambiguity)
+            cos_sim = np.abs(np.dot(pred_v_norm, gt_v_norm))
+            cos_similarities.append(cos_sim)
+
+        cos_similarities = np.array(cos_similarities)
+
+        # Mean eigenvector similarity (all eigenvectors)
+        metrics['eigenvector_similarity_mean'] = float(cos_similarities.mean())
+
+        # Eigenvector similarity excluding first (constant) eigenvector
+        if k > 1:
+            metrics['eigenvector_similarity_mean_skip0'] = float(cos_similarities[1:].mean())
+
+        # Individual eigenvector similarities for first few
+        for i in range(min(k, 5)):
+            metrics[f'eigenvector_{i}_similarity'] = float(cos_similarities[i])
+
+        # Overall spectral distance (combines eigenvalue and eigenvector differences)
+        # Lower is better
+        eigenvalue_error = float(np.mean(((pred_eig - gt_eig) / (gt_eig + 1e-6)) ** 2)) if k > 0 else 0.0
+        eigenvector_error = 1.0 - float(cos_similarities.mean())
+        metrics['spectral_distance'] = eigenvalue_error + eigenvector_error
+
+        return metrics

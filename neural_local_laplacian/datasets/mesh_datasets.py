@@ -1,14 +1,13 @@
 # Standard library
-import os
 from pathlib import Path
-from typing import List, Optional, Union
-from abc import ABC, abstractmethod
+from typing import List, Optional, Tuple, Union
 
 # Third-party libraries
 import numpy as np
 import torch
 from torch_geometric.data import Dataset, Data
 from sklearn.neighbors import NearestNeighbors
+import robust_laplacian
 
 # Trimesh for mesh loading
 import trimesh
@@ -18,6 +17,27 @@ from neural_local_laplacian.datasets.base_datasets import PoseType
 from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 from neural_local_laplacian.utils import utils
+
+
+class MeshPatchData(Data):
+    """
+    Data object that preserves internal patch structure during PyG batching.
+
+    Uses patch_idx instead of batch to store patch assignments, preventing
+    PyG's DataLoader from resetting the indices.
+    """
+
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        # patch_idx concatenates along dim 0 (standard behavior)
+        if key == 'patch_idx':
+            return 0
+        return super().__cat_dim__(key, value, *args, **kwargs)
+
+    def __inc__(self, key, value, *args, **kwargs):
+        # Don't increment patch_idx - preserve internal patch structure
+        if key == 'patch_idx':
+            return 0
+        return super().__inc__(key, value, *args, **kwargs)
 
 
 class MeshDataset(Dataset):
@@ -35,8 +55,9 @@ class MeshDataset(Dataset):
             self,
             mesh_folder_path: Union[str, Path],
             k: int,
+            num_eigenvalues: int = 20,
             feature_extractor: Optional[FeatureExtractor] = None,
-            pose_transformer: Optional[PoseTransformer] = None
+            pose_transformers: Optional[List[PoseTransformer]] = None
     ):
         """
         Initialize the MeshDataset.
@@ -44,15 +65,17 @@ class MeshDataset(Dataset):
         Args:
             mesh_folder_path: Path to folder containing mesh files
             k: Number of nearest neighbors to extract (excluding center point)
+            num_eigenvalues: Number of eigenvalues/eigenvectors to compute for ground truth
             feature_extractor: Feature extractor to apply to patch points
-            pose_transformer: Optional pose transformation to apply
+            pose_transformers: Optional list of pose transformations to apply sequentially
         """
         super().__init__()
 
         self._mesh_folder_path = Path(mesh_folder_path)
         self._k = k
+        self._num_eigenvalues = num_eigenvalues
         self._feature_extractor = feature_extractor
-        self._pose_transformer = pose_transformer
+        self._pose_transformers = pose_transformers if pose_transformers is not None else []
 
         # Validate inputs
         self._validate_inputs()
@@ -97,7 +120,7 @@ class MeshDataset(Dataset):
         """Return the number of mesh files in the dataset."""
         return len(self._mesh_file_paths)
 
-    def get(self, idx: int) -> List[Data]:
+    def get(self, idx: int) -> Data:
         """
         Load and process a mesh file, returning local patches for each vertex.
 
@@ -105,7 +128,7 @@ class MeshDataset(Dataset):
             idx: Index of the mesh file to load
 
         Returns:
-            List containing a single Data object with all local patches
+            Data object with all local patches
         """
         if idx >= len(self._mesh_file_paths):
             raise IndexError(f"Index {idx} out of range for {len(self._mesh_file_paths)} mesh files")
@@ -127,7 +150,7 @@ class MeshDataset(Dataset):
 
             # Extract faces before normalization
             if hasattr(mesh, 'faces'):
-                faces = np.array(mesh.faces, dtype=np.int32)
+                faces = np.array(mesh.faces, dtype=np.int64)
                 original_num_faces = len(faces)
             else:
                 faces = np.array([])
@@ -144,6 +167,11 @@ class MeshDataset(Dataset):
             else:
                 raise ValueError(f"Could not compute vertex normals for mesh: {mesh_file_path}")
 
+            # Compute ground-truth Laplacian eigendecomposition using robust-laplacian
+            gt_eigenvalues, gt_eigenvectors = self._compute_ground_truth_eigendecomposition(
+                vertices, faces
+            )
+
         except Exception as e:
             raise RuntimeError(f"Failed to load mesh {mesh_file_path}: {e}")
 
@@ -154,8 +182,7 @@ class MeshDataset(Dataset):
         # Extract local patches for all vertices
         patches_data = self._extract_all_patches(vertices, vertex_normals)
 
-        # CRITICAL ADDITION: Add mesh metadata as individual attributes (more robust for PyTorch Geometric)
-        # Store metadata as individual attributes rather than nested dict to avoid batching issues
+        # Add mesh metadata as individual attributes (more robust for PyTorch Geometric batching)
         patches_data.mesh_file_path = str(mesh_file_path)
         patches_data.original_num_vertices = original_num_vertices
         patches_data.original_num_faces = original_num_faces
@@ -163,17 +190,35 @@ class MeshDataset(Dataset):
         patches_data.normalized_num_vertices = len(vertices)
         patches_data.k_neighbors = self._k
 
-        # Also store as dict for backward compatibility (but individual attributes are primary)
-        patches_data['mesh_metadata'] = {
-            'mesh_file_path': str(mesh_file_path),
-            'original_num_vertices': original_num_vertices,
-            'original_num_faces': original_num_faces,
-            'mesh_idx': idx,
-            'normalized_num_vertices': len(vertices),  # After normalization (should be same as original)
-            'k_neighbors': self._k
-        }
+        # Store ground-truth eigendecomposition as a tuple (PyG doesn't concatenate tuples)
+        patches_data.gt_eigen = (gt_eigenvalues, gt_eigenvectors)
 
-        return [patches_data]  # Return as list to match synthetic dataset interface
+        return patches_data
+
+    def _compute_ground_truth_eigendecomposition(
+            self,
+            vertices: np.ndarray,
+            faces: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute ground-truth Laplacian eigendecomposition using robust-laplacian.
+
+        Args:
+            vertices: Mesh vertices of shape (N, 3)
+            faces: Mesh faces of shape (F, 3)
+
+        Returns:
+            Tuple of (eigenvalues, eigenvectors):
+            - eigenvalues: Array of shape (num_eigenvalues,)
+            - eigenvectors: Array of shape (N, num_eigenvalues)
+        """
+        # Compute robust Laplacian (returns Laplacian L and mass matrix M)
+        L, M = robust_laplacian.mesh_laplacian(vertices, faces)
+
+        # Use shared eigendecomposition function
+        return utils.compute_laplacian_eigendecomposition(
+            L, self._num_eigenvalues, mass_matrix=M
+        )
 
     def _extract_all_patches(self, vertices: np.ndarray, vertex_normals: np.ndarray) -> Data:
         """
@@ -219,7 +264,7 @@ class MeshDataset(Dataset):
         patch_positions = all_neighbor_positions - center_positions_expanded  # Shape: (N, k, 3)
 
         # Apply pose transformations if specified (vectorized over patches)
-        if self._pose_transformer is not None:
+        if self._pose_transformers:
             patch_positions, vertex_normals = self._apply_pose_transformation(
                 patch_positions, vertex_normals
             )
@@ -242,68 +287,24 @@ class MeshDataset(Dataset):
         # Convert to tensors
         pos_tensor = torch.from_numpy(all_positions).float()
         features_tensor = torch.from_numpy(all_features).float()
-        batch_tensor = torch.from_numpy(batch_indices).long()
+        patch_idx_tensor = torch.from_numpy(batch_indices).long()
         vertex_indices_tensor = torch.from_numpy(all_neighbor_indices).long()
         center_indices_tensor = torch.from_numpy(all_center_indices).long()
 
-        # Create Data object
-        data = Data(
+        # Create MeshPatchData object (preserves patch_idx during PyG batching)
+        data = MeshPatchData(
             pos=pos_tensor,
             x=features_tensor,
-            batch=batch_tensor,
-            vertex_indices=vertex_indices_tensor,  # Neighbor vertex indices
-            center_indices=center_indices_tensor  # Center vertex index for each patch
+            patch_idx=patch_idx_tensor,  # Use patch_idx instead of batch
+            vertex_indices=vertex_indices_tensor,
+            center_indices=center_indices_tensor
         )
 
         return data
 
-    def _apply_pose_transformation_vectorized(self, patch_positions: np.ndarray, vertex_normals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _apply_pose_transformation(self, patch_positions: np.ndarray, vertex_normals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply pose transformation to ALL patches using vectorized operations.
-
-        Args:
-            patch_positions: Patch positions of shape (N, k, 3)
-            vertex_normals: Center vertex normals of shape (N, 3)
-
-        Returns:
-            Tuple of (transformed_patch_positions, transformed_vertex_normals)
-        """
-        if self._pose_transformer is None:
-            return patch_positions, vertex_normals
-
-        # Convert to tensors for pose transformation (preserve batch structure)
-        pos_tensor = torch.from_numpy(patch_positions).float()  # Shape: (N, k, 3)
-        normal_tensor = torch.from_numpy(vertex_normals).float()  # Shape: (N, 3)
-
-        # Apply pose transformation using the batch-aware transformer
-        # The pose transformer expects batched inputs
-        translation, rotation_matrix = self._pose_transformer.transform(pos_tensor, normal_tensor)
-
-        # translation: (N, 3) or (3,) if single patch
-        # rotation_matrix: (N, 3, 3) or (3, 3) if single patch
-
-        # Handle single vs batch case
-        if translation.dim() == 1:  # Single patch case
-            translation = translation.unsqueeze(0)  # Shape: (1, 3)
-        if rotation_matrix.dim() == 2:  # Single patch case
-            rotation_matrix = rotation_matrix.unsqueeze(0)  # Shape: (1, 3, 3)
-
-        # Apply translation and rotation to positions
-        # Reshape for broadcasting: (N, k, 3) + (N, 1, 3) -> (N, k, 3)
-        pos_tensor = pos_tensor + translation.unsqueeze(1)
-
-        # Apply rotation: (N, k, 3) @ (N, 3, 3)^T -> (N, k, 3)
-        # Use batch matrix multiplication
-        pos_tensor = torch.bmm(pos_tensor, rotation_matrix.transpose(-1, -2))
-
-        # Transform normals using rotation matrix: (N, 3) @ (N, 3, 3)^T -> (N, 3)
-        normal_tensor = torch.bmm(normal_tensor.unsqueeze(1), rotation_matrix.transpose(-1, -2)).squeeze(1)
-
-        return pos_tensor.numpy(), normal_tensor.numpy()
-
-    def _apply_pose_transformation(self, patch_positions: np.ndarray, vertex_normals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Apply pose transformation to batch of patch positions and vertex normals.
+        Apply pose transformations sequentially to batch of patch positions and vertex normals.
 
         Args:
             patch_positions: Patch positions of shape (N, k, 3) - N patches with k neighbors each
@@ -312,36 +313,29 @@ class MeshDataset(Dataset):
         Returns:
             Tuple of (transformed_patch_positions, transformed_vertex_normals)
         """
-        if self._pose_transformer is None:
+        if not self._pose_transformers:
             return patch_positions, vertex_normals
 
         # Convert to tensors for pose transformation (preserve batch structure)
         pos_tensor = torch.from_numpy(patch_positions).float()  # Shape: (N, k, 3)
         normal_tensor = torch.from_numpy(vertex_normals).float()  # Shape: (N, 3)
 
-        # Apply pose transformation using the batch-aware transformer
-        # The pose transformer expects batched inputs
-        translation, rotation_matrix = self._pose_transformer.transform(pos_tensor, normal_tensor)
+        # Apply each pose transformer sequentially
+        for pose_transformer in self._pose_transformers:
+            translation, rotation_matrix = pose_transformer.transform(pos_tensor, normal_tensor)
 
-        # translation: (N, 3) or (3,) if single patch
-        # rotation_matrix: (N, 3, 3) or (3, 3) if single patch
+            # Handle single vs batch case
+            if translation.dim() == 1:
+                translation = translation.unsqueeze(0)
+            if rotation_matrix.dim() == 2:
+                rotation_matrix = rotation_matrix.unsqueeze(0)
 
-        # Handle single vs batch case
-        if translation.dim() == 1:  # Single patch case
-            translation = translation.unsqueeze(0)  # Shape: (1, 3)
-        if rotation_matrix.dim() == 2:  # Single patch case
-            rotation_matrix = rotation_matrix.unsqueeze(0)  # Shape: (1, 3, 3)
+            # Apply translation and rotation to positions
+            pos_tensor = pos_tensor + translation.unsqueeze(1)
+            pos_tensor = torch.bmm(pos_tensor, rotation_matrix.transpose(-1, -2))
 
-        # Apply translation and rotation to positions
-        # Reshape for broadcasting: (N, k, 3) + (N, 1, 3) -> (N, k, 3)
-        pos_tensor = pos_tensor + translation.unsqueeze(1)
-
-        # Apply rotation: (N, k, 3) @ (N, 3, 3)^T -> (N, k, 3)
-        # Use batch matrix multiplication
-        pos_tensor = torch.bmm(pos_tensor, rotation_matrix.transpose(-1, -2))
-
-        # Transform normals using rotation matrix: (N, 3) @ (N, 3, 3)^T -> (N, 3)
-        normal_tensor = torch.bmm(normal_tensor.unsqueeze(1), rotation_matrix.transpose(-1, -2)).squeeze(1)
+            # Transform normals for next transformer
+            normal_tensor = torch.bmm(normal_tensor.unsqueeze(1), rotation_matrix.transpose(-1, -2)).squeeze(1)
 
         return pos_tensor.numpy(), normal_tensor.numpy()
 
@@ -369,7 +363,9 @@ class MeshDataset(Dataset):
                 )
                 return features
             except Exception as e:
+                import traceback
                 print(f"Warning: Feature extraction failed, using positions as features: {e}")
+                traceback.print_exc()
                 return patch_positions
         else:
             # Fallback: use positions as features

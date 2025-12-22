@@ -15,7 +15,6 @@ plyfile
 polyscope
 robust-laplacian
 pymeshlab
-deltaconv
 pygeodesic
 siren-pytorch
 lightly
@@ -32,10 +31,4 @@ jupyterlab
 pandas
 meshio
 trimesh
-cmake
-lz4
-boost
-pybind11
-pytest
-torch-householder
 kornia

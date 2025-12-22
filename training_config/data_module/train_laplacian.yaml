@@ -16,19 +16,18 @@ module:
           num_points_range: [5, 30]
       feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
-          num_fourier_features: 128
-          use_fourier: False
       diff_geom_at_origin_only: True
+      include_origin_in_grid: False
+      flip_normal_if_negative_curvature: False
       conv_k_nearest: null
-      pose_transformer:
-        _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      pose_transformers:
+        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
       coeff_generation_method:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
         _args_: ['uniform']
       diff_geom_components:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
           _args_: ['mean_curvature']
-      flip_normal_if_negative_curvature: False
     batch_size: 250
     num_workers: 0
     shuffle: True
@@ -38,12 +37,11 @@ module:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
         mesh_folder_path: './assets/meshes'
         k: 10
+        num_eigenvalues: ${globals.num_eigenvalues}
         feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
-          num_fourier_features: 128
-          use_fourier: False
-        pose_transformer:
-          _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
-      batch_size: 1
+        pose_transformers:
+          - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      batch_size: 2
       num_workers: 0
       shuffle: False

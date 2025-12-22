@@ -5,3 +5,4 @@ wandb/
 *.ini
 local-laplacian-venv/
 checkpoints/
+.venvs/
