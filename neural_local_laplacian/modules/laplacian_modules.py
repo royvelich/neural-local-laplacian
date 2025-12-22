@@ -63,7 +63,11 @@ class LaplacianModuleBase(lightning.pytorch.LightningModule):
                 return True
             if 'wandb' in path:
                 return True
+            if 'checkpoints' in path:
+                return True
             if '.git' in path:
+                return True
+            if '.venvs' in path:
                 return True
 
             return False
@@ -116,6 +120,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  dim_feedforward: int = 2048,
                  dropout: float = 0.1,
                  num_eigenvalues: int = 10,
+                 normalize_loss_weights: bool = True,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -129,8 +134,12 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                 'num_losses': len(loss_configs),
                 'loss_types': [type(config.loss_module).__name__ for config in loss_configs],
                 'loss_weights': [config.weight for config in loss_configs],
-                'normalized_weights': [config.weight for config in self._normalize_loss_weights(loss_configs)]
+                'normalize_loss_weights': normalize_loss_weights
             }
+            if normalize_loss_weights:
+                self.hparams['loss_info']['normalized_weights'] = [
+                    config.weight for config in self._normalize_loss_weights(loss_configs)
+                ]
 
         # Validate input_dim
         if input_dim is None or input_dim <= 0:
@@ -140,8 +149,11 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._input_dim = input_dim
         self._num_eigenvalues = num_eigenvalues
 
-        # Normalize loss weights to sum to 1
-        self._loss_configs = self._normalize_loss_weights(loss_configs)
+        # Store loss configs (optionally normalized)
+        if normalize_loss_weights:
+            self._loss_configs = self._normalize_loss_weights(loss_configs)
+        else:
+            self._loss_configs = loss_configs
 
         # Input projection
         self.input_projection = nn.Linear(input_dim, d_model)
@@ -163,7 +175,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Output projection to scalar weights
         self.output_projection = nn.Linear(d_model, 1)
 
-    def _normalize_loss_weights(self, loss_configs: List['LossConfig']) -> List['LossConfig']:
+    def _normalize_loss_weights(self, loss_configs: List[LossConfig]) -> List[LossConfig]:
         """
         Normalize loss weights so they sum to 1.
 
@@ -422,7 +434,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
         # Target: H * nÌ‚ (mean curvature times unit normal at origin)
-        target_mean_curvature_vectors = 2 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
+        target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
         total_loss = 0.0
