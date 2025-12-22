@@ -16,9 +16,9 @@ logger:
 callbacks:
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: "./checkpoints"
-    filename: "model-{epoch:010d}-{ReconstructionLoss:.4f}"
+    filename: "model-{epoch:010d}"
     save_top_k: -1
-    every_n_epochs: 100
+    every_n_epochs: 2
     save_last: False
     verbose: False
     save_on_train_epoch_end: True
