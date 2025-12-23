@@ -509,7 +509,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Log validation metrics
         for metric_name, metric_value in averaged_metrics.items():
             self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True,
-                     logger=True, batch_size=len(mesh_list))
+                     logger=True, batch_size=len(mesh_list), sync_dist=True)
 
         return averaged_metrics
 
