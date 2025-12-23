@@ -179,34 +179,40 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Normalize loss weights so they sum to 1.
 
+        Loss configs with weight=None are kept as-is (logged but not included in backprop).
+
         Args:
             loss_configs: List of LossConfig objects
 
         Returns:
-            List of LossConfig objects with normalized weights
+            List of LossConfig objects with normalized weights (for non-None weights)
         """
         if not loss_configs:
             return loss_configs
 
-        # Calculate total weight
-        total_weight = sum(config.weight for config in loss_configs)
+        # Calculate total weight (only for non-None weights)
+        total_weight = sum(config.weight for config in loss_configs if config.weight is not None)
 
         if total_weight == 0:
-            raise ValueError("Total loss weights cannot be zero")
+            raise ValueError("Total loss weights cannot be zero (at least one loss must have a non-None weight)")
 
         # Create new configs with normalized weights
         normalized_configs = []
         for config in loss_configs:
-            normalized_weight = config.weight / total_weight
-            # Create a new LossConfig with normalized weight
-            normalized_config = LossConfig(
-                loss_module=config.loss_module,
-                weight=normalized_weight
-            )
-            normalized_configs.append(normalized_config)
+            if config.weight is None:
+                # Keep as-is for logging-only losses
+                normalized_configs.append(config)
+            else:
+                normalized_weight = config.weight / total_weight
+                # Create a new LossConfig with normalized weight
+                normalized_config = LossConfig(
+                    loss_module=config.loss_module,
+                    weight=normalized_weight
+                )
+                normalized_configs.append(normalized_config)
 
-        # Verify weights sum to 1 (within numerical precision)
-        total_normalized = sum(config.weight for config in normalized_configs)
+        # Verify non-None weights sum to 1 (within numerical precision)
+        total_normalized = sum(config.weight for config in normalized_configs if config.weight is not None)
         assert abs(total_normalized - 1.0) < 1e-6, f"Normalized weights sum to {total_normalized}, not 1.0"
 
         return normalized_configs
@@ -283,9 +289,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Compute predicted mean curvature vectors from token weights using fully vectorized operations.
 
-        This method computes Î”r = Î£áµ¢ wáµ¢ * páµ¢ for each patch, where:
-        - wáµ¢ are the learned token weights
-        - páµ¢ are the patch positions (centered at origin)
+        This method computes Delta_r = Sum_i w_i * p_i for each patch, where:
+        - w_i are the learned token weights
+        - p_i are the patch positions (centered at origin)
 
         Args:
             forward_result: Dictionary containing token_weights, attention_mask, and batch_sizes
@@ -334,7 +340,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Get valid positions
         valid_positions = positions[actual_position_indices]  # (num_valid, 3)
 
-        # Compute weighted positions: wáµ¢ * páµ¢
+        # Compute weighted positions: w_i * p_i
         weighted_positions = valid_weights.unsqueeze(-1) * valid_positions  # (num_valid, 3)
 
         # Sum weighted positions for each batch using scatter_add
@@ -433,7 +439,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         normals = batch_data.normal  # (batch_size, 3) - one normal per surface at origin
         mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
-        # Target: H * nÌ‚ (mean curvature times unit normal at origin)
+        # Target: H * n_hat (mean curvature times unit normal at origin)
         target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
@@ -445,17 +451,22 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             # Compute unweighted loss
             unweighted_loss = loss_config.loss_module(predicted_mean_curvature_vectors, target_mean_curvature_vectors)
 
-            # Compute weighted loss
-            weighted_loss = loss_config.weight * unweighted_loss
-            total_loss += weighted_loss
-
-            # Store both weighted and unweighted loss components for logging
+            # Store unweighted loss for logging
             loss_name = f"{loss_config.loss_module.__class__.__name__}"
-            loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
             loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
 
+            # Only add to total loss if weight is not None
+            if loss_config.weight is not None:
+                weighted_loss = loss_config.weight * unweighted_loss
+                total_loss = total_loss + weighted_loss  # This converts 0.0 to tensor on first add
+                loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
+
+        # Ensure total_loss is a tensor (at least one loss must have non-None weight)
+        if not isinstance(total_loss, torch.Tensor):
+            raise ValueError("At least one loss must have a non-None weight for training")
+
         # Log the total loss
-        self.log('train/loss', float(total_loss.item()), on_step=False, on_epoch=True, prog_bar=True,
+        self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True, prog_bar=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
