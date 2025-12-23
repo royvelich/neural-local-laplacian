@@ -451,11 +451,11 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
             # Store both weighted and unweighted loss components for logging
             loss_name = f"{loss_config.loss_module.__class__.__name__}"
-            loss_components_weighted[f"train_{loss_name}_weighted"] = weighted_loss
-            loss_components_unweighted[f"train_{loss_name}"] = unweighted_loss
+            loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
+            loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
 
         # Log the total loss
-        self.log('train_loss', float(total_loss.item()), on_step=False, on_epoch=True, prog_bar=True,
+        self.log('train/loss', float(total_loss.item()), on_step=False, on_epoch=True, prog_bar=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
@@ -508,7 +508,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # Log validation metrics
         for metric_name, metric_value in averaged_metrics.items():
-            self.log(f'val_{metric_name}', metric_value, on_step=False, on_epoch=True,
+            self.log(f'val/{metric_name}', metric_value, on_step=False, on_epoch=True,
                      logger=True, batch_size=len(mesh_list), sync_dist=True)
 
         return averaged_metrics
