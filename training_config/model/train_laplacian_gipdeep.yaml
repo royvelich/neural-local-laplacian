@@ -14,11 +14,11 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.VectorMSELoss
       weight: 1
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-#      weight: 10
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.MagnitudeMSELoss
-#      weight: 1
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: null
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.MagnitudeMSELoss
+      weight: null

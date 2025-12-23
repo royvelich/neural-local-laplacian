@@ -7,16 +7,19 @@ from dataclasses import dataclass
 
 @dataclass
 class LossConfig:
-    """Configuration for a loss module with its associated weight."""
+    """Configuration for a loss module with its associated weight.
+
+    If weight is None, the loss is computed and logged but not included in backprop.
+    """
     loss_module: nn.Module
-    weight: float
+    weight: Optional[float]
 
     def __post_init__(self):
         """Validate the loss configuration after initialization."""
         if not isinstance(self.loss_module, nn.Module):
             raise ValueError(f"loss_module must be a nn.Module, got {type(self.loss_module)}")
-        if not isinstance(self.weight, (int, float)) or self.weight < 0:
-            raise ValueError(f"weight must be a non-negative number, got {self.weight}")
+        if self.weight is not None and (not isinstance(self.weight, (int, float)) or self.weight < 0):
+            raise ValueError(f"weight must be None or a non-negative number, got {self.weight}")
 
 
 class VectorMSELoss(nn.Module):
