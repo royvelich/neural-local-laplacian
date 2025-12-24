@@ -5,7 +5,7 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
       seed: ${globals.training_seed}
-      epoch_size: 32000
+      epoch_size: 4000
       grid_radius_range: [1.0]
       grid_offset_range: [0.0]
       points_scale_range: [1.0]
@@ -28,7 +28,7 @@ module:
       diff_geom_at_origin_only: True
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
-    batch_size: 4000
+    batch_size: 1000
     num_workers: 2
     shuffle: True
   val_dataset_specifications:

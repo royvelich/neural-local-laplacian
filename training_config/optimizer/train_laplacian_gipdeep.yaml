@@ -1,3 +1,3 @@
 _target_: torch.optim.AdamW
 _partial_: true
-lr: 5e-4
+lr: 1e-4
