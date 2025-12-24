@@ -41,7 +41,7 @@ import trimesh
 from pyFM.mesh import TriMesh
 
 # neural laplacian
-from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, compute_laplacian_eigendecomposition
+from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, compute_laplacian_eigendecomposition
 from neural_local_laplacian.modules.losses import LossConfig
 
 
@@ -174,8 +174,18 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             num_layers=num_encoder_layers
         )
 
-        # Output projection
-        self.output_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
+        # Stiffness projection: per-token → scalar stiffness weight s_ij
+        self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
+
+        # Area head: aggregated features → scalar area A_i
+        # Uses mean pooling of token features followed by MLP
+        self.area_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+            nn.Softplus()  # Ensure positive area
+        )
 
     @staticmethod
     def _build_projection(in_dim: int, out_dim: int, hidden_dims: Optional[List[int]] = None) -> nn.Module:
@@ -315,36 +325,41 @@ class LaplacianTransformerModule(LaplacianModuleBase):
     def _compute_mean_curvature_vectors_vectorized(self, forward_result: Dict[str, torch.Tensor],
                                                    batch_data: Batch) -> torch.Tensor:
         """
-        Compute predicted mean curvature vectors from token weights using fully vectorized operations.
+        Compute predicted mean curvature vectors from stiffness weights and areas.
 
-        This method computes Delta_r = Sum_i w_i * p_i for each patch, where:
-        - w_i are the learned token weights
-        - p_i are the patch positions (centered at origin)
+        This method computes the mean curvature vector as:
+            mcv = (Sum_j s_ij * p_j) / A_i
+
+        where:
+        - s_ij are the learned stiffness weights
+        - p_j are the neighbor positions (centered at origin)
+        - A_i is the learned area for the center vertex
 
         Args:
-            forward_result: Dictionary containing token_weights, attention_mask, and batch_sizes
+            forward_result: Dictionary containing stiffness_weights, areas, attention_mask, and batch_sizes
             batch_data: PyTorch Geometric batch containing positions and batch indices
 
         Returns:
             predicted_mean_curvature_vectors: (batch_size, 3) tensor of predicted mean curvature vectors
         """
         # Extract results
-        token_weights = forward_result['token_weights']  # (batch_size, max_k)
+        stiffness_weights = forward_result['stiffness_weights']  # (batch_size, max_k)
+        areas = forward_result['areas']  # (batch_size,)
         attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
         batch_sizes = forward_result['batch_sizes']  # (batch_size,)
         batch_size = len(batch_sizes)
 
-        # Get positions and flatten token weights with attention mask
+        # Get positions and flatten stiffness weights with attention mask
         positions = batch_data.pos  # (total_points, 3)
 
-        # Apply attention mask to token weights (zero out padded positions)
-        masked_weights = token_weights.masked_fill(~attention_mask, 0.0)  # (batch_size, max_k)
+        # Apply attention mask to stiffness weights (zero out padded positions)
+        masked_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)  # (batch_size, max_k)
 
         # Flatten masked weights to match positions structure
         weights_flat = masked_weights.flatten()  # (batch_size * max_k,)
 
         # Create batch indices for flattened weights
-        batch_indices_weights = torch.arange(batch_size, device=token_weights.device).repeat_interleave(token_weights.shape[1])
+        batch_indices_weights = torch.arange(batch_size, device=stiffness_weights.device).repeat_interleave(stiffness_weights.shape[1])
 
         # Create position indices within each batch for mapping
         # This maps from flattened weight indices to actual position indices
@@ -352,10 +367,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         batch_starts = torch.cat([torch.zeros(1, device=batch_cumsum.device, dtype=batch_cumsum.dtype), batch_cumsum[:-1]])
 
         # Create position indices for each weight
-        position_indices = torch.arange(token_weights.shape[1], device=token_weights.device).repeat(batch_size)
+        position_indices = torch.arange(stiffness_weights.shape[1], device=stiffness_weights.device).repeat(batch_size)
 
         # Filter out indices that exceed actual batch sizes
-        valid_mask = position_indices < batch_sizes.repeat_interleave(token_weights.shape[1])
+        valid_mask = position_indices < batch_sizes.repeat_interleave(stiffness_weights.shape[1])
 
         # Get valid weights and their corresponding batch indices
         valid_weights = weights_flat[valid_mask]  # (num_valid,)
@@ -368,14 +383,18 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Get valid positions
         valid_positions = positions[actual_position_indices]  # (num_valid, 3)
 
-        # Compute weighted positions: w_i * p_i
+        # Compute weighted positions: s_ij * p_j
         weighted_positions = valid_weights.unsqueeze(-1) * valid_positions  # (num_valid, 3)
 
         # Sum weighted positions for each batch using scatter_add
-        predicted_mean_curvature_vectors = torch.zeros(batch_size, 3, device=token_weights.device)
-        predicted_mean_curvature_vectors.scatter_add_(0,
-                                                      valid_batch_indices.unsqueeze(-1).expand(-1, 3),
-                                                      weighted_positions)
+        # This gives Sum_j s_ij * p_j for each patch
+        stiffness_sum = torch.zeros(batch_size, 3, device=stiffness_weights.device)
+        stiffness_sum.scatter_add_(0,
+                                   valid_batch_indices.unsqueeze(-1).expand(-1, 3),
+                                   weighted_positions)
+
+        # Divide by area to get mean curvature vector: mcv = stiffness_sum / A_i
+        predicted_mean_curvature_vectors = stiffness_sum / areas.unsqueeze(-1)
 
         return predicted_mean_curvature_vectors
 
@@ -395,12 +414,15 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Forward pass supporting variable-sized patches.
 
+        Predicts both stiffness weights (per neighbor) and area (per patch center).
+
         Args:
             batch: PyTorch Geometric batch
 
         Returns:
             Dict containing:
-            - token_weights: (batch_size, max_k) - learned Laplacian weights (padded)
+            - stiffness_weights: (batch_size, max_k) - learned stiffness weights s_ij (padded)
+            - areas: (batch_size,) - learned area A_i for each patch center
             - attention_mask: (batch_size, max_k) - True for real tokens, False for padding
             - batch_sizes: (batch_size,) - actual number of points per patch
         """
@@ -426,18 +448,32 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Note: src_key_padding_mask expects True for positions to IGNORE
         encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=~attention_mask)
 
-        # Output projection to get scalar weights per token
-        token_weights = self.output_projection(encoded_features)  # (batch_size, max_k, 1)
-        token_weights = token_weights.squeeze(-1)  # (batch_size, max_k)
+        # === Stiffness weights (per token) ===
+        stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, max_k, 1)
+        stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, max_k)
 
-        # Apply softplus to ensure positive weights
-        token_weights = torch.exp(token_weights)
+        # Apply exp to ensure positive weights
+        stiffness_weights = torch.exp(stiffness_weights)
 
         # Mask out padded positions
-        token_weights = token_weights.masked_fill(~attention_mask, 0.0)
+        stiffness_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)
+
+        # === Area prediction (per patch) ===
+        # Mean pooling of encoded features (excluding padding)
+        # Create float mask for proper averaging
+        float_mask = attention_mask.float()  # (batch_size, max_k)
+        num_tokens = float_mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
+
+        # Masked mean: sum of (features * mask) / num_tokens
+        masked_features = encoded_features * float_mask.unsqueeze(-1)  # (batch_size, max_k, d_model)
+        pooled_features = masked_features.sum(dim=1) / num_tokens  # (batch_size, d_model)
+
+        # Area head outputs positive scalar per patch
+        areas = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
 
         return {
-            'token_weights': token_weights,
+            'stiffness_weights': stiffness_weights,
+            'areas': areas,
             'attention_mask': attention_mask,
             'batch_sizes': batch_sizes
         }
@@ -468,7 +504,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
         # Target: H * n_hat (mean curvature times unit normal at origin)
-        target_mean_curvature_vectors = 2 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
+        target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
         total_loss = 0.0
@@ -497,6 +533,11 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         cosine_sim = F.cosine_similarity(predicted_mean_curvature_vectors, target_mean_curvature_vectors, dim=1)
         avg_cosine_sim = cosine_sim.mean()
 
+        # Log area statistics (useful for monitoring the area head)
+        areas = forward_result['areas']
+        area_mean = areas.mean()
+        area_std = areas.std()
+
         # Log the total loss
         self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True, prog_bar=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
@@ -504,6 +545,12 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Log average cosine similarity
         self.log('train/cosine_similarity', avg_cosine_sim.item(), on_step=False, on_epoch=True,
                  prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Log area statistics
+        self.log('train/area_mean', area_mean.item(), on_step=False, on_epoch=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/area_std', area_std.item(), on_step=False, on_epoch=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
         for loss_name, loss_value in loss_components_unweighted.items():
@@ -564,6 +611,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Validate a single mesh by comparing predicted vs ground-truth eigendecomposition.
 
+        Uses the generalized eigenvalue problem S @ v = lambda * M @ v where:
+        - S is the symmetric stiffness matrix
+        - M is the diagonal mass matrix
+
         Args:
             mesh_data: PyTorch Geometric Data object for a single mesh
 
@@ -577,21 +628,24 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
         batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
 
-        # Assemble sparse Laplacian matrix from learned weights
-        laplacian_matrix = assemble_sparse_laplacian_variable(
-            weights=forward_result['token_weights'],
+        # Assemble separate stiffness and mass matrices
+        stiffness_matrix, mass_matrix = assemble_stiffness_and_mass_matrices(
+            stiffness_weights=forward_result['stiffness_weights'],
+            areas=forward_result['areas'],
             attention_mask=forward_result['attention_mask'],
             vertex_indices=mesh_batch.vertex_indices,
             center_indices=mesh_batch.center_indices,
             batch_indices=batch_indices
         )
 
-        # Store Laplacian matrix for callback (last mesh in batch)
-        self._last_laplacian_matrix = laplacian_matrix
+        # Store matrices for callback (last mesh in batch)
+        self._last_stiffness_matrix = stiffness_matrix
+        self._last_mass_matrix = mass_matrix
 
-        # Compute predicted eigendecomposition
+        # Compute predicted eigendecomposition using generalized eigenvalue problem
+        # S @ v = lambda * M @ v (matches how robust_laplacian computes GT)
         pred_eigenvalues, pred_eigenvectors = compute_laplacian_eigendecomposition(
-            laplacian_matrix, self._num_eigenvalues
+            stiffness_matrix, self._num_eigenvalues, mass_matrix=mass_matrix
         )
 
         # Get ground-truth eigendecomposition (stored as tuple to avoid PyG batching issues)

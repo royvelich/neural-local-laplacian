@@ -90,8 +90,8 @@ def normalize_mesh_vertices(vertices: np.ndarray) -> np.ndarray:
 
 
 def assemble_sparse_laplacian_variable(weights: torch.Tensor, attention_mask: torch.Tensor,
-                                     vertex_indices: torch.Tensor, center_indices: torch.Tensor,
-                                     batch_indices: torch.Tensor) -> scipy.sparse.csr_matrix:
+                                       vertex_indices: torch.Tensor, center_indices: torch.Tensor,
+                                       batch_indices: torch.Tensor) -> scipy.sparse.csr_matrix:
     """
     Assemble sparse Laplacian matrix from variable-sized patch weights using fully vectorized operations.
 
@@ -195,6 +195,140 @@ def assemble_sparse_laplacian_variable(weights: torch.Tensor, attention_mask: to
     return laplacian_csr
 
 
+def assemble_stiffness_and_mass_matrices(
+        stiffness_weights: torch.Tensor,
+        areas: torch.Tensor,
+        attention_mask: torch.Tensor,
+        vertex_indices: torch.Tensor,
+        center_indices: torch.Tensor,
+        batch_indices: torch.Tensor
+) -> Tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
+    """
+    Assemble separate stiffness and mass matrices from predicted weights and areas.
+
+    The stiffness matrix S is symmetric and contains the edge weights.
+    The mass matrix M is diagonal and contains the vertex areas.
+    Together they define the generalized eigenvalue problem: S @ v = lambda * M @ v
+
+    Args:
+        stiffness_weights: Stiffness weights of shape (num_patches, max_k)
+        areas: Predicted areas of shape (num_patches,)
+        attention_mask: Mask of shape (num_patches, max_k) - True for real tokens
+        vertex_indices: Neighbor vertex indices of shape (total_points,)
+        center_indices: Center vertex index for each patch, shape (num_patches,)
+        batch_indices: Batch indices of shape (total_points,)
+
+    Returns:
+        Tuple of (S, M):
+        - S: Symmetric stiffness matrix (N, N)
+        - M: Diagonal mass matrix (N, N)
+    """
+    # Get dimensions
+    num_patches = stiffness_weights.shape[0]
+    max_k = stiffness_weights.shape[1]
+    device = stiffness_weights.device
+
+    # Get number of vertices
+    num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
+
+    # Flatten weights and attention mask
+    weights_flat = stiffness_weights.flatten()  # (num_patches * max_k,)
+    attention_mask_flat = attention_mask.flatten()  # (num_patches * max_k,)
+
+    # Create patch indices for the flattened weights
+    patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)
+
+    # Filter out padded positions
+    valid_mask = attention_mask_flat
+    valid_weights = weights_flat[valid_mask]
+    valid_patch_indices = patch_indices_flat[valid_mask]
+
+    # Get center vertex for each valid weight
+    valid_center_vertices = center_indices[valid_patch_indices]
+
+    # Get cumulative sizes to find the start position of each patch in vertex_indices
+    batch_sizes = batch_indices.bincount(minlength=num_patches)
+    cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
+    starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
+
+    # Vectorized position calculation
+    unique_patches, counts = torch.unique_consecutive(valid_patch_indices, return_counts=True)
+    positions_in_patch = torch.cat([torch.arange(count, device=device) for count in counts])
+
+    # Get the actual vertex indices for valid weights
+    valid_neighbor_vertices = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
+
+    # === Build Stiffness Matrix S (symmetric) ===
+    # Each edge (i, j) gets contributions from both patches centered at i and j
+    # We average to ensure symmetry: S[i,j] = (s_ij + s_ji) / 2
+
+    # Center -> neighbor entries (negative off-diagonal)
+    center_to_neighbor_rows = valid_center_vertices
+    center_to_neighbor_cols = valid_neighbor_vertices
+    center_to_neighbor_weights = -valid_weights
+
+    # Neighbor -> center entries (symmetric contribution)
+    neighbor_to_center_rows = valid_neighbor_vertices
+    neighbor_to_center_cols = valid_center_vertices
+    neighbor_to_center_weights = -valid_weights
+
+    # Combine all entries
+    all_row_indices = torch.cat([center_to_neighbor_rows, neighbor_to_center_rows])
+    all_col_indices = torch.cat([center_to_neighbor_cols, neighbor_to_center_cols])
+    all_weights = torch.cat([center_to_neighbor_weights, neighbor_to_center_weights])
+
+    # Convert to numpy
+    all_row_indices_np = all_row_indices.detach().cpu().numpy()
+    all_col_indices_np = all_col_indices.detach().cpu().numpy()
+    all_weights_np = all_weights.detach().cpu().numpy()
+
+    # Create sparse stiffness matrix (off-diagonal entries)
+    stiffness_coo = scipy.sparse.coo_matrix(
+        (all_weights_np, (all_row_indices_np, all_col_indices_np)),
+        shape=(num_vertices, num_vertices)
+    )
+
+    # Sum duplicates and convert to CSR
+    stiffness_csr = stiffness_coo.tocsr()
+    stiffness_csr.sum_duplicates()
+
+    # Average symmetric entries: S = (S + S^T) / 2
+    stiffness_csr = 0.5 * (stiffness_csr + stiffness_csr.T)
+
+    # Set diagonal: S[i,i] = -sum of off-diagonal entries in row i
+    row_sums = np.array(stiffness_csr.sum(axis=1)).flatten()
+    diagonal_values = -row_sums
+    stiffness_csr.setdiag(diagonal_values)
+
+    # === Build Mass Matrix M (diagonal) ===
+    # M[i,i] = area of vertex i (from when vertex i was center)
+    center_indices_np = center_indices.detach().cpu().numpy()
+    areas_np = areas.detach().cpu().numpy()
+
+    # Each vertex should appear exactly once as a center
+    # If a vertex appears multiple times (shouldn't happen), we average
+    mass_diagonal = np.zeros(num_vertices)
+    mass_counts = np.zeros(num_vertices)
+
+    for center_idx, area in zip(center_indices_np, areas_np):
+        mass_diagonal[center_idx] += area
+        mass_counts[center_idx] += 1
+
+    # Average if vertex appeared multiple times (edge case)
+    nonzero_mask = mass_counts > 0
+    mass_diagonal[nonzero_mask] /= mass_counts[nonzero_mask]
+
+    # Handle vertices that were never centers (shouldn't happen in complete coverage)
+    # Set to small positive value to avoid singularity
+    zero_mask = mass_counts == 0
+    if np.any(zero_mask):
+        mass_diagonal[zero_mask] = 1e-6
+
+    mass_csr = scipy.sparse.diags(mass_diagonal, format='csr')
+
+    return stiffness_csr, mass_csr
+
+
 def split_results_by_nodes(results: torch.Tensor, batch: Batch) -> List[torch.Tensor]:
     return [results[batch.batch == i] for i in range(batch.num_graphs)]
 
@@ -219,6 +353,7 @@ def rebuild_batch_from_dictionary_of_lists(batch: Batch, property_dict: Dict[str
     for property_name, property_tensor_list in property_dict.items():
         batch = rebuild_batch_from_list(batch=batch, property_name=property_name, property_tensor_list=property_tensor_list)
     return batch
+
 
 def compute_laplacian_eigendecomposition(
         laplacian_matrix: scipy.sparse.spmatrix,
