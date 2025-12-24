@@ -468,7 +468,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
         # Target: H * n_hat (mean curvature times unit normal at origin)
-        target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
+        target_mean_curvature_vectors = 2 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
         total_loss = 0.0
