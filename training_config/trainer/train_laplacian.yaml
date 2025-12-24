@@ -5,7 +5,7 @@ accelerator: 'auto'
 strategy: 'auto'
 num_sanity_val_steps: 0
 log_every_n_steps: 1
-check_val_every_n_epoch: 100
+check_val_every_n_epoch: 5
 enable_progress_bar: True
 #logger: False
 logger:
@@ -18,7 +18,7 @@ callbacks:
     dirpath: "./checkpoints"
     filename: "model-{epoch:010d}-{ReconstructionLoss:.4f}"
     save_top_k: -1
-    every_n_epochs: 100
+    every_n_epochs: 5
     save_last: False
     verbose: False
     save_on_train_epoch_end: True

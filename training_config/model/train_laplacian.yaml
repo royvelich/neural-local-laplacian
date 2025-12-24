@@ -1,21 +1,22 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 256
-  nhead: 8
+  d_model: 64
+  nhead: 4
   num_encoder_layers: 6
-  dim_feedforward: 256
+  dim_feedforward: 128
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.0
+  normalize_loss_weights: False
   loss_configs:
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.VectorMSELoss
-      weight: 1
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-#      weight: 5
+#        _target_: neural_local_laplacian.modules.losses.VectorMSELoss
+#      weight: 1
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 1
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.MagnitudeMSELoss

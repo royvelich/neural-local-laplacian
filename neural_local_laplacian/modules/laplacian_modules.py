@@ -121,6 +121,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  dropout: float = 0.1,
                  num_eigenvalues: int = 10,
                  normalize_loss_weights: bool = True,
+                 input_projection_hidden_dims: Optional[List[int]] = None,
+                 output_projection_hidden_dims: Optional[List[int]] = None,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -155,8 +157,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         else:
             self._loss_configs = loss_configs
 
-        # Input projection
-        self.input_projection = nn.Linear(input_dim, d_model)
+        # Input and output projections
+        self.input_projection = self._build_projection(input_dim, d_model, input_projection_hidden_dims)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -172,8 +174,34 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             num_layers=num_encoder_layers
         )
 
-        # Output projection to scalar weights
-        self.output_projection = nn.Linear(d_model, 1)
+        # Output projection
+        self.output_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
+
+    @staticmethod
+    def _build_projection(in_dim: int, out_dim: int, hidden_dims: Optional[List[int]] = None) -> nn.Module:
+        """
+        Build a projection module: either single linear or MLP with hidden layers.
+
+        Args:
+            in_dim: Input dimension
+            out_dim: Output dimension
+            hidden_dims: Optional list of hidden layer dimensions. If None or empty, uses single linear.
+
+        Returns:
+            nn.Linear or nn.Sequential module
+        """
+        if hidden_dims is None or len(hidden_dims) == 0:
+            return nn.Linear(in_dim, out_dim)
+
+        layers = []
+        prev_dim = in_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, out_dim))
+        return nn.Sequential(*layers)
 
     def _normalize_loss_weights(self, loss_configs: List[LossConfig]) -> List[LossConfig]:
         """
@@ -465,9 +493,17 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         if not isinstance(total_loss, torch.Tensor):
             raise ValueError("At least one loss must have a non-None weight for training")
 
+        # Compute average cosine similarity between predicted and target mean curvature vectors
+        cosine_sim = F.cosine_similarity(predicted_mean_curvature_vectors, target_mean_curvature_vectors, dim=1)
+        avg_cosine_sim = cosine_sim.mean()
+
         # Log the total loss
         self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True, prog_bar=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Log average cosine similarity
+        self.log('train/cosine_similarity', avg_cosine_sim.item(), on_step=False, on_epoch=True,
+                 prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
         for loss_name, loss_value in loss_components_unweighted.items():
