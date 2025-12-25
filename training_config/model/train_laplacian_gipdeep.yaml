@@ -12,12 +12,15 @@ module:
   input_projection_hidden_dims: [32, 64, 128]
   output_projection_hidden_dims: [128, 64, 32]
   loss_configs:
-    - loss_module:
-        _target_: neural_local_laplacian.modules.losses.NormalDirectionCosineLoss
-      weight: 1.0
-#    - loss_module:
-#        _target_: neural_local_laplacian.modules.losses.NormalMagnitudeLoss
-#      weight: 1.0
-#    - loss_module:
-#        _target_: neural_local_laplacian.modules.losses.MeanCurvatureMSELoss
-#      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.VectorMSELoss
+#      weight: 1
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 1
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.MagnitudeMSELoss
+#      weight: 1
