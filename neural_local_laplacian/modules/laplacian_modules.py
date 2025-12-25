@@ -572,42 +572,13 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         target_normals = F.normalize(target_normals, p=2, dim=1)
 
         # === Compute losses using unified signature ===
-        if self._loss_configs:
-            total_loss = 0.0
-            loss_components_weighted = {}
-            loss_components_unweighted = {}
+        total_loss = 0.0
+        loss_components_weighted = {}
+        loss_components_unweighted = {}
 
-            for loss_config in self._loss_configs:
-                # All losses receive the same arguments (unified signature)
-                unweighted_loss = loss_config.loss_module(
-                    normal_weights=normal_weights,
-                    areas=areas,
-                    mean_curvatures=mean_curvatures,
-                    positions=positions,
-                    attention_mask=attention_mask,
-                    batch_sizes=batch_sizes,
-                    target_normals=target_normals,
-                    target_curvatures=target_curvatures
-                )
-                loss_name = f"{loss_config.loss_module.__class__.__name__}"
-                loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
-
-                if loss_config.weight is not None:
-                    weighted_loss = loss_config.weight * unweighted_loss
-                    total_loss = total_loss + weighted_loss
-                    loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
-
-            if not isinstance(total_loss, torch.Tensor):
-                raise ValueError("At least one loss must have a non-None weight for training")
-        else:
-            # Default: use NormalMSELoss and MeanCurvatureMSELoss with equal weighting
-            # Import here to avoid circular imports
-            from neural_local_laplacian.modules.losses import NormalMSELoss, MeanCurvatureMSELoss
-
-            normal_loss_fn = NormalMSELoss()
-            curvature_loss_fn = MeanCurvatureMSELoss()
-
-            normal_loss = normal_loss_fn(
+        for loss_config in self._loss_configs:
+            # All losses receive the same arguments (unified signature)
+            unweighted_loss = loss_config.loss_module(
                 normal_weights=normal_weights,
                 areas=areas,
                 mean_curvatures=mean_curvatures,
@@ -617,23 +588,16 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                 target_normals=target_normals,
                 target_curvatures=target_curvatures
             )
-            curvature_loss = curvature_loss_fn(
-                normal_weights=normal_weights,
-                areas=areas,
-                mean_curvatures=mean_curvatures,
-                positions=positions,
-                attention_mask=attention_mask,
-                batch_sizes=batch_sizes,
-                target_normals=target_normals,
-                target_curvatures=target_curvatures
-            )
+            loss_name = f"{loss_config.loss_module.__class__.__name__}"
+            loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
 
-            total_loss = 0.5 * normal_loss + 0.5 * curvature_loss
-            loss_components_unweighted = {
-                'train/NormalMSELoss': normal_loss,
-                'train/MeanCurvatureMSELoss': curvature_loss
-            }
-            loss_components_weighted = {}
+            if loss_config.weight is not None:
+                weighted_loss = loss_config.weight * unweighted_loss
+                total_loss = total_loss + weighted_loss
+                loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
+
+        if not isinstance(total_loss, torch.Tensor):
+            raise ValueError("At least one loss must have a non-None weight for training")
 
         # === Compute metrics for logging ===
         # Compute predictions for detailed logging
