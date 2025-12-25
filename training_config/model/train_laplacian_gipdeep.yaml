@@ -14,7 +14,7 @@ module:
   loss_configs:
     - loss_module:
         _target_: neural_local_laplacian.modules.losses.NormalMSELoss
-      weight: 1.0
+      weight: 20.0
     - loss_module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureMSELoss
       weight: 1.0
