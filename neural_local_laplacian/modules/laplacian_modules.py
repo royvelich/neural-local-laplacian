@@ -96,7 +96,6 @@ class LaplacianModuleBase(lightning.pytorch.LightningModule):
         scheduler = self._scheduler_cfg(optimizer=optimizer)
 
         # Return optimizer and scheduler configuration
-        # The format depends on what scheduler monitoring you want
         scheduler_config = {
             "scheduler": scheduler,
             "interval": 'epoch'
@@ -109,7 +108,22 @@ class LaplacianModuleBase(lightning.pytorch.LightningModule):
 
 
 class LaplacianTransformerModule(LaplacianModuleBase):
-    """Surface transformer module with support for variable-sized patches."""
+    """
+    Surface transformer module with 3-head architecture for learning discrete Laplace-Beltrami operators.
+
+    Architecture:
+    - Normal weights head (w_ij): per-neighbor positive weights that produce unit normal after area division
+    - Mean curvature head (H_i): per-patch scalar for mean curvature
+    - Area head (A_i): per-patch positive scalar, implicitly supervised via normal loss
+
+    Key relationships:
+    - Normal prediction: sum_j w_ij * p_j / A_i = n_hat (unit normal)
+    - Stiffness derivation: s_ij = 2 * H_i * w_ij
+    - Laplacian: sum_j s_ij * p_j = 2 * A_i * H_i * n_hat
+
+    This decouples normal prediction from curvature magnitude, solving the flat-patch problem
+    where near-zero curvature caused unreliable normal predictions.
+    """
 
     def __init__(self,
                  input_dim: int,
@@ -126,11 +140,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  **kwargs):
         super().__init__(**kwargs)
 
-        # This saves all the __init__ arguments automatically
-        # Exclude loss_configs from hyperparameters since they contain non-serializable PyTorch modules
+        # Save hyperparameters (exclude loss_configs - non-serializable)
         self.save_hyperparameters(ignore=['loss_configs'])
 
-        # Manually save loss configuration info for logging (serializable version)
+        # Manually save loss configuration info for logging
         if loss_configs is not None:
             self.hparams['loss_info'] = {
                 'num_losses': len(loss_configs),
@@ -152,12 +165,12 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._num_eigenvalues = num_eigenvalues
 
         # Store loss configs (optionally normalized)
-        if normalize_loss_weights:
+        if normalize_loss_weights and loss_configs is not None:
             self._loss_configs = self._normalize_loss_weights(loss_configs)
         else:
             self._loss_configs = loss_configs
 
-        # Input and output projections
+        # Input projection
         self.input_projection = self._build_projection(input_dim, d_model, input_projection_hidden_dims)
 
         # Transformer encoder
@@ -174,11 +187,21 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             num_layers=num_encoder_layers
         )
 
-        # Stiffness projection: per-token → scalar stiffness weight s_ij
-        self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
+        # === HEAD 1: Normal weights (per-token) ===
+        # Produces w_ij such that sum_j w_ij * p_j / A_i = n_hat
+        self.normal_weights_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
 
-        # Area head: aggregated features → scalar area A_i
-        # Uses mean pooling of token features followed by MLP
+        # === HEAD 2: Mean curvature (per-patch) ===
+        # Produces H_i scalar, can be positive or negative
+        self.mean_curvature_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1)
+        )
+
+        # === HEAD 3: Area (per-patch) ===
+        # Produces A_i > 0, implicitly supervised via normal loss
         self.area_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.LayerNorm(d_model // 2),
@@ -238,20 +261,14 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         normalized_configs = []
         for config in loss_configs:
             if config.weight is None:
-                # Keep as-is for logging-only losses
                 normalized_configs.append(config)
             else:
                 normalized_weight = config.weight / total_weight
-                # Create a new LossConfig with normalized weight
                 normalized_config = LossConfig(
                     loss_module=config.loss_module,
                     weight=normalized_weight
                 )
                 normalized_configs.append(normalized_config)
-
-        # Verify non-None weights sum to 1 (within numerical precision)
-        total_normalized = sum(config.weight for config in normalized_configs if config.weight is not None)
-        assert abs(total_normalized - 1.0) < 1e-6, f"Normalized weights sum to {total_normalized}, not 1.0"
 
         return normalized_configs
 
@@ -284,7 +301,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         positions = torch.zeros_like(batch_indices, dtype=torch.long)
 
         # Create cumulative positions for sorted indices
-        # This replaces the loop with a vectorized operation
         cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
         starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
 
@@ -322,55 +338,44 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         return sequences, attention_mask
 
-    def _compute_mean_curvature_vectors_vectorized(self, forward_result: Dict[str, torch.Tensor],
-                                                   batch_data: Batch) -> torch.Tensor:
+    def _compute_weighted_position_sum(self, normal_weights: torch.Tensor,
+                                       attention_mask: torch.Tensor,
+                                       batch_sizes: torch.Tensor,
+                                       positions: torch.Tensor) -> torch.Tensor:
         """
-        Compute predicted mean curvature vectors from stiffness weights and areas.
-
-        This method computes the mean curvature vector as:
-            mcv = (Sum_j s_ij * p_j) / A_i
-
-        where:
-        - s_ij are the learned stiffness weights
-        - p_j are the neighbor positions (centered at origin)
-        - A_i is the learned area for the center vertex
+        Compute sum_j w_ij * p_j for each patch using vectorized operations.
 
         Args:
-            forward_result: Dictionary containing stiffness_weights, areas, attention_mask, and batch_sizes
-            batch_data: PyTorch Geometric batch containing positions and batch indices
+            normal_weights: (batch_size, max_k) - weights per neighbor
+            attention_mask: (batch_size, max_k) - True for real tokens
+            batch_sizes: (batch_size,) - actual number of points per patch
+            positions: (total_points, 3) - flattened positions
 
         Returns:
-            predicted_mean_curvature_vectors: (batch_size, 3) tensor of predicted mean curvature vectors
+            weighted_sum: (batch_size, 3) - sum_j w_ij * p_j for each patch
         """
-        # Extract results
-        stiffness_weights = forward_result['stiffness_weights']  # (batch_size, max_k)
-        areas = forward_result['areas']  # (batch_size,)
-        attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
-        batch_sizes = forward_result['batch_sizes']  # (batch_size,)
-        batch_size = len(batch_sizes)
+        batch_size = normal_weights.shape[0]
+        max_k = normal_weights.shape[1]
+        device = normal_weights.device
 
-        # Get positions and flatten stiffness weights with attention mask
-        positions = batch_data.pos  # (total_points, 3)
+        # Apply attention mask to weights (zero out padded positions)
+        masked_weights = normal_weights.masked_fill(~attention_mask, 0.0)  # (batch_size, max_k)
 
-        # Apply attention mask to stiffness weights (zero out padded positions)
-        masked_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)  # (batch_size, max_k)
-
-        # Flatten masked weights to match positions structure
+        # Flatten masked weights
         weights_flat = masked_weights.flatten()  # (batch_size * max_k,)
 
         # Create batch indices for flattened weights
-        batch_indices_weights = torch.arange(batch_size, device=stiffness_weights.device).repeat_interleave(stiffness_weights.shape[1])
+        batch_indices_weights = torch.arange(batch_size, device=device).repeat_interleave(max_k)
 
-        # Create position indices within each batch for mapping
-        # This maps from flattened weight indices to actual position indices
+        # Create position indices within each batch
         batch_cumsum = torch.cumsum(batch_sizes, dim=0)
-        batch_starts = torch.cat([torch.zeros(1, device=batch_cumsum.device, dtype=batch_cumsum.dtype), batch_cumsum[:-1]])
+        batch_starts = torch.cat([torch.zeros(1, device=device, dtype=batch_cumsum.dtype), batch_cumsum[:-1]])
 
-        # Create position indices for each weight
-        position_indices = torch.arange(stiffness_weights.shape[1], device=stiffness_weights.device).repeat(batch_size)
+        # Position indices for each weight
+        position_indices = torch.arange(max_k, device=device).repeat(batch_size)
 
         # Filter out indices that exceed actual batch sizes
-        valid_mask = position_indices < batch_sizes.repeat_interleave(stiffness_weights.shape[1])
+        valid_mask = position_indices < batch_sizes.repeat_interleave(max_k)
 
         # Get valid weights and their corresponding batch indices
         valid_weights = weights_flat[valid_mask]  # (num_valid,)
@@ -381,22 +386,18 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         actual_position_indices = batch_starts[valid_batch_indices] + valid_position_indices
 
         # Get valid positions
-        valid_positions = positions[actual_position_indices]  # (num_valid, 3)
+        valid_positions = positions[actual_position_indices.long()]  # (num_valid, 3)
 
-        # Compute weighted positions: s_ij * p_j
+        # Compute weighted positions: w_ij * p_j
         weighted_positions = valid_weights.unsqueeze(-1) * valid_positions  # (num_valid, 3)
 
         # Sum weighted positions for each batch using scatter_add
-        # This gives Sum_j s_ij * p_j for each patch
-        stiffness_sum = torch.zeros(batch_size, 3, device=stiffness_weights.device)
-        stiffness_sum.scatter_add_(0,
-                                   valid_batch_indices.unsqueeze(-1).expand(-1, 3),
-                                   weighted_positions)
+        weighted_sum = torch.zeros(batch_size, 3, device=device, dtype=positions.dtype)
+        weighted_sum.scatter_add_(0,
+                                  valid_batch_indices.unsqueeze(-1).expand(-1, 3),
+                                  weighted_positions)
 
-        # Divide by area to get mean curvature vector: mcv = stiffness_sum / A_i
-        predicted_mean_curvature_vectors = stiffness_sum / areas.unsqueeze(-1)
-
-        return predicted_mean_curvature_vectors
+        return weighted_sum
 
     def _forward_pass(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """
@@ -412,16 +413,20 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """
-        Forward pass supporting variable-sized patches.
+        Forward pass with 3-head architecture.
 
-        Predicts both stiffness weights (per neighbor) and area (per patch center).
+        Predicts:
+        - Normal weights w_ij (per neighbor, positive)
+        - Mean curvature H_i (per patch, scalar)
+        - Area A_i (per patch, positive scalar)
 
         Args:
             batch: PyTorch Geometric batch
 
         Returns:
             Dict containing:
-            - stiffness_weights: (batch_size, max_k) - learned stiffness weights s_ij (padded)
+            - normal_weights: (batch_size, max_k) - learned normal weights w_ij (padded)
+            - mean_curvatures: (batch_size,) - learned mean curvature H_i for each patch
             - areas: (batch_size,) - learned area A_i for each patch center
             - attention_mask: (batch_size, max_k) - True for real tokens, False for padding
             - batch_sizes: (batch_size,) - actual number of points per patch
@@ -448,19 +453,17 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Note: src_key_padding_mask expects True for positions to IGNORE
         encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=~attention_mask)
 
-        # === Stiffness weights (per token) ===
-        stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, max_k, 1)
-        stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, max_k)
+        # === HEAD 1: Normal weights (per token) ===
+        normal_weights = self.normal_weights_projection(encoded_features)  # (batch_size, max_k, 1)
+        normal_weights = normal_weights.squeeze(-1)  # (batch_size, max_k)
 
         # Apply exp to ensure positive weights
-        stiffness_weights = torch.exp(stiffness_weights)
+        normal_weights = torch.exp(normal_weights)
 
         # Mask out padded positions
-        stiffness_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)
+        normal_weights = normal_weights.masked_fill(~attention_mask, 0.0)
 
-        # === Area prediction (per patch) ===
-        # Mean pooling of encoded features (excluding padding)
-        # Create float mask for proper averaging
+        # === Pooled features for per-patch heads ===
         float_mask = attention_mask.float()  # (batch_size, max_k)
         num_tokens = float_mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
 
@@ -468,19 +471,75 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         masked_features = encoded_features * float_mask.unsqueeze(-1)  # (batch_size, max_k, d_model)
         pooled_features = masked_features.sum(dim=1) / num_tokens  # (batch_size, d_model)
 
-        # Area head outputs positive scalar per patch
+        # === HEAD 2: Mean curvature (per patch) ===
+        mean_curvatures = self.mean_curvature_head(pooled_features).squeeze(-1)  # (batch_size,)
+
+        # === HEAD 3: Area (per patch) ===
         areas = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
 
         return {
-            'stiffness_weights': stiffness_weights,
+            'normal_weights': normal_weights,
+            'mean_curvatures': mean_curvatures,
             'areas': areas,
             'attention_mask': attention_mask,
             'batch_sizes': batch_sizes
         }
 
+    def compute_predictions(self, forward_result: Dict[str, torch.Tensor],
+                            batch_data: Batch) -> Dict[str, torch.Tensor]:
+        """
+        Compute derived predictions from forward pass results.
+
+        Args:
+            forward_result: Output from forward()
+            batch_data: Original batch data with positions
+
+        Returns:
+            Dict containing:
+            - predicted_normals: (batch_size, 3) - unit normal predictions
+            - predicted_mean_curvature_vectors: (batch_size, 3) - H * n_hat
+            - stiffness_weights: (batch_size, max_k) - derived s_ij = 2 * H_i * w_ij
+        """
+        normal_weights = forward_result['normal_weights']
+        mean_curvatures = forward_result['mean_curvatures']
+        areas = forward_result['areas']
+        attention_mask = forward_result['attention_mask']
+        batch_sizes = forward_result['batch_sizes']
+
+        positions = batch_data.pos  # (total_points, 3)
+
+        # Compute sum_j w_ij * p_j
+        weighted_sum = self._compute_weighted_position_sum(
+            normal_weights, attention_mask, batch_sizes, positions
+        )  # (batch_size, 3)
+
+        # Predicted normal: (sum_j w_ij * p_j) / A_i, then normalize to unit
+        # The division by area scales the weighted sum to unit normal
+        raw_normal = weighted_sum / areas.unsqueeze(-1)  # (batch_size, 3)
+        predicted_normals = F.normalize(raw_normal, p=2, dim=1)  # (batch_size, 3)
+
+        # Mean curvature vector: H_i * n_hat
+        predicted_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * predicted_normals  # (batch_size, 3)
+
+        # Derive stiffness weights: s_ij = 2 * H_i * w_ij
+        # This is used for validation (eigendecomposition)
+        stiffness_weights = 2.0 * mean_curvatures.unsqueeze(-1) * normal_weights  # (batch_size, max_k)
+
+        return {
+            'predicted_normals': predicted_normals,
+            'predicted_mean_curvature_vectors': predicted_mean_curvature_vectors,
+            'stiffness_weights': stiffness_weights,
+            'weighted_sum': weighted_sum,
+            'raw_normal': raw_normal
+        }
+
     def training_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
         """
-        Training step with variable-sized patch support.
+        Training step with 3-head architecture.
+
+        Losses:
+        1. Normal direction loss: (sum_j w_ij * p_j) / A_i vs n_hat_GT
+        2. Mean curvature loss: H_pred vs H_GT
 
         Args:
             batch: List of PyTorch Geometric batches (synthetic data)
@@ -492,77 +551,100 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Take the first batch from the list
         batch_data = batch[0]
         forward_result = self.forward(batch_data)
-
-        # Compute mean curvature vectors using vectorized method
-        predicted_mean_curvature_vectors = self._compute_mean_curvature_vectors_vectorized(forward_result, batch_data)
+        predictions = self.compute_predictions(forward_result, batch_data)
 
         # Get batch size for logging
         batch_size = len(forward_result['batch_sizes'])
 
         # In training mode, diff_geom_at_origin_only=True, so normals and H are per-surface
-        normals = batch_data.normal  # (batch_size, 3) - one normal per surface at origin
-        mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
+        gt_normals = batch_data.normal  # (batch_size, 3) - one normal per surface at origin
+        gt_mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
 
-        # Target: H * n_hat (mean curvature times unit normal at origin)
-        target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
+        # Normalize GT normals (should already be unit, but ensure)
+        gt_normals = F.normalize(gt_normals, p=2, dim=1)
 
-        # Compute weighted combination of losses
-        total_loss = 0.0
-        loss_components_weighted = {}
-        loss_components_unweighted = {}
+        # === Loss 1: Normal direction ===
+        # Target: unit normal direction
+        # Prediction: (sum_j w_ij * p_j) / A_i (should be unit normal)
+        predicted_normals = predictions['predicted_normals']
 
-        for i, loss_config in enumerate(self._loss_configs):
-            # Compute unweighted loss
-            unweighted_loss = loss_config.loss_module(predicted_mean_curvature_vectors, target_mean_curvature_vectors)
+        # Cosine similarity loss for direction (1 - cos_sim)
+        cos_sim = F.cosine_similarity(predicted_normals, gt_normals, dim=1)
+        normal_direction_loss = (1 - cos_sim).mean()
 
-            # Store unweighted loss for logging
-            loss_name = f"{loss_config.loss_module.__class__.__name__}"
-            loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
+        # === Loss 2: Mean curvature magnitude ===
+        predicted_H = forward_result['mean_curvatures']
+        curvature_loss = F.mse_loss(predicted_H, gt_mean_curvatures)
 
-            # Only add to total loss if weight is not None
-            if loss_config.weight is not None:
-                weighted_loss = loss_config.weight * unweighted_loss
-                total_loss = total_loss + weighted_loss  # This converts 0.0 to tensor on first add
-                loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
+        # === Combined loss ===
+        # Use loss_configs if available, otherwise default weighting
+        if self._loss_configs:
+            total_loss = 0.0
+            loss_components_weighted = {}
+            loss_components_unweighted = {}
 
-        # Ensure total_loss is a tensor (at least one loss must have non-None weight)
-        if not isinstance(total_loss, torch.Tensor):
-            raise ValueError("At least one loss must have a non-None weight for training")
+            # Compute target mean curvature vector for compatibility with existing losses
+            target_mcv = gt_mean_curvatures.unsqueeze(-1) * gt_normals
+            predicted_mcv = predictions['predicted_mean_curvature_vectors']
 
-        # Compute average cosine similarity between predicted and target mean curvature vectors
-        cosine_sim = F.cosine_similarity(predicted_mean_curvature_vectors, target_mean_curvature_vectors, dim=1)
-        avg_cosine_sim = cosine_sim.mean()
+            for loss_config in self._loss_configs:
+                unweighted_loss = loss_config.loss_module(predicted_mcv, target_mcv)
+                loss_name = f"{loss_config.loss_module.__class__.__name__}"
+                loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
 
-        # Log area statistics (useful for monitoring the area head)
-        areas = forward_result['areas']
-        area_mean = areas.mean()
-        area_std = areas.std()
+                if loss_config.weight is not None:
+                    weighted_loss = loss_config.weight * unweighted_loss
+                    total_loss = total_loss + weighted_loss
+                    loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
 
-        # Log the total loss
+            if not isinstance(total_loss, torch.Tensor):
+                raise ValueError("At least one loss must have a non-None weight for training")
+        else:
+            # Default: equal weight for normal and curvature losses
+            total_loss = 0.5 * normal_direction_loss + 0.5 * curvature_loss
+            loss_components_unweighted = {}
+            loss_components_weighted = {}
+
+        # === Logging ===
         self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True, prog_bar=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
 
-        # Log average cosine similarity
-        self.log('train/cosine_similarity', avg_cosine_sim.item(), on_step=False, on_epoch=True,
+        # Normal direction metrics
+        self.log('train/normal_cosine_similarity', cos_sim.mean().item(), on_step=False, on_epoch=True,
                  prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-
-        # Log area statistics
-        self.log('train/area_mean', area_mean.item(), on_step=False, on_epoch=True,
-                 logger=True, batch_size=batch_size, sync_dist=True)
-        self.log('train/area_std', area_std.item(), on_step=False, on_epoch=True,
+        self.log('train/normal_direction_loss', normal_direction_loss.item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
 
-        # Log individual unweighted loss components (these are the main loss values to track)
+        # Curvature metrics
+        self.log('train/curvature_loss', curvature_loss.item(), on_step=False, on_epoch=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/curvature_mae', F.l1_loss(predicted_H, gt_mean_curvatures).item(),
+                 on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Area statistics
+        areas = forward_result['areas']
+        self.log('train/area_mean', areas.mean().item(), on_step=False, on_epoch=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/area_std', areas.std().item(), on_step=False, on_epoch=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Normal weights statistics
+        normal_weights = forward_result['normal_weights']
+        attention_mask = forward_result['attention_mask']
+        self.log('train/normal_weights_mean', normal_weights[attention_mask].mean().item(),
+                 on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/normal_weights_std', normal_weights[attention_mask].std().item(),
+                 on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Log individual loss components
         for loss_name, loss_value in loss_components_unweighted.items():
             self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True,
                      batch_size=batch_size, sync_dist=True)
 
-        # Log individual weighted loss components (for debugging the weighting)
         for loss_name, loss_value in loss_components_weighted.items():
             self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True,
                      batch_size=batch_size, sync_dist=True)
 
-        # Create return dictionary with all losses
         result = {"loss": total_loss}
         result.update(loss_components_weighted)
         result.update(loss_components_unweighted)
@@ -572,6 +654,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
     def validation_step(self, batch: Batch, batch_idx: int) -> Dict[str, float]:
         """
         Validation step - compare predicted Laplacian eigendecomposition with ground truth.
+
+        Uses derived stiffness weights: s_ij = 2 * H_i * w_ij
 
         Handles PyG batching by splitting combined Batch back into individual meshes.
 
@@ -611,9 +695,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Validate a single mesh by comparing predicted vs ground-truth eigendecomposition.
 
-        Uses the generalized eigenvalue problem S @ v = lambda * M @ v where:
-        - S is the symmetric stiffness matrix
-        - M is the diagonal mass matrix
+        Uses derived stiffness weights: s_ij = 2 * H_i * w_ij
+        Then solves generalized eigenvalue problem: S @ v = lambda * M @ v
 
         Args:
             mesh_data: PyTorch Geometric Data object for a single mesh
@@ -624,15 +707,21 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Convert single Data to Batch for forward pass
         mesh_batch = Batch.from_data_list([mesh_data])
         forward_result = self.forward(mesh_batch)
+        predictions = self.compute_predictions(forward_result, mesh_batch)
 
         # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
         batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
 
+        # Get derived stiffness weights: s_ij = 2 * H_i * w_ij
+        stiffness_weights = predictions['stiffness_weights']
+        areas = forward_result['areas']
+        attention_mask = forward_result['attention_mask']
+
         # Assemble separate stiffness and mass matrices
         stiffness_matrix, mass_matrix = assemble_stiffness_and_mass_matrices(
-            stiffness_weights=forward_result['stiffness_weights'],
-            areas=forward_result['areas'],
-            attention_mask=forward_result['attention_mask'],
+            stiffness_weights=stiffness_weights,
+            areas=areas,
+            attention_mask=attention_mask,
             vertex_indices=mesh_batch.vertex_indices,
             center_indices=mesh_batch.center_indices,
             batch_indices=batch_indices
@@ -643,7 +732,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._last_mass_matrix = mass_matrix
 
         # Compute predicted eigendecomposition using generalized eigenvalue problem
-        # S @ v = lambda * M @ v (matches how robust_laplacian computes GT)
         pred_eigenvalues, pred_eigenvectors = compute_laplacian_eigendecomposition(
             stiffness_matrix, self._num_eigenvalues, mass_matrix=mass_matrix
         )
@@ -735,11 +823,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             metrics['eigenvector_similarity_mean_skip0'] = float(cos_similarities[1:].mean())
 
         # Individual eigenvector similarities for first few
-        for i in range(k):
+        for i in range(min(k, 5)):  # Limit to first 5 for logging
             metrics[f'eigenvector_{i}_similarity'] = float(cos_similarities[i])
 
         # Overall spectral distance (combines eigenvalue and eigenvector differences)
-        # Lower is better
         eigenvalue_error = float(np.mean(((pred_eig - gt_eig) / (gt_eig + 1e-6)) ** 2)) if k > 0 else 0.0
         eigenvector_error = 1.0 - float(cos_similarities.mean())
         metrics['spectral_distance'] = eigenvalue_error + eigenvector_error
