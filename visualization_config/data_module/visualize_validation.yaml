@@ -5,12 +5,11 @@ val_dataset_specifications:
     dataset:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
       mesh_folder_path: './assets/meshes'
-      k: 20
+      k: 70
       feature_extractor:
         _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
-        num_fourier_features: 128
-        use_fourier: False
-      pose_transformer: null
+      pose_transformers:
+        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
     batch_size: 1
     num_workers: 0
     shuffle: False

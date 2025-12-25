@@ -103,7 +103,7 @@ def to_numpy(tensor: torch.Tensor) -> np.ndarray:
 
 def load_trained_model(ckpt_path: Path, device: torch.device) -> LaplacianTransformerModule:
     """
-    Load trained SurfaceTransformerModule from checkpoint.
+    Load trained LaplacianTransformerModule from checkpoint.
 
     Args:
         ckpt_path: Path to the checkpoint file
@@ -122,18 +122,11 @@ def load_trained_model(ckpt_path: Path, device: torch.device) -> LaplacianTransf
     try:
         print(f"Loading model checkpoint from: {ckpt_path}")
 
-        # Load model from checkpoint
+        # Load model from checkpoint - hyperparameters are saved automatically via save_hyperparameters()
         model = LaplacianTransformerModule.load_from_checkpoint(
             str(ckpt_path),
-            input_dim=3,
-            d_model=256,
-            nhead=8,
-            num_encoder_layers=4,
-            dim_feedforward=256,
-            num_eigenvalues=50,
-            dropout=0,
-            optimizer_cfg=None,
-            loss_configs=[])
+            map_location=device,
+        )
 
         model.eval()
         model.to(device)
@@ -174,43 +167,57 @@ def predict_normal_from_patch(model: LaplacianTransformerModule,
                               surface_data: Data,
                               device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Use trained model to predict normal at center using learned weights.
-    Mimics the validation step logic from SurfaceTransformerModule.
+    Use trained model to predict mean curvature vector and normal at center.
+
+    The mean curvature vector is computed as:
+        mcv = (Sum_j s_ij * p_j) / A_i
+
+    where:
+    - s_ij are the learned stiffness weights
+    - p_j are the neighbor positions (centered at origin)
+    - A_i is the learned area for the center vertex
 
     Args:
-        model: Trained SurfaceTransformerModule in eval mode
+        model: Trained LaplacianTransformerModule in eval mode
         surface_data: Single surface patch Data object
         device: Device for computation
 
     Returns:
-        Tuple of (predicted_normal, token_weights, predicted_laplacian)
+        Tuple of (predicted_normal, stiffness_weights, predicted_mean_curvature_vector)
         - predicted_normal: Normalized predicted normal vector (3,)
-        - token_weights: Raw learned weights for visualization (num_points,)
-        - predicted_laplacian: Raw Laplacian vector before normalization (3,)
+        - stiffness_weights: Raw learned stiffness weights for visualization (num_points,)
+        - predicted_mean_curvature_vector: Raw mean curvature vector before normalization (3,)
     """
     with torch.no_grad():
         # Prepare batch for model
         batch = prepare_surface_for_model(surface_data, device)
 
-        # Forward pass to get token weights (NEW: returns dict with attention_mask)
+        # Forward pass to get stiffness weights and areas
         forward_result = model.forward(batch)
-        token_weights = forward_result['token_weights']  # Shape: (1, num_points)
-        attention_mask = forward_result['attention_mask']  # Shape: (1, num_points)
+        stiffness_weights = forward_result['stiffness_weights']  # Shape: (1, max_k)
+        areas = forward_result['areas']  # Shape: (1,)
+        attention_mask = forward_result['attention_mask']  # Shape: (1, max_k)
 
-        # Apply attention mask (for synthetic surfaces, should be all True anyway)
-        token_weights = token_weights.masked_fill(~attention_mask, 0.0)
+        # Apply attention mask (zero out padded positions)
+        stiffness_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)
 
-        # Extract positions and reshape for computation
-        positions = batch.pos.view(1, -1, 3)  # Shape: (1, num_points, 3)
+        # Extract positions
+        positions = batch.pos  # Shape: (num_points, 3)
+        num_points = positions.shape[0]
 
-        # Apply Laplace-Beltrami operator: Delta_r = sum_i w_i * p_i
-        # Since center point is at origin, we don't need to subtract center coordinates
-        predicted_laplacian = torch.sum(token_weights.unsqueeze(-1) * positions, dim=1)  # Shape: (1, 3)
+        # Get valid stiffness weights (handle case where max_k might differ from num_points)
+        weights = stiffness_weights[0, :num_points]  # Shape: (num_points,)
+
+        # Compute weighted sum of positions: Sum_j s_ij * p_j
+        stiffness_sum = (weights.unsqueeze(-1) * positions).sum(dim=0)  # Shape: (3,)
+
+        # Divide by area to get mean curvature vector: mcv = stiffness_sum / A_i
+        predicted_mean_curvature_vector = stiffness_sum / areas[0]  # Shape: (3,)
 
         # Normalize to get predicted normal direction
-        predicted_normal = F.normalize(predicted_laplacian, p=2, dim=1)  # Shape: (1, 3)
+        predicted_normal = F.normalize(predicted_mean_curvature_vector.unsqueeze(0), p=2, dim=1).squeeze(0)  # Shape: (3,)
 
-        return predicted_normal.squeeze(0), token_weights.squeeze(0), predicted_laplacian.squeeze(0)
+        return predicted_normal, weights, predicted_mean_curvature_vector
 
 
 def visualize_patch(points: np.ndarray, faces: np.ndarray, name: str, vis_config: VisualizationConfig) -> ps.SurfaceMesh:
@@ -808,7 +815,7 @@ class SurfaceVisualizer:
     def _add_normal_comparison_visualization(self, surface: Data, surface_name: str,
                                              gt_normal: np.ndarray,
                                              predicted_normal: Optional[torch.Tensor],
-                                             predicted_laplacian: Optional[torch.Tensor],
+                                             predicted_mean_curvature_vector: Optional[torch.Tensor],
                                              predicted_weights: Optional[torch.Tensor],
                                              translation: np.ndarray) -> Optional[dict]:
         """
@@ -819,8 +826,8 @@ class SurfaceVisualizer:
             surface_name: Name of the surface for labeling
             gt_normal: Ground truth normal vector (1, 3) or (N, 3) - broadcasted for visualization
             predicted_normal: Predicted normal vector (3,) - single vector at center/origin
-            predicted_laplacian: Predicted Laplacian vector (3,) for mean curvature
-            predicted_weights: Learned token weights (num_points,) or None
+            predicted_mean_curvature_vector: Predicted mean curvature vector (3,) = stiffness_sum / area
+            predicted_weights: Learned stiffness weights (num_points,) or None
             translation: Translation offset for positioning
 
         Returns:
@@ -845,8 +852,8 @@ class SurfaceVisualizer:
         # Convert predicted normal to numpy
         pred_normal_np = to_numpy(predicted_normal)  # Shape: (3,)
 
-        # Compute predicted mean curvature from the passed laplacian
-        predicted_mean_curvature = torch.norm(predicted_laplacian, p=2).item()
+        # Compute predicted mean curvature as the norm of the mean curvature vector
+        predicted_mean_curvature = torch.norm(predicted_mean_curvature_vector, p=2).item()
 
         # Get origin point using consistent helper
         origin_3d = self._get_origin_position(surface, translation)
@@ -1058,8 +1065,8 @@ class SurfaceVisualizer:
                     # Get ground truth normal (from differential geometry computation)
                     gt_normal = to_numpy(surface.normal)  # Shape: (1, 3) or (N, 3)
 
-                    # Predict normal using trained model (now returns laplacian too)
-                    predicted_normal, predicted_weights, predicted_laplacian = predict_normal_from_patch(
+                    # Predict normal using trained model
+                    predicted_normal, predicted_weights, predicted_mcv = predict_normal_from_patch(
                         model=self.trained_model,
                         surface_data=surface,
                         device=self.device
@@ -1071,7 +1078,7 @@ class SurfaceVisualizer:
                         surface_name=name,
                         gt_normal=gt_normal,
                         predicted_normal=predicted_normal,
-                        predicted_laplacian=predicted_laplacian,
+                        predicted_mean_curvature_vector=predicted_mcv,
                         predicted_weights=predicted_weights,
                         translation=translation
                     )

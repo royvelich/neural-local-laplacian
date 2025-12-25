@@ -1,0 +1,5 @@
+training_seed: 42
+validation_seed: 3
+num_eigenvalues: 50
+ckpt_path: null
+seed: 2

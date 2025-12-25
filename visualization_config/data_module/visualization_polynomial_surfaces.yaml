@@ -14,7 +14,7 @@ train_dataset_specification:
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.RegularGridSampler
         num_points: 1000
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
-        num_points_range: 10
+        num_points_range: 30
     feature_extractor:
         _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
     diff_geom_at_origin_only: False
@@ -25,7 +25,7 @@ train_dataset_specification:
       - _target_: neural_local_laplacian.utils.pose_transformers.AlignNormalZTransformer
     coeff_generation_method:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
-      _args_: ['uniform']
+      _args_: ['normal']
     diff_geom_components:
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
         _args_: ['mean_curvature']
