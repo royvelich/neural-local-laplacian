@@ -111,7 +111,7 @@ class ThreeHeadLossBase(nn.Module):
         weighted_sum = self._compute_weighted_position_sum(
             normal_weights, attention_mask, batch_sizes, positions
         )
-        return weighted_sum / (areas.unsqueeze(-1) + self.eps)
+        return weighted_sum
 
     def _apply_reduction(self, loss: torch.Tensor) -> torch.Tensor:
         """Apply reduction to loss tensor."""
