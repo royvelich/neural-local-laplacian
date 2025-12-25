@@ -537,9 +537,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Training step with 3-head architecture.
 
-        Losses:
-        1. Normal direction loss: (sum_j w_ij * p_j) / A_i vs n_hat_GT
-        2. Mean curvature loss: H_pred vs H_GT
+        Losses (using unified signature - all losses receive same arguments):
+        1. Normal losses: supervise (sum_j w_ij * p_j) / A_i to be unit normal
+        2. Curvature losses: supervise H_pred vs H_GT
 
         Args:
             batch: List of PyTorch Geometric batches (synthetic data)
@@ -551,44 +551,44 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Take the first batch from the list
         batch_data = batch[0]
         forward_result = self.forward(batch_data)
-        predictions = self.compute_predictions(forward_result, batch_data)
 
         # Get batch size for logging
         batch_size = len(forward_result['batch_sizes'])
 
+        # Extract forward results
+        normal_weights = forward_result['normal_weights']  # (batch_size, max_k)
+        areas = forward_result['areas']  # (batch_size,)
+        mean_curvatures = forward_result['mean_curvatures']  # (batch_size,)
+        attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
+        batch_sizes = forward_result['batch_sizes']  # (batch_size,)
+        positions = batch_data.pos  # (total_points, 3)
+
+        # Ground truth targets
         # In training mode, diff_geom_at_origin_only=True, so normals and H are per-surface
-        gt_normals = batch_data.normal  # (batch_size, 3) - one normal per surface at origin
-        gt_mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
+        target_normals = batch_data.normal  # (batch_size, 3)
+        target_curvatures = batch_data.H  # (batch_size,)
 
         # Normalize GT normals (should already be unit, but ensure)
-        gt_normals = F.normalize(gt_normals, p=2, dim=1)
+        target_normals = F.normalize(target_normals, p=2, dim=1)
 
-        # === Loss 1: Normal direction ===
-        # Target: unit normal direction
-        # Prediction: (sum_j w_ij * p_j) / A_i (should be unit normal)
-        predicted_normals = predictions['predicted_normals']
-
-        # Cosine similarity loss for direction (1 - cos_sim)
-        cos_sim = F.cosine_similarity(predicted_normals, gt_normals, dim=1)
-        normal_direction_loss = (1 - cos_sim).mean()
-
-        # === Loss 2: Mean curvature magnitude ===
-        predicted_H = forward_result['mean_curvatures']
-        curvature_loss = F.mse_loss(predicted_H, gt_mean_curvatures)
-
-        # === Combined loss ===
-        # Use loss_configs if available, otherwise default weighting
+        # === Compute losses using unified signature ===
         if self._loss_configs:
             total_loss = 0.0
             loss_components_weighted = {}
             loss_components_unweighted = {}
 
-            # Compute target mean curvature vector for compatibility with existing losses
-            target_mcv = gt_mean_curvatures.unsqueeze(-1) * gt_normals
-            predicted_mcv = predictions['predicted_mean_curvature_vectors']
-
             for loss_config in self._loss_configs:
-                unweighted_loss = loss_config.loss_module(predicted_mcv, target_mcv)
+                # All losses receive the same arguments (unified signature)
+                unweighted_loss = loss_config.loss_module(
+                    normal_weights=normal_weights,
+                    areas=areas,
+                    mean_curvatures=mean_curvatures,
+                    positions=positions,
+                    attention_mask=attention_mask,
+                    batch_sizes=batch_sizes,
+                    target_normals=target_normals,
+                    target_curvatures=target_curvatures
+                )
                 loss_name = f"{loss_config.loss_module.__class__.__name__}"
                 loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
 
@@ -600,10 +600,58 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             if not isinstance(total_loss, torch.Tensor):
                 raise ValueError("At least one loss must have a non-None weight for training")
         else:
-            # Default: equal weight for normal and curvature losses
-            total_loss = 0.5 * normal_direction_loss + 0.5 * curvature_loss
-            loss_components_unweighted = {}
+            # Default: use NormalMSELoss and MeanCurvatureMSELoss with equal weighting
+            # Import here to avoid circular imports
+            from neural_local_laplacian.modules.losses import NormalMSELoss, MeanCurvatureMSELoss
+
+            normal_loss_fn = NormalMSELoss()
+            curvature_loss_fn = MeanCurvatureMSELoss()
+
+            normal_loss = normal_loss_fn(
+                normal_weights=normal_weights,
+                areas=areas,
+                mean_curvatures=mean_curvatures,
+                positions=positions,
+                attention_mask=attention_mask,
+                batch_sizes=batch_sizes,
+                target_normals=target_normals,
+                target_curvatures=target_curvatures
+            )
+            curvature_loss = curvature_loss_fn(
+                normal_weights=normal_weights,
+                areas=areas,
+                mean_curvatures=mean_curvatures,
+                positions=positions,
+                attention_mask=attention_mask,
+                batch_sizes=batch_sizes,
+                target_normals=target_normals,
+                target_curvatures=target_curvatures
+            )
+
+            total_loss = 0.5 * normal_loss + 0.5 * curvature_loss
+            loss_components_unweighted = {
+                'train/NormalMSELoss': normal_loss,
+                'train/MeanCurvatureMSELoss': curvature_loss
+            }
             loss_components_weighted = {}
+
+        # === Compute metrics for logging ===
+        # Compute predictions for detailed logging
+        predictions = self.compute_predictions(forward_result, batch_data)
+
+        # Normal metrics
+        predicted_normals = predictions['predicted_normals']  # Normalized to unit
+        raw_normal = predictions['raw_normal']  # Unnormalized: (sum w*p)/A
+
+        # Direction: cosine similarity
+        cos_sim = F.cosine_similarity(predicted_normals, target_normals, dim=1)
+
+        # Magnitude: ||raw_normal|| should be 1
+        raw_normal_magnitude = torch.norm(raw_normal, p=2, dim=1)
+        magnitude_error = (raw_normal_magnitude - 1.0).abs()
+
+        # Curvature metrics
+        curvature_mae = F.l1_loss(mean_curvatures, target_curvatures)
 
         # === Logging ===
         self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True, prog_bar=True,
@@ -612,25 +660,28 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Normal direction metrics
         self.log('train/normal_cosine_similarity', cos_sim.mean().item(), on_step=False, on_epoch=True,
                  prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log('train/normal_direction_loss', normal_direction_loss.item(), on_step=False, on_epoch=True,
+        self.log('train/normal_direction_loss', (1 - cos_sim).mean().item(), on_step=False, on_epoch=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Normal magnitude metrics (unit norm constraint)
+        self.log('train/normal_magnitude_mean', raw_normal_magnitude.mean().item(), on_step=False, on_epoch=True,
+                 logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/normal_magnitude_error', magnitude_error.mean().item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
 
         # Curvature metrics
-        self.log('train/curvature_loss', curvature_loss.item(), on_step=False, on_epoch=True,
-                 logger=True, batch_size=batch_size, sync_dist=True)
-        self.log('train/curvature_mae', F.l1_loss(predicted_H, gt_mean_curvatures).item(),
+        self.log('train/curvature_mse', F.mse_loss(mean_curvatures, target_curvatures).item(),
+                 on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/curvature_mae', curvature_mae.item(),
                  on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Area statistics
-        areas = forward_result['areas']
         self.log('train/area_mean', areas.mean().item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
         self.log('train/area_std', areas.std().item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
 
         # Normal weights statistics
-        normal_weights = forward_result['normal_weights']
-        attention_mask = forward_result['attention_mask']
         self.log('train/normal_weights_mean', normal_weights[attention_mask].mean().item(),
                  on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
         self.log('train/normal_weights_std', normal_weights[attention_mask].std().item(),
