@@ -336,24 +336,22 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
     def __init__(
             self,
-            grid_samplers: List[GridSampler],  # Added grid_samplers parameter here
+            grid_samplers: List[GridSampler],
             grid_radius_range: Tuple[float, float],
-            grid_offset_range: Tuple[float, float],
             points_scale_range: Tuple[float, float],
             diff_geom_components: Optional[List[DifferentialGeometryComponent]] = None,
             diff_geom_at_origin_only: bool = False,
-            flip_normal_if_negative_curvature: bool = False,  # NEW FLAG
-            include_origin_in_grid: bool = False,  # NEW FLAG: ensure (0,0) is in sampled points
+            flip_normal_if_negative_curvature: bool = False,
+            include_origin_in_grid: bool = False,
             **kwargs
     ):
         super().__init__(**kwargs)
-        self._grid_samplers = grid_samplers  # Store grid samplers here
+        self._grid_samplers = grid_samplers
         self._grid_radius_range = self._validate_range(param_range=grid_radius_range, name="grid_radius_range")
-        self._grid_offset_range = self._validate_range(param_range=grid_offset_range, name="grid_offset_range")
         self._points_scale_range = self._validate_range(param_range=points_scale_range, name="points_scale_range")
         self._diff_geom_at_origin_only = diff_geom_at_origin_only
-        self._flip_normal_if_negative_curvature = flip_normal_if_negative_curvature  # NEW PARAMETER
-        self._include_origin_in_grid = include_origin_in_grid  # NEW PARAMETER
+        self._flip_normal_if_negative_curvature = flip_normal_if_negative_curvature
+        self._include_origin_in_grid = include_origin_in_grid
 
         # Available differential geometry components
         available_components = list(DifferentialGeometryComponent)
@@ -447,7 +445,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             raise RuntimeError(f"Failed to create surface mesh: {e}")
 
     def _compute_first_derivatives(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute first partial derivatives âˆ‚z/âˆ‚x and âˆ‚z/âˆ‚y."""
+        """Compute first partial derivatives Ã¢Ë†â€šz/Ã¢Ë†â€šx and Ã¢Ë†â€šz/Ã¢Ë†â€šy."""
         dz_dx = torch.autograd.grad(
             outputs=z.sum(),
             inputs=x,
@@ -735,8 +733,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         # Sample other parameters once
         grid_radius = self._sample_parameter(param_range=self._grid_radius_range)
         points_scale = self._sample_parameter(param_range=self._points_scale_range)
-        grid_offset = self._sample_parameter(param_range=self._grid_offset_range)
-        grid_range = (-grid_radius + grid_offset, grid_radius + grid_offset)
+        grid_range = (-grid_radius, grid_radius)  # Always centered at (0, 0)
 
         surfaces = []
         for grid_sampler in self._grid_samplers:
@@ -785,18 +782,32 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
 
 class PolynomialSurfaceDataset(ParametricSurfaceDataset):
-    """Dataset for polynomial surfaces."""
+    """Dataset for polynomial surfaces with optional coordinate offset."""
 
     def __init__(
             self,
             order_range: Tuple[int, int],
             coefficient_scale_range: Tuple[float, float],
             coeff_generation_method: CoeffGenerationMethod,
+            polynomial_offset_range: Tuple[float, float] = (0.0, 0.0),
             **kwargs
     ):
+        """
+        Initialize PolynomialSurfaceDataset.
+
+        Args:
+            order_range: Range of polynomial orders (min, max)
+            coefficient_scale_range: Range for scaling coefficients
+            coeff_generation_method: Method for generating coefficients (UNIFORM or NORMAL)
+            polynomial_offset_range: Range for random offset applied to polynomial evaluation.
+                                     The polynomial is evaluated at (x + offset_x, y + offset_y),
+                                     effectively "sliding" the surface under the grid.
+            **kwargs: Additional arguments passed to ParametricSurfaceDataset
+        """
         super().__init__(**kwargs)
         self._order_range = self._validate_order_range(order_range=order_range)
         self._coefficient_scale_range = self._validate_range(param_range=coefficient_scale_range, name="coefficient_scale_range")
+        self._polynomial_offset_range = self._validate_range(param_range=polynomial_offset_range, name="polynomial_offset_range")
         self._coeff_generation_method = coeff_generation_method
 
     def _validate_order_range(self, order_range: Tuple[int, int]) -> Tuple[int, int]:
@@ -815,7 +826,7 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         return [(i, j) for i in range(order + 1) for j in range(order + 1) if 0 < i + j <= order]
 
     def _generate_surface_parameters(self) -> Dict[str, Any]:
-        """Generate random polynomial coefficients and order."""
+        """Generate random polynomial coefficients, order, and coordinate offsets."""
         order = int(self._rng.integers(low=self._order_range[0], high=self._order_range[1] + 1))
         pairs = self._get_polynomial_pairs(order)
         num_coeffs = len(pairs)
@@ -828,18 +839,29 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         else:
             raise ValueError(f"Invalid coefficient generation method: {self._coeff_generation_method}")
 
+        # Sample coordinate offsets
+        offset_x = self._sample_parameter(param_range=self._polynomial_offset_range)
+        offset_y = self._sample_parameter(param_range=self._polynomial_offset_range)
+
         return {
             'coefficients': coefficients,
             'order': order,
-            'pairs': pairs  # Cache pairs for evaluation
+            'pairs': pairs,
+            'offset': (offset_x, offset_y)
         }
 
     def _evaluate_surface_with_parameters(self, x: torch.Tensor, y: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
-        """Evaluate polynomial surface using pre-generated parameters."""
+        """Evaluate polynomial surface using pre-generated parameters with coordinate offset."""
         coefficients = surface_params['coefficients']
         pairs = surface_params['pairs']
+        offset_x, offset_y = surface_params['offset']
+
+        # Apply offset: evaluate polynomial at shifted coordinates
+        # This effectively "slides" the surface under the grid
+        x_shifted = x + offset_x
+        y_shifted = y + offset_y
 
         z = torch.zeros_like(x)
         for c, (i, j) in zip(coefficients, pairs):
-            z += c * (x ** i) * (y ** j)
+            z += c * (x_shifted ** i) * (y_shifted ** j)
         return z
