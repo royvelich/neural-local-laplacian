@@ -394,8 +394,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                                    weighted_positions)
 
         # Divide by area to get mean curvature vector: mcv = stiffness_sum / A_i
-        # predicted_mean_curvature_vectors = stiffness_sum / areas.unsqueeze(-1)
-        predicted_mean_curvature_vectors = stiffness_sum
+        predicted_mean_curvature_vectors = stiffness_sum / areas.unsqueeze(-1)
 
         return predicted_mean_curvature_vectors
 
@@ -506,7 +505,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # Target: H * n_hat (mean curvature times unit normal at origin)
         target_mean_curvature_vectors = mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
-        # target_mean_curvature_vectors = F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
         # Compute weighted combination of losses
         total_loss = 0.0
