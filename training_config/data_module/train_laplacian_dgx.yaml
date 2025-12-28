@@ -29,7 +29,7 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
     batch_size: 4000
-    num_workers: 2
+    num_workers: 0
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
