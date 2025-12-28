@@ -5,7 +5,7 @@ val_dataset_specifications:
     dataset:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
       mesh_folder_path: './assets/meshes'
-      k: 70
+      k: 50
       feature_extractor:
         _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
       pose_transformers:

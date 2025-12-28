@@ -28,8 +28,8 @@ module:
       diff_geom_at_origin_only: True
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
-    batch_size: 4000
-    num_workers: 0
+    batch_size: 2000
+    num_workers: 2
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification

@@ -174,10 +174,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             num_layers=num_encoder_layers
         )
 
-        # Stiffness projection: per-token → scalar stiffness weight s_ij
+        # Stiffness projection: per-token â†’ scalar stiffness weight s_ij
         self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
 
-        # Area head: aggregated features → scalar area A_i
+        # Area head: aggregated features â†’ scalar area A_i
         # Uses mean pooling of token features followed by MLP
         self.area_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -331,26 +331,36 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             mcv = (Sum_j s_ij * p_j) / A_i
 
         where:
-        - s_ij are the learned stiffness weights
-        - p_j are the neighbor positions (centered at origin)
-        - A_i is the learned area for the center vertex
+        - s_ij are stiffness weights (scale-invariant, like cotangent weights)
+        - p_j are the original neighbor positions (centered at origin)
+        - A_i is the scale-corrected area (A = A' * d², already scaled in forward())
+
+        Scale invariance is achieved by:
+        - Model sees normalized geometry (unit sphere) and outputs s', A'
+        - Stiffness weights s = s' (unchanged - cotangent weights are scale-invariant)
+        - Areas A = A' * d² (scaled back to original geometry)
+        - mcv = Σ s·p / A = Σ s'·p / (A'·d²) = H·n̂  ✓
 
         Args:
-            forward_result: Dictionary containing stiffness_weights, areas, attention_mask, and batch_sizes
+            forward_result: Dictionary containing stiffness_weights, areas, attention_mask,
+                          batch_sizes, and scale_factors
             batch_data: PyTorch Geometric batch containing positions and batch indices
 
         Returns:
             predicted_mean_curvature_vectors: (batch_size, 3) tensor of predicted mean curvature vectors
         """
         # Extract results
-        stiffness_weights = forward_result['stiffness_weights']  # (batch_size, max_k)
-        areas = forward_result['areas']  # (batch_size,)
+        stiffness_weights = forward_result['stiffness_weights']  # (batch_size, max_k) - scale-invariant
+        areas = forward_result['areas']  # (batch_size,) - already scaled: A = A' * d²
         attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
         batch_sizes = forward_result['batch_sizes']  # (batch_size,)
         batch_size = len(batch_sizes)
 
-        # Get positions and flatten stiffness weights with attention mask
+        # Get original positions (areas are scaled to work with original geometry)
         positions = batch_data.pos  # (total_points, 3)
+
+        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
+        batch_indices = getattr(batch_data, 'patch_idx', batch_data.batch)
 
         # Apply attention mask to stiffness weights (zero out padded positions)
         masked_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)  # (batch_size, max_k)
@@ -362,7 +372,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         batch_indices_weights = torch.arange(batch_size, device=stiffness_weights.device).repeat_interleave(stiffness_weights.shape[1])
 
         # Create position indices within each batch for mapping
-        # This maps from flattened weight indices to actual position indices
         batch_cumsum = torch.cumsum(batch_sizes, dim=0)
         batch_starts = torch.cat([torch.zeros(1, device=batch_cumsum.device, dtype=batch_cumsum.dtype), batch_cumsum[:-1]])
 
@@ -380,14 +389,13 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Calculate actual position indices in the flattened positions array
         actual_position_indices = batch_starts[valid_batch_indices] + valid_position_indices
 
-        # Get valid positions
+        # Get valid positions (original scale)
         valid_positions = positions[actual_position_indices]  # (num_valid, 3)
 
         # Compute weighted positions: s_ij * p_j
         weighted_positions = valid_weights.unsqueeze(-1) * valid_positions  # (num_valid, 3)
 
         # Sum weighted positions for each batch using scatter_add
-        # This gives Sum_j s_ij * p_j for each patch
         stiffness_sum = torch.zeros(batch_size, 3, device=stiffness_weights.device)
         stiffness_sum.scatter_add_(0,
                                    valid_batch_indices.unsqueeze(-1).expand(-1, 3),
@@ -412,21 +420,30 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """
-        Forward pass supporting variable-sized patches.
+        Forward pass supporting variable-sized patches with scale-invariant normalization.
 
-        Predicts both stiffness weights (per neighbor) and area (per patch center).
+        Each patch is normalized to fit within the unit sphere before processing,
+        making the model invariant to input scale. The model outputs:
+        - Stiffness weights s' (scale-invariant, like cotangent weights)
+        - Areas A' (on unit sphere), which are then scaled back: A = A' * d²
+
+        This ensures the returned values work correctly with original geometry:
+        - mcv = Σ s·p / A = Σ s'·p / (A'·d²) gives correct mean curvature vector
+        - Laplacian L = M⁻¹·S has correctly scaled eigenvalues
 
         Args:
             batch: PyTorch Geometric batch
 
         Returns:
             Dict containing:
-            - stiffness_weights: (batch_size, max_k) - learned stiffness weights s_ij (padded)
-            - areas: (batch_size,) - learned area A_i for each patch center
+            - stiffness_weights: (batch_size, max_k) - scale-invariant stiffness weights
+            - areas: (batch_size,) - scale-corrected areas (A = A' * d²)
             - attention_mask: (batch_size, max_k) - True for real tokens, False for padding
             - batch_sizes: (batch_size,) - actual number of points per patch
+            - scale_factors: (batch_size,) - max_dist per patch (d)
         """
         features = batch.x  # Shape: (total_points, feature_dim)
+        positions = batch.pos  # Shape: (total_points, 3)
 
         # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
         batch_indices = getattr(batch, 'patch_idx', batch.batch)
@@ -435,13 +452,31 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         batch_sizes = batch_indices.bincount()
         batch_size = len(batch_sizes)
         max_k = batch_sizes.max().item()
+        device = features.device
+
+        # === Compute per-patch scale factors (max distance from origin) ===
+        distances = torch.norm(positions, dim=1)  # (total_points,)
+
+        # Get max distance per patch using scatter_reduce
+        scale_factors = torch.zeros(batch_size, device=device)
+        scale_factors.scatter_reduce_(0, batch_indices, distances, reduce='amax')
+
+        # Clamp to avoid division by zero (for degenerate patches)
+        scale_factors = torch.clamp(scale_factors, min=1e-6)
+
+        # Expand scale factors to per-point
+        scale_per_point = scale_factors[batch_indices]  # (total_points,)
+
+        # === Normalize features to unit sphere ===
+        # Assuming features are XYZ coordinates or derived from them
+        features_normalized = features / scale_per_point.unsqueeze(-1)
 
         # Project to model dimension
-        features = self.input_projection(features)  # (total_points, d_model)
+        features_projected = self.input_projection(features_normalized)  # (total_points, d_model)
 
         # Pad sequences to max_k and create attention masks
         sequences, attention_mask = self._pad_sequences_vectorized(
-            features, batch_indices, batch_size, max_k
+            features_projected, batch_indices, batch_size, max_k
         )
 
         # Pass through transformer with attention mask
@@ -458,9 +493,12 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Mask out padded positions
         stiffness_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)
 
+        # NOTE: Stiffness weights are NOT scaled here.
+        # Cotangent-style weights are inherently scale-invariant (they depend only on angles).
+        # The model operates on normalized geometry and outputs s' ≈ true cotangent weights.
+
         # === Area prediction (per patch) ===
         # Mean pooling of encoded features (excluding padding)
-        # Create float mask for proper averaging
         float_mask = attention_mask.float()  # (batch_size, max_k)
         num_tokens = float_mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
 
@@ -468,14 +506,22 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         masked_features = encoded_features * float_mask.unsqueeze(-1)  # (batch_size, max_k, d_model)
         pooled_features = masked_features.sum(dim=1) / num_tokens  # (batch_size, d_model)
 
-        # Area head outputs positive scalar per patch
-        areas = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
+        # Area head outputs positive scalar per patch (for unit sphere geometry)
+        areas_normalized = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
+
+        # === Scale correction for areas ===
+        # The model outputs A' (area on unit sphere). To get original-scale area:
+        # A = A' * d² (area scales as length²)
+        # This ensures returned areas work correctly with original geometry and
+        # are directly comparable to GT vertex areas.
+        areas = areas_normalized * (scale_factors ** 2)
 
         return {
             'stiffness_weights': stiffness_weights,
             'areas': areas,
             'attention_mask': attention_mask,
-            'batch_sizes': batch_sizes
+            'batch_sizes': batch_sizes,
+            'scale_factors': scale_factors
         }
 
     def training_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
