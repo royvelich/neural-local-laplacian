@@ -1,16 +1,17 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 128
+  d_model: 512
   nhead: 8
   num_encoder_layers: 6
-  dim_feedforward: 128
+  dim_feedforward: 512
   num_eigenvalues: ${globals.num_eigenvalues}
 #  use_permutation_invariant: True
   dropout: 0.0
   normalize_loss_weights: False
-  input_projection_hidden_dims: [16, 64]
-  output_projection_hidden_dims: [64, 16]
+  normalize_patches_to_unit_sphere: False
+  input_projection_hidden_dims: [32, 64]
+  output_projection_hidden_dims: [64, 32]
   loss_configs:
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
