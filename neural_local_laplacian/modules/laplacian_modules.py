@@ -123,7 +123,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  normalize_loss_weights: bool = True,
                  input_projection_hidden_dims: Optional[List[int]] = None,
                  output_projection_hidden_dims: Optional[List[int]] = None,
-                 normalize_patches_to_unit_sphere: bool = True,
+                 normalize_patch_features: bool = True,
+                 scale_areas_by_patch_size: bool = True,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -151,7 +152,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._d_model = d_model
         self._input_dim = input_dim
         self._num_eigenvalues = num_eigenvalues
-        self._normalize_patches_to_unit_sphere = normalize_patches_to_unit_sphere
+        self._normalize_patch_features = normalize_patch_features
+        self._scale_areas_by_patch_size = scale_areas_by_patch_size
 
         # Store loss configs (optionally normalized)
         if normalize_loss_weights:
@@ -176,10 +178,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             num_layers=num_encoder_layers
         )
 
-        # Stiffness projection: per-token â†’ scalar stiffness weight s_ij
+        # Stiffness projection: per-token -> scalar stiffness weight s_ij
         self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
 
-        # Area head: aggregated features â†’ scalar area A_i
+        # Area head: aggregated features -> scalar area A_i
         # Uses mean pooling of token features followed by MLP
         self.area_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -324,7 +326,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         return sequences, attention_mask
 
-    def _compute_mean_curvature_vectors_vectorized(self, forward_result: Dict[str, torch.Tensor],
+    def _compute_mean_curvature_vectors(self, forward_result: Dict[str, torch.Tensor],
                                                    batch_data: Batch) -> torch.Tensor:
         """
         Compute predicted mean curvature vectors from stiffness weights and areas.
@@ -418,8 +420,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         Predicts both stiffness weights (per neighbor) and area (per patch center).
 
-        If normalize_patches_to_unit_sphere=True:
+        If normalize_patch_features=True:
         - Normalizes patch positions to unit sphere before transformer
+
+        If scale_areas_by_patch_size=True:
         - Scales output areas by d² to restore original geometry scale
 
         Args:
@@ -445,7 +449,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         max_k = batch_sizes.max().item()
 
         # === Compute scale factors and optionally normalize ===
-        if self._normalize_patches_to_unit_sphere:
+        if self._normalize_patch_features:
             # Compute max distance per patch for normalization
             distances = torch.norm(positions, dim=1)  # (total_points,)
 
@@ -500,7 +504,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         areas_normalized = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
 
         # === Scale areas back to original geometry ===
-        if self._normalize_patches_to_unit_sphere:
+        if self._scale_areas_by_patch_size:
             # A = A' * d² (area scales as length²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
@@ -530,7 +534,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         forward_result = self.forward(batch_data)
 
         # Compute mean curvature vectors using vectorized method
-        predicted_mean_curvature_vectors = self._compute_mean_curvature_vectors_vectorized(forward_result, batch_data)
+        predicted_mean_curvature_vectors = self._compute_mean_curvature_vectors(forward_result, batch_data)
 
         # Get batch size for logging
         batch_size = len(forward_result['batch_sizes'])
