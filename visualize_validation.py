@@ -73,7 +73,7 @@ class VisualizationConfig:
 @dataclass
 class ReconstructionSettings:
     """Settings for mesh reconstruction visualization."""
-    use_pred_mean_curvature_as_areas: bool = False
+    use_pred_areas: bool = False  # Use predicted areas from model's area head
     current_pred_k: int = 20  # Will be updated with actual k from dataset
 
 
@@ -167,18 +167,18 @@ class RealTimeEigenanalysisVisualizer:
         """ImGui callback for reconstruction settings window."""
         import polyscope.imgui as psim
 
-        # Checkbox for using predicted mean curvature as vertex areas
+        # Checkbox for using predicted areas for area-weighted reconstruction
         psim.Text("PRED Mesh Reconstruction Options:")
         psim.Separator()
 
         changed, new_setting = psim.Checkbox(
-            "Use Predicted Mean Curvature as Vertex Areas",
-            self.reconstruction_settings.use_pred_mean_curvature_as_areas
+            "Use Predicted Areas (Area-Weighted)",
+            self.reconstruction_settings.use_pred_areas
         )
 
         if changed:
-            self.reconstruction_settings.use_pred_mean_curvature_as_areas = new_setting
-            print(f"ðŸ”„ Reconstruction setting changed: use_pred_mean_curvature_as_areas = {new_setting}")
+            self.reconstruction_settings.use_pred_areas = new_setting
+            print(f"[*] Reconstruction setting changed: use_pred_areas = {new_setting}")
 
             # Re-compute and update reconstructions if we have current data
             if self._has_current_batch_data():
@@ -200,7 +200,7 @@ class RealTimeEigenanalysisVisualizer:
 
             if k_changed and new_k != self.reconstruction_settings.current_pred_k:
                 self.reconstruction_settings.current_pred_k = new_k
-                print(f"ðŸ”„ PRED k changed: {new_k}")
+                print(f"[*] PRED k changed: {new_k}")
 
                 # Re-compute PRED with new k if we have current data
                 if self._has_current_batch_data():
@@ -212,11 +212,11 @@ class RealTimeEigenanalysisVisualizer:
 
         psim.Text("")
         psim.Text("Current Settings:")
-        if self.reconstruction_settings.use_pred_mean_curvature_as_areas:
-            psim.TextColored((0.0, 1.0, 0.0, 1.0), "âœ“ Using predicted mean curvature as areas")
+        if self.reconstruction_settings.use_pred_areas:
+            psim.TextColored((0.0, 1.0, 0.0, 1.0), "[OK] Using predicted areas from model")
             psim.Text("  (Area-weighted reconstruction for PRED)")
         else:
-            psim.TextColored((1.0, 0.5, 0.0, 1.0), "â—‹ Using standard Euclidean reconstruction")
+            psim.TextColored((1.0, 0.5, 0.0, 1.0), "[o] Using standard Euclidean reconstruction")
             psim.Text("  (Standard L2 projection for PRED)")
 
         if self.original_k is not None:
@@ -235,21 +235,23 @@ class RealTimeEigenanalysisVisualizer:
                 self.current_areas is not None and
                 self.current_original_vertices is not None)
 
-    def _compute_predicted_vertex_areas(self, predicted_data: Dict) -> Optional[np.ndarray]:
-        """Compute predicted vertex areas based on current settings."""
-        if not self.reconstruction_settings.use_pred_mean_curvature_as_areas:
+    def _compute_predicted_vertex_areas(self, inference_result: Dict) -> Optional[np.ndarray]:
+        """Compute predicted vertex areas based on current settings.
+
+        Uses the areas predicted by the model's area head.
+        """
+        if not self.reconstruction_settings.use_pred_areas:
             return None
 
-        if predicted_data.get('predicted_mean_curvature') is not None:
-            predicted_mean_curvature = predicted_data['predicted_mean_curvature']
-            predicted_vertex_areas = np.abs(predicted_mean_curvature) + 1e-7
-            print(f"Using predicted mean curvature as vertex areas (range: [{predicted_vertex_areas.min():.6f}, {predicted_vertex_areas.max():.6f}])")
+        if inference_result.get('areas') is not None:
+            predicted_vertex_areas = inference_result['areas']
+            print(f"Using predicted areas from model (range: [{predicted_vertex_areas.min():.6f}, {predicted_vertex_areas.max():.6f}])")
             return predicted_vertex_areas
         else:
-            print(f"âš ï¸  No predicted mean curvature available, falling back to standard reconstruction")
+            print(f"[!] No predicted areas available, falling back to standard reconstruction")
             return None
 
-    def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict, predicted_data: Dict) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         """Compute both GT and predicted reconstructions."""
         gt_reconstructions = []
         pred_reconstructions = []
@@ -266,24 +268,24 @@ class RealTimeEigenanalysisVisualizer:
 
         # Compute predicted reconstructions (respecting current setting)
         if inference_result['predicted_eigenvectors'] is not None:
-            predicted_vertex_areas = self._compute_predicted_vertex_areas(predicted_data)
+            predicted_vertex_areas = self._compute_predicted_vertex_areas(inference_result)
             pred_reconstructions = self.compute_mesh_reconstruction(
                 gt_data['vertices'],  # Use original vertices as reference
                 inference_result['predicted_eigenvectors'],
                 inference_result['predicted_eigenvalues'],
                 self.config.num_eigenvectors_to_show,
-                vertex_areas=predicted_vertex_areas  # None for standard, or predicted areas
+                vertex_areas=predicted_vertex_areas  # None for standard, or predicted areas from model
             )
 
         return gt_reconstructions, pred_reconstructions
 
-    def _update_mesh_reconstructions(self, gt_data: Dict, inference_result: Dict, predicted_data: Dict):
+    def _update_mesh_reconstructions(self, gt_data: Dict, inference_result: Dict):
         """Complete pipeline for computing and visualizing mesh reconstructions."""
         print(f"Computing and visualizing mesh reconstructions...")
 
         # Compute reconstructions
         gt_reconstructions, pred_reconstructions = self._compute_all_reconstructions(
-            gt_data, inference_result, predicted_data
+            gt_data, inference_result
         )
 
         # Visualize reconstructions
@@ -295,9 +297,9 @@ class RealTimeEigenanalysisVisualizer:
                 gt_data.get('gt_eigenvalues'),
                 inference_result['predicted_eigenvalues']
             )
-            print("âœ… Mesh reconstructions completed")
+            print("[OK] Mesh reconstructions completed")
         else:
-            print("âš ï¸  No reconstructions to visualize")
+            print("[!] No reconstructions to visualize")
 
     def _recompute_knn_connectivity_for_k(self, new_k: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -439,20 +441,20 @@ class RealTimeEigenanalysisVisualizer:
     def _recompute_and_update_reconstructions(self):
         """Re-compute and update mesh reconstructions with new settings."""
         if not self._has_current_batch_data():
-            print("âš ï¸  No current batch data available for re-computation")
+            print("[!] No current batch data available for re-computation")
             return
 
-        print("ðŸ”„ Re-computing mesh reconstructions with new settings...")
+        print("[*] Re-computing mesh reconstructions with new settings...")
 
         # Remove existing reconstruction structures
         self._remove_existing_reconstructions()
 
         # Re-compute and visualize with new settings
         self._update_mesh_reconstructions(
-            self.current_gt_data, self.current_inference_result, self.current_predicted_data
+            self.current_gt_data, self.current_inference_result
         )
 
-        print("âœ… Mesh reconstructions updated with new settings")
+        print("[OK] Mesh reconstructions updated with new settings")
 
     def _remove_existing_reconstructions(self):
         """Remove existing reconstruction structures from polyscope."""
@@ -493,16 +495,20 @@ class RealTimeEigenanalysisVisualizer:
             # Extract model arguments from config
             model_cfg = cfg.model.module
 
-            # Load model from checkpoint with model arguments from config
+            # Load model from checkpoint with inference-time settings:
+            # - normalize_patch_features=True: normalize inputs to unit sphere (same as training)
+            # - scale_areas_by_patch_size=False: don't scale areas back (Laplacian assembly uses normalized space)
             model = LaplacianTransformerModule.load_from_checkpoint(
                 str(ckpt_path),
                 map_location=device,
+                normalize_patch_features=True,
+                scale_areas_by_patch_size=True,
             )
 
             model.eval()
             model.to(device)
 
-            print(f"âœ… Model loaded successfully on {device}")
+            print(f"[OK] Model loaded successfully on {device}")
             print(f"   Model type: {type(model).__name__}")
             print(f"   Input dim: {model._input_dim}")
             print(f"   Model dim: {model._d_model}")
@@ -832,14 +838,14 @@ class RealTimeEigenanalysisVisualizer:
         Compute mesh reconstruction using area-weighted least squares (for GT case).
 
         Solves the weighted least squares problem:
-        min_c ||f - A_â„“ c||_M^2
+        min_c ||f - A_l c||_M^2
         where M = diag(vertex_areas) is the mass matrix.
 
         Args:
-            original_vertices: Original mesh vertices f âˆˆ R^{nÃ—3}
-            eigenvectors: Eigenvectors Î¦ âˆˆ R^{nÃ—k}
+            original_vertices: Original mesh vertices f in R^{n x 3}
+            eigenvectors: Eigenvectors Phi in R^{n x k}
             num_available: Number of available eigenvectors to use
-            vertex_areas: Vertex areas a âˆˆ R^n
+            vertex_areas: Vertex areas a in R^n
 
         Returns:
             List of reconstructed vertex arrays
@@ -851,24 +857,24 @@ class RealTimeEigenanalysisVisualizer:
         f = original_vertices  # Shape: (n, 3)
 
         for num_eigenvecs in range(1, num_available + 1):
-            # Step 1: Extract basis A_â„“ = Î¦[:, 1:â„“] (first â„“ eigenvectors)
-            A_l = eigenvectors[:, :num_eigenvecs]  # Shape: (n, â„“)
+            # Step 1: Extract basis A_l = Phi[:, 1:l] (first l eigenvectors)
+            A_l = eigenvectors[:, :num_eigenvecs]  # Shape: (n, l)
 
-            # Step 2: Compute Gram matrix G = A_â„“^T M A_â„“
-            G = A_l.T @ M @ A_l  # Shape: (â„“, â„“)
+            # Step 2: Compute Gram matrix G = A_l^T M A_l
+            G = A_l.T @ M @ A_l  # Shape: (l, l)
 
-            # Step 3: Compute projection target b = A_â„“^T M f
-            b = A_l.T @ M @ f  # Shape: (â„“, 3)
+            # Step 3: Compute projection target b = A_l^T M f
+            b = A_l.T @ M @ f  # Shape: (l, 3)
 
             # Step 4: Solve for coefficients G c = b
             try:
-                c = np.linalg.solve(G, b)  # Shape: (â„“, 3)
+                c = np.linalg.solve(G, b)  # Shape: (l, 3)
             except np.linalg.LinAlgError:
                 # Fallback to pseudoinverse if G is singular
                 print(f"Warning: Gram matrix singular for {num_eigenvecs} eigenvectors, using pseudoinverse")
-                c = np.linalg.pinv(G) @ b  # Shape: (â„“, 3)
+                c = np.linalg.pinv(G) @ b  # Shape: (l, 3)
 
-            # Step 5: Reconstruct fÌ‚_â„“ = A_â„“ c
+            # Step 5: Reconstruct f_l = A_l c
             reconstructed_vertices = A_l @ c  # Shape: (n, 3)
 
             reconstructed_meshes.append(reconstructed_vertices)
@@ -895,10 +901,10 @@ class RealTimeEigenanalysisVisualizer:
             current_eigenvectors = eigenvectors[:, :num_eigenvecs]  # Shape: (N, num_eigenvecs)
 
             # Compute standard projection coefficients
-            # c_i = âŸ¨coords, Ï†_iâŸ© = Î£ coords_j * Ï†_i_j
+            # c_i = <coords, phi_i> = Sum coords_j * phi_i_j
             coefficients = np.dot(original_vertices.T, current_eigenvectors)  # Shape: (3, num_eigenvecs)
 
-            # Reconstruct coordinates: coords = Î£ c_i * Ï†_i
+            # Reconstruct coordinates: coords = Sum c_i * phi_i
             reconstructed_vertices = np.dot(current_eigenvectors, coefficients.T)  # Shape: (N, 3)
 
             reconstructed_meshes.append(reconstructed_vertices)
@@ -946,7 +952,7 @@ class RealTimeEigenanalysisVisualizer:
             # Position all GT reconstructions at the same location (right side)
             offset_vertices = gt_vertices + gt_offset
 
-            mesh_name = f"GT Recon {num_eigenvecs:02d} eigenvec (Î»={gt_eigenval:.3f})"
+            mesh_name = f"GT Recon {num_eigenvecs:02d} eigenvec (lambda={gt_eigenval:.3f})"
 
             try:
                 gt_mesh = ps.register_surface_mesh(
@@ -981,8 +987,8 @@ class RealTimeEigenanalysisVisualizer:
             offset_vertices = pred_vertices + pred_offset
 
             # Include reconstruction method in name
-            method_suffix = " (Mean Curv Areas)" if self.reconstruction_settings.use_pred_mean_curvature_as_areas else " (Standard)"
-            mesh_name = f"PRED Recon {num_eigenvecs:02d} eigenvec (Î»={pred_eigenval:.3f}){method_suffix}"
+            method_suffix = " (Pred Areas)" if self.reconstruction_settings.use_pred_areas else " (Standard)"
+            mesh_name = f"PRED Recon {num_eigenvecs:02d} eigenvec (lambda={pred_eigenval:.3f}){method_suffix}"
 
             try:
                 pred_mesh = ps.register_surface_mesh(
@@ -1066,7 +1072,7 @@ class RealTimeEigenanalysisVisualizer:
         for i in range(min(8, correlation_matrix.shape[0])):
             best_match_idx = np.argmax(correlation_matrix[i, :])
             best_correlation = correlation_matrix[i, best_match_idx]
-            print(f"  GT Eigenvector {i} â†” Pred Eigenvector {best_match_idx}: {best_correlation:.4f}")
+            print(f"  GT Eigenvector {i} -> Pred Eigenvector {best_match_idx}: {best_correlation:.4f}")
 
         # Overall statistics
         diagonal_corrs = np.diag(correlation_matrix)
@@ -1271,11 +1277,11 @@ class RealTimeEigenanalysisVisualizer:
                 gt_eigenvalue = gt_eigenvalues[i] if gt_eigenvalues is not None else 0.0
 
                 if i == 0:
-                    gt_name = f"Eigenvector {i:02d}a GT (Î»={gt_eigenvalue:.2e}, constant)"
+                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.2e}, constant)"
                 elif i == 1:
-                    gt_name = f"Eigenvector {i:02d}a GT (Î»={gt_eigenvalue:.6f}, Fiedler)"
+                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f}, Fiedler)"
                 else:
-                    gt_name = f"Eigenvector {i:02d}a GT (Î»={gt_eigenvalue:.6f})"
+                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f})"
 
                 mesh_structure.add_scalar_quantity(
                     name=gt_name,
@@ -1290,11 +1296,11 @@ class RealTimeEigenanalysisVisualizer:
                 pred_eigenvalue = pred_eigenvalues[i] if pred_eigenvalues is not None else 0.0
 
                 if i == 0:
-                    pred_name = f"Eigenvector {i:02d}b PRED (Î»={pred_eigenvalue:.2e}, constant)"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.2e}, constant)"
                 elif i == 1:
-                    pred_name = f"Eigenvector {i:02d}b PRED (Î»={pred_eigenvalue:.6f}, Fiedler)"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}, Fiedler)"
                 else:
-                    pred_name = f"Eigenvector {i:02d}b PRED (Î»={pred_eigenvalue:.6f})"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f})"
 
                 mesh_structure.add_scalar_quantity(
                     name=pred_name,
@@ -1346,7 +1352,7 @@ class RealTimeEigenanalysisVisualizer:
         inference_result = self.perform_model_inference(model, data, device)
 
         if inference_result['predicted_eigenvalues'] is None:
-            print("âŒ Failed to compute eigendecomposition, skipping this batch")
+            print("[X] Failed to compute eigendecomposition, skipping this batch")
             return
 
         # STEP 4: Compute predicted quantities
@@ -1407,9 +1413,9 @@ class RealTimeEigenanalysisVisualizer:
 
         # Add mesh reconstructions using eigenvectors
         print(f"\nSTEP 7: Computing and visualizing mesh reconstructions")
-        self._update_mesh_reconstructions(gt_data, inference_result, predicted_data)
+        self._update_mesh_reconstructions(gt_data, inference_result)
 
-        print(f"\nâœ… Comprehensive visualization completed for {Path(mesh_file_path).name}")
+        print(f"\n[OK] Comprehensive visualization completed for {Path(mesh_file_path).name}")
 
     def run_dataset_iteration(self, cfg: DictConfig):
         """Run visualization on all meshes in the dataset."""
@@ -1453,7 +1459,7 @@ class RealTimeEigenanalysisVisualizer:
 
         # Process all batches
         for batch_idx, batch_data in enumerate(data_loader):
-            print(f"\nðŸ” Processing batch {batch_idx + 1}")
+            print(f"\n[>] Processing batch {batch_idx + 1}")
 
             try:
                 self.process_batch(model, batch_data, batch_idx, device)
@@ -1463,7 +1469,7 @@ class RealTimeEigenanalysisVisualizer:
                 ps.show()
 
             except Exception as e:
-                print(f"âŒ Error processing batch {batch_idx}: {e}")
+                print(f"[X] Error processing batch {batch_idx}: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -1471,7 +1477,7 @@ class RealTimeEigenanalysisVisualizer:
                 if user_input != 'y':
                     break
 
-        print(f"\nâœ… Completed processing all batches!")
+        print(f"\n[OK] Completed processing all batches!")
 
 
 @hydra.main(version_base="1.2", config_path='./visualization_config')
@@ -1491,14 +1497,14 @@ def main(cfg: DictConfig) -> None:
     print("Checking dependencies...")
     try:
         from pyFM.mesh import TriMesh
-        print("âœ“ PyFM available")
+        print("[OK] PyFM available")
     except ImportError:
         raise ImportError("PyFM is required for GT eigendecomposition. Install with: pip install pyFM")
 
     if HAS_IGL:
-        print("âœ“ libigl available")
+        print("[OK] libigl available")
     else:
-        print("âš  libigl not available - GT mean curvature will be skipped")
+        print("[!] libigl not available - GT mean curvature will be skipped")
 
     # Create visualizer and run
     visualizer = RealTimeEigenanalysisVisualizer(config=vis_config)
