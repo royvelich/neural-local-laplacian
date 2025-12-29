@@ -182,3 +182,106 @@ class MagnitudeMSELoss(nn.Module):
         target_magnitude = torch.norm(target, p=2, dim=1)  # (batch_size,)
 
         return F.mse_loss(predicted_magnitude, target_magnitude, reduction=self.reduction)
+
+
+class RelativeMagnitudeLoss(nn.Module):
+    """
+    Relative MSE loss between vector magnitudes.
+    Computes ((||pred|| - ||target||) / ||target||)^2.
+
+    This ensures that samples with small magnitudes (low curvature regions)
+    contribute equally to the loss when they have the same relative error
+    as samples with large magnitudes.
+    """
+
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8):
+        """
+        Initialize the RelativeMagnitudeLoss.
+
+        Args:
+            reduction: Specifies the reduction to apply to the output.
+                      'mean' | 'sum' | 'none'
+            eps: Small epsilon to avoid division by zero for near-zero targets
+        """
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute relative MSE loss between vector magnitudes.
+
+        Args:
+            predicted: Predicted vectors of shape (batch_size, 3)
+            target: Target vectors of shape (batch_size, 3)
+
+        Returns:
+            Relative MSE loss: mean/sum of ((||pred|| - ||target||) / ||target||)^2
+        """
+        predicted_magnitude = torch.norm(predicted, p=2, dim=1)  # (batch_size,)
+        target_magnitude = torch.norm(target, p=2, dim=1)  # (batch_size,)
+
+        # Relative error: (pred - target) / target
+        relative_error = (predicted_magnitude - target_magnitude) / (target_magnitude + self.eps)
+        relative_error_sq = relative_error ** 2
+
+        if self.reduction == 'mean':
+            return torch.mean(relative_error_sq)
+        elif self.reduction == 'sum':
+            return torch.sum(relative_error_sq)
+        elif self.reduction == 'none':
+            return relative_error_sq
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class LogMagnitudeLoss(nn.Module):
+    """
+    Log-space MSE loss between vector magnitudes.
+    Computes (log(||pred||) - log(||target||))^2 = (log(||pred|| / ||target||))^2.
+
+    This is scale-invariant and symmetric: a 2x overestimate and 2x underestimate
+    produce the same loss. Particularly useful when magnitudes span multiple
+    orders of magnitude (e.g., curvature values).
+    """
+
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8):
+        """
+        Initialize the LogMagnitudeLoss.
+
+        Args:
+            reduction: Specifies the reduction to apply to the output.
+                      'mean' | 'sum' | 'none'
+            eps: Small epsilon to avoid log(0) for near-zero magnitudes
+        """
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log-space MSE loss between vector magnitudes.
+
+        Args:
+            predicted: Predicted vectors of shape (batch_size, 3)
+            target: Target vectors of shape (batch_size, 3)
+
+        Returns:
+            Log-space MSE loss: mean/sum of (log(||pred||) - log(||target||))^2
+        """
+        predicted_magnitude = torch.norm(predicted, p=2, dim=1)  # (batch_size,)
+        target_magnitude = torch.norm(target, p=2, dim=1)  # (batch_size,)
+
+        # Log-space difference: log(pred) - log(target) = log(pred/target)
+        log_pred = torch.log(predicted_magnitude + self.eps)
+        log_target = torch.log(target_magnitude + self.eps)
+        log_error_sq = (log_pred - log_target) ** 2
+
+        if self.reduction == 'mean':
+            return torch.mean(log_error_sq)
+        elif self.reduction == 'sum':
+            return torch.sum(log_error_sq)
+        elif self.reduction == 'none':
+            return log_error_sq
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
