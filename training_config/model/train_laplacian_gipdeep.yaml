@@ -9,8 +9,8 @@ module:
 #  use_permutation_invariant: True
   dropout: 0.0
   normalize_loss_weights: False
-  normalize_patch_features: True
-  scale_areas_by_patch_size: True
+  normalize_patch_features: False
+  scale_areas_by_patch_size: False
   input_projection_hidden_dims: [32, 64]
   output_projection_hidden_dims: [64, 32]
   loss_configs:
