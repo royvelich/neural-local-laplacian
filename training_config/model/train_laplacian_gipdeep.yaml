@@ -24,5 +24,5 @@ module:
       weight: 100
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.RelativeMagnitudeLoss
+        _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
       weight: 1
