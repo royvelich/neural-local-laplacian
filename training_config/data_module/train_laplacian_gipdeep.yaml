@@ -29,8 +29,8 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_area: False
-    batch_size: 2000
-    num_workers: 3
+    batch_size: 4000
+    num_workers: 6
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
