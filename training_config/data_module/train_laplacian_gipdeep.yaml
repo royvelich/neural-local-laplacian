@@ -9,11 +9,11 @@ module:
       grid_radius_range: [1.0]
       polynomial_offset_range: [0.0, 0.1]
       points_scale_range: [1.0]
-      coefficient_scale_range: [0.8, 1.25]
+      coefficient_scale_range: [1.0]
       order_range: [2, 3]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
-          num_points_range: [20, 40]
+          num_points_range: 6
       feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
       conv_k_nearest: null
@@ -28,6 +28,7 @@ module:
       diff_geom_at_origin_only: True
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
+      normalize_to_unit_area: False
     batch_size: 2000
     num_workers: 3
     shuffle: True

@@ -1251,6 +1251,48 @@ class RealTimeEigenanalysisVisualizer:
                 cmap='coolwarm'
             )
 
+    def _compute_eigenvector_cosine_similarities(
+            self,
+            gt_eigenvectors: Optional[np.ndarray],
+            pred_eigenvectors: Optional[np.ndarray]
+    ) -> Optional[np.ndarray]:
+        """
+        Compute cosine similarity between GT and predicted eigenvectors.
+
+        Handles sign ambiguity by taking absolute value of dot product.
+
+        Args:
+            gt_eigenvectors: GT eigenvectors of shape (N, k_gt)
+            pred_eigenvectors: Predicted eigenvectors of shape (N, k_pred)
+
+        Returns:
+            Array of cosine similarities for each eigenvector pair, or None if not computable
+        """
+        if gt_eigenvectors is None or pred_eigenvectors is None:
+            return None
+
+        num_pairs = min(gt_eigenvectors.shape[1], pred_eigenvectors.shape[1])
+        cosine_similarities = np.zeros(num_pairs)
+
+        for i in range(num_pairs):
+            gt_vec = gt_eigenvectors[:, i]
+            pred_vec = pred_eigenvectors[:, i]
+
+            # Normalize vectors
+            gt_norm = np.linalg.norm(gt_vec)
+            pred_norm = np.linalg.norm(pred_vec)
+
+            if gt_norm > 1e-8 and pred_norm > 1e-8:
+                gt_vec_normalized = gt_vec / gt_norm
+                pred_vec_normalized = pred_vec / pred_norm
+
+                # Absolute value to handle sign ambiguity
+                cosine_similarities[i] = np.abs(np.dot(gt_vec_normalized, pred_vec_normalized))
+            else:
+                cosine_similarities[i] = 0.0
+
+        return cosine_similarities
+
     def visualize_comprehensive_eigenvectors(self, mesh_structure,
                                              gt_eigenvalues: Optional[np.ndarray], gt_eigenvectors: Optional[np.ndarray],
                                              pred_eigenvalues: Optional[np.ndarray], pred_eigenvectors: Optional[np.ndarray]):
@@ -1269,19 +1311,54 @@ class RealTimeEigenanalysisVisualizer:
         print(f"  Predicted eigenvectors available: {pred_available}")
         print(f"  Showing: {num_to_show} eigenvectors per type")
 
+        # Compute cosine similarities between GT and predicted eigenvectors
+        cosine_similarities = self._compute_eigenvector_cosine_similarities(
+            gt_eigenvectors, pred_eigenvectors
+        )
+
+        # Print cosine similarities to console
+        if cosine_similarities is not None:
+            print(f"\n" + "-" * 70)
+            print("EIGENVECTOR COSINE SIMILARITIES (GT vs PRED)")
+            print("-" * 70)
+            print(f"{'Index':<8} {'Cosine Sim':<12} {'Description'}")
+            print("-" * 70)
+            for i in range(min(num_to_show, len(cosine_similarities))):
+                if i == 0:
+                    desc = "constant"
+                elif i == 1:
+                    desc = "Fiedler"
+                else:
+                    desc = ""
+                print(f"{i:<8} {cosine_similarities[i]:<12.6f} {desc}")
+
+            # Summary statistics
+            print("-" * 70)
+            print(f"Mean cosine similarity: {cosine_similarities[:num_to_show].mean():.6f}")
+            print(f"Min cosine similarity:  {cosine_similarities[:num_to_show].min():.6f}")
+            print(f"Max cosine similarity:  {cosine_similarities[:num_to_show].max():.6f}")
+            if num_to_show > 1:
+                # Exclude first (constant) eigenvector for non-trivial stats
+                print(f"Mean (excluding constant): {cosine_similarities[1:num_to_show].mean():.6f}")
+            print("-" * 70 + "\n")
+
         # Add eigenvectors in groups
         for i in range(num_to_show):
+            # Get cosine similarity for this pair (if available)
+            cos_sim = cosine_similarities[i] if cosine_similarities is not None and i < len(cosine_similarities) else None
+            cos_sim_str = f", cos={cos_sim:.4f}" if cos_sim is not None else ""
+
             # Add GT eigenvector
             if gt_eigenvectors is not None and i < gt_available:
                 gt_eigenvector = gt_eigenvectors[:, i]
                 gt_eigenvalue = gt_eigenvalues[i] if gt_eigenvalues is not None else 0.0
 
                 if i == 0:
-                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.2e}, constant)"
+                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.2e}, constant{cos_sim_str})"
                 elif i == 1:
-                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f}, Fiedler)"
+                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f}, Fiedler{cos_sim_str})"
                 else:
-                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f})"
+                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f}{cos_sim_str})"
 
                 mesh_structure.add_scalar_quantity(
                     name=gt_name,
@@ -1296,11 +1373,11 @@ class RealTimeEigenanalysisVisualizer:
                 pred_eigenvalue = pred_eigenvalues[i] if pred_eigenvalues is not None else 0.0
 
                 if i == 0:
-                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.2e}, constant)"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.2e}, constant{cos_sim_str})"
                 elif i == 1:
-                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}, Fiedler)"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}, Fiedler{cos_sim_str})"
                 else:
-                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f})"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}{cos_sim_str})"
 
                 mesh_structure.add_scalar_quantity(
                     name=pred_name,
