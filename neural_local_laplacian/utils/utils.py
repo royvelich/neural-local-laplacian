@@ -377,6 +377,12 @@ def compute_laplacian_eigendecomposition(
         - eigenvalues: Array of shape (num_eigenvalues,) sorted ascending
         - eigenvectors: Array of shape (N, num_eigenvalues)
     """
+    # Ensure consistent dtype (float64 is more stable for eigendecomposition)
+    # This prevents ARPACK convergence issues from mixed precision
+    laplacian_matrix = laplacian_matrix.astype(np.float64)
+    if mass_matrix is not None:
+        mass_matrix = mass_matrix.astype(np.float64)
+
     # Use shift-invert mode with sigma close to 0 to find smallest eigenvalues
     if mass_matrix is not None:
         # Generalized eigenvalue problem: L @ v = lambda * M @ v
