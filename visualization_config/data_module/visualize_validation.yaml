@@ -4,8 +4,8 @@ val_dataset_specifications:
   - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
     dataset:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-      mesh_folder_path: './assets/meshes4'
-      k: 6
+      mesh_folder_path: './assets/meshes'
+      k: 40
       feature_extractor:
         _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
       pose_transformers:

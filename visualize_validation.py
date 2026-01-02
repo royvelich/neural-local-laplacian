@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 import sys
+import time
 
 import numpy as np
 import torch
@@ -37,6 +38,9 @@ try:
 except ImportError:
     HAS_IGL = False
     print("Warning: libigl not available, GT mean curvature will not be computed")
+
+# For robust-laplacian eigendecomposition
+import robust_laplacian
 
 # For eigendecomposition
 import scipy.sparse
@@ -73,7 +77,7 @@ class VisualizationConfig:
 @dataclass
 class ReconstructionSettings:
     """Settings for mesh reconstruction visualization."""
-    use_pred_areas: bool = False  # Use predicted areas from model's area head
+    use_pred_areas: bool = True  # Required for M-orthonormal eigenvectors from generalized EVP
     current_pred_k: int = 20  # Will be updated with actual k from dataset
 
 
@@ -123,6 +127,36 @@ class VectorScales:
         return scale_map.get(vector_name, cls.DEFAULT_VECTOR)
 
 
+@dataclass
+class LaplacianTimingResults:
+    """Timing results for Laplacian matrix assembly comparison.
+
+    All times are in seconds. We time ONLY the matrix assembly (L, M computation),
+    NOT the eigendecomposition, for a fair comparison.
+
+    For each method we time the full pipeline from (vertices, k or faces) to (L, M):
+    - PRED: k-NN extraction + model forward pass + sparse matrix assembly
+    - Robust: point_cloud_laplacian (includes k-NN + weight computation + assembly)
+    - GT: cotangent matrix computation from mesh connectivity (igl.cotmatrix + massmatrix)
+    """
+    # PRED timings (in seconds) - broken down for analysis
+    pred_patch_extraction_time: float = 0.0  # k-NN search + data preparation
+    pred_model_inference_time: float = 0.0  # Neural network forward pass
+    pred_matrix_assembly_time: float = 0.0  # Sparse matrix construction from weights
+    pred_total_time: float = 0.0  # Sum of above
+
+    # GT (mesh-based cotangent) timing
+    gt_matrix_assembly_time: float = 0.0  # igl.cotmatrix + massmatrix
+
+    # Robust (k-NN point cloud) timing
+    robust_matrix_assembly_time: float = 0.0  # point_cloud_laplacian (k-NN + weights + assembly)
+
+    # Mesh info
+    num_vertices: int = 0
+    num_faces: int = 0
+    current_k: int = 0
+
+
 class RealTimeEigenanalysisVisualizer:
     """Real-time eigenanalysis visualizer using MeshDataset and model inference."""
 
@@ -149,8 +183,20 @@ class RealTimeEigenanalysisVisualizer:
         self.current_center_indices = None
         self.current_batch_indices = None
 
+        # Store model, device, and mesh info for k updates
+        self.current_model = None
+        self.current_device = None
+        self.current_mesh_file_path = None
+        self.current_faces = None
+
         # NEW: Track reconstruction structure names for removal
         self.reconstruction_structure_names = []
+
+        # Store average eigenvector cosine similarity for UI display
+        self.current_avg_cosine_similarity = None
+
+        # NEW: Timing results for Laplacian assembly comparison
+        self.timing_results = LaplacianTimingResults()
 
     def setup_polyscope(self):
         """Initialize and configure polyscope with UI callback."""
@@ -226,6 +272,71 @@ class RealTimeEigenanalysisVisualizer:
         psim.Separator()
         psim.Text("Note: GT always uses PyFM vertex areas and original mesh connectivity")
 
+        # Display eigenvector cosine similarity
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Eigenvector Alignment:")
+        if self.current_avg_cosine_similarity is not None:
+            avg_cos_sim = self.current_avg_cosine_similarity
+            # Color code based on similarity quality
+            if avg_cos_sim > 0.9:
+                psim.TextColored((0.0, 1.0, 0.0, 1.0), f"Avg |cos| similarity: {avg_cos_sim:.4f}")
+            elif avg_cos_sim > 0.7:
+                psim.TextColored((1.0, 1.0, 0.0, 1.0), f"Avg |cos| similarity: {avg_cos_sim:.4f}")
+            else:
+                psim.TextColored((1.0, 0.3, 0.0, 1.0), f"Avg |cos| similarity: {avg_cos_sim:.4f}")
+        else:
+            psim.Text("Avg |cos| similarity: (not computed)")
+
+        # === TIMING COMPARISON TABLE ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Laplacian Assembly Timing Comparison:")
+
+        t = self.timing_results
+        if t.num_vertices > 0:
+            # Mesh info
+            psim.Text(f"Mesh: {t.num_vertices} verts, {t.num_faces} faces, k={t.current_k}")
+            psim.Text("")
+
+            # Table header
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<20} {'Time (ms)':>12}")
+            psim.Separator()
+
+            # PRED breakdown
+            psim.TextColored((1.0, 0.5, 0.0, 1.0), "PRED (Neural Network)")
+            psim.Text(f"  k-NN extraction:   {t.pred_patch_extraction_time * 1000:>10.1f} ms")
+            psim.Text(f"  Model inference:   {t.pred_model_inference_time * 1000:>10.1f} ms")
+            psim.Text(f"  Matrix assembly:   {t.pred_matrix_assembly_time * 1000:>10.1f} ms")
+            pred_total_ms = t.pred_total_time * 1000
+            psim.TextColored((1.0, 0.5, 0.0, 1.0), f"  TOTAL:             {pred_total_ms:>10.1f} ms")
+
+            psim.Text("")
+
+            # Robust
+            robust_ms = t.robust_matrix_assembly_time * 1000
+            psim.TextColored((0.0, 0.7, 1.0, 1.0), f"Robust (Point Cloud):{robust_ms:>10.1f} ms")
+
+            # GT
+            gt_ms = t.gt_matrix_assembly_time * 1000
+            psim.TextColored((0.0, 1.0, 0.0, 1.0), f"GT (Mesh Cotangent): {gt_ms:>10.1f} ms")
+
+            psim.Text("")
+
+            # Speedup comparison
+            if t.gt_matrix_assembly_time > 0:
+                pred_vs_gt = t.pred_total_time / t.gt_matrix_assembly_time
+                robust_vs_gt = t.robust_matrix_assembly_time / t.gt_matrix_assembly_time if t.robust_matrix_assembly_time > 0 else 0
+                psim.Text(f"Relative to GT:")
+                psim.Text(f"  PRED:   {pred_vs_gt:>6.2f}x")
+                psim.Text(f"  Robust: {robust_vs_gt:>6.2f}x")
+
+            if t.robust_matrix_assembly_time > 0 and t.pred_total_time > 0:
+                pred_vs_robust = t.pred_total_time / t.robust_matrix_assembly_time
+                psim.Text(f"PRED vs Robust: {pred_vs_robust:.2f}x")
+        else:
+            psim.Text("(No timing data yet)")
+
     def _has_current_batch_data(self) -> bool:
         """Check if we have current batch data available for re-computation."""
         return (self.current_gt_data is not None and
@@ -251,19 +362,20 @@ class RealTimeEigenanalysisVisualizer:
             print(f"[!] No predicted areas available, falling back to standard reconstruction")
             return None
 
-    def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """Compute both GT and predicted reconstructions."""
+    def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        """Compute GT, predicted, and robust-laplacian reconstructions."""
         gt_reconstructions = []
         pred_reconstructions = []
+        robust_reconstructions = []
 
-        # Compute GT reconstructions (always use area weighting)
+        # Compute GT reconstructions (always use area weighting with PyFM areas)
         if gt_data.get('gt_eigenvectors') is not None:
             gt_reconstructions = self.compute_mesh_reconstruction(
                 gt_data['vertices'],
                 gt_data['gt_eigenvectors'],
                 gt_data.get('gt_eigenvalues'),
                 self.config.num_eigenvectors_to_show,
-                vertex_areas=gt_data.get('vertex_areas')  # Always use GT areas
+                vertex_areas=gt_data.get('vertex_areas')  # Always use PyFM areas
             )
 
         # Compute predicted reconstructions (respecting current setting)
@@ -277,25 +389,37 @@ class RealTimeEigenanalysisVisualizer:
                 vertex_areas=predicted_vertex_areas  # None for standard, or predicted areas from model
             )
 
-        return gt_reconstructions, pred_reconstructions
+        # Compute robust-laplacian reconstructions (always use area weighting with robust areas)
+        if gt_data.get('robust_eigenvectors') is not None:
+            robust_reconstructions = self.compute_mesh_reconstruction(
+                gt_data['vertices'],
+                gt_data['robust_eigenvectors'],
+                gt_data.get('robust_eigenvalues'),
+                self.config.num_eigenvectors_to_show,
+                vertex_areas=gt_data.get('robust_vertex_areas')  # Use robust-laplacian areas
+            )
+
+        return gt_reconstructions, pred_reconstructions, robust_reconstructions
 
     def _update_mesh_reconstructions(self, gt_data: Dict, inference_result: Dict):
         """Complete pipeline for computing and visualizing mesh reconstructions."""
         print(f"Computing and visualizing mesh reconstructions...")
 
         # Compute reconstructions
-        gt_reconstructions, pred_reconstructions = self._compute_all_reconstructions(
+        gt_reconstructions, pred_reconstructions, robust_reconstructions = self._compute_all_reconstructions(
             gt_data, inference_result
         )
 
         # Visualize reconstructions
-        if gt_reconstructions or pred_reconstructions:
+        if gt_reconstructions or pred_reconstructions or robust_reconstructions:
             self.visualize_mesh_reconstructions(
                 gt_data['faces'],
                 gt_reconstructions,
                 pred_reconstructions,
+                robust_reconstructions,
                 gt_data.get('gt_eigenvalues'),
-                inference_result['predicted_eigenvalues']
+                inference_result['predicted_eigenvalues'],
+                gt_data.get('robust_eigenvalues')
             )
             print("[OK] Mesh reconstructions completed")
         else:
@@ -411,32 +535,329 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print(f"  Failed to compute eigendecomposition for k={new_k}")
 
+    def _extract_patches_for_mesh_with_k(self, vertices: np.ndarray, k: int) -> Data:
+        """
+        Extract k-NN patches from mesh vertices for model inference.
+
+        This replicates MeshDataset._extract_all_patches logic with configurable k.
+
+        Args:
+            vertices: Mesh vertices of shape (N, 3)
+            k: Number of nearest neighbors per patch
+
+        Returns:
+            Data object ready for model inference
+        """
+        from sklearn.neighbors import NearestNeighbors
+        from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
+
+        num_vertices = len(vertices)
+
+        # Build k-NN index
+        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices)
+        distances, neighbor_indices = nbrs.kneighbors(vertices)  # Shape: (N, k+1)
+
+        # Remove center point from neighbors (vectorized)
+        center_positions = np.arange(num_vertices)[:, np.newaxis]
+        is_center_mask = neighbor_indices == center_positions
+        keep_mask = ~is_center_mask
+        keep_positions = np.cumsum(keep_mask, axis=1)
+        final_mask = (keep_positions <= k) & keep_mask
+
+        neighbor_indices_flat = neighbor_indices[final_mask]
+        neighbor_indices_filtered = neighbor_indices_flat.reshape(num_vertices, k)
+
+        # Extract neighbor positions and translate to origin
+        all_neighbor_positions = vertices[neighbor_indices_filtered]  # (N, k, 3)
+        center_positions_expanded = vertices[:, np.newaxis, :]  # (N, 1, 3)
+        patch_positions = all_neighbor_positions - center_positions_expanded  # (N, k, 3)
+
+        # Flatten for PyG
+        all_positions = patch_positions.reshape(-1, 3)  # (N*k, 3)
+        all_neighbor_indices = neighbor_indices_filtered.flatten()  # (N*k,)
+        all_center_indices = np.arange(num_vertices)  # (N,)
+        batch_indices = np.repeat(range(num_vertices), k)  # (N*k,)
+
+        # Convert to tensors
+        pos_tensor = torch.from_numpy(all_positions).float()
+        features_tensor = pos_tensor.clone()  # XYZ as features
+        patch_idx_tensor = torch.from_numpy(batch_indices).long()
+        vertex_indices_tensor = torch.from_numpy(all_neighbor_indices).long()
+        center_indices_tensor = torch.from_numpy(all_center_indices).long()
+
+        data = MeshPatchData(
+            pos=pos_tensor,
+            x=features_tensor,
+            patch_idx=patch_idx_tensor,
+            vertex_indices=vertex_indices_tensor,
+            center_indices=center_indices_tensor
+        )
+
+        return data
+
+    def _compute_robust_laplacian_with_k(self, vertices: np.ndarray, k: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Compute robust-laplacian eigendecomposition using point_cloud_laplacian with k neighbors.
+
+        This uses point cloud laplacian (k-NN based) instead of mesh laplacian,
+        making it comparable to PRED which also uses k-NN connectivity.
+
+        Args:
+            vertices: Mesh vertices of shape (N, 3)
+            k: Number of neighbors for point cloud laplacian
+
+        Returns:
+            Tuple of (eigenvalues, eigenvectors, vertex_areas) or (None, None, None) on failure
+        """
+        try:
+            import robust_laplacian
+
+            print(f"  Computing robust point_cloud_laplacian with k={k}...")
+
+            # === TIME: Robust Laplacian assembly (k-NN + weight computation + matrix construction) ===
+            t_robust_start = time.perf_counter()
+
+            # Use point_cloud_laplacian with n_neighbors=k (same as PRED k-NN)
+            L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
+
+            t_robust_end = time.perf_counter()
+            robust_laplacian_time = t_robust_end - t_robust_start
+
+            # Store timing
+            self.timing_results.robust_matrix_assembly_time = robust_laplacian_time
+            self.timing_results.current_k = k
+            print(f"  [TIMING] Robust matrix assembly: {robust_laplacian_time * 1000:.2f} ms")
+
+            # Compute eigendecomposition (NOT timed - same for all methods)
+            eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
+                L_robust, self.config.num_eigenvectors_to_show, mass_matrix=M_robust
+            )
+
+            # Extract vertex areas from mass matrix diagonal
+            vertex_areas = np.array(M_robust.diagonal()).flatten()
+
+            print(f"  Robust eigenvalue range: [{eigenvalues[0]:.2e}, {eigenvalues[-1]:.6f}]")
+
+            return eigenvalues, eigenvectors, vertex_areas
+
+        except Exception as e:
+            print(f"  Warning: Failed to compute robust-laplacian with k={k}: {e}")
+            return None, None, None
+
+    def _compute_gt_matrices_timed(self, vertices: np.ndarray, faces: np.ndarray) -> Tuple[float, Optional[scipy.sparse.csr_matrix], Optional[scipy.sparse.csr_matrix]]:
+        """
+        Compute GT Laplacian (cotangent) and mass matrices using igl, with timing.
+
+        This times ONLY the matrix construction, not eigendecomposition,
+        for fair comparison with PRED and Robust.
+
+        Args:
+            vertices: Mesh vertices of shape (N, 3)
+            faces: Mesh faces of shape (F, 3)
+
+        Returns:
+            Tuple of (assembly_time_seconds, L_matrix, M_matrix) or (0, None, None) on failure
+        """
+        if not HAS_IGL:
+            print("  [!] igl not available for GT matrix timing")
+            return 0.0, None, None
+
+        try:
+            # Convert to float64 for igl
+            V = vertices.astype(np.float64)
+            F = faces.astype(np.int32)
+
+            # === TIME: GT cotangent Laplacian + mass matrix assembly ===
+            t_start = time.perf_counter()
+
+            # Compute cotangent Laplacian (stiffness matrix)
+            L = igl.cotmatrix(V, F)
+
+            # Compute mass matrix (barycentric vertex areas)
+            M = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+
+            t_end = time.perf_counter()
+            assembly_time = t_end - t_start
+
+            self.timing_results.gt_matrix_assembly_time = assembly_time
+            print(f"  [TIMING] GT matrix assembly (igl.cotmatrix + massmatrix): {assembly_time * 1000:.2f} ms")
+
+            return assembly_time, L, M
+
+        except Exception as e:
+            print(f"  Warning: Failed to compute GT matrices with igl: {e}")
+            return 0.0, None, None
+
+    def _print_timing_summary(self):
+        """Print a summary table comparing matrix assembly times for all methods."""
+        t = self.timing_results
+
+        print(f"\n{'=' * 70}")
+        print("LAPLACIAN MATRIX ASSEMBLY TIMING COMPARISON")
+        print(f"{'=' * 70}")
+        print(f"Mesh: {t.num_vertices} vertices, {t.num_faces} faces, k={t.current_k}")
+        print(f"{'-' * 70}")
+        print(f"{'Method':<25} {'Time (ms)':<15} {'Notes'}")
+        print(f"{'-' * 70}")
+
+        # PRED breakdown
+        print(f"{'PRED (Neural Network)':<25}")
+        print(f"  {'k-NN extraction':<23} {t.pred_patch_extraction_time * 1000:>10.2f} ms")
+        print(f"  {'Model inference':<23} {t.pred_model_inference_time * 1000:>10.2f} ms")
+        print(f"  {'Matrix assembly':<23} {t.pred_matrix_assembly_time * 1000:>10.2f} ms")
+        print(f"  {'TOTAL':<23} {t.pred_total_time * 1000:>10.2f} ms")
+
+        print(f"{'-' * 70}")
+
+        # Robust
+        print(f"{'Robust (Point Cloud)':<25} {t.robust_matrix_assembly_time * 1000:>10.2f} ms   k-NN + weights + assembly")
+
+        print(f"{'-' * 70}")
+
+        # GT
+        print(f"{'GT (Mesh Cotangent)':<25} {t.gt_matrix_assembly_time * 1000:>10.2f} ms   igl.cotmatrix + massmatrix")
+
+        print(f"{'-' * 70}")
+
+        # Speedup comparison (if GT is non-zero)
+        if t.gt_matrix_assembly_time > 0:
+            pred_vs_gt = t.pred_total_time / t.gt_matrix_assembly_time
+            robust_vs_gt = t.robust_matrix_assembly_time / t.gt_matrix_assembly_time if t.robust_matrix_assembly_time > 0 else 0
+            print(f"Relative to GT:  PRED = {pred_vs_gt:.2f}x,  Robust = {robust_vs_gt:.2f}x")
+
+        if t.robust_matrix_assembly_time > 0 and t.pred_total_time > 0:
+            pred_vs_robust = t.pred_total_time / t.robust_matrix_assembly_time
+            print(f"PRED vs Robust:  {pred_vs_robust:.2f}x")
+
+        print(f"{'=' * 70}\n")
+
     def _update_pred_with_new_k(self, new_k: int):
         """
-        Complete pipeline for updating PRED with new k.
+        Complete pipeline for updating PRED and Robust-laplacian with new k.
+
+        Re-extracts patches from mesh, re-runs model inference, and recomputes
+        robust-laplacian with point_cloud_laplacian using the same k.
 
         Args:
             new_k: New number of neighbors per patch
         """
-        print(f"Updating PRED reconstructions with k={new_k}...")
+        print(f"\n{'=' * 60}")
+        print(f"UPDATING WITH NEW k={new_k}")
+        print('=' * 60)
 
-        # Recompute PRED matrices and eigendata
-        self._recompute_pred_laplacian_with_k(new_k)
+        if self.current_model is None or self.current_device is None:
+            print("[!] Model or device not available for re-inference")
+            return
 
-        # Recompute predicted quantities from new matrices
-        if self.current_inference_result.get('stiffness_matrix') is not None:
-            new_predicted_data = self.compute_predicted_quantities_from_laplacian(
-                self.current_inference_result['stiffness_matrix'],
-                self.current_gt_data['vertices'],
-                mass_matrix=self.current_inference_result.get('mass_matrix')
-            )
-            self.current_predicted_data = new_predicted_data
-            print(f"  Updated predicted quantities")
+        if self.current_original_vertices is None:
+            print("[!] No mesh vertices available")
+            return
 
-        # Recompute and update reconstructions (reuses existing pipeline!)
-        self._recompute_and_update_reconstructions()
+        # STEP 1: Re-extract patches with new k
+        print(f"STEP 1: Re-extracting patches with k={new_k}...")
 
-        print(f"PRED updated with k={new_k}")
+        # === TIME: PRED patch extraction (k-NN search + data preparation) ===
+        t_extraction_start = time.perf_counter()
+
+        new_patch_data = self._extract_patches_for_mesh_with_k(
+            self.current_original_vertices, new_k
+        )
+
+        t_extraction_end = time.perf_counter()
+        pred_extraction_time = t_extraction_end - t_extraction_start
+        self.timing_results.pred_patch_extraction_time = pred_extraction_time
+
+        print(f"  Extracted {len(new_patch_data.center_indices)} patches with {new_k} neighbors each")
+        print(f"  [TIMING] PRED patch extraction: {pred_extraction_time * 1000:.2f} ms")
+
+        # STEP 2: Re-run model inference (timing is inside perform_model_inference)
+        print(f"STEP 2: Re-running model inference...")
+        new_inference_result = self.perform_model_inference(
+            self.current_model, new_patch_data, self.current_device
+        )
+
+        if new_inference_result['predicted_eigenvalues'] is None:
+            print("[!] Failed to compute PRED eigendecomposition")
+            return
+
+        self.current_inference_result = new_inference_result
+        print(f"  PRED eigenvalue range: [{new_inference_result['predicted_eigenvalues'][0]:.2e}, {new_inference_result['predicted_eigenvalues'][-1]:.6f}]")
+
+        # Compute PRED total time
+        pred_total_time = (self.timing_results.pred_patch_extraction_time +
+                           self.timing_results.pred_model_inference_time +
+                           self.timing_results.pred_matrix_assembly_time)
+        self.timing_results.pred_total_time = pred_total_time
+
+        # STEP 3: Recompute robust-laplacian with same k (timing is inside _compute_robust_laplacian_with_k)
+        print(f"STEP 3: Recomputing robust-laplacian with k={new_k}...")
+        robust_eigenvalues, robust_eigenvectors, robust_vertex_areas = self._compute_robust_laplacian_with_k(
+            self.current_original_vertices, new_k
+        )
+
+        # Update gt_data with new robust-laplacian results
+        self.current_gt_data['robust_eigenvalues'] = robust_eigenvalues
+        self.current_gt_data['robust_eigenvectors'] = robust_eigenvectors
+        self.current_gt_data['robust_vertex_areas'] = robust_vertex_areas
+
+        # STEP 4: Recompute predicted quantities
+        print(f"STEP 4: Recomputing predicted quantities...")
+        new_predicted_data = self.compute_predicted_quantities_from_laplacian(
+            new_inference_result['stiffness_matrix'],
+            self.current_gt_data['vertices'],
+            mass_matrix=new_inference_result.get('mass_matrix')
+        )
+        self.current_predicted_data = new_predicted_data
+
+        # STEP 5: Update visualizations
+        print(f"STEP 5: Updating visualizations...")
+        self._remove_existing_reconstructions()
+        self._update_mesh_reconstructions(self.current_gt_data, self.current_inference_result)
+
+        # Update eigenvector visualizations on the mesh
+        self._update_eigenvector_visualizations()
+
+        # Print timing summary
+        self._print_timing_summary()
+
+        print(f"\n[OK] Updated PRED and Robust with k={new_k}")
+        print('=' * 60)
+
+    def _update_eigenvector_visualizations(self):
+        """Update eigenvector scalar fields on the mesh structure."""
+        if self.current_mesh_structure is None:
+            return
+
+        # Remove old eigenvector quantities and add new ones
+        # Note: Polyscope doesn't have a clean way to remove quantities,
+        # so we just add new ones with updated values
+
+        gt_eigenvalues = self.current_gt_data.get('gt_eigenvalues')
+        gt_eigenvectors = self.current_gt_data.get('gt_eigenvectors')
+        pred_eigenvalues = self.current_inference_result.get('predicted_eigenvalues')
+        pred_eigenvectors = self.current_inference_result.get('predicted_eigenvectors')
+        robust_eigenvalues = self.current_gt_data.get('robust_eigenvalues')
+        robust_eigenvectors = self.current_gt_data.get('robust_eigenvectors')
+
+        # Recompute cosine similarities
+        cosine_similarities_pred = self._compute_eigenvector_cosine_similarities(
+            gt_eigenvectors, pred_eigenvectors
+        )
+        cosine_similarities_robust = self._compute_eigenvector_cosine_similarities(
+            gt_eigenvectors, robust_eigenvectors
+        )
+
+        # Update stored average for UI
+        if cosine_similarities_pred is not None:
+            num_to_show = min(self.config.num_eigenvectors_to_show, len(cosine_similarities_pred))
+            self.current_avg_cosine_similarity = float(cosine_similarities_pred[:num_to_show].mean())
+
+        # Print updated comparison
+        print(f"\nUpdated eigenvector cosine similarities:")
+        if cosine_similarities_pred is not None:
+            print(f"  GT vs PRED mean: {cosine_similarities_pred.mean():.4f}")
+        if cosine_similarities_robust is not None:
+            print(f"  GT vs Robust mean: {cosine_similarities_robust.mean():.4f}")
 
     def _recompute_and_update_reconstructions(self):
         """Re-compute and update mesh reconstructions with new settings."""
@@ -474,7 +895,7 @@ class RealTimeEigenanalysisVisualizer:
         except Exception as e:
             print(f"  Warning: Failed to remove some reconstruction structures: {e}")
 
-    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig) -> LaplacianTransformerModule:
+    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig, use_torch_compile: bool = True) -> LaplacianTransformerModule:
         """
         Load trained LaplacianTransformerModule from checkpoint.
 
@@ -482,6 +903,7 @@ class RealTimeEigenanalysisVisualizer:
             ckpt_path: Path to the checkpoint file
             device: Device to load the model on
             cfg: Hydra config containing model configuration
+            use_torch_compile: Whether to use torch.compile() for faster inference
 
         Returns:
             Loaded model in evaluation mode
@@ -508,6 +930,19 @@ class RealTimeEigenanalysisVisualizer:
             model.eval()
             model.to(device)
 
+            # Disable gradient checkpointing for inference (if present)
+            # This ensures we don't have unnecessary overhead from checkpointing logic
+            self._disable_gradient_checkpointing(model)
+
+            # Apply torch.compile() for faster inference (PyTorch 2.0+)
+            if use_torch_compile:
+                try:
+                    print("Applying torch.compile() for optimized inference...")
+                    model = torch.compile(model, mode="reduce-overhead")
+                    print("[OK] torch.compile() applied successfully")
+                except Exception as e:
+                    print(f"[!] torch.compile() failed, using eager mode: {e}")
+
             print(f"[OK] Model loaded successfully on {device}")
             print(f"   Model type: {type(model).__name__}")
             print(f"   Input dim: {model._input_dim}")
@@ -518,6 +953,104 @@ class RealTimeEigenanalysisVisualizer:
 
         except Exception as e:
             raise RuntimeError(f"Failed to load model from {ckpt_path}: {e}")
+
+    def _disable_gradient_checkpointing(self, model: torch.nn.Module):
+        """
+        Disable gradient checkpointing on the model for faster inference.
+
+        Gradient checkpointing saves memory during training by recomputing activations,
+        but adds overhead during inference when we don't need gradients.
+
+        Args:
+            model: The model to disable gradient checkpointing on
+        """
+        disabled_count = 0
+
+        # Check for HuggingFace-style gradient checkpointing
+        if hasattr(model, 'gradient_checkpointing_disable'):
+            model.gradient_checkpointing_disable()
+            disabled_count += 1
+            print("  Disabled HuggingFace-style gradient checkpointing")
+
+        # Check for gradient_checkpointing attribute
+        if hasattr(model, 'gradient_checkpointing'):
+            model.gradient_checkpointing = False
+            disabled_count += 1
+            print("  Disabled gradient_checkpointing attribute")
+
+        # Recursively check submodules for TransformerEncoder with checkpoint settings
+        for name, module in model.named_modules():
+            # PyTorch TransformerEncoder may have enable_nested_tensor which affects performance
+            if hasattr(module, 'enable_nested_tensor'):
+                # enable_nested_tensor=True is faster for inference with padding
+                if not module.enable_nested_tensor:
+                    print(f"  Note: {name} has enable_nested_tensor=False")
+
+            # Check for any checkpoint-related attributes
+            if hasattr(module, 'checkpoint'):
+                module.checkpoint = False
+                disabled_count += 1
+            if hasattr(module, 'use_checkpoint'):
+                module.use_checkpoint = False
+                disabled_count += 1
+
+        if disabled_count > 0:
+            print(f"  Disabled {disabled_count} gradient checkpointing setting(s)")
+        else:
+            print("  No gradient checkpointing found (good for inference)")
+
+    def _warmup_model(self, model: LaplacianTransformerModule, device: torch.device, num_warmup: int = 3):
+        """
+        Warmup the model to trigger torch.compile() compilation.
+
+        The first few inferences after torch.compile() are slow due to compilation.
+        We run warmup passes so that actual benchmarking reflects optimized performance.
+
+        Args:
+            model: The model to warm up
+            device: Device to run on
+            num_warmup: Number of warmup iterations
+        """
+        print(f"Warming up model ({num_warmup} iterations)...")
+
+        # Create dummy input similar to real data
+        # Use reasonable sizes: 1000 patches, 30 neighbors, 3D features
+        num_patches = 1000
+        k = 30
+
+        from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
+
+        dummy_data = MeshPatchData(
+            pos=torch.randn(num_patches * k, 3, device=device),
+            x=torch.randn(num_patches * k, 3, device=device),
+            patch_idx=torch.arange(num_patches, device=device).repeat_interleave(k),
+            vertex_indices=torch.randint(0, num_patches, (num_patches * k,), device=device),
+            center_indices=torch.arange(num_patches, device=device)
+        )
+
+        # Determine mixed precision dtype (must match inference for torch.compile)
+        use_amp = device.type == 'cuda'
+        if use_amp:
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        try:
+            with torch.no_grad():
+                for i in range(num_warmup):
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+
+                    # Use same mixed precision as inference
+                    if use_amp:
+                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                            _ = model._forward_pass(dummy_data)
+                    else:
+                        _ = model._forward_pass(dummy_data)
+
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+            print(f"[OK] Model warmup complete")
+        except Exception as e:
+            print(f"[!] Model warmup failed (this is OK if not using torch.compile): {e}")
 
     def compute_eigendecomposition(self, stiffness_matrix: scipy.sparse.csr_matrix,
                                    k: int = 50,
@@ -539,19 +1072,11 @@ class RealTimeEigenanalysisVisualizer:
         """
         try:
             # Use the centralized eigendecomposition function from utils
+            # Note: eigsh returns M-orthonormal eigenvectors (Î¦^T M Î¦ = I)
+            # We preserve this property for correct area-weighted reconstruction
             eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
                 stiffness_matrix, k, mass_matrix=mass_matrix
             )
-
-            # Ensure predicted eigenvectors are normalized
-            if eigenvectors is not None:
-                # Normalize each eigenvector to unit length
-                eigenvectors_norms = np.linalg.norm(eigenvectors, axis=0, keepdims=True)
-                # Avoid division by zero
-                eigenvectors_norms = np.where(eigenvectors_norms > 1e-10, eigenvectors_norms, 1.0)
-                eigenvectors = eigenvectors / eigenvectors_norms
-
-                print(f"Predicted eigenvectors normalized to unit length")
 
             return eigenvalues, eigenvectors
 
@@ -621,27 +1146,32 @@ class RealTimeEigenanalysisVisualizer:
 
         # Compute GT Laplacian eigendecomposition using PyFM
         print("Computing GT Laplacian eigendecomposition using PyFM...")
+        gt_laplacian_time = 0.0
         try:
             # Create PyFM TriMesh object
             pyfm_mesh = TriMesh(vertices, faces)
 
+            # === TIME: GT Laplacian assembly (PyFM uses cotangent weights from mesh) ===
+            # Note: process() computes Laplacian AND eigendecomposition together
+            # We time the whole call but the Laplacian assembly is O(N) while eigen is O(N*k)
+            t_gt_start = time.perf_counter()
+
             # Process the mesh and compute the Laplacian spectrum
             pyfm_mesh.process(k=self.config.num_eigenvectors_to_show, intrinsic=False, verbose=False)
 
+            t_gt_end = time.perf_counter()
+            gt_laplacian_time = t_gt_end - t_gt_start
+
+            # Store timing (note: includes eigendecomposition)
+            self.timing_results.gt_laplacian_time = gt_laplacian_time
+            print(f"[TIMING] GT (PyFM) Laplacian + eigen: {gt_laplacian_time * 1000:.2f} ms")
+
             # Retrieve eigenvalues, eigenfunctions, and vertex areas
+            # Note: PyFM returns M-orthonormal eigenvectors (Î¦^T M Î¦ = I)
+            # We preserve this property for correct area-weighted reconstruction
             gt_eigenvalues = pyfm_mesh.eigenvalues
             gt_eigenvectors = pyfm_mesh.eigenvectors
             vertex_areas = pyfm_mesh.vertex_areas
-
-            # Ensure GT eigenvectors are normalized
-            if gt_eigenvectors is not None:
-                # Normalize each eigenvector to unit length
-                gt_eigenvectors_norms = np.linalg.norm(gt_eigenvectors, axis=0, keepdims=True)
-                # Avoid division by zero
-                gt_eigenvectors_norms = np.where(gt_eigenvectors_norms > 1e-10, gt_eigenvectors_norms, 1.0)
-                gt_eigenvectors = gt_eigenvectors / gt_eigenvectors_norms
-
-                print(f"GT eigenvectors normalized to unit length")
 
             print(f"Computed {len(gt_eigenvalues)} GT eigenvalues")
             print(f"GT eigenvalue range: [{gt_eigenvalues[0]:.2e}, {gt_eigenvalues[-1]:.6f}]")
@@ -652,15 +1182,28 @@ class RealTimeEigenanalysisVisualizer:
             gt_eigenvectors = None
             vertex_areas = None
 
+        except Exception as e:
+            print(f"Warning: Failed to compute GT eigendecomposition: {e}")
+            gt_eigenvalues = None
+            gt_eigenvectors = None
+            vertex_areas = None
+
+        # Note: robust-laplacian is computed later in process_batch with the actual k value
+        # to ensure it uses point_cloud_laplacian with the same k as PRED
+
         return {
             'vertices': vertices,
             'faces': faces,
             'gt_vertex_normals': gt_vertex_normals,
             'gt_mean_curvature': gt_mean_curvature,
-            'gt_mean_curvature_vector': gt_mean_curvature_vector,  # New: GT mean curvature vector
+            'gt_mean_curvature_vector': gt_mean_curvature_vector,
             'gt_eigenvalues': gt_eigenvalues,
             'gt_eigenvectors': gt_eigenvectors,
-            'vertex_areas': vertex_areas
+            'vertex_areas': vertex_areas,
+            # Robust-laplacian data (computed later with actual k)
+            'robust_eigenvalues': None,
+            'robust_eigenvectors': None,
+            'robust_vertex_areas': None
         }
 
     def perform_model_inference(self, model: LaplacianTransformerModule, batch_data: Data, device: torch.device) -> Dict[str, Any]:
@@ -680,13 +1223,38 @@ class RealTimeEigenanalysisVisualizer:
         # Move batch data to device
         batch_data = batch_data.to(device)
 
+        # Determine mixed precision dtype (BF16 preferred on Ampere+, else FP16)
+        use_amp = device.type == 'cuda'
+        if use_amp:
+            if torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+                print("  Using mixed precision: BF16")
+            else:
+                amp_dtype = torch.float16
+                print("  Using mixed precision: FP16")
+
         with torch.no_grad():
-            # Forward pass to get new result structure with stiffness weights and areas
-            forward_result = model._forward_pass(batch_data)
+            # === TIME: Model inference (forward pass) ===
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_inference_start = time.perf_counter()
+
+            # Forward pass with mixed precision for faster inference
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                    forward_result = model._forward_pass(batch_data)
+            else:
+                forward_result = model._forward_pass(batch_data)
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_inference_end = time.perf_counter()
+            pred_inference_time = t_inference_end - t_inference_start
 
             # Extract components from new forward result structure
-            stiffness_weights = forward_result['stiffness_weights']  # Shape: (batch_size, max_k)
-            areas = forward_result['areas']  # Shape: (batch_size,)
+            # Convert back to float32 for downstream processing (matrix assembly, eigendecomp)
+            stiffness_weights = forward_result['stiffness_weights'].float()  # Shape: (batch_size, max_k)
+            areas = forward_result['areas'].float()  # Shape: (batch_size,)
             attention_mask = forward_result['attention_mask']  # Shape: (batch_size, max_k)
             batch_sizes = forward_result['batch_sizes']  # Shape: (batch_size,)
 
@@ -699,6 +1267,9 @@ class RealTimeEigenanalysisVisualizer:
             # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
             batch_indices = getattr(batch_data, 'patch_idx', batch_data.batch)
 
+            # === TIME: Matrix assembly ===
+            t_assembly_start = time.perf_counter()
+
             # Assemble separate stiffness and mass matrices
             stiffness_matrix, mass_matrix = assemble_stiffness_and_mass_matrices(
                 stiffness_weights=stiffness_weights,
@@ -709,8 +1280,17 @@ class RealTimeEigenanalysisVisualizer:
                 batch_indices=batch_indices
             )
 
+            t_assembly_end = time.perf_counter()
+            pred_assembly_time = t_assembly_end - t_assembly_start
+
             print(f"Assembled stiffness matrix: {stiffness_matrix.shape} ({stiffness_matrix.nnz} non-zeros)")
             print(f"Assembled mass matrix: {mass_matrix.shape} (diagonal)")
+
+            # Store timing results
+            self.timing_results.pred_model_inference_time = pred_inference_time
+            self.timing_results.pred_matrix_assembly_time = pred_assembly_time
+            print(f"[TIMING] PRED model inference: {pred_inference_time * 1000:.2f} ms")
+            print(f"[TIMING] PRED matrix assembly: {pred_assembly_time * 1000:.2f} ms")
 
             # Compute eigendecomposition using generalized eigenvalue problem
             predicted_eigenvalues, predicted_eigenvectors = self.compute_eigendecomposition(
@@ -835,56 +1415,65 @@ class RealTimeEigenanalysisVisualizer:
     def _compute_area_weighted_reconstruction(self, original_vertices: np.ndarray, eigenvectors: np.ndarray,
                                               num_available: int, vertex_areas: np.ndarray) -> List[np.ndarray]:
         """
-        Compute mesh reconstruction using area-weighted least squares (for GT case).
+        Compute mesh reconstruction using area-weighted inner products (fully vectorized).
 
-        Solves the weighted least squares problem:
-        min_c ||f - A_l c||_M^2
-        where M = diag(vertex_areas) is the mass matrix.
+        For M-orthonormal eigenvectors from generalized eigenvalue problem (S v = Î» M v),
+        the Gram matrix G = Î¦^T M Î¦ = I, so projection coefficients simplify to:
+            c = Î¦^T M f
+        and reconstruction is:
+            f_l = Î¦_l c_l = Î£_{i=0}^{l-1} Ï†_i (Ï†_i^T M f)
+
+        This vectorized implementation computes all progressive reconstructions efficiently
+        using cumulative sums, avoiding Python loops entirely.
 
         Args:
             original_vertices: Original mesh vertices f in R^{n x 3}
-            eigenvectors: Eigenvectors Phi in R^{n x k}
+            eigenvectors: Eigenvectors Phi in R^{n x k} (M-orthonormal: Î¦^T M Î¦ = I)
             num_available: Number of available eigenvectors to use
-            vertex_areas: Vertex areas a in R^n
+            vertex_areas: Vertex areas a in R^n (diagonal of mass matrix M)
 
         Returns:
-            List of reconstructed vertex arrays
+            List of reconstructed vertex arrays [f_1, f_2, ..., f_L] where f_l uses l eigenvectors
         """
-        reconstructed_meshes = []
+        if num_available == 0:
+            return []
 
-        # Create mass matrix M = diag(vertex_areas)
-        M = np.diag(vertex_areas)  # Shape: (n, n)
-        f = original_vertices  # Shape: (n, 3)
+        # Apply diagonal mass matrix efficiently: M @ f = diag(areas) @ f
+        # No need to form full nÃ—n matrix - just element-wise multiplication
+        M_f = vertex_areas[:, np.newaxis] * original_vertices  # (n, 3)
 
-        for num_eigenvecs in range(1, num_available + 1):
-            # Step 1: Extract basis A_l = Phi[:, 1:l] (first l eigenvectors)
-            A_l = eigenvectors[:, :num_eigenvecs]  # Shape: (n, l)
+        # Compute all M-weighted coefficients at once: c = Î¦^T M f
+        # Since Î¦ is M-orthonormal, these are the exact projection coefficients
+        Phi = eigenvectors[:, :num_available]  # (n, L)
+        coefficients = Phi.T @ M_f  # (L, 3)
 
-            # Step 2: Compute Gram matrix G = A_l^T M A_l
-            G = A_l.T @ M @ A_l  # Shape: (l, l)
+        # Compute contribution from each eigenvector via broadcasting:
+        # contribution_i = Ï†_i âŠ— c_i^T (outer product, but c_i is a row vector)
+        # Shape: (n, L, 1) * (1, L, 3) â†’ (n, L, 3)
+        contributions = Phi[:, :, np.newaxis] * coefficients[np.newaxis, :, :]
 
-            # Step 3: Compute projection target b = A_l^T M f
-            b = A_l.T @ M @ f  # Shape: (l, 3)
+        # Cumulative sum along eigenvector axis gives progressive reconstructions:
+        # cumulative[:, l, :] = Î£_{i=0}^{l} contribution_i = reconstruction using (l+1) eigenvectors
+        cumulative = np.cumsum(contributions, axis=1)  # (n, L, 3)
 
-            # Step 4: Solve for coefficients G c = b
-            try:
-                c = np.linalg.solve(G, b)  # Shape: (l, 3)
-            except np.linalg.LinAlgError:
-                # Fallback to pseudoinverse if G is singular
-                print(f"Warning: Gram matrix singular for {num_eigenvecs} eigenvectors, using pseudoinverse")
-                c = np.linalg.pinv(G) @ b  # Shape: (l, 3)
-
-            # Step 5: Reconstruct f_l = A_l c
-            reconstructed_vertices = A_l @ c  # Shape: (n, 3)
-
-            reconstructed_meshes.append(reconstructed_vertices)
-
-        return reconstructed_meshes
+        # Convert to list of (n, 3) arrays
+        return [cumulative[:, i, :] for i in range(num_available)]
 
     def _compute_standard_reconstruction(self, original_vertices: np.ndarray, eigenvectors: np.ndarray,
                                          num_available: int) -> List[np.ndarray]:
         """
-        Compute mesh reconstruction using standard Euclidean inner products (for PRED case).
+        Compute mesh reconstruction using standard Euclidean inner products (optimized).
+
+        Solves the least squares problem for each l:
+            min_c ||f - Î¦_l c||_2^2
+
+        Solution: c = (Î¦_l^T Î¦_l)^{-1} Î¦_l^T f, then f_l = Î¦_l c
+
+        Note: Eigenvectors from generalized EVP are M-orthonormal, not L2-orthonormal.
+        Even after L2-renormalization, they are L2-normalized but NOT L2-orthogonal.
+        So we must compute the actual Gram matrix G = Î¦^T Î¦.
+
+        Optimized by precomputing Î¦^T Î¦ and Î¦^T f once, then extracting submatrices.
 
         Args:
             original_vertices: Original mesh vertices of shape (N, 3)
@@ -892,22 +1481,31 @@ class RealTimeEigenanalysisVisualizer:
             num_available: Number of available eigenvectors to use
 
         Returns:
-            List of reconstructed vertex arrays
+            List of reconstructed vertex arrays [f_1, f_2, ..., f_L] where f_l uses l eigenvectors
         """
+        if num_available == 0:
+            return []
+
+        Phi = eigenvectors[:, :num_available]  # (n, L)
+
+        # Precompute full Gram matrix G_full = Î¦^T Î¦ and projection target b_full = Î¦^T f
+        G_full = Phi.T @ Phi  # (L, L)
+        b_full = Phi.T @ original_vertices  # (L, 3)
+
         reconstructed_meshes = []
+        for l in range(1, num_available + 1):
+            # Extract lÃ—l submatrix and lÃ—3 subvector
+            G_l = G_full[:l, :l]
+            b_l = b_full[:l, :]
 
-        for num_eigenvecs in range(1, num_available + 1):
-            # Use first num_eigenvecs eigenvectors
-            current_eigenvectors = eigenvectors[:, :num_eigenvecs]  # Shape: (N, num_eigenvecs)
+            # Solve G_l c = b_l for coefficients
+            try:
+                c = np.linalg.solve(G_l, b_l)  # (l, 3)
+            except np.linalg.LinAlgError:
+                c = np.linalg.pinv(G_l) @ b_l
 
-            # Compute standard projection coefficients
-            # c_i = <coords, phi_i> = Sum coords_j * phi_i_j
-            coefficients = np.dot(original_vertices.T, current_eigenvectors)  # Shape: (3, num_eigenvecs)
-
-            # Reconstruct coordinates: coords = Sum c_i * phi_i
-            reconstructed_vertices = np.dot(current_eigenvectors, coefficients.T)  # Shape: (N, 3)
-
-            reconstructed_meshes.append(reconstructed_vertices)
+            # Reconstruct: f_l = Î¦_l c
+            reconstructed_meshes.append(Phi[:, :l] @ c)
 
         return reconstructed_meshes
 
@@ -925,26 +1523,31 @@ class RealTimeEigenanalysisVisualizer:
         return correlation_matrix
 
     def visualize_mesh_reconstructions(self, original_faces: np.ndarray, gt_reconstructions: List[np.ndarray],
-                                       pred_reconstructions: List[np.ndarray], gt_eigenvalues: Optional[np.ndarray],
-                                       pred_eigenvalues: Optional[np.ndarray]):
+                                       pred_reconstructions: List[np.ndarray], robust_reconstructions: List[np.ndarray],
+                                       gt_eigenvalues: Optional[np.ndarray],
+                                       pred_eigenvalues: Optional[np.ndarray],
+                                       robust_eigenvalues: Optional[np.ndarray]):
         """
         Visualize progressive mesh reconstructions using eigenvectors.
-        All GT reconstructions are overlaid on the right, all PRED reconstructions on the left.
+        GT (PyFM) on the right, PRED in the center-left, Robust on the far left.
 
         Args:
             original_faces: Mesh faces for topology
-            gt_reconstructions: List of GT reconstructed vertices
+            gt_reconstructions: List of GT (PyFM) reconstructed vertices
             pred_reconstructions: List of predicted reconstructed vertices
+            robust_reconstructions: List of robust-laplacian reconstructed vertices
             gt_eigenvalues: GT eigenvalues for labeling
             pred_eigenvalues: Predicted eigenvalues for labeling
+            robust_eigenvalues: Robust-laplacian eigenvalues for labeling
         """
         print("Adding mesh reconstruction visualizations...")
 
         # Fixed positions for overlaid reconstructions
-        gt_offset = np.array([3.0, 0.0, 0.0])  # GT reconstructions on the right
-        pred_offset = np.array([-3.0, 0.0, 0.0])  # PRED reconstructions on the left
+        gt_offset = np.array([3.0, 0.0, 0.0])  # GT (PyFM) reconstructions on the right
+        pred_offset = np.array([0.0, 0.0, -3.0])  # PRED reconstructions in front
+        robust_offset = np.array([-3.0, 0.0, 0.0])  # Robust reconstructions on the left
 
-        # Visualize GT reconstructions (all overlaid on the right)
+        # Visualize GT (PyFM) reconstructions (all overlaid on the right)
         for i, gt_vertices in enumerate(gt_reconstructions):
             num_eigenvecs = i + 1
             gt_eigenval = gt_eigenvalues[i] if gt_eigenvalues is not None else 0.0
@@ -952,7 +1555,7 @@ class RealTimeEigenanalysisVisualizer:
             # Position all GT reconstructions at the same location (right side)
             offset_vertices = gt_vertices + gt_offset
 
-            mesh_name = f"GT Recon {num_eigenvecs:02d} eigenvec (lambda={gt_eigenval:.3f})"
+            mesh_name = f"GT-PyFM Recon {num_eigenvecs:02d} eigenvec (lambda={gt_eigenval:.3f})"
 
             try:
                 gt_mesh = ps.register_surface_mesh(
@@ -978,12 +1581,12 @@ class RealTimeEigenanalysisVisualizer:
             except Exception as e:
                 print(f"Warning: Failed to visualize GT reconstruction {num_eigenvecs}: {e}")
 
-        # Visualize predicted reconstructions (all overlaid on the left)
+        # Visualize predicted reconstructions (in front)
         for i, pred_vertices in enumerate(pred_reconstructions):
             num_eigenvecs = i + 1
             pred_eigenval = pred_eigenvalues[i] if pred_eigenvalues is not None else 0.0
 
-            # Position all PRED reconstructions at the same location (left side)
+            # Position all PRED reconstructions at the same location (front)
             offset_vertices = pred_vertices + pred_offset
 
             # Include reconstruction method in name
@@ -1014,20 +1617,55 @@ class RealTimeEigenanalysisVisualizer:
             except Exception as e:
                 print(f"Warning: Failed to visualize predicted reconstruction {num_eigenvecs}: {e}")
 
-        print(f"Added {len(gt_reconstructions)} GT and {len(pred_reconstructions)} predicted mesh reconstructions")
+        # Visualize robust-laplacian reconstructions (all overlaid on the left)
+        for i, robust_vertices in enumerate(robust_reconstructions):
+            num_eigenvecs = i + 1
+            robust_eigenval = robust_eigenvalues[i] if robust_eigenvalues is not None else 0.0
+
+            # Position all robust reconstructions at the same location (left side)
+            offset_vertices = robust_vertices + robust_offset
+
+            mesh_name = f"Robust Recon {num_eigenvecs:02d} eigenvec (lambda={robust_eigenval:.3f})"
+
+            try:
+                robust_mesh = ps.register_surface_mesh(
+                    name=mesh_name,
+                    vertices=offset_vertices,
+                    faces=original_faces,
+                    enabled=(i == 0)  # Only enable the first one by default
+                )
+
+                # Track this structure for later removal
+                self.reconstruction_structure_names.append(mesh_name)
+
+                # Color robust reconstructions in green tones with slight variation
+                green_intensity = 0.5 + 0.5 * (i / max(1, len(robust_reconstructions) - 1))
+                mesh_color = np.array([0.2, green_intensity, 0.3])
+                vertex_colors = np.tile(mesh_color, (len(offset_vertices), 1))
+                robust_mesh.add_color_quantity(
+                    name="robust_color",
+                    values=vertex_colors,
+                    enabled=True
+                )
+
+            except Exception as e:
+                print(f"Warning: Failed to visualize robust reconstruction {num_eigenvecs}: {e}")
+
+        print(f"Added {len(gt_reconstructions)} GT-PyFM, {len(pred_reconstructions)} PRED, and {len(robust_reconstructions)} Robust mesh reconstructions")
         print("Toggle visibility to compare different numbers of eigenvectors")
 
     def print_eigenvalue_analysis(self, gt_eigenvalues: Optional[np.ndarray],
                                   predicted_eigenvalues: Optional[np.ndarray],
-                                  mesh_name: str):
+                                  mesh_name: str,
+                                  robust_eigenvalues: Optional[np.ndarray] = None):
         """Print detailed eigenvalue comparison analysis."""
         print(f"\n" + "-" * 70)
         print(f"EIGENVALUE COMPARISON ANALYSIS - {mesh_name}")
         print("-" * 70)
 
-        # Ground-truth analysis
+        # Ground-truth (PyFM) analysis
         if gt_eigenvalues is not None:
-            print("GROUND-TRUTH EIGENVALUES:")
+            print("GT (PyFM) EIGENVALUES:")
             print(f"  Number of eigenvalues: {len(gt_eigenvalues)}")
             print(f"  First eigenvalue (should be ~0): {gt_eigenvalues[0]:.2e}")
             if len(gt_eigenvalues) > 1:
@@ -1045,7 +1683,17 @@ class RealTimeEigenanalysisVisualizer:
                 print(f"  Spectral gap: {predicted_eigenvalues[1] - predicted_eigenvalues[0]:.6f}")
             print(f"  Largest eigenvalue: {predicted_eigenvalues[-1]:.6f}")
 
-        # Comparison metrics
+        # Robust-laplacian analysis
+        if robust_eigenvalues is not None:
+            print("\nROBUST-LAPLACIAN EIGENVALUES:")
+            print(f"  Number of eigenvalues: {len(robust_eigenvalues)}")
+            print(f"  First eigenvalue (should be ~0): {robust_eigenvalues[0]:.2e}")
+            if len(robust_eigenvalues) > 1:
+                print(f"  Second eigenvalue (Fiedler): {robust_eigenvalues[1]:.6f}")
+                print(f"  Spectral gap: {robust_eigenvalues[1] - robust_eigenvalues[0]:.6f}")
+            print(f"  Largest eigenvalue: {robust_eigenvalues[-1]:.6f}")
+
+        # Comparison metrics: PRED vs GT
         if gt_eigenvalues is not None and predicted_eigenvalues is not None:
             min_len = min(len(gt_eigenvalues), len(predicted_eigenvalues))
             if min_len > 0:
@@ -1053,12 +1701,25 @@ class RealTimeEigenanalysisVisualizer:
                 pred_subset = predicted_eigenvalues[:min_len]
 
                 abs_errors = np.abs(pred_subset - gt_subset)
-                rel_errors = abs_errors / (np.abs(gt_subset) + 1e-10)
 
-                print(f"\nPREDICTED VS GT COMPARISON:")
+                print(f"\nPREDICTED VS GT (PyFM) COMPARISON:")
                 print(f"  Mean absolute error: {abs_errors.mean():.6f}")
                 print(f"  Max absolute error: {abs_errors.max():.6f}")
                 print(f"  Correlation coefficient: {np.corrcoef(gt_subset, pred_subset)[0, 1]:.6f}")
+
+        # Comparison metrics: Robust vs GT
+        if gt_eigenvalues is not None and robust_eigenvalues is not None:
+            min_len = min(len(gt_eigenvalues), len(robust_eigenvalues))
+            if min_len > 0:
+                gt_subset = gt_eigenvalues[:min_len]
+                robust_subset = robust_eigenvalues[:min_len]
+
+                abs_errors = np.abs(robust_subset - gt_subset)
+
+                print(f"\nROBUST VS GT (PyFM) COMPARISON:")
+                print(f"  Mean absolute error: {abs_errors.mean():.6f}")
+                print(f"  Max absolute error: {abs_errors.max():.6f}")
+                print(f"  Correlation coefficient: {np.corrcoef(gt_subset, robust_subset)[0, 1]:.6f}")
 
         print("-" * 70)
 
@@ -1155,6 +1816,14 @@ class RealTimeEigenanalysisVisualizer:
                 values=gt_data['gt_mean_curvature'],
                 enabled=False,
                 cmap='plasma'
+            )
+
+            # Add absolute value of GT mean curvature
+            mesh_structure.add_scalar_quantity(
+                name="A2 |Mean Curvature| - GT",
+                values=np.abs(gt_data['gt_mean_curvature']),
+                enabled=False,
+                cmap='viridis'
             )
 
         if predicted_data.get('predicted_mean_curvature') is not None:
@@ -1295,70 +1964,84 @@ class RealTimeEigenanalysisVisualizer:
 
     def visualize_comprehensive_eigenvectors(self, mesh_structure,
                                              gt_eigenvalues: Optional[np.ndarray], gt_eigenvectors: Optional[np.ndarray],
-                                             pred_eigenvalues: Optional[np.ndarray], pred_eigenvectors: Optional[np.ndarray]):
-        """Add GT and predicted eigenvector scalar fields to the mesh."""
+                                             pred_eigenvalues: Optional[np.ndarray], pred_eigenvectors: Optional[np.ndarray],
+                                             robust_eigenvalues: Optional[np.ndarray] = None, robust_eigenvectors: Optional[np.ndarray] = None):
+        """Add GT (PyFM), predicted, and robust-laplacian eigenvector scalar fields to the mesh."""
         num_to_show = self.config.num_eigenvectors_to_show
 
         # Determine how many eigenvectors we can show for each type
         gt_available = gt_eigenvectors.shape[1] if gt_eigenvectors is not None else 0
         pred_available = pred_eigenvectors.shape[1] if pred_eigenvectors is not None else 0
+        robust_available = robust_eigenvectors.shape[1] if robust_eigenvectors is not None else 0
 
-        max_available = max(gt_available, pred_available)
+        max_available = max(gt_available, pred_available, robust_available)
         num_to_show = min(num_to_show, max_available)
 
         print(f"Adding eigenvector visualization:")
-        print(f"  GT eigenvectors available: {gt_available}")
+        print(f"  GT (PyFM) eigenvectors available: {gt_available}")
         print(f"  Predicted eigenvectors available: {pred_available}")
+        print(f"  Robust-laplacian eigenvectors available: {robust_available}")
         print(f"  Showing: {num_to_show} eigenvectors per type")
 
         # Compute cosine similarities between GT and predicted eigenvectors
-        cosine_similarities = self._compute_eigenvector_cosine_similarities(
+        cosine_similarities_pred = self._compute_eigenvector_cosine_similarities(
             gt_eigenvectors, pred_eigenvectors
         )
 
+        # Compute cosine similarities between GT and robust eigenvectors
+        cosine_similarities_robust = self._compute_eigenvector_cosine_similarities(
+            gt_eigenvectors, robust_eigenvectors
+        )
+
         # Print cosine similarities to console
-        if cosine_similarities is not None:
-            print(f"\n" + "-" * 70)
-            print("EIGENVECTOR COSINE SIMILARITIES (GT vs PRED)")
-            print("-" * 70)
-            print(f"{'Index':<8} {'Cosine Sim':<12} {'Description'}")
-            print("-" * 70)
-            for i in range(min(num_to_show, len(cosine_similarities))):
+        if cosine_similarities_pred is not None or cosine_similarities_robust is not None:
+            print(f"\n" + "-" * 85)
+            print("EIGENVECTOR COSINE SIMILARITIES")
+            print("-" * 85)
+            print(f"{'Index':<8} {'GT vs PRED':<14} {'GT vs Robust':<14} {'Description'}")
+            print("-" * 85)
+            for i in range(num_to_show):
                 if i == 0:
                     desc = "constant"
                 elif i == 1:
                     desc = "Fiedler"
                 else:
                     desc = ""
-                print(f"{i:<8} {cosine_similarities[i]:<12.6f} {desc}")
+
+                pred_sim = cosine_similarities_pred[i] if cosine_similarities_pred is not None and i < len(cosine_similarities_pred) else float('nan')
+                robust_sim = cosine_similarities_robust[i] if cosine_similarities_robust is not None and i < len(cosine_similarities_robust) else float('nan')
+
+                print(f"{i:<8} {pred_sim:<14.6f} {robust_sim:<14.6f} {desc}")
 
             # Summary statistics
-            print("-" * 70)
-            print(f"Mean cosine similarity: {cosine_similarities[:num_to_show].mean():.6f}")
-            print(f"Min cosine similarity:  {cosine_similarities[:num_to_show].min():.6f}")
-            print(f"Max cosine similarity:  {cosine_similarities[:num_to_show].max():.6f}")
-            if num_to_show > 1:
-                # Exclude first (constant) eigenvector for non-trivial stats
-                print(f"Mean (excluding constant): {cosine_similarities[1:num_to_show].mean():.6f}")
-            print("-" * 70 + "\n")
+            print("-" * 85)
+            if cosine_similarities_pred is not None:
+                print(f"GT vs PRED - Mean: {cosine_similarities_pred[:num_to_show].mean():.6f}, Min: {cosine_similarities_pred[:num_to_show].min():.6f}, Max: {cosine_similarities_pred[:num_to_show].max():.6f}")
+            if cosine_similarities_robust is not None:
+                print(f"GT vs Robust - Mean: {cosine_similarities_robust[:num_to_show].mean():.6f}, Min: {cosine_similarities_robust[:num_to_show].min():.6f}, Max: {cosine_similarities_robust[:num_to_show].max():.6f}")
+            print("-" * 85 + "\n")
+
+            # Store average cosine similarity for UI display (GT vs PRED)
+            if cosine_similarities_pred is not None:
+                self.current_avg_cosine_similarity = float(cosine_similarities_pred[:num_to_show].mean())
 
         # Add eigenvectors in groups
         for i in range(num_to_show):
-            # Get cosine similarity for this pair (if available)
-            cos_sim = cosine_similarities[i] if cosine_similarities is not None and i < len(cosine_similarities) else None
-            cos_sim_str = f", cos={cos_sim:.4f}" if cos_sim is not None else ""
+            # Get cosine similarities for this index
+            cos_sim_pred = cosine_similarities_pred[i] if cosine_similarities_pred is not None and i < len(cosine_similarities_pred) else None
+            cos_sim_robust = cosine_similarities_robust[i] if cosine_similarities_robust is not None and i < len(cosine_similarities_robust) else None
 
-            # Add GT eigenvector
+            # Add GT (PyFM) eigenvector
             if gt_eigenvectors is not None and i < gt_available:
                 gt_eigenvector = gt_eigenvectors[:, i]
                 gt_eigenvalue = gt_eigenvalues[i] if gt_eigenvalues is not None else 0.0
 
                 if i == 0:
-                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.2e}, constant{cos_sim_str})"
+                    gt_name = f"Eigenvector {i:02d}a GT-PyFM (lambda={gt_eigenvalue:.2e}, constant)"
                 elif i == 1:
-                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f}, Fiedler{cos_sim_str})"
+                    gt_name = f"Eigenvector {i:02d}a GT-PyFM (lambda={gt_eigenvalue:.6f}, Fiedler)"
                 else:
-                    gt_name = f"Eigenvector {i:02d}a GT (lambda={gt_eigenvalue:.6f}{cos_sim_str})"
+                    gt_name = f"Eigenvector {i:02d}a GT-PyFM (lambda={gt_eigenvalue:.6f})"
 
                 mesh_structure.add_scalar_quantity(
                     name=gt_name,
@@ -1371,17 +2054,38 @@ class RealTimeEigenanalysisVisualizer:
             if pred_eigenvectors is not None and i < pred_available:
                 pred_eigenvector = pred_eigenvectors[:, i]
                 pred_eigenvalue = pred_eigenvalues[i] if pred_eigenvalues is not None else 0.0
+                cos_str = f", cos={cos_sim_pred:.4f}" if cos_sim_pred is not None else ""
 
                 if i == 0:
-                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.2e}, constant{cos_sim_str})"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.2e}, constant{cos_str})"
                 elif i == 1:
-                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}, Fiedler{cos_sim_str})"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}, Fiedler{cos_str})"
                 else:
-                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}{cos_sim_str})"
+                    pred_name = f"Eigenvector {i:02d}b PRED (lambda={pred_eigenvalue:.6f}{cos_str})"
 
                 mesh_structure.add_scalar_quantity(
                     name=pred_name,
                     values=pred_eigenvector,
+                    enabled=False,
+                    cmap=self.config.colormap
+                )
+
+            # Add robust-laplacian eigenvector
+            if robust_eigenvectors is not None and i < robust_available:
+                robust_eigenvector = robust_eigenvectors[:, i]
+                robust_eigenvalue = robust_eigenvalues[i] if robust_eigenvalues is not None else 0.0
+                cos_str = f", cos={cos_sim_robust:.4f}" if cos_sim_robust is not None else ""
+
+                if i == 0:
+                    robust_name = f"Eigenvector {i:02d}c Robust (lambda={robust_eigenvalue:.2e}, constant{cos_str})"
+                elif i == 1:
+                    robust_name = f"Eigenvector {i:02d}c Robust (lambda={robust_eigenvalue:.6f}, Fiedler{cos_str})"
+                else:
+                    robust_name = f"Eigenvector {i:02d}c Robust (lambda={robust_eigenvalue:.6f}{cos_str})"
+
+                mesh_structure.add_scalar_quantity(
+                    name=robust_name,
+                    values=robust_eigenvector,
                     enabled=False,
                     cmap=self.config.colormap
                 )
@@ -1420,17 +2124,45 @@ class RealTimeEigenanalysisVisualizer:
         print(f"Total patch points: {len(data.pos)}")
         print(f"Number of patches: {len(data.center_indices)}")
 
+        # Calculate original k from dataset
+        original_k = len(data.pos) // len(data.center_indices)
+        print(f"Original k (from dataset): {original_k}")
+
         # STEP 2: Load original mesh for GT computation
         print(f"\nSTEP 2: Loading original mesh for GT computation")
         gt_data = self.load_original_mesh_for_gt(mesh_file_path)
 
-        # STEP 3: Model inference
+        # STEP 2.5: Re-extract patches with timing for fair comparison
+        # (MeshDataset does k-NN during data loading, but we need to time it for comparison
+        # since robust_laplacian includes k-NN search in its timing)
+        print(f"\nSTEP 2.5: Extracting patches with k={original_k} (for timing comparison)...")
+        t_extraction_start = time.perf_counter()
+
+        patch_data = self._extract_patches_for_mesh_with_k(gt_data['vertices'], original_k)
+
+        t_extraction_end = time.perf_counter()
+        pred_extraction_time = t_extraction_end - t_extraction_start
+        self.timing_results.pred_patch_extraction_time = pred_extraction_time
+        print(f"  [TIMING] PRED patch extraction (k-NN): {pred_extraction_time * 1000:.2f} ms")
+
+        # STEP 3: Model inference (use our extracted patches for consistent timing)
         print(f"\nSTEP 3: Model inference")
-        inference_result = self.perform_model_inference(model, data, device)
+        inference_result = self.perform_model_inference(model, patch_data, device)
 
         if inference_result['predicted_eigenvalues'] is None:
             print("[X] Failed to compute eigendecomposition, skipping this batch")
             return
+
+        # Compute PRED total time
+        self.timing_results.pred_total_time = (
+                self.timing_results.pred_patch_extraction_time +
+                self.timing_results.pred_model_inference_time +
+                self.timing_results.pred_matrix_assembly_time
+        )
+
+        # Compute GT matrix assembly timing (for fair comparison, time only matrix construction)
+        print(f"\nSTEP 3.5: Computing GT matrix assembly timing...")
+        self._compute_gt_matrices_timed(gt_data['vertices'], gt_data['faces'])
 
         # STEP 4: Compute predicted quantities
         print(f"\nSTEP 4: Computing predicted quantities")
@@ -1448,14 +2180,34 @@ class RealTimeEigenanalysisVisualizer:
         self.current_stiffness_weights = torch.from_numpy(inference_result['stiffness_weights'])
         self.current_areas = torch.from_numpy(inference_result['areas'])
         self.current_original_vertices = gt_data['vertices']
-        self.original_k = len(data.pos) // len(data.center_indices)  # Calculate original k
-        self.current_vertex_indices = data.vertex_indices
-        self.current_center_indices = data.center_indices
-        self.current_batch_indices = data.batch
+        self.original_k = original_k  # Use the k calculated earlier
+        self.current_vertex_indices = patch_data.vertex_indices
+        self.current_center_indices = patch_data.center_indices
+        self.current_batch_indices = patch_data.patch_idx  # MeshPatchData uses patch_idx
+
+        # Store model, device, and mesh info for k updates
+        self.current_model = model
+        self.current_device = device
+        self.current_mesh_file_path = mesh_file_path
+        self.current_faces = gt_data['faces']
 
         # Initialize PRED k slider with original k
         self.reconstruction_settings.current_pred_k = self.original_k
         print(f"Initialized PRED k slider with original k={self.original_k}")
+
+        # Update timing results with mesh info (needed for UI display)
+        self.timing_results.num_vertices = len(gt_data['vertices'])
+        self.timing_results.num_faces = len(gt_data['faces'])
+        self.timing_results.current_k = self.original_k
+
+        # STEP 5.5: Compute robust-laplacian with point_cloud_laplacian using same k as PRED
+        print(f"\nSTEP 5.5: Computing robust-laplacian with k={self.original_k}...")
+        robust_eigenvalues, robust_eigenvectors, robust_vertex_areas = self._compute_robust_laplacian_with_k(
+            gt_data['vertices'], self.original_k
+        )
+        gt_data['robust_eigenvalues'] = robust_eigenvalues
+        gt_data['robust_eigenvectors'] = robust_eigenvectors
+        gt_data['robust_vertex_areas'] = robust_vertex_areas
 
         # STEP 6: Visualization
         print(f"\nSTEP 6: Creating comprehensive visualization")
@@ -1483,7 +2235,8 @@ class RealTimeEigenanalysisVisualizer:
         self.visualize_comprehensive_eigenvectors(
             mesh_structure,
             gt_data.get('gt_eigenvalues'), gt_data.get('gt_eigenvectors'),
-            inference_result['predicted_eigenvalues'], inference_result['predicted_eigenvectors']
+            inference_result['predicted_eigenvalues'], inference_result['predicted_eigenvectors'],
+            gt_data.get('robust_eigenvalues'), gt_data.get('robust_eigenvectors')
         )
 
         self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data, inference_result)
@@ -1491,6 +2244,9 @@ class RealTimeEigenanalysisVisualizer:
         # Add mesh reconstructions using eigenvectors
         print(f"\nSTEP 7: Computing and visualizing mesh reconstructions")
         self._update_mesh_reconstructions(gt_data, inference_result)
+
+        # Print timing summary to console
+        self._print_timing_summary()
 
         print(f"\n[OK] Comprehensive visualization completed for {Path(mesh_file_path).name}")
 
@@ -1517,6 +2273,9 @@ class RealTimeEigenanalysisVisualizer:
 
         # Load trained model
         model = self.load_trained_model(ckpt_path, device, cfg)
+
+        # Warmup for torch.compile (first inference triggers compilation)
+        self._warmup_model(model, device)
 
         # Set random seed for reproducibility
         pl.seed_everything(cfg.globals.seed)

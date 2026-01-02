@@ -95,6 +95,8 @@ def assemble_sparse_laplacian_variable(weights: torch.Tensor, attention_mask: to
     """
     Assemble sparse Laplacian matrix from variable-sized patch weights using fully vectorized operations.
 
+    GPU-OPTIMIZED VERSION: All computation stays on GPU until final scipy conversion.
+
     Args:
         weights: Token weights of shape (batch_size, max_k)
         attention_mask: Mask of shape (batch_size, max_k) - True for real tokens
@@ -105,91 +107,85 @@ def assemble_sparse_laplacian_variable(weights: torch.Tensor, attention_mask: to
     Returns:
         Sparse Laplacian matrix
     """
-    # Get dimensions
+    device = weights.device
     num_patches = weights.shape[0]
     max_k = weights.shape[1]
-    device = weights.device
 
     # Get number of vertices
     num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
 
-    # Flatten weights and attention mask
+    # === STEP 1: Filter valid weights (GPU) ===
     weights_flat = weights.flatten()  # (batch_size * max_k,)
-    attention_mask_flat = attention_mask.flatten()  # (batch_size * max_k,)
+    attention_mask_flat = attention_mask.flatten()
 
-    # Create batch indices for the flattened weights (which patch each weight belongs to)
-    patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)  # (batch_size * max_k,)
+    # Create batch indices for the flattened weights
+    patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)
 
-    # Filter out padded positions
-    valid_mask = attention_mask_flat  # Only keep valid (non-padded) entries
+    # Filter to valid (non-padded) entries
+    valid_mask = attention_mask_flat
     valid_weights = weights_flat[valid_mask]  # (num_valid,)
     valid_patch_indices = patch_indices_flat[valid_mask]  # (num_valid,)
 
     # Get center vertex for each valid weight
-    valid_center_vertices = center_indices[valid_patch_indices]  # (num_valid,)
+    valid_center_vertices = center_indices[valid_patch_indices]
 
-    # For variable-sized patches, we need to map from flattened valid indices back to vertex_indices
-    # Create a mapping from valid positions to their corresponding vertex indices
+    # === STEP 2: Compute positions within each patch (GPU, fully vectorized) ===
+    num_valid = len(valid_patch_indices)
 
-    # Get cumulative sizes to find the start position of each patch in vertex_indices
-    batch_sizes = batch_indices.bincount(minlength=num_patches)  # (num_patches,)
+    if num_valid > 0:
+        # Find where patch index changes (boundaries between patches)
+        patch_changes = torch.ones(num_valid, dtype=torch.bool, device=device)
+        if num_valid > 1:
+            patch_changes[1:] = valid_patch_indices[1:] != valid_patch_indices[:-1]
+
+        # Get start index of each group using the change positions
+        change_indices = torch.where(patch_changes)[0]
+
+        # Group IDs (0, 0, 0, 1, 1, 2, 2, 2, ...)
+        group_ids = torch.cumsum(patch_changes.long(), dim=0) - 1
+
+        # For each element, subtract its group's start index to get position within group
+        group_starts = change_indices[group_ids]
+        positions_in_patch = torch.arange(num_valid, device=device, dtype=torch.long) - group_starts
+    else:
+        positions_in_patch = torch.tensor([], device=device, dtype=torch.long)
+
+    # === STEP 3: Get neighbor vertex indices (GPU) ===
+    batch_sizes = batch_indices.bincount(minlength=num_patches)
     cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
-    starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
+    starts = torch.cat([torch.tensor([0], device=device, dtype=torch.long), cumsum_sizes[:-1]])
 
-    # For each valid weight, find its position within its patch
-    # Count how many valid weights we've seen for each patch so far
-    patch_counts = torch.zeros(num_patches, device=device, dtype=torch.long)
-    positions_in_patch = torch.zeros_like(valid_patch_indices, dtype=torch.long)
-
-    # Vectorized position calculation
-    unique_patches, counts = torch.unique_consecutive(valid_patch_indices, return_counts=True)
-    positions_in_patch = torch.cat([torch.arange(count, device=device) for count in counts])
-
-    # Get the actual vertex indices for valid weights
     valid_neighbor_vertices = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
 
-    # Create all off-diagonal entries vectorized
-    # Each valid weight creates two entries: center->neighbor and neighbor->center
-    num_valid = len(valid_weights)
+    # === STEP 4: Build off-diagonal entries (GPU) ===
+    all_row_indices = torch.cat([valid_center_vertices, valid_neighbor_vertices])
+    all_col_indices = torch.cat([valid_neighbor_vertices, valid_center_vertices])
+    all_weights = torch.cat([-valid_weights, -valid_weights])
 
-    # Center -> neighbor entries
-    center_to_neighbor_rows = valid_center_vertices  # (num_valid,)
-    center_to_neighbor_cols = valid_neighbor_vertices  # (num_valid,)
-    center_to_neighbor_weights = -valid_weights  # (num_valid,)
+    # === STEP 5: Compute diagonal using GPU scatter_add ===
+    row_sums = torch.zeros(num_vertices, device=device, dtype=all_weights.dtype)
+    row_sums.scatter_add_(0, all_row_indices, all_weights)
+    diagonal_values = -row_sums
 
-    # Neighbor -> center entries (symmetric)
-    neighbor_to_center_rows = valid_neighbor_vertices  # (num_valid,)
-    neighbor_to_center_cols = valid_center_vertices  # (num_valid,)
-    neighbor_to_center_weights = -valid_weights  # (num_valid,)
+    # Add diagonal entries
+    diag_indices = torch.arange(num_vertices, device=device, dtype=torch.long)
+    all_row_indices = torch.cat([all_row_indices, diag_indices])
+    all_col_indices = torch.cat([all_col_indices, diag_indices])
+    all_weights = torch.cat([all_weights, diagonal_values])
 
-    # Combine all entries
-    all_row_indices = torch.cat([center_to_neighbor_rows, neighbor_to_center_rows])  # (2 * num_valid,)
-    all_col_indices = torch.cat([center_to_neighbor_cols, neighbor_to_center_cols])  # (2 * num_valid,)
-    all_weights = torch.cat([center_to_neighbor_weights, neighbor_to_center_weights])  # (2 * num_valid,)
+    # === STEP 6: Single GPU->CPU transfer and scipy sparse matrix creation ===
+    row_np = all_row_indices.cpu().numpy()
+    col_np = all_col_indices.cpu().numpy()
+    data_np = all_weights.cpu().numpy()
 
-    # Convert to numpy for scipy operations
-    all_row_indices_np = all_row_indices.detach().cpu().numpy()
-    all_col_indices_np = all_col_indices.detach().cpu().numpy()
-    all_weights_np = all_weights.detach().cpu().numpy()
-
-    # Create sparse matrix from coordinates (off-diagonal entries only)
     laplacian_coo = scipy.sparse.coo_matrix(
-        (all_weights_np, (all_row_indices_np, all_col_indices_np)),
+        (data_np, (row_np, col_np)),
         shape=(num_vertices, num_vertices)
     )
-
-    # Sum duplicate entries and convert to CSR
     laplacian_csr = laplacian_coo.tocsr()
     laplacian_csr.sum_duplicates()
 
-    # Vectorized diagonal computation: each diagonal entry = -sum of off-diagonal entries in that row
-    row_sums = np.array(laplacian_csr.sum(axis=1)).flatten()
-    diagonal_values = -row_sums
-
-    # Set diagonal entries
-    laplacian_csr.setdiag(diagonal_values)
-
-    # Ensure numerical symmetry
+    # Symmetrize
     laplacian_csr = 0.5 * (laplacian_csr + laplacian_csr.T)
 
     return laplacian_csr
@@ -206,6 +202,13 @@ def assemble_stiffness_and_mass_matrices(
     """
     Assemble separate stiffness and mass matrices from predicted weights and areas.
 
+    GPU-OPTIMIZED VERSION: All computation stays on GPU until final scipy conversion.
+    Key optimizations:
+    - Fully vectorized position-in-patch calculation (no Python loops)
+    - GPU-based scatter operations for row sums and diagonal
+    - Single CPU transfer at the end
+    - Vectorized mass matrix construction
+
     The stiffness matrix S is symmetric and contains the edge weights.
     The mass matrix M is diagonal and contains the vertex areas.
     Together they define the generalized eigenvalue problem: S @ v = lambda * M @ v
@@ -220,106 +223,110 @@ def assemble_stiffness_and_mass_matrices(
 
     Returns:
         Tuple of (S, M):
-        - S: Symmetric stiffness matrix (N, N)
-        - M: Diagonal mass matrix (N, N)
+        - S: Symmetric stiffness matrix (N, N) as scipy.sparse.csr_matrix
+        - M: Diagonal mass matrix (N, N) as scipy.sparse.csr_matrix
     """
-    # Get dimensions
+    device = stiffness_weights.device
     num_patches = stiffness_weights.shape[0]
     max_k = stiffness_weights.shape[1]
-    device = stiffness_weights.device
 
     # Get number of vertices
     num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
 
-    # Flatten weights and attention mask
+    # === STEP 1: Filter valid weights (GPU) ===
     weights_flat = stiffness_weights.flatten()  # (num_patches * max_k,)
-    attention_mask_flat = attention_mask.flatten()  # (num_patches * max_k,)
+    attention_mask_flat = attention_mask.flatten()
 
-    # Create patch indices for the flattened weights
+    # Create patch indices for flattened weights
     patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)
 
-    # Filter out padded positions
+    # Filter to valid (non-padded) entries
     valid_mask = attention_mask_flat
-    valid_weights = weights_flat[valid_mask]
-    valid_patch_indices = patch_indices_flat[valid_mask]
+    valid_weights = weights_flat[valid_mask]  # (num_valid,)
+    valid_patch_indices = patch_indices_flat[valid_mask]  # (num_valid,)
 
-    # Get center vertex for each valid weight
-    valid_center_vertices = center_indices[valid_patch_indices]
+    # === STEP 2: Compute positions within each patch (GPU, fully vectorized) ===
+    # This replaces the slow: torch.cat([torch.arange(count) for count in counts])
+    num_valid = len(valid_patch_indices)
 
-    # Get cumulative sizes to find the start position of each patch in vertex_indices
+    if num_valid > 0:
+        # Find where patch index changes (boundaries between patches)
+        patch_changes = torch.ones(num_valid, dtype=torch.bool, device=device)
+        if num_valid > 1:
+            patch_changes[1:] = valid_patch_indices[1:] != valid_patch_indices[:-1]
+
+        # Cumsum of changes gives group IDs (0, 0, 0, 1, 1, 2, 2, 2, ...)
+        group_ids = torch.cumsum(patch_changes.long(), dim=0) - 1
+
+        # Get start index of each group using the change positions
+        change_indices = torch.where(patch_changes)[0]  # Indices where new groups start
+
+        # For each element, subtract its group's start index to get position within group
+        group_starts = change_indices[group_ids]  # Start index for each element's group
+        positions_in_patch = torch.arange(num_valid, device=device, dtype=torch.long) - group_starts
+    else:
+        positions_in_patch = torch.tensor([], device=device, dtype=torch.long)
+
+    # === STEP 3: Get neighbor vertex indices (GPU) ===
     batch_sizes = batch_indices.bincount(minlength=num_patches)
     cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
-    starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
+    starts = torch.cat([torch.tensor([0], device=device, dtype=torch.long), cumsum_sizes[:-1]])
 
-    # Vectorized position calculation
-    unique_patches, counts = torch.unique_consecutive(valid_patch_indices, return_counts=True)
-    positions_in_patch = torch.cat([torch.arange(count, device=device) for count in counts])
-
-    # Get the actual vertex indices for valid weights
+    # Get center and neighbor vertices
+    valid_center_vertices = center_indices[valid_patch_indices]
     valid_neighbor_vertices = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
 
-    # === Build Stiffness Matrix S (symmetric) ===
-    # Each edge (i, j) gets contributions from both patches centered at i and j
-    # We average to ensure symmetry: S[i,j] = (s_ij + s_ji) / 2
+    # === STEP 4: Build stiffness matrix entries (GPU) ===
+    # Symmetric entries: both (center, neighbor) and (neighbor, center)
+    all_row_indices = torch.cat([valid_center_vertices, valid_neighbor_vertices])
+    all_col_indices = torch.cat([valid_neighbor_vertices, valid_center_vertices])
+    all_weights = torch.cat([-valid_weights, -valid_weights])  # Negative for off-diagonal
 
-    # Center -> neighbor entries (negative off-diagonal)
-    center_to_neighbor_rows = valid_center_vertices
-    center_to_neighbor_cols = valid_neighbor_vertices
-    center_to_neighbor_weights = -valid_weights
+    # === STEP 5: Compute diagonal using GPU scatter_add ===
+    # Sum weights going OUT of each vertex (before symmetrization)
+    row_sums = torch.zeros(num_vertices, device=device, dtype=all_weights.dtype)
+    row_sums.scatter_add_(0, all_row_indices, all_weights)
 
-    # Neighbor -> center entries (symmetric contribution)
-    neighbor_to_center_rows = valid_neighbor_vertices
-    neighbor_to_center_cols = valid_center_vertices
-    neighbor_to_center_weights = -valid_weights
+    # Diagonal values = -row_sums (so each row sums to 0)
+    diagonal_values = -row_sums
 
-    # Combine all entries
-    all_row_indices = torch.cat([center_to_neighbor_rows, neighbor_to_center_rows])
-    all_col_indices = torch.cat([center_to_neighbor_cols, neighbor_to_center_cols])
-    all_weights = torch.cat([center_to_neighbor_weights, neighbor_to_center_weights])
+    # Add diagonal entries to the triplets
+    diag_indices = torch.arange(num_vertices, device=device, dtype=torch.long)
+    all_row_indices = torch.cat([all_row_indices, diag_indices])
+    all_col_indices = torch.cat([all_col_indices, diag_indices])
+    all_weights = torch.cat([all_weights, diagonal_values])
 
-    # Convert to numpy
-    all_row_indices_np = all_row_indices.detach().cpu().numpy()
-    all_col_indices_np = all_col_indices.detach().cpu().numpy()
-    all_weights_np = all_weights.detach().cpu().numpy()
+    # === STEP 6: Single GPU->CPU transfer and scipy sparse matrix creation ===
+    row_np = all_row_indices.cpu().numpy()
+    col_np = all_col_indices.cpu().numpy()
+    data_np = all_weights.cpu().numpy()
 
-    # Create sparse stiffness matrix (off-diagonal entries)
+    # Create COO matrix and convert to CSR
     stiffness_coo = scipy.sparse.coo_matrix(
-        (all_weights_np, (all_row_indices_np, all_col_indices_np)),
+        (data_np, (row_np, col_np)),
         shape=(num_vertices, num_vertices)
     )
-
-    # Sum duplicates and convert to CSR
     stiffness_csr = stiffness_coo.tocsr()
     stiffness_csr.sum_duplicates()
 
-    # Average symmetric entries: S = (S + S^T) / 2
+    # Symmetrize: S = (S + S^T) / 2
     stiffness_csr = 0.5 * (stiffness_csr + stiffness_csr.T)
 
-    # Set diagonal: S[i,i] = -sum of off-diagonal entries in row i
-    row_sums = np.array(stiffness_csr.sum(axis=1)).flatten()
-    diagonal_values = -row_sums
-    stiffness_csr.setdiag(diagonal_values)
+    # === STEP 7: Build mass matrix (vectorized, no Python loop) ===
+    center_indices_np = center_indices.cpu().numpy()
+    areas_np = areas.cpu().numpy()
 
-    # === Build Mass Matrix M (diagonal) ===
-    # M[i,i] = area of vertex i (from when vertex i was center)
-    center_indices_np = center_indices.detach().cpu().numpy()
-    areas_np = areas.detach().cpu().numpy()
+    # Vectorized accumulation using np.add.at
+    mass_diagonal = np.zeros(num_vertices, dtype=np.float64)
+    mass_counts = np.zeros(num_vertices, dtype=np.float64)
+    np.add.at(mass_diagonal, center_indices_np, areas_np)
+    np.add.at(mass_counts, center_indices_np, 1.0)
 
-    # Each vertex should appear exactly once as a center
-    # If a vertex appears multiple times (shouldn't happen), we average
-    mass_diagonal = np.zeros(num_vertices)
-    mass_counts = np.zeros(num_vertices)
-
-    for center_idx, area in zip(center_indices_np, areas_np):
-        mass_diagonal[center_idx] += area
-        mass_counts[center_idx] += 1
-
-    # Average if vertex appeared multiple times (edge case)
+    # Average if vertex appeared multiple times
     nonzero_mask = mass_counts > 0
     mass_diagonal[nonzero_mask] /= mass_counts[nonzero_mask]
 
-    # Handle vertices that were never centers (shouldn't happen in complete coverage)
-    # Set to small positive value to avoid singularity
+    # Handle vertices never seen as centers
     zero_mask = mass_counts == 0
     if np.any(zero_mask):
         mass_diagonal[zero_mask] = 1e-6
