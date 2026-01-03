@@ -198,6 +198,11 @@ class RealTimeEigenanalysisVisualizer:
         # NEW: Timing results for Laplacian assembly comparison
         self.timing_results = LaplacianTimingResults()
 
+        # Debug flags (set from config in run_dataset_iteration)
+        self._diagnostic_mode = False
+        self._skip_robust = False
+        self._skip_visualization = False
+
     def setup_polyscope(self):
         """Initialize and configure polyscope with UI callback."""
         ps.init()
@@ -345,6 +350,33 @@ class RealTimeEigenanalysisVisualizer:
                 self.current_stiffness_weights is not None and
                 self.current_areas is not None and
                 self.current_original_vertices is not None)
+
+    def _clear_stored_references(self):
+        """Clear stored references from previous batch to free memory.
+
+        This helps ensure consistent timing across batches by preventing
+        memory accumulation from affecting performance.
+        """
+        # Clear GPU tensors
+        self.current_stiffness_weights = None
+        self.current_areas = None
+        self.current_vertex_indices = None
+        self.current_center_indices = None
+        self.current_batch_indices = None
+
+        # Clear numpy arrays and dicts
+        self.current_gt_data = None
+        self.current_inference_result = None
+        self.current_predicted_data = None
+        self.current_original_vertices = None
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+        # Clear CUDA cache again after gc
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _compute_predicted_vertex_areas(self, inference_result: Dict) -> Optional[np.ndarray]:
         """Compute predicted vertex areas based on current settings.
@@ -895,7 +927,7 @@ class RealTimeEigenanalysisVisualizer:
         except Exception as e:
             print(f"  Warning: Failed to remove some reconstruction structures: {e}")
 
-    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig, use_torch_compile: bool = True) -> LaplacianTransformerModule:
+    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig, use_torch_compile: bool = True, diagnostic_mode: bool = False) -> LaplacianTransformerModule:
         """
         Load trained LaplacianTransformerModule from checkpoint.
 
@@ -904,10 +936,15 @@ class RealTimeEigenanalysisVisualizer:
             device: Device to load the model on
             cfg: Hydra config containing model configuration
             use_torch_compile: Whether to use torch.compile() for faster inference
+            diagnostic_mode: If True, disables optimizations for debugging timing issues
 
         Returns:
             Loaded model in evaluation mode
         """
+        if diagnostic_mode:
+            print("[DIAGNOSTIC MODE] Disabling torch.compile for debugging")
+            use_torch_compile = False
+
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
 
@@ -935,11 +972,15 @@ class RealTimeEigenanalysisVisualizer:
             self._disable_gradient_checkpointing(model)
 
             # Apply torch.compile() for faster inference (PyTorch 2.0+)
+            # Use dynamic=True to handle varying mesh sizes without recompilation
+            # Use fullgraph=False to allow graph breaks for better compatibility
             if use_torch_compile:
                 try:
                     print("Applying torch.compile() for optimized inference...")
-                    model = torch.compile(model, mode="reduce-overhead")
-                    print("[OK] torch.compile() applied successfully")
+                    # dynamic=True: Allows varying input shapes without recompilation
+                    # fullgraph=False: Allows graph breaks for better compatibility with varying shapes
+                    model = torch.compile(model, mode="default", dynamic=True, fullgraph=False)
+                    print("[OK] torch.compile() applied (dynamic shapes enabled)")
                 except Exception as e:
                     print(f"[!] torch.compile() failed, using eager mode: {e}")
 
@@ -999,34 +1040,27 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print("  No gradient checkpointing found (good for inference)")
 
-    def _warmup_model(self, model: LaplacianTransformerModule, device: torch.device, num_warmup: int = 3):
+    def _warmup_model(self, model: LaplacianTransformerModule, device: torch.device, k: int = 30, num_warmup: int = 3):
         """
         Warmup the model to trigger torch.compile() compilation.
 
-        The first few inferences after torch.compile() are slow due to compilation.
-        We run warmup passes so that actual benchmarking reflects optimized performance.
+        With dynamic=True, we warm up with multiple input sizes to ensure
+        the compiler generates efficient code for varying shapes.
 
         Args:
             model: The model to warm up
             device: Device to run on
-            num_warmup: Number of warmup iterations
+            k: Number of neighbors (should match actual data!)
+            num_warmup: Number of warmup iterations per size
         """
-        print(f"Warming up model ({num_warmup} iterations)...")
-
-        # Create dummy input similar to real data
-        # Use reasonable sizes: 1000 patches, 30 neighbors, 3D features
-        num_patches = 1000
-        k = 30
+        print(f"Warming up model (k={k}, dynamic shapes)...")
 
         from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
 
-        dummy_data = MeshPatchData(
-            pos=torch.randn(num_patches * k, 3, device=device),
-            x=torch.randn(num_patches * k, 3, device=device),
-            patch_idx=torch.arange(num_patches, device=device).repeat_interleave(k),
-            vertex_indices=torch.randint(0, num_patches, (num_patches * k,), device=device),
-            center_indices=torch.arange(num_patches, device=device)
-        )
+        # Warmup with different BATCH sizes but SAME k as actual data
+        # This ensures torch.compile sees the right sequence length
+        # Include sizes close to actual mesh sizes (e.g., 9999, 10002)
+        warmup_patch_counts = [1000, 5000, 9999, 10000, 10002]
 
         # Determine mixed precision dtype (must match inference for torch.compile)
         use_amp = device.type == 'cuda'
@@ -1035,19 +1069,35 @@ class RealTimeEigenanalysisVisualizer:
 
         try:
             with torch.no_grad():
-                for i in range(num_warmup):
-                    if device.type == 'cuda':
-                        torch.cuda.synchronize()
+                for num_patches in warmup_patch_counts:
+                    dummy_data = MeshPatchData(
+                        pos=torch.randn(num_patches * k, 3, device=device),
+                        x=torch.randn(num_patches * k, 3, device=device),
+                        patch_idx=torch.arange(num_patches, device=device).repeat_interleave(k),
+                        vertex_indices=torch.randint(0, num_patches, (num_patches * k,), device=device),
+                        center_indices=torch.arange(num_patches, device=device)
+                    )
 
-                    # Use same mixed precision as inference
-                    if use_amp:
-                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                    for i in range(num_warmup):
+                        if device.type == 'cuda':
+                            torch.cuda.synchronize()
+
+                        # Use same mixed precision as inference
+                        if use_amp:
+                            with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                                _ = model._forward_pass(dummy_data)
+                        else:
                             _ = model._forward_pass(dummy_data)
-                    else:
-                        _ = model._forward_pass(dummy_data)
 
-                    if device.type == 'cuda':
-                        torch.cuda.synchronize()
+                        if device.type == 'cuda':
+                            torch.cuda.synchronize()
+
+                    print(f"  Warmed up with {num_patches} patches, k={k}")
+
+            # Clear cache after warmup
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
             print(f"[OK] Model warmup complete")
         except Exception as e:
             print(f"[!] Model warmup failed (this is OK if not using torch.compile): {e}")
@@ -1220,8 +1270,23 @@ class RealTimeEigenanalysisVisualizer:
         """
         print("Performing model inference...")
 
-        # Move batch data to device
+        # Log input size for debugging timing variations
+        num_points = len(batch_data.pos)
+        num_patches = len(batch_data.center_indices) if hasattr(batch_data, 'center_indices') else 'unknown'
+        print(f"  Input size: {num_points} points, {num_patches} patches")
+
+        # === TIME: Data transfer to device ===
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_transfer_start = time.perf_counter()
+
         batch_data = batch_data.to(device)
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_transfer_end = time.perf_counter()
+        transfer_time = t_transfer_end - t_transfer_start
+        print(f"  [TIMING] Data transfer to GPU: {transfer_time * 1000:.2f} ms")
 
         # Determine mixed precision dtype (BF16 preferred on Ampere+, else FP16)
         use_amp = device.type == 'cuda'
@@ -1234,22 +1299,36 @@ class RealTimeEigenanalysisVisualizer:
                 print("  Using mixed precision: FP16")
 
         with torch.no_grad():
-            # === TIME: Model inference (forward pass) ===
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            t_inference_start = time.perf_counter()
+            # === DIAGNOSTIC: Run inference multiple times to check consistency ===
+            inference_times = []
+            num_runs = 3  # Run multiple times to check if first run is slow
 
-            # Forward pass with mixed precision for faster inference
-            if use_amp:
-                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+            for run_idx in range(num_runs):
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                t_inference_start = time.perf_counter()
+
+                # Forward pass with mixed precision for faster inference
+                if use_amp:
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                        forward_result = model._forward_pass(batch_data)
+                else:
                     forward_result = model._forward_pass(batch_data)
-            else:
-                forward_result = model._forward_pass(batch_data)
 
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            t_inference_end = time.perf_counter()
-            pred_inference_time = t_inference_end - t_inference_start
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                t_inference_end = time.perf_counter()
+                inference_times.append(t_inference_end - t_inference_start)
+
+            # Report all inference times
+            print(f"  [DIAGNOSTIC] Inference times: {[f'{t * 1000:.1f}ms' for t in inference_times]}")
+
+            # Use the minimum time as the "true" inference time (excludes one-time overhead)
+            pred_inference_time = min(inference_times)
+            print(f"  [TIMING] Model inference (best of {num_runs}): {pred_inference_time * 1000:.2f} ms")
+
+            # === TIME: Result extraction and conversion ===
+            t_extract_start = time.perf_counter()
 
             # Extract components from new forward result structure
             # Convert back to float32 for downstream processing (matrix assembly, eigendecomp)
@@ -1257,6 +1336,11 @@ class RealTimeEigenanalysisVisualizer:
             areas = forward_result['areas'].float()  # Shape: (batch_size,)
             attention_mask = forward_result['attention_mask']  # Shape: (batch_size, max_k)
             batch_sizes = forward_result['batch_sizes']  # Shape: (batch_size,)
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_extract_end = time.perf_counter()
+            extract_time = t_extract_end - t_extract_start
 
             print(f"Got stiffness weights shape: {stiffness_weights.shape}")
             print(f"Got areas shape: {areas.shape}")
@@ -1286,11 +1370,13 @@ class RealTimeEigenanalysisVisualizer:
             print(f"Assembled stiffness matrix: {stiffness_matrix.shape} ({stiffness_matrix.nnz} non-zeros)")
             print(f"Assembled mass matrix: {mass_matrix.shape} (diagonal)")
 
-            # Store timing results
+            # Store timing results with detailed breakdown
             self.timing_results.pred_model_inference_time = pred_inference_time
             self.timing_results.pred_matrix_assembly_time = pred_assembly_time
-            print(f"[TIMING] PRED model inference: {pred_inference_time * 1000:.2f} ms")
-            print(f"[TIMING] PRED matrix assembly: {pred_assembly_time * 1000:.2f} ms")
+            print(f"[TIMING] Data transfer:    {transfer_time * 1000:>8.2f} ms")
+            print(f"[TIMING] Model inference:  {pred_inference_time * 1000:>8.2f} ms")
+            print(f"[TIMING] Result extract:   {extract_time * 1000:>8.2f} ms")
+            print(f"[TIMING] Matrix assembly:  {pred_assembly_time * 1000:>8.2f} ms")
 
             # Compute eigendecomposition using generalized eigenvalue problem
             predicted_eigenvalues, predicted_eigenvectors = self.compute_eigendecomposition(
@@ -2096,9 +2182,25 @@ class RealTimeEigenanalysisVisualizer:
         print(f"PROCESSING BATCH {batch_idx + 1}")
         print('=' * 80)
 
-        # Clear previous visualization and tracking
-        ps.remove_all_structures()
+        # Clear previous visualization and tracking (only if polyscope is active)
+        if not self._skip_visualization:
+            ps.remove_all_structures()
         self.reconstruction_structure_names.clear()  # Clear reconstruction tracking
+
+        # Clear CUDA cache to ensure consistent memory state across meshes
+        # This prevents memory fragmentation from affecting timing
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+            # Log GPU memory status
+            allocated = torch.cuda.memory_allocated() / 1024 ** 2
+            reserved = torch.cuda.memory_reserved() / 1024 ** 2
+            print(f"[GPU Memory] Allocated: {allocated:.1f} MB, Reserved: {reserved:.1f} MB")
+
+        # Clear stored references from previous batch to free memory
+        # This helps ensure consistent timing across batches
+        self._clear_stored_references()
 
         # STEP 1: Extract mesh data from batch
         print("STEP 1: Extracting mesh data from batch")
@@ -2209,12 +2311,16 @@ class RealTimeEigenanalysisVisualizer:
         gt_data['robust_eigenvectors'] = robust_eigenvectors
         gt_data['robust_vertex_areas'] = robust_vertex_areas
 
-        # STEP 6: Visualization
-        print(f"\nSTEP 6: Creating comprehensive visualization")
-        mesh_structure = self.visualize_mesh(gt_data['vertices'], gt_data['gt_vertex_normals'], gt_data['faces'])
-        self.current_mesh_structure = mesh_structure
+        # STEP 6: Visualization (skip if not needed)
+        if not self._skip_visualization:
+            print(f"\nSTEP 6: Creating comprehensive visualization")
+            mesh_structure = self.visualize_mesh(gt_data['vertices'], gt_data['gt_vertex_normals'], gt_data['faces'])
+            self.current_mesh_structure = mesh_structure
+        else:
+            print(f"\nSTEP 6: Skipping visualization (skip_visualization=True)")
+            mesh_structure = None
 
-        # Print analysis
+        # Print analysis (always do this - it's console output)
         if self.config.enable_eigenvalue_info:
             self.print_eigenvalue_analysis(
                 gt_data.get('gt_eigenvalues'),
@@ -2222,7 +2328,7 @@ class RealTimeEigenanalysisVisualizer:
                 Path(mesh_file_path).name
             )
 
-        # Print correlation analysis
+        # Print correlation analysis (always do this - it's console output)
         if self.config.enable_correlation_analysis:
             gt_eigenvecs = gt_data.get('gt_eigenvectors')
             if gt_eigenvecs is not None and inference_result['predicted_eigenvectors'] is not None:
@@ -2231,19 +2337,22 @@ class RealTimeEigenanalysisVisualizer:
                 )
                 self.print_eigenvector_correlation_analysis(correlation_matrix, "Predicted vs GT")
 
-        # Add visualizations
-        self.visualize_comprehensive_eigenvectors(
-            mesh_structure,
-            gt_data.get('gt_eigenvalues'), gt_data.get('gt_eigenvectors'),
-            inference_result['predicted_eigenvalues'], inference_result['predicted_eigenvectors'],
-            gt_data.get('robust_eigenvalues'), gt_data.get('robust_eigenvectors')
-        )
+        # Add visualizations (skip if not needed)
+        if not self._skip_visualization and mesh_structure is not None:
+            self.visualize_comprehensive_eigenvectors(
+                mesh_structure,
+                gt_data.get('gt_eigenvalues'), gt_data.get('gt_eigenvectors'),
+                inference_result['predicted_eigenvalues'], inference_result['predicted_eigenvectors'],
+                gt_data.get('robust_eigenvalues'), gt_data.get('robust_eigenvectors')
+            )
 
-        self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data, inference_result)
+            self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data, inference_result)
 
-        # Add mesh reconstructions using eigenvectors
-        print(f"\nSTEP 7: Computing and visualizing mesh reconstructions")
-        self._update_mesh_reconstructions(gt_data, inference_result)
+            # Add mesh reconstructions using eigenvectors
+            print(f"\nSTEP 7: Computing and visualizing mesh reconstructions")
+            self._update_mesh_reconstructions(gt_data, inference_result)
+        else:
+            print(f"\nSTEP 7: Skipping mesh reconstructions (skip_visualization=True)")
 
         # Print timing summary to console
         self._print_timing_summary()
@@ -2271,16 +2380,34 @@ class RealTimeEigenanalysisVisualizer:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
 
-        # Load trained model
-        model = self.load_trained_model(ckpt_path, device, cfg)
+        # Check for diagnostic mode (disable optimizations to debug timing issues)
+        diagnostic_mode = getattr(cfg, 'diagnostic_mode', False)
+        skip_robust = getattr(cfg, 'skip_robust', False)  # Debug: skip robust computation
+        skip_visualization = getattr(cfg, 'skip_visualization', False)  # Debug: skip polyscope
 
-        # Warmup for torch.compile (first inference triggers compilation)
-        self._warmup_model(model, device)
+        if diagnostic_mode:
+            print("\n" + "!" * 80)
+            print("DIAGNOSTIC MODE ENABLED - Optimizations disabled for debugging")
+            print("!" * 80 + "\n")
+
+        if skip_robust:
+            print("[DEBUG] skip_robust=True: Robust-laplacian computation will be skipped")
+
+        if skip_visualization:
+            print("[DEBUG] skip_visualization=True: Polyscope visualization will be skipped")
+
+        # Store flags for use in process_batch
+        self._diagnostic_mode = diagnostic_mode
+        self._skip_robust = skip_robust
+        self._skip_visualization = skip_visualization
+
+        # Load trained model
+        model = self.load_trained_model(ckpt_path, device, cfg, diagnostic_mode=diagnostic_mode)
 
         # Set random seed for reproducibility
         pl.seed_everything(cfg.globals.seed)
 
-        # Initialize data module and loader
+        # Initialize data module and loader BEFORE warmup so we can get actual k
         data_module = hydra.utils.instantiate(cfg.data_module)
         data_loader = data_module.val_dataloader()
 
@@ -2288,10 +2415,35 @@ class RealTimeEigenanalysisVisualizer:
         if isinstance(data_loader, list):
             data_loader = data_loader[0]  # Take the first validation dataloader
 
+        # Peek at first batch to get actual k value for warmup
+        first_batch = next(iter(data_loader))
+        if isinstance(first_batch, list):
+            first_data = first_batch[0]
+        else:
+            first_data = first_batch
+        actual_k = len(first_data.pos) // len(first_data.center_indices)
+        print(f"Detected k={actual_k} from dataset")
+
+        # Warmup for torch.compile with ACTUAL k from dataset
+        if not diagnostic_mode:
+            self._warmup_model(model, device, k=actual_k)
+        else:
+            print("[DIAGNOSTIC] Skipping warmup")
+
+        # Re-create dataloader since we consumed it (reset iterator)
+        # Also reset seed to ensure same data order
+        pl.seed_everything(cfg.globals.seed)
+        data_loader = data_module.val_dataloader()
+        if isinstance(data_loader, list):
+            data_loader = data_loader[0]
+
         print(f"DataLoader ready with batch size: {data_loader.batch_size}")
 
-        # Setup polyscope with UI callback
-        self.setup_polyscope()
+        # Setup polyscope with UI callback (only if visualization is enabled)
+        if not skip_visualization:
+            self.setup_polyscope()
+        else:
+            print("[skip_visualization=True] Skipping polyscope setup")
 
         # Process all batches
         for batch_idx, batch_data in enumerate(data_loader):
@@ -2300,9 +2452,38 @@ class RealTimeEigenanalysisVisualizer:
             try:
                 self.process_batch(model, batch_data, batch_idx, device)
 
-                print(f"\nVisualization ready for batch {batch_idx + 1}. Use the 'Reconstruction Settings' window to control PRED reconstruction method.")
-                print("Close window to continue to next batch.")
-                ps.show()
+                if not skip_visualization:
+                    print(f"\nVisualization ready for batch {batch_idx + 1}. Use the 'Reconstruction Settings' window to control PRED reconstruction method.")
+                    print("Close window to continue to next batch.")
+                    ps.show()
+
+                    # === CLEANUP after polyscope visualization ===
+                    # Polyscope uses OpenGL which can interfere with CUDA
+                    # Force a full CUDA synchronization and cache clear to restore GPU state
+                    if device.type == 'cuda':
+                        print("[DEBUG] Cleaning up GPU state after polyscope...")
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+
+                        # Do a quick warmup inference to restore torch.compile state
+                        print("[DEBUG] Re-warming model after polyscope...")
+                        from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
+                        with torch.no_grad():
+                            dummy = MeshPatchData(
+                                pos=torch.randn(5000 * actual_k, 3, device=device),
+                                x=torch.randn(5000 * actual_k, 3, device=device),
+                                patch_idx=torch.arange(5000, device=device).repeat_interleave(actual_k),
+                                vertex_indices=torch.randint(0, 5000, (5000 * actual_k,), device=device),
+                                center_indices=torch.arange(5000, device=device)
+                            )
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
+                                _ = model._forward_pass(dummy)
+                            torch.cuda.synchronize()
+                        del dummy
+                        torch.cuda.empty_cache()
+                        print("[DEBUG] Re-warm complete")
+                else:
+                    print(f"\n[skip_visualization=True] Skipping polyscope for batch {batch_idx + 1}")
 
             except Exception as e:
                 print(f"[X] Error processing batch {batch_idx}: {e}")

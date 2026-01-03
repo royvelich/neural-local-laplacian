@@ -327,7 +327,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         return sequences, attention_mask
 
     def _compute_mean_curvature_vectors(self, forward_result: Dict[str, torch.Tensor],
-                                                   batch_data: Batch) -> torch.Tensor:
+                                        batch_data: Batch) -> torch.Tensor:
         """
         Compute predicted mean curvature vectors from stiffness weights and areas.
 
@@ -406,13 +406,117 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Internal forward pass method that can be called from both forward() and validation_step().
 
+        Automatically selects between optimized fixed-k path and variable-k path.
+
         Args:
             batch: PyTorch Geometric batch
 
         Returns:
             Dictionary containing forward pass results
         """
-        return self.forward(batch)
+        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
+        batch_indices = getattr(batch, 'patch_idx', batch.batch)
+
+        # Check if all patches have the same size (fixed k)
+        batch_sizes = batch_indices.bincount()
+
+        # If all batch sizes are equal, use optimized fixed-k path
+        if torch.all(batch_sizes == batch_sizes[0]):
+            return self.forward_fixed_k(batch)
+        else:
+            return self.forward(batch)
+
+    def forward_fixed_k(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """
+        Optimized forward pass for fixed-k inference (all patches have same size).
+
+        Skips padding, attention masking, and related overhead for faster inference.
+        This is automatically used when all patches have the same number of neighbors.
+
+        Args:
+            batch: PyTorch Geometric batch where all patches have identical size
+
+        Returns:
+            Dict containing:
+            - stiffness_weights: (batch_size, k) - learned stiffness weights s_ij
+            - areas: (batch_size,) - learned area A_i for each patch center
+            - attention_mask: (batch_size, k) - all True (for compatibility)
+            - batch_sizes: (batch_size,) - all equal to k
+            - scale_factors: (batch_size,) - max_dist per patch (only if normalizing)
+        """
+        features = batch.x  # Shape: (total_points, feature_dim)
+        positions = batch.pos  # Shape: (total_points, 3)
+
+        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
+        batch_indices = getattr(batch, 'patch_idx', batch.batch)
+
+        # Get batch info - all sizes should be equal
+        batch_sizes = batch_indices.bincount()
+        batch_size = len(batch_sizes)
+        k = batch_sizes[0].item()  # Fixed k for all patches
+
+        # === Compute scale factors and optionally normalize ===
+        if self._normalize_patch_features:
+            # Compute max distance per patch for normalization
+            distances = torch.norm(positions, dim=1)  # (total_points,)
+
+            # Get max distance per patch using scatter_reduce
+            scale_factors = torch.zeros(batch_size, device=positions.device, dtype=positions.dtype)
+            scale_factors.scatter_reduce_(
+                0, batch_indices, distances, reduce='amax', include_self=True
+            )
+            # Avoid division by zero
+            scale_factors = torch.clamp(scale_factors, min=1e-8)
+
+            # Normalize features by scale factors (broadcast per-patch scale to per-point)
+            per_point_scales = scale_factors[batch_indices]  # (total_points,)
+            features = features / per_point_scales.unsqueeze(-1)  # (total_points, feature_dim)
+        else:
+            # No normalization - scale factors are all 1.0
+            scale_factors = torch.ones(batch_size, device=features.device, dtype=features.dtype)
+
+        # Project to model dimension
+        features = self.input_projection(features)  # (total_points, d_model)
+
+        # === OPTIMIZED: Direct reshape instead of padding ===
+        # Since all patches have the same size k, we can directly reshape
+        sequences = features.view(batch_size, k, -1)  # (batch_size, k, d_model)
+
+        # === OPTIMIZED: No attention mask needed (pass None) ===
+        # src_key_padding_mask=None means no masking, which is correct for fixed k
+        encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=None)
+
+        # === Stiffness weights (per token) ===
+        stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, k, 1)
+        stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, k)
+
+        # Apply exp to ensure positive weights (no masking needed)
+        stiffness_weights = torch.exp(stiffness_weights)
+
+        # === Area prediction (per patch) ===
+        # OPTIMIZED: Simple mean pooling (no mask needed)
+        pooled_features = encoded_features.mean(dim=1)  # (batch_size, d_model)
+
+        # Area head outputs positive scalar per patch (for normalized geometry)
+        areas_normalized = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
+
+        # === Scale areas back to original geometry ===
+        if self._scale_areas_by_patch_size:
+            # A = A' * d² (area scales as length²)
+            areas = areas_normalized * (scale_factors ** 2)
+        else:
+            areas = areas_normalized
+
+        # Create dummy attention mask (all True) for compatibility with downstream code
+        attention_mask = torch.ones(batch_size, k, dtype=torch.bool, device=features.device)
+
+        return {
+            'stiffness_weights': stiffness_weights,
+            'areas': areas,
+            'attention_mask': attention_mask,
+            'batch_sizes': batch_sizes,
+            'scale_factors': scale_factors
+        }
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """
@@ -424,7 +528,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         - Normalizes patch positions to unit sphere before transformer
 
         If scale_areas_by_patch_size=True:
-        - Scales output areas by d² to restore original geometry scale
+        - Scales output areas by dÂ² to restore original geometry scale
 
         Args:
             batch: PyTorch Geometric batch
@@ -505,7 +609,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # === Scale areas back to original geometry ===
         if self._scale_areas_by_patch_size:
-            # A = A' * d² (area scales as length²)
+            # A = A' * dÂ² (area scales as lengthÂ²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
