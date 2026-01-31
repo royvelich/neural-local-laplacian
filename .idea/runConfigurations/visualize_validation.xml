@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="visualize_validation" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+  <configuration default="false" name="visualize_validation" type="PythonConfigurationType" factoryName="Python">
     <module name="neural-local-laplacian" />
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />
@@ -13,8 +13,9 @@
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+    <option name="RUN_TOOL" value="" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/visualize_validation.py" />
-    <option name="PARAMETERS" value="C:\Users\Roy\Downloads\validation_mesh_data_epoch_1099" />
+    <option name="PARAMETERS" value="+ckpt_path=&quot;C:\Users\Roy\Downloads\model.ckpt&quot; +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />

@@ -5,10 +5,10 @@ train_dataset_specification:
     _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
     seed: ${globals.seed}
     epoch_size: 1000
-    grid_radius_range: [2.0]
-    polynomial_offset_range: [0.2, 1.0]
+    grid_radius_range: [1.0]
+    polynomial_offset_range: [0.0]
     points_scale_range: [1.0]
-    coefficient_scale_range: [0.2]
+    coefficient_scale_range: [0.4]
     order_range: [2, 3]
     grid_samplers:
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.RegularGridSampler
@@ -21,7 +21,7 @@ train_dataset_specification:
     include_origin_in_grid: True
     conv_k_nearest: null
     pose_transformers:
-      - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+#      - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
       - _target_: neural_local_laplacian.utils.pose_transformers.AlignNormalZTransformer
     coeff_generation_method:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
