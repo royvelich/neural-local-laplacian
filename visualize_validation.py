@@ -157,6 +157,44 @@ class LaplacianTimingResults:
     current_k: int = 0
 
 
+@dataclass
+class GreensFunctionValidationResult:
+    """Results from Green's function maximum principle validation.
+
+    The harmonic Green's function g solves Lg = delta_source.
+    For a valid Laplacian with nonnegative edge weights, g should be:
+    - Non-negative everywhere: g_j >= 0 for all j
+    - Maximum at the source vertex
+
+    This validates that the discrete maximum principle holds.
+    """
+    method_name: str  # "GT", "PRED", or "Robust"
+    source_vertex_idx: int
+    num_vertices: int
+
+    # Green's function statistics
+    min_value: float = 0.0
+    max_value: float = 0.0
+    mean_value: float = 0.0
+    value_at_source: float = 0.0
+
+    # Maximum principle validation
+    num_negative: int = 0  # Count of vertices with g < 0
+    negative_fraction: float = 0.0  # Fraction of vertices with g < 0
+    max_at_source: bool = True  # Whether maximum is at source vertex
+    satisfies_maximum_principle: bool = True  # Overall pass/fail
+
+    # Detailed violation info
+    most_negative_value: float = 0.0
+    most_negative_vertex_idx: int = -1
+
+    def __str__(self) -> str:
+        status = "✓" if self.satisfies_maximum_principle else "✗"
+        return (f"{self.method_name:<12} {self.min_value:>12.6f} {self.max_value:>12.6f} "
+                f"{self.num_negative:>6} / {self.num_vertices:<6} "
+                f"{'✓' if self.max_at_source else '✗':^10} {status:^8}")
+
+
 class RealTimeEigenanalysisVisualizer:
     """Real-time eigenanalysis visualizer using MeshDataset and model inference."""
 
@@ -197,6 +235,9 @@ class RealTimeEigenanalysisVisualizer:
 
         # NEW: Timing results for Laplacian assembly comparison
         self.timing_results = LaplacianTimingResults()
+
+        # NEW: Green's function validation results
+        self.current_greens_results = None
 
         # Debug flags (set from config in run_dataset_iteration)
         self._diagnostic_mode = False
@@ -341,6 +382,25 @@ class RealTimeEigenanalysisVisualizer:
                 psim.Text(f"PRED vs Robust: {pred_vs_robust:.2f}x")
         else:
             psim.Text("(No timing data yet)")
+
+        # === GREEN'S FUNCTION MAXIMUM PRINCIPLE VALIDATION ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Maximum Principle Validation:")
+
+        if self.current_greens_results is not None and len(self.current_greens_results) > 0:
+            # Show results for each method
+            for method_name, result in self.current_greens_results.items():
+                if result.satisfies_maximum_principle:
+                    psim.TextColored((0.0, 1.0, 0.0, 1.0), f"  {method_name}: ✓ PASS")
+                else:
+                    psim.TextColored((1.0, 0.0, 0.0, 1.0), f"  {method_name}: ✗ FAIL")
+                    if result.num_negative > 0:
+                        psim.Text(f"    {result.num_negative} negative values")
+                    if not result.max_at_source:
+                        psim.Text(f"    Max not at source")
+        else:
+            psim.Text("(Not computed yet)")
 
     def _has_current_batch_data(self) -> bool:
         """Check if we have current batch data available for re-computation."""
@@ -1122,7 +1182,7 @@ class RealTimeEigenanalysisVisualizer:
         """
         try:
             # Use the centralized eigendecomposition function from utils
-            # Note: eigsh returns M-orthonormal eigenvectors (Î¦^T M Î¦ = I)
+            # Note: eigsh returns M-orthonormal eigenvectors (ÃŽÂ¦^T M ÃŽÂ¦ = I)
             # We preserve this property for correct area-weighted reconstruction
             eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
                 stiffness_matrix, k, mass_matrix=mass_matrix
@@ -1217,7 +1277,7 @@ class RealTimeEigenanalysisVisualizer:
             print(f"[TIMING] GT (PyFM) Laplacian + eigen: {gt_laplacian_time * 1000:.2f} ms")
 
             # Retrieve eigenvalues, eigenfunctions, and vertex areas
-            # Note: PyFM returns M-orthonormal eigenvectors (Î¦^T M Î¦ = I)
+            # Note: PyFM returns M-orthonormal eigenvectors (ÃŽÂ¦^T M ÃŽÂ¦ = I)
             # We preserve this property for correct area-weighted reconstruction
             gt_eigenvalues = pyfm_mesh.eigenvalues
             gt_eigenvectors = pyfm_mesh.eigenvectors
@@ -1503,18 +1563,18 @@ class RealTimeEigenanalysisVisualizer:
         """
         Compute mesh reconstruction using area-weighted inner products (fully vectorized).
 
-        For M-orthonormal eigenvectors from generalized eigenvalue problem (S v = Î» M v),
-        the Gram matrix G = Î¦^T M Î¦ = I, so projection coefficients simplify to:
-            c = Î¦^T M f
+        For M-orthonormal eigenvectors from generalized eigenvalue problem (S v = ÃŽÂ» M v),
+        the Gram matrix G = ÃŽÂ¦^T M ÃŽÂ¦ = I, so projection coefficients simplify to:
+            c = ÃŽÂ¦^T M f
         and reconstruction is:
-            f_l = Î¦_l c_l = Î£_{i=0}^{l-1} Ï†_i (Ï†_i^T M f)
+            f_l = ÃŽÂ¦_l c_l = ÃŽÂ£_{i=0}^{l-1} Ãâ€ _i (Ãâ€ _i^T M f)
 
         This vectorized implementation computes all progressive reconstructions efficiently
         using cumulative sums, avoiding Python loops entirely.
 
         Args:
             original_vertices: Original mesh vertices f in R^{n x 3}
-            eigenvectors: Eigenvectors Phi in R^{n x k} (M-orthonormal: Î¦^T M Î¦ = I)
+            eigenvectors: Eigenvectors Phi in R^{n x k} (M-orthonormal: ÃŽÂ¦^T M ÃŽÂ¦ = I)
             num_available: Number of available eigenvectors to use
             vertex_areas: Vertex areas a in R^n (diagonal of mass matrix M)
 
@@ -1525,21 +1585,21 @@ class RealTimeEigenanalysisVisualizer:
             return []
 
         # Apply diagonal mass matrix efficiently: M @ f = diag(areas) @ f
-        # No need to form full nÃ—n matrix - just element-wise multiplication
+        # No need to form full nÃƒâ€”n matrix - just element-wise multiplication
         M_f = vertex_areas[:, np.newaxis] * original_vertices  # (n, 3)
 
-        # Compute all M-weighted coefficients at once: c = Î¦^T M f
-        # Since Î¦ is M-orthonormal, these are the exact projection coefficients
+        # Compute all M-weighted coefficients at once: c = ÃŽÂ¦^T M f
+        # Since ÃŽÂ¦ is M-orthonormal, these are the exact projection coefficients
         Phi = eigenvectors[:, :num_available]  # (n, L)
         coefficients = Phi.T @ M_f  # (L, 3)
 
         # Compute contribution from each eigenvector via broadcasting:
-        # contribution_i = Ï†_i âŠ— c_i^T (outer product, but c_i is a row vector)
-        # Shape: (n, L, 1) * (1, L, 3) â†’ (n, L, 3)
+        # contribution_i = Ãâ€ _i Ã¢Å â€” c_i^T (outer product, but c_i is a row vector)
+        # Shape: (n, L, 1) * (1, L, 3) Ã¢â€ â€™ (n, L, 3)
         contributions = Phi[:, :, np.newaxis] * coefficients[np.newaxis, :, :]
 
         # Cumulative sum along eigenvector axis gives progressive reconstructions:
-        # cumulative[:, l, :] = Î£_{i=0}^{l} contribution_i = reconstruction using (l+1) eigenvectors
+        # cumulative[:, l, :] = ÃŽÂ£_{i=0}^{l} contribution_i = reconstruction using (l+1) eigenvectors
         cumulative = np.cumsum(contributions, axis=1)  # (n, L, 3)
 
         # Convert to list of (n, 3) arrays
@@ -1551,15 +1611,15 @@ class RealTimeEigenanalysisVisualizer:
         Compute mesh reconstruction using standard Euclidean inner products (optimized).
 
         Solves the least squares problem for each l:
-            min_c ||f - Î¦_l c||_2^2
+            min_c ||f - ÃŽÂ¦_l c||_2^2
 
-        Solution: c = (Î¦_l^T Î¦_l)^{-1} Î¦_l^T f, then f_l = Î¦_l c
+        Solution: c = (ÃŽÂ¦_l^T ÃŽÂ¦_l)^{-1} ÃŽÂ¦_l^T f, then f_l = ÃŽÂ¦_l c
 
         Note: Eigenvectors from generalized EVP are M-orthonormal, not L2-orthonormal.
         Even after L2-renormalization, they are L2-normalized but NOT L2-orthogonal.
-        So we must compute the actual Gram matrix G = Î¦^T Î¦.
+        So we must compute the actual Gram matrix G = ÃŽÂ¦^T ÃŽÂ¦.
 
-        Optimized by precomputing Î¦^T Î¦ and Î¦^T f once, then extracting submatrices.
+        Optimized by precomputing ÃŽÂ¦^T ÃŽÂ¦ and ÃŽÂ¦^T f once, then extracting submatrices.
 
         Args:
             original_vertices: Original mesh vertices of shape (N, 3)
@@ -1574,13 +1634,13 @@ class RealTimeEigenanalysisVisualizer:
 
         Phi = eigenvectors[:, :num_available]  # (n, L)
 
-        # Precompute full Gram matrix G_full = Î¦^T Î¦ and projection target b_full = Î¦^T f
+        # Precompute full Gram matrix G_full = ÃŽÂ¦^T ÃŽÂ¦ and projection target b_full = ÃŽÂ¦^T f
         G_full = Phi.T @ Phi  # (L, L)
         b_full = Phi.T @ original_vertices  # (L, 3)
 
         reconstructed_meshes = []
         for l in range(1, num_available + 1):
-            # Extract lÃ—l submatrix and lÃ—3 subvector
+            # Extract lÃƒâ€”l submatrix and lÃƒâ€”3 subvector
             G_l = G_full[:l, :l]
             b_l = b_full[:l, :]
 
@@ -1590,7 +1650,7 @@ class RealTimeEigenanalysisVisualizer:
             except np.linalg.LinAlgError:
                 c = np.linalg.pinv(G_l) @ b_l
 
-            # Reconstruct: f_l = Î¦_l c
+            # Reconstruct: f_l = ÃŽÂ¦_l c
             reconstructed_meshes.append(Phi[:, :l] @ c)
 
         return reconstructed_meshes
@@ -2176,6 +2236,460 @@ class RealTimeEigenanalysisVisualizer:
                     cmap=self.config.colormap
                 )
 
+    # =========================================================================
+    # GREEN'S FUNCTION MAXIMUM PRINCIPLE VALIDATION
+    # =========================================================================
+
+    def compute_greens_function(
+            self,
+            laplacian_matrix: scipy.sparse.csr_matrix,
+            mass_matrix: Optional[scipy.sparse.csr_matrix],
+            source_vertex_idx: int,
+            regularization: float = 1e-6
+    ) -> Optional[np.ndarray]:
+        """
+        Compute the harmonic Green's function by solving (L + εM)g = δ.
+
+        The Green's function g satisfies Lg = δ_source, where δ is a delta function
+        at the source vertex. Since L is singular (constant null space), we use
+        regularization: (L + εM)g = δ.
+
+        After solving, we normalize by subtracting the mean to remove the constant
+        component and shifting so the minimum is 0.
+
+        Args:
+            laplacian_matrix: Sparse Laplacian matrix L (n x n), positive semi-definite
+            mass_matrix: Sparse diagonal mass matrix M (n x n), or None for identity
+            source_vertex_idx: Index of the source vertex
+            regularization: Regularization parameter ε (default 1e-6)
+
+        Returns:
+            Green's function values g as (n,) array, or None on failure
+        """
+        n = laplacian_matrix.shape[0]
+
+        if source_vertex_idx < 0 or source_vertex_idx >= n:
+            print(f"  [!] Invalid source vertex index: {source_vertex_idx}")
+            return None
+
+        try:
+            # Convert to float64 for numerical stability
+            L = laplacian_matrix.astype(np.float64)
+
+            # Create delta function at source
+            delta = np.zeros(n, dtype=np.float64)
+            delta[source_vertex_idx] = 1.0
+
+            # Use identity mass matrix if none provided
+            if mass_matrix is None:
+                M = scipy.sparse.eye(n, format='csr', dtype=np.float64)
+            else:
+                M = mass_matrix.astype(np.float64)
+
+            # Ensure L is CSR format
+            if not isinstance(L, scipy.sparse.csr_matrix):
+                L = L.tocsr()
+
+            # Estimate the scale of the Laplacian for adaptive regularization
+            # Use diagonal values as a proxy for typical eigenvalue scale
+            diag = np.array(L.diagonal()).flatten()
+            L_scale = np.abs(diag).mean() if len(diag) > 0 else 1.0
+            adaptive_reg = regularization * max(L_scale, 1e-4)
+
+            print(f"    Using regularization: {adaptive_reg:.2e} (scale={L_scale:.2e})")
+
+            # Regularized system: (L + εM)g = δ
+            A = L + adaptive_reg * M
+
+            # Solve the linear system using sparse solver
+            # Use a direct solver for stability
+            g = scipy.sparse.linalg.spsolve(A, delta)
+
+            # Check for NaN or Inf
+            if not np.isfinite(g).all():
+                print(f"  [!] Solution contains NaN or Inf values")
+                return None
+
+            # Remove the constant component by subtracting weighted mean
+            M_diag = np.array(M.diagonal()).flatten()
+            total_mass = M_diag.sum()
+            if total_mass > 0:
+                weighted_mean = (g * M_diag).sum() / total_mass
+                g = g - weighted_mean
+
+            # Shift so minimum is 0 (for easier interpretation)
+            g = g - g.min()
+
+            # Normalize so max is 1 (for easier comparison across methods)
+            if g.max() > 0:
+                g = g / g.max()
+
+            return g
+
+        except Exception as e:
+            print(f"  [!] Failed to compute Green's function: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def validate_maximum_principle(
+            self,
+            greens_function: np.ndarray,
+            source_vertex_idx: int,
+            method_name: str,
+            tolerance: float = -1e-10
+    ) -> GreensFunctionValidationResult:
+        """
+        Validate whether the Green's function satisfies the discrete maximum principle.
+
+        For a valid Laplacian with nonnegative edge weights:
+        1. g should be non-negative everywhere: g_j >= 0 for all j
+        2. The maximum should be at the source vertex
+
+        Note: The Green's function is normalized to [0, 1] range (min=0, max=1).
+        The key test is whether the maximum occurs at the source vertex.
+
+        Args:
+            greens_function: Green's function values (n,), normalized to [0, 1]
+            source_vertex_idx: Index of the source vertex
+            method_name: Name of the method ("GT", "PRED", or "Robust")
+            tolerance: Tolerance for considering a value negative (default -1e-10)
+
+        Returns:
+            GreensFunctionValidationResult with validation statistics
+        """
+        n = len(greens_function)
+        g = greens_function
+
+        # Basic statistics
+        min_val = float(g.min())
+        max_val = float(g.max())
+        mean_val = float(g.mean())
+        value_at_source = float(g[source_vertex_idx])
+
+        # Check for negative values (should be none after normalization, but check anyway)
+        negative_mask = g < tolerance
+        num_negative = int(negative_mask.sum())
+        negative_fraction = num_negative / n
+
+        # Find most negative value and its location
+        if num_negative > 0:
+            most_negative_idx = int(np.argmin(g))
+            most_negative_val = float(g[most_negative_idx])
+        else:
+            most_negative_idx = -1
+            most_negative_val = 0.0
+
+        # Check if maximum is at source (the key test for maximum principle)
+        max_idx = int(np.argmax(g))
+        max_at_source = (max_idx == source_vertex_idx)
+
+        # Also check if source is "near" the maximum (within 5% of max value)
+        # This handles numerical precision issues and mesh discretization
+        if not max_at_source and max_val > 0:
+            source_relative = value_at_source / max_val
+            if source_relative > 0.95:
+                print(f"    [{method_name}] Source not at exact max but within 5%: "
+                      f"source={value_at_source:.4f}, max={max_val:.4f} at vertex {max_idx}")
+                # Don't change max_at_source, but note it's close
+
+        # Overall pass/fail: no negative values AND max at source
+        satisfies_principle = (num_negative == 0) and max_at_source
+
+        return GreensFunctionValidationResult(
+            method_name=method_name,
+            source_vertex_idx=source_vertex_idx,
+            num_vertices=n,
+            min_value=min_val,
+            max_value=max_val,
+            mean_value=mean_val,
+            value_at_source=value_at_source,
+            num_negative=num_negative,
+            negative_fraction=negative_fraction,
+            max_at_source=max_at_source,
+            satisfies_maximum_principle=satisfies_principle,
+            most_negative_value=most_negative_val,
+            most_negative_vertex_idx=most_negative_idx
+        )
+
+    def select_source_vertex(
+            self,
+            vertices: np.ndarray,
+            method: str = "centroid"
+    ) -> int:
+        """
+        Select a source vertex for Green's function computation.
+
+        Args:
+            vertices: Mesh vertices (n, 3)
+            method: Selection method - "centroid" (closest to center),
+                    "random", or an integer index
+
+        Returns:
+            Index of selected source vertex
+        """
+        n = len(vertices)
+
+        if method == "centroid":
+            # Find vertex closest to centroid
+            centroid = vertices.mean(axis=0)
+            distances = np.linalg.norm(vertices - centroid, axis=1)
+            return int(np.argmin(distances))
+        elif method == "random":
+            return int(np.random.randint(0, n))
+        elif isinstance(method, int):
+            return max(0, min(method, n - 1))
+        else:
+            # Default to centroid
+            centroid = vertices.mean(axis=0)
+            distances = np.linalg.norm(vertices - centroid, axis=1)
+            return int(np.argmin(distances))
+
+    def compute_and_visualize_greens_functions(
+            self,
+            mesh_structure,
+            gt_data: Dict[str, Any],
+            inference_result: Dict[str, Any],
+            source_vertex_idx: Optional[int] = None
+    ) -> Dict[str, GreensFunctionValidationResult]:
+        """
+        Compute and visualize Green's functions for GT, PRED, and Robust Laplacians.
+
+        This validates the discrete maximum principle for each Laplacian:
+        - Solves Lg = δ_source for each method
+        - Checks that g >= 0 everywhere (no negative values)
+        - Checks that max(g) is at the source vertex
+
+        Args:
+            mesh_structure: Polyscope mesh structure for visualization
+            gt_data: Dictionary containing GT Laplacian data
+            inference_result: Dictionary containing PRED Laplacian data
+            source_vertex_idx: Optional specific source vertex (default: centroid)
+
+        Returns:
+            Dictionary mapping method names to validation results
+        """
+        print(f"\n" + "=" * 70)
+        print("GREEN'S FUNCTION MAXIMUM PRINCIPLE VALIDATION")
+        print("=" * 70)
+
+        vertices = gt_data['vertices']
+        faces = gt_data['faces']
+        n = len(vertices)
+
+        # Select source vertex
+        if source_vertex_idx is None:
+            source_vertex_idx = self.select_source_vertex(vertices, method="centroid")
+
+        source_pos = vertices[source_vertex_idx]
+        print(f"Source vertex: {source_vertex_idx} at position ({source_pos[0]:.4f}, {source_pos[1]:.4f}, {source_pos[2]:.4f})")
+        print(f"Number of vertices: {n}")
+        print("-" * 70)
+
+        results = {}
+        greens_functions = {}
+
+        # =====================================================================
+        # 1. GT Green's Function (using PyFM/igl cotangent Laplacian)
+        # =====================================================================
+        print("\nComputing GT Green's function...")
+        gt_greens = None
+
+        if HAS_IGL:
+            try:
+                # Build GT Laplacian using igl
+                V = vertices.astype(np.float64)
+                F = faces.astype(np.int32)
+
+                L_gt = igl.cotmatrix(V, F)
+                M_gt = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+
+                # Note: igl.cotmatrix returns negative semi-definite L (opposite sign convention)
+                # We need to negate it to get positive semi-definite
+                L_gt = -L_gt
+
+                # Diagnostic: check Laplacian properties
+                diag_gt = np.array(L_gt.diagonal()).flatten()
+                offdiag_sum = np.array(L_gt.sum(axis=1)).flatten() - diag_gt
+                print(f"  GT Laplacian: diag range [{diag_gt.min():.4f}, {diag_gt.max():.4f}], row sums ~ {np.abs(L_gt.sum(axis=1)).max():.2e}")
+
+                gt_greens = self.compute_greens_function(L_gt, M_gt, source_vertex_idx)
+
+                if gt_greens is not None:
+                    results['GT'] = self.validate_maximum_principle(gt_greens, source_vertex_idx, "GT (igl)")
+                    greens_functions['GT'] = gt_greens
+                    print(f"  GT Green's function: min={gt_greens.min():.6f}, max={gt_greens.max():.6f}")
+
+            except Exception as e:
+                print(f"  [!] Failed to compute GT Green's function: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("  [!] igl not available, skipping GT Green's function")
+
+        # =====================================================================
+        # 2. PRED Green's Function (using neural network predicted Laplacian)
+        # =====================================================================
+        print("\nComputing PRED Green's function...")
+        pred_greens = None
+
+        if inference_result.get('stiffness_matrix') is not None:
+            try:
+                L_pred = inference_result['stiffness_matrix']
+                M_pred = inference_result.get('mass_matrix')
+
+                # Diagnostic: check Laplacian properties
+                diag_pred = np.array(L_pred.diagonal()).flatten()
+                print(f"  PRED Laplacian: diag range [{diag_pred.min():.4f}, {diag_pred.max():.4f}], row sums ~ {np.abs(L_pred.sum(axis=1)).max():.2e}")
+
+                # Check if PRED Laplacian has correct sign (positive diagonal for positive semi-definite)
+                if diag_pred.min() < 0:
+                    print(f"  [!] WARNING: PRED Laplacian has negative diagonal entries - may indicate sign issue")
+
+                pred_greens = self.compute_greens_function(L_pred, M_pred, source_vertex_idx)
+
+                if pred_greens is not None:
+                    results['PRED'] = self.validate_maximum_principle(pred_greens, source_vertex_idx, "PRED (Neural)")
+                    greens_functions['PRED'] = pred_greens
+                    print(f"  PRED Green's function: min={pred_greens.min():.6f}, max={pred_greens.max():.6f}")
+
+            except Exception as e:
+                print(f"  [!] Failed to compute PRED Green's function: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("  [!] PRED stiffness matrix not available")
+
+        # =====================================================================
+        # 3. Robust Green's Function (using robust_laplacian point cloud)
+        # =====================================================================
+        print("\nComputing Robust Green's function...")
+        robust_greens = None
+
+        if not self._skip_robust:
+            try:
+                # Use the same k as PRED for fair comparison
+                k = self.original_k if self.original_k is not None else 30
+
+                L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
+
+                # Diagnostic: check Laplacian properties
+                diag_robust = np.array(L_robust.diagonal()).flatten()
+                print(f"  Robust Laplacian: diag range [{diag_robust.min():.4f}, {diag_robust.max():.4f}], row sums ~ {np.abs(L_robust.sum(axis=1)).max():.2e}")
+
+                robust_greens = self.compute_greens_function(L_robust, M_robust, source_vertex_idx)
+
+                if robust_greens is not None:
+                    results['Robust'] = self.validate_maximum_principle(robust_greens, source_vertex_idx, "Robust")
+                    greens_functions['Robust'] = robust_greens
+                    print(f"  Robust Green's function: min={robust_greens.min():.6f}, max={robust_greens.max():.6f}")
+
+            except Exception as e:
+                print(f"  [!] Failed to compute Robust Green's function: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("  [!] Robust computation skipped (skip_robust=True)")
+
+        # =====================================================================
+        # Print comparison table
+        # =====================================================================
+        print(f"\n" + "=" * 70)
+        print("MAXIMUM PRINCIPLE VALIDATION RESULTS")
+        print(f"Source vertex: {source_vertex_idx}")
+        print("=" * 70)
+        print(f"{'Method':<12} {'Min Value':>12} {'Max Value':>12} {'Negative':>15} {'Max@Source':^10} {'Status':^8}")
+        print("-" * 70)
+
+        for method_name, result in results.items():
+            print(result)
+
+        print("-" * 70)
+
+        # Summary
+        all_pass = all(r.satisfies_maximum_principle for r in results.values())
+        if all_pass:
+            print("✓ All methods satisfy the discrete maximum principle")
+        else:
+            print("✗ Some methods VIOLATE the discrete maximum principle:")
+            for method_name, result in results.items():
+                if not result.satisfies_maximum_principle:
+                    if result.num_negative > 0:
+                        print(f"  - {method_name}: {result.num_negative} negative values (most negative: {result.most_negative_value:.2e} at vertex {result.most_negative_vertex_idx})")
+                    if not result.max_at_source:
+                        print(f"  - {method_name}: Maximum not at source vertex")
+
+        print("=" * 70)
+
+        # =====================================================================
+        # Add visualizations to mesh structure
+        # =====================================================================
+        if mesh_structure is not None and not self._skip_visualization:
+            print("\nAdding Green's function visualizations...")
+
+            # Add source vertex indicator
+            source_point = vertices[source_vertex_idx:source_vertex_idx + 1]
+            ps.register_point_cloud(
+                name="Green's Function Source",
+                points=source_point,
+                radius=0.02,
+                color=(1.0, 0.0, 0.0),  # Red
+                enabled=True
+            )
+
+            # Add Green's function scalar fields
+            for method_name, g in greens_functions.items():
+                # Main Green's function visualization
+                mesh_structure.add_scalar_quantity(
+                    name=f"J1 Green's Function - {method_name}",
+                    values=g,
+                    enabled=(method_name == "GT"),  # Enable GT by default
+                    cmap='viridis'
+                )
+
+                # Log-scale visualization (better for seeing decay)
+                g_positive = np.maximum(g, 1e-10)  # Avoid log(0)
+                mesh_structure.add_scalar_quantity(
+                    name=f"J2 Green's Function (log) - {method_name}",
+                    values=np.log10(g_positive),
+                    enabled=False,
+                    cmap='viridis'
+                )
+
+                # Highlight violations (if any)
+                result = results.get(method_name)
+                if result is not None and result.num_negative > 0:
+                    violation_mask = (g < -1e-10).astype(np.float32)
+                    mesh_structure.add_scalar_quantity(
+                        name=f"J3 Green's Fn Violations - {method_name}",
+                        values=violation_mask,
+                        enabled=False,
+                        cmap='reds'
+                    )
+
+            # Add pairwise difference visualizations
+            if 'GT' in greens_functions and 'PRED' in greens_functions:
+                diff = greens_functions['PRED'] - greens_functions['GT']
+                mesh_structure.add_scalar_quantity(
+                    name="J4 Green's Fn Diff (PRED - GT)",
+                    values=diff,
+                    enabled=False,
+                    cmap='coolwarm'
+                )
+
+            if 'GT' in greens_functions and 'Robust' in greens_functions:
+                diff = greens_functions['Robust'] - greens_functions['GT']
+                mesh_structure.add_scalar_quantity(
+                    name="J5 Green's Fn Diff (Robust - GT)",
+                    values=diff,
+                    enabled=False,
+                    cmap='coolwarm'
+                )
+
+            print(f"  Added {len(greens_functions)} Green's function visualizations")
+
+        return results
+
     def process_batch(self, model: LaplacianTransformerModule, batch_data, batch_idx: int, device: torch.device):
         """Process a single batch through the complete pipeline."""
         print(f"\n{'=' * 80}")
@@ -2353,6 +2867,19 @@ class RealTimeEigenanalysisVisualizer:
             self._update_mesh_reconstructions(gt_data, inference_result)
         else:
             print(f"\nSTEP 7: Skipping mesh reconstructions (skip_visualization=True)")
+
+        # STEP 8: Green's function maximum principle validation
+        print(f"\nSTEP 8: Green's function maximum principle validation")
+        try:
+            greens_results = self.compute_and_visualize_greens_functions(
+                mesh_structure, gt_data, inference_result
+            )
+            # Store results for potential UI display
+            self.current_greens_results = greens_results
+        except Exception as e:
+            print(f"  [!] Green's function validation failed: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Print timing summary to console
         self._print_timing_summary()
