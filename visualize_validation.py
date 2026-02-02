@@ -162,37 +162,60 @@ class GreensFunctionValidationResult:
     """Results from Green's function maximum principle validation.
 
     The harmonic Green's function g solves Lg = delta_source.
-    For a valid Laplacian with nonnegative edge weights, g should be:
-    - Non-negative everywhere: g_j >= 0 for all j
-    - Maximum at the source vertex
+    For a valid Laplacian with nonnegative edge weights:
+    - The MAXIMUM should be at the source vertex (key test!)
 
-    This validates that the discrete maximum principle holds.
+    After mean-centering, the Green's function has positive and negative values.
+    This is expected - the key test is whether the max is at the source.
+
+    If the Laplacian has negative edge weights (e.g., from bad triangulation),
+    the maximum may occur away from the source, violating the maximum principle.
     """
     method_name: str  # "GT", "PRED", or "Robust"
     source_vertex_idx: int
     num_vertices: int
 
-    # Green's function statistics
+    # Green's function statistics (after mean-centering)
     min_value: float = 0.0
     max_value: float = 0.0
-    mean_value: float = 0.0
+    mean_value: float = 0.0  # Should be ~0 after centering
     value_at_source: float = 0.0
 
-    # Maximum principle validation
-    num_negative: int = 0  # Count of vertices with g < 0
-    negative_fraction: float = 0.0  # Fraction of vertices with g < 0
-    max_at_source: bool = True  # Whether maximum is at source vertex
+    # === PRIMARY TEST: Maximum Principle ===
+    max_at_source: bool = True  # Whether maximum is at source vertex (KEY TEST)
     satisfies_maximum_principle: bool = True  # Overall pass/fail
+    num_violations: int = 0  # Count of vertices with value > source
+    worst_violation_vertex: int = -1  # Index of vertex with highest value (if not source)
+    worst_violation_value: float = 0.0  # Value at worst violating vertex
 
-    # Detailed violation info
-    most_negative_value: float = 0.0
-    most_negative_vertex_idx: int = -1
+    # === SOURCE-CENTERED CHECK (Sharp & Crane style) ===
+    # After shifting so source = 0, all values should be <= 0
+    # This directly tests: "Is any vertex hotter than the source?"
+    num_positive_vertices: int = 0  # Count of vertices with g > g_source (should be 0)
+    max_positive_value: float = 0.0  # Worst violation: max(g - g_source) (should be <= 0)
+    positive_vertex_idx: int = -1  # Index of worst positive vertex
+
+    # === SECONDARY TEST: Monotonic Decay ===
+    # Green's function should decrease with distance from source
+    distance_correlation: float = 0.0  # Correlation(g, -distance), should be positive
+    monotonicity_score: float = 0.0  # Fraction of vertex pairs where closer→higher value
+
+    # === TERTIARY TEST: Smoothness ===
+    laplacian_residual_norm: float = 0.0  # ||Lg - delta|| / ||delta|| (should be small)
+
+    # === COMPARISON: Correlation with GT ===
+    correlation_with_gt: float = 0.0  # Pearson correlation with GT (for PRED/Robust)
+
+    # === DIAGNOSTIC: Min location info ===
+    min_vertex_idx: int = -1  # Index of vertex with minimum value
+    geodesic_dist_to_min: float = 0.0  # Geodesic distance from source to min vertex
+    max_geodesic_dist: float = 0.0  # Maximum geodesic distance from source (for reference)
 
     def __str__(self) -> str:
-        status = "✓" if self.satisfies_maximum_principle else "✗"
-        return (f"{self.method_name:<12} {self.min_value:>12.6f} {self.max_value:>12.6f} "
-                f"{self.num_negative:>6} / {self.num_vertices:<6} "
-                f"{'✓' if self.max_at_source else '✗':^10} {status:^8}")
+        status = "✓ PASS" if self.satisfies_maximum_principle else "✗ FAIL"
+        max_status = "✓" if self.max_at_source else "✗"
+        return (f"{self.method_name:<14} {self.value_at_source:>10.4f} {self.max_value:>10.4f} "
+                f"{max_status:^12} {self.num_violations:>6} {status:>10}")
 
 
 class RealTimeEigenanalysisVisualizer:
@@ -395,10 +418,10 @@ class RealTimeEigenanalysisVisualizer:
                     psim.TextColored((0.0, 1.0, 0.0, 1.0), f"  {method_name}: ✓ PASS")
                 else:
                     psim.TextColored((1.0, 0.0, 0.0, 1.0), f"  {method_name}: ✗ FAIL")
-                    if result.num_negative > 0:
-                        psim.Text(f"    {result.num_negative} negative values")
+                    if result.num_violations > 0:
+                        psim.Text(f"    {result.num_violations} vertices above source")
                     if not result.max_at_source:
-                        psim.Text(f"    Max not at source")
+                        psim.Text(f"    Max at vertex {result.worst_violation_vertex}")
         else:
             psim.Text("(Not computed yet)")
 
@@ -2246,7 +2269,7 @@ class RealTimeEigenanalysisVisualizer:
             mass_matrix: Optional[scipy.sparse.csr_matrix],
             source_vertex_idx: int,
             regularization: float = 1e-6
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[Tuple[np.ndarray, float]]:
         """
         Compute the harmonic Green's function by solving (L + εM)g = δ.
 
@@ -2254,17 +2277,28 @@ class RealTimeEigenanalysisVisualizer:
         at the source vertex. Since L is singular (constant null space), we use
         regularization: (L + εM)g = δ.
 
-        After solving, we normalize by subtracting the mean to remove the constant
-        component and shifting so the minimum is 0.
+        After solving:
+        1. Compute Laplacian residual on RAW solution (before normalization)
+        2. Remove constant component (subtract weighted mean)
+        3. Shift so min = 0
+        4. Scale so max = 1
+
+        The normalization makes visualization easier and doesn't affect:
+        - argmax (maximum principle test)
+        - correlation (monotonicity and GT comparison)
+        - relative ordering (pairwise monotonicity)
 
         Args:
-            laplacian_matrix: Sparse Laplacian matrix L (n x n), positive semi-definite
+            laplacian_matrix: Sparse Laplacian matrix L (n x n), should be positive semi-definite
             mass_matrix: Sparse diagonal mass matrix M (n x n), or None for identity
             source_vertex_idx: Index of the source vertex
             regularization: Regularization parameter ε (default 1e-6)
 
         Returns:
-            Green's function values g as (n,) array, or None on failure
+            Tuple of (g, residual_norm) where:
+            - g: Normalized Green's function values in [0, 1] range
+            - residual_norm: ||Lg_raw - δ|| / ||δ|| computed before normalization
+            Returns None on failure.
         """
         n = laplacian_matrix.shape[0]
 
@@ -2291,7 +2325,6 @@ class RealTimeEigenanalysisVisualizer:
                 L = L.tocsr()
 
             # Estimate the scale of the Laplacian for adaptive regularization
-            # Use diagonal values as a proxy for typical eigenvalue scale
             diag = np.array(L.diagonal()).flatten()
             L_scale = np.abs(diag).mean() if len(diag) > 0 else 1.0
             adaptive_reg = regularization * max(L_scale, 1e-4)
@@ -2301,30 +2334,59 @@ class RealTimeEigenanalysisVisualizer:
             # Regularized system: (L + εM)g = δ
             A = L + adaptive_reg * M
 
-            # Solve the linear system using sparse solver
-            # Use a direct solver for stability
-            g = scipy.sparse.linalg.spsolve(A, delta)
+            # Solve the linear system
+            g_raw = scipy.sparse.linalg.spsolve(A, delta)
 
             # Check for NaN or Inf
-            if not np.isfinite(g).all():
+            if not np.isfinite(g_raw).all():
                 print(f"  [!] Solution contains NaN or Inf values")
                 return None
 
-            # Remove the constant component by subtracting weighted mean
+            # =========================================================
+            # Diagnostic: Raw solution statistics
+            # =========================================================
+            print(f"    Raw solution: min={g_raw.min():.4e}, max={g_raw.max():.4e}, "
+                  f"range={g_raw.max() - g_raw.min():.4e}")
+            print(f"    Raw value at source: {g_raw[source_vertex_idx]:.4e}")
+
+            # Check if raw solution has the max at source (before any normalization)
+            raw_max_idx = np.argmax(g_raw)
+            if raw_max_idx != source_vertex_idx:
+                print(f"    [!] WARNING: Raw max NOT at source! Max at vertex {raw_max_idx} "
+                      f"(value={g_raw[raw_max_idx]:.4e} vs source={g_raw[source_vertex_idx]:.4e})")
+
+            # =========================================================
+            # Compute Laplacian residual BEFORE normalization
+            # This measures how well Lg ≈ δ
+            # =========================================================
+            Lg = L @ g_raw
+            residual = Lg - delta
+            residual_norm = float(np.linalg.norm(residual) / np.linalg.norm(delta))
+
+            # =========================================================
+            # Now normalize for display (doesn't affect key metrics)
+            # =========================================================
+
+            # Step 1: Remove constant component (subtract weighted mean)
             M_diag = np.array(M.diagonal()).flatten()
             total_mass = M_diag.sum()
             if total_mass > 0:
-                weighted_mean = (g * M_diag).sum() / total_mass
-                g = g - weighted_mean
+                weighted_mean = (g_raw * M_diag).sum() / total_mass
+                g = g_raw - weighted_mean
+            else:
+                g = g_raw - g_raw.mean()
 
-            # Shift so minimum is 0 (for easier interpretation)
+            print(f"    After mean removal: min={g.min():.4e}, max={g.max():.4e}, "
+                  f"range={g.max() - g.min():.4e}")
+
+            # Step 2: Shift so min = 0
             g = g - g.min()
 
-            # Normalize so max is 1 (for easier comparison across methods)
+            # Step 3: Scale so max = 1 (if max > 0)
             if g.max() > 0:
                 g = g / g.max()
 
-            return g
+            return g, residual_norm
 
         except Exception as e:
             print(f"  [!] Failed to compute Green's function: {e}")
@@ -2337,64 +2399,249 @@ class RealTimeEigenanalysisVisualizer:
             greens_function: np.ndarray,
             source_vertex_idx: int,
             method_name: str,
-            tolerance: float = -1e-10
+            vertices: np.ndarray,
+            faces: np.ndarray,
+            laplacian_residual_norm: float = 0.0,
+            gt_greens_function: np.ndarray = None
     ) -> GreensFunctionValidationResult:
         """
-        Validate whether the Green's function satisfies the discrete maximum principle.
+        Validate whether the Green's function satisfies the discrete maximum principle
+        and compute additional quality metrics.
 
-        For a valid Laplacian with nonnegative edge weights:
-        1. g should be non-negative everywhere: g_j >= 0 for all j
-        2. The maximum should be at the source vertex
+        The Green's function is normalized to [0, 1] range (min=0, max=1).
+        This normalization does NOT affect:
+        - argmax location (maximum principle test)
+        - Pearson correlation (monotonicity and GT comparison)
+        - Relative ordering (pairwise comparisons)
 
-        Note: The Green's function is normalized to [0, 1] range (min=0, max=1).
-        The key test is whether the maximum occurs at the source vertex.
+        Tests performed:
+        1. PRIMARY: Is the maximum at the source vertex? (argmax invariant to normalization)
+        2. SECONDARY: Does value decrease with GEODESIC distance? (uses igl.exact_geodesic)
+        3. TERTIARY: Laplacian residual (computed before normalization, passed in)
+        4. COMPARISON: Correlation with GT (invariant to normalization)
 
         Args:
-            greens_function: Green's function values (n,), normalized to [0, 1]
+            greens_function: Normalized Green's function values in [0, 1]
             source_vertex_idx: Index of the source vertex
             method_name: Name of the method ("GT", "PRED", or "Robust")
-            tolerance: Tolerance for considering a value negative (default -1e-10)
+            vertices: Mesh vertices (n, 3) for computing distances
+            faces: Mesh faces (m, 3) for geodesic distance computation
+            laplacian_residual_norm: Pre-computed ||Lg - δ|| / ||δ|| (before normalization)
+            gt_greens_function: Optional GT Green's function for comparison (also normalized)
 
         Returns:
-            GreensFunctionValidationResult with validation statistics
+            GreensFunctionValidationResult with all validation metrics
         """
         n = len(greens_function)
         g = greens_function
 
-        # Basic statistics
-        min_val = float(g.min())
-        max_val = float(g.max())
+        # =====================================================================
+        # Basic statistics (on normalized values)
+        # =====================================================================
+        min_val = float(g.min())  # Should be 0
+        max_val = float(g.max())  # Should be 1
         mean_val = float(g.mean())
         value_at_source = float(g[source_vertex_idx])
 
-        # Check for negative values (should be none after normalization, but check anyway)
-        negative_mask = g < tolerance
-        num_negative = int(negative_mask.sum())
-        negative_fraction = num_negative / n
-
-        # Find most negative value and its location
-        if num_negative > 0:
-            most_negative_idx = int(np.argmin(g))
-            most_negative_val = float(g[most_negative_idx])
-        else:
-            most_negative_idx = -1
-            most_negative_val = 0.0
-
-        # Check if maximum is at source (the key test for maximum principle)
+        # =====================================================================
+        # PRIMARY TEST: Maximum at source
+        # argmax is INVARIANT to shifting and scaling!
+        # =====================================================================
         max_idx = int(np.argmax(g))
         max_at_source = (max_idx == source_vertex_idx)
 
-        # Also check if source is "near" the maximum (within 5% of max value)
-        # This handles numerical precision issues and mesh discretization
-        if not max_at_source and max_val > 0:
-            source_relative = value_at_source / max_val
-            if source_relative > 0.95:
-                print(f"    [{method_name}] Source not at exact max but within 5%: "
-                      f"source={value_at_source:.4f}, max={max_val:.4f} at vertex {max_idx}")
-                # Don't change max_at_source, but note it's close
+        # For normalized g, "violations" are vertices with g > value_at_source
+        # If max is at source, value_at_source = 1.0 and there are no violations
+        # If max is elsewhere, value_at_source < 1.0 and violations exist
+        violation_mask = g > value_at_source + 1e-10
+        num_violations = int(violation_mask.sum())
 
-        # Overall pass/fail: no negative values AND max at source
-        satisfies_principle = (num_negative == 0) and max_at_source
+        if not max_at_source:
+            worst_violation_vertex = max_idx
+            worst_violation_value = float(g[max_idx])
+        else:
+            worst_violation_vertex = -1
+            worst_violation_value = 0.0
+
+        satisfies_principle = max_at_source
+
+        # =====================================================================
+        # SOURCE-CENTERED CHECK (Sharp & Crane style)
+        # Shift so source = 0, then check all values are <= 0
+        # This directly tests: "Is any vertex hotter than the source?"
+        # =====================================================================
+        g_source_centered = g - value_at_source  # Now g[source] = 0
+
+        # All values should be <= 0 (source is the "hottest" point)
+        positive_mask = g_source_centered > 1e-10  # Tolerance for numerical precision
+        num_positive_vertices = int(positive_mask.sum())
+
+        if num_positive_vertices > 0:
+            # Find the worst violation
+            positive_vertex_idx = int(np.argmax(g_source_centered))
+            max_positive_value = float(g_source_centered[positive_vertex_idx])
+        else:
+            positive_vertex_idx = -1
+            max_positive_value = float(g_source_centered.max())  # Should be ~0 or negative
+
+        # =====================================================================
+        # SECONDARY TEST: Monotonic decay with GEODESIC distance
+        # The Green's function should decrease with geodesic distance from source,
+        # NOT Euclidean distance (heat flows along the surface, not through air)
+        # =====================================================================
+        distance_correlation = 0.0
+        monotonicity_score = 1.0
+        distances = None  # Will store geodesic distances for later use
+
+        # Try to compute geodesic distances using various methods
+        # Priority: 1) pygeodesic (fast, robust), 2) igl.heat_geodesic, 3) igl.exact_geodesic, 4) Euclidean
+
+        geodesic_computed = False
+
+        # Method 1: Try pygeodesic (fastest and most robust)
+        try:
+            import pygeodesic.geodesic as geodesic
+
+            V = vertices.astype(np.float64)
+            F = faces.astype(np.int32)
+
+            # Create geodesic algorithm object
+            geoalg = geodesic.PyGeodesicAlgorithmExact(V, F)
+
+            # Compute distances from source to all vertices
+            distances, _ = geoalg.geodesicDistances(np.array([source_vertex_idx]), None)
+
+            if distances is not None and len(distances) == n:
+                geodesic_computed = True
+            else:
+                raise ValueError(f"pygeodesic returned invalid result")
+
+        except ImportError:
+            pass  # pygeodesic not installed, try next method
+        except Exception as e:
+            print(f"    [!] pygeodesic failed: {e}")
+
+        # Method 2: Try igl heat geodesic
+        if not geodesic_computed and HAS_IGL:
+            try:
+                V = vertices.astype(np.float64)
+                F = faces.astype(np.int32)
+
+                # Compute mean edge length for time parameter
+                edges = np.vstack([
+                    F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]
+                ])
+                edge_lengths = np.linalg.norm(V[edges[:, 0]] - V[edges[:, 1]], axis=1)
+                mean_edge = edge_lengths.mean()
+                t = mean_edge ** 2  # Default time parameter
+
+                # Source vertex
+                gamma = np.array([source_vertex_idx], dtype=np.int32)
+
+                # Compute heat geodesic distances
+                distances = igl.heat_geodesic(V, F, t, gamma)
+
+                if distances is not None and len(distances) == n:
+                    geodesic_computed = True
+                else:
+                    raise ValueError("heat_geodesic returned invalid result")
+
+            except Exception as e:
+                print(f"    [!] igl.heat_geodesic failed: {e}")
+
+        # Method 3: Try igl exact geodesic
+        if not geodesic_computed and HAS_IGL:
+            try:
+                V = vertices.astype(np.float64)
+                F = faces.astype(np.int32)
+
+                VS = np.array([source_vertex_idx], dtype=np.int32)
+                VT = np.arange(n, dtype=np.int32)
+                distances = igl.exact_geodesic(V, F, VS, VT)
+
+                if distances is not None and len(distances) == n:
+                    geodesic_computed = True
+                else:
+                    raise ValueError("exact_geodesic returned invalid result")
+
+            except Exception as e:
+                print(f"    [!] igl.exact_geodesic failed: {e}")
+
+        # Method 4: Fall back to Euclidean distances
+        if not geodesic_computed:
+            print(f"    [!] All geodesic methods failed, using Euclidean distances")
+            distances = np.linalg.norm(vertices - vertices[source_vertex_idx], axis=1)
+
+        # Now compute correlation and monotonicity using the distances
+        if distances is not None and len(distances) == n:
+            # Exclude source vertex from correlation (distance = 0)
+            mask = np.ones(n, dtype=bool)
+            mask[source_vertex_idx] = False
+
+            if mask.sum() > 1:
+                g_masked = g[mask]
+                dist_masked = distances[mask]
+
+                # Filter out any infinite distances (disconnected vertices)
+                finite_mask = np.isfinite(dist_masked)
+                if finite_mask.sum() > 1:
+                    g_finite = g_masked[finite_mask]
+                    dist_finite = dist_masked[finite_mask]
+
+                    # Correlation between g and -distance (should be positive: closer = higher g)
+                    corr_matrix = np.corrcoef(g_finite, -dist_finite)
+                    distance_correlation = float(corr_matrix[0, 1]) if not np.isnan(corr_matrix[0, 1]) else 0.0
+
+                    # Pairwise monotonicity: sample random pairs
+                    num_finite = len(g_finite)
+                    num_samples = min(10000, num_finite * (num_finite - 1) // 2)
+                    if num_samples > 100:
+                        # Get indices into the finite arrays
+                        idx1 = np.random.randint(0, num_finite, num_samples)
+                        idx2 = np.random.randint(0, num_finite, num_samples)
+                        valid = idx1 != idx2
+                        idx1, idx2 = idx1[valid], idx2[valid]
+
+                        if len(idx1) > 0:
+                            d1, d2 = dist_finite[idx1], dist_finite[idx2]
+                            g1, g2 = g_finite[idx1], g_finite[idx2]
+
+                            # If d1 < d2 (closer), then g1 should be > g2 (higher)
+                            closer_is_higher = ((d1 < d2) & (g1 > g2)) | ((d2 < d1) & (g2 > g1))
+                            not_tie = (np.abs(d1 - d2) > 1e-10) & (np.abs(g1 - g2) > 1e-10)
+
+                            if not_tie.sum() > 0:
+                                monotonicity_score = float(closer_is_higher[not_tie].sum() / not_tie.sum())
+
+        # =====================================================================
+        # TERTIARY TEST: Laplacian residual (passed in, computed before normalization)
+        # =====================================================================
+        # Already computed before normalization and passed as argument
+
+        # =====================================================================
+        # COMPARISON: Correlation with GT
+        # Pearson correlation is INVARIANT to linear transforms!
+        # =====================================================================
+        correlation_with_gt = 0.0
+        if gt_greens_function is not None and len(gt_greens_function) == n:
+            corr_matrix = np.corrcoef(g, gt_greens_function)
+            correlation_with_gt = float(corr_matrix[0, 1]) if not np.isnan(corr_matrix[0, 1]) else 0.0
+
+        # =====================================================================
+        # DIAGNOSTIC: Min location and geodesic distance to it
+        # The minimum should be at the geodesically farthest point from source
+        # =====================================================================
+        min_vertex_idx = int(np.argmin(g))
+        geodesic_dist_to_min = 0.0
+        max_geodesic_dist = 0.0
+
+        # Use the distances array computed earlier (geodesic if available)
+        if distances is not None and len(distances) == n:
+            finite_distances = distances[np.isfinite(distances)]
+            if len(finite_distances) > 0:
+                max_geodesic_dist = float(np.max(finite_distances))
+            if np.isfinite(distances[min_vertex_idx]):
+                geodesic_dist_to_min = float(distances[min_vertex_idx])
 
         return GreensFunctionValidationResult(
             method_name=method_name,
@@ -2404,12 +2651,21 @@ class RealTimeEigenanalysisVisualizer:
             max_value=max_val,
             mean_value=mean_val,
             value_at_source=value_at_source,
-            num_negative=num_negative,
-            negative_fraction=negative_fraction,
             max_at_source=max_at_source,
             satisfies_maximum_principle=satisfies_principle,
-            most_negative_value=most_negative_val,
-            most_negative_vertex_idx=most_negative_idx
+            num_violations=num_violations,
+            worst_violation_vertex=worst_violation_vertex,
+            worst_violation_value=worst_violation_value,
+            num_positive_vertices=num_positive_vertices,
+            max_positive_value=max_positive_value,
+            positive_vertex_idx=positive_vertex_idx,
+            distance_correlation=distance_correlation,
+            monotonicity_score=monotonicity_score,
+            laplacian_residual_norm=laplacian_residual_norm,
+            correlation_with_gt=correlation_with_gt,
+            min_vertex_idx=min_vertex_idx,
+            geodesic_dist_to_min=geodesic_dist_to_min,
+            max_geodesic_dist=max_geodesic_dist
         )
 
     def select_source_vertex(
@@ -2477,6 +2733,122 @@ class RealTimeEigenanalysisVisualizer:
         faces = gt_data['faces']
         n = len(vertices)
 
+        # =====================================================================
+        # Mesh diagnostics: check for potential issues
+        # =====================================================================
+        print("\nMesh diagnostics:")
+        print(f"  Vertices: {n}, Faces: {len(faces)}")
+
+        # Check for duplicate vertices (vertices at the same position)
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(vertices)
+            pairs = tree.query_pairs(r=1e-10)  # Find vertices within tiny distance
+            if len(pairs) > 0:
+                print(f"  [!] WARNING: {len(pairs)} pairs of duplicate/near-duplicate vertices detected!")
+                print(f"      This can cause the mesh to appear closed but have topological holes.")
+            else:
+                print(f"  No duplicate vertices detected")
+        except Exception as e:
+            print(f"  [!] Could not check for duplicates: {e}")
+
+        # Check for non-manifold edges (edges shared by != 2 faces)
+        try:
+            edge_face_count = {}
+            for fi, f in enumerate(faces):
+                for i in range(3):
+                    e = tuple(sorted([f[i], f[(i + 1) % 3]]))
+                    edge_face_count[e] = edge_face_count.get(e, 0) + 1
+
+            non_manifold_edges = [(e, c) for e, c in edge_face_count.items() if c > 2]
+            if len(non_manifold_edges) > 0:
+                print(f"  [!] WARNING: {len(non_manifold_edges)} non-manifold edges (shared by >2 faces)!")
+
+            # Edges with count 1 are boundary, count 2 are manifold interior
+            boundary_count = sum(1 for c in edge_face_count.values() if c == 1)
+            interior_count = sum(1 for c in edge_face_count.values() if c == 2)
+            print(f"  Edge counts: {boundary_count} boundary, {interior_count} interior, {len(non_manifold_edges)} non-manifold")
+        except Exception as e:
+            print(f"  [!] Could not check edge manifoldness: {e}")
+
+        # Check for connected components using scipy
+        try:
+            from scipy.sparse.csgraph import connected_components
+
+            # Build adjacency matrix from faces
+            rows = np.concatenate([faces[:, 0], faces[:, 1], faces[:, 2],
+                                   faces[:, 1], faces[:, 2], faces[:, 0]])
+            cols = np.concatenate([faces[:, 1], faces[:, 2], faces[:, 0],
+                                   faces[:, 0], faces[:, 1], faces[:, 2]])
+            data = np.ones(len(rows))
+            adj = scipy.sparse.csr_matrix((data, (rows, cols)), shape=(n, n))
+
+            n_components, labels = connected_components(adj, directed=False)
+            print(f"  Connected components: {n_components}")
+
+            if n_components > 1:
+                component_sizes = [(labels == i).sum() for i in range(n_components)]
+                print(f"  Component sizes: {sorted(component_sizes, reverse=True)}")
+                print(f"  [!] WARNING: Mesh has multiple components - Green's function may be unreliable!")
+        except Exception as e:
+            print(f"  [!] Could not check connectivity: {e}")
+
+        # Check for boundary vertices
+        try:
+            # An edge is boundary if it appears in only one face
+            edges = {}
+            for f in faces:
+                for i in range(3):
+                    e = tuple(sorted([f[i], f[(i + 1) % 3]]))
+                    edges[e] = edges.get(e, 0) + 1
+
+            boundary_edges = [e for e, count in edges.items() if count == 1]
+            boundary_vertices = set()
+            for e in boundary_edges:
+                boundary_vertices.add(e[0])
+                boundary_vertices.add(e[1])
+
+            print(f"  Boundary edges: {len(boundary_edges)}")
+            print(f"  Boundary vertices: {len(boundary_vertices)}")
+
+            if len(boundary_edges) > 0:
+                print(f"  [!] Mesh has boundaries (not closed)")
+
+                # Count number of boundary loops
+                # Build adjacency for boundary vertices only
+                from collections import defaultdict
+                boundary_adj = defaultdict(set)
+                for e in boundary_edges:
+                    boundary_adj[e[0]].add(e[1])
+                    boundary_adj[e[1]].add(e[0])
+
+                # Count connected components in boundary graph
+                visited = set()
+                num_loops = 0
+                for start in boundary_vertices:
+                    if start not in visited:
+                        # BFS to find this loop
+                        queue = [start]
+                        while queue:
+                            v = queue.pop()
+                            if v in visited:
+                                continue
+                            visited.add(v)
+                            for neighbor in boundary_adj[v]:
+                                if neighbor not in visited:
+                                    queue.append(neighbor)
+                        num_loops += 1
+
+                print(f"  Number of boundary loops (holes): {num_loops}")
+                if num_loops > 1:
+                    print(f"  [!] WARNING: Multiple boundary loops can cause patchy Green's function!")
+            else:
+                print(f"  Mesh is closed (no boundaries)")
+        except Exception as e:
+            print(f"  [!] Could not check boundaries: {e}")
+
+        print("-" * 70)
+
         # Select source vertex
         if source_vertex_idx is None:
             source_vertex_idx = self.select_source_vertex(vertices, method="centroid")
@@ -2494,6 +2866,8 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         print("\nComputing GT Green's function...")
         gt_greens = None
+        gt_residual = 0.0
+        L_gt = None
 
         if HAS_IGL:
             try:
@@ -2510,13 +2884,19 @@ class RealTimeEigenanalysisVisualizer:
 
                 # Diagnostic: check Laplacian properties
                 diag_gt = np.array(L_gt.diagonal()).flatten()
-                offdiag_sum = np.array(L_gt.sum(axis=1)).flatten() - diag_gt
                 print(f"  GT Laplacian: diag range [{diag_gt.min():.4f}, {diag_gt.max():.4f}], row sums ~ {np.abs(L_gt.sum(axis=1)).max():.2e}")
 
-                gt_greens = self.compute_greens_function(L_gt, M_gt, source_vertex_idx)
+                result = self.compute_greens_function(L_gt, M_gt, source_vertex_idx)
 
-                if gt_greens is not None:
-                    results['GT'] = self.validate_maximum_principle(gt_greens, source_vertex_idx, "GT (igl)")
+                if result is not None:
+                    gt_greens, gt_residual = result
+                    results['GT'] = self.validate_maximum_principle(
+                        gt_greens, source_vertex_idx, "GT (igl)",
+                        vertices=vertices,
+                        faces=faces,
+                        laplacian_residual_norm=gt_residual,
+                        gt_greens_function=None  # This IS the GT
+                    )
                     greens_functions['GT'] = gt_greens
                     print(f"  GT Green's function: min={gt_greens.min():.6f}, max={gt_greens.max():.6f}")
 
@@ -2532,6 +2912,8 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         print("\nComputing PRED Green's function...")
         pred_greens = None
+        pred_residual = 0.0
+        L_pred = None
 
         if inference_result.get('stiffness_matrix') is not None:
             try:
@@ -2546,10 +2928,17 @@ class RealTimeEigenanalysisVisualizer:
                 if diag_pred.min() < 0:
                     print(f"  [!] WARNING: PRED Laplacian has negative diagonal entries - may indicate sign issue")
 
-                pred_greens = self.compute_greens_function(L_pred, M_pred, source_vertex_idx)
+                result = self.compute_greens_function(L_pred, M_pred, source_vertex_idx)
 
-                if pred_greens is not None:
-                    results['PRED'] = self.validate_maximum_principle(pred_greens, source_vertex_idx, "PRED (Neural)")
+                if result is not None:
+                    pred_greens, pred_residual = result
+                    results['PRED'] = self.validate_maximum_principle(
+                        pred_greens, source_vertex_idx, "PRED (Neural)",
+                        vertices=vertices,
+                        faces=faces,
+                        laplacian_residual_norm=pred_residual,
+                        gt_greens_function=gt_greens  # Compare to GT
+                    )
                     greens_functions['PRED'] = pred_greens
                     print(f"  PRED Green's function: min={pred_greens.min():.6f}, max={pred_greens.max():.6f}")
 
@@ -2565,6 +2954,8 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         print("\nComputing Robust Green's function...")
         robust_greens = None
+        robust_residual = 0.0
+        L_robust = None
 
         if not self._skip_robust:
             try:
@@ -2577,10 +2968,17 @@ class RealTimeEigenanalysisVisualizer:
                 diag_robust = np.array(L_robust.diagonal()).flatten()
                 print(f"  Robust Laplacian: diag range [{diag_robust.min():.4f}, {diag_robust.max():.4f}], row sums ~ {np.abs(L_robust.sum(axis=1)).max():.2e}")
 
-                robust_greens = self.compute_greens_function(L_robust, M_robust, source_vertex_idx)
+                result = self.compute_greens_function(L_robust, M_robust, source_vertex_idx)
 
-                if robust_greens is not None:
-                    results['Robust'] = self.validate_maximum_principle(robust_greens, source_vertex_idx, "Robust")
+                if result is not None:
+                    robust_greens, robust_residual = result
+                    results['Robust'] = self.validate_maximum_principle(
+                        robust_greens, source_vertex_idx, "Robust",
+                        vertices=vertices,
+                        faces=faces,
+                        laplacian_residual_norm=robust_residual,
+                        gt_greens_function=gt_greens  # Compare to GT
+                    )
                     greens_functions['Robust'] = robust_greens
                     print(f"  Robust Green's function: min={robust_greens.min():.6f}, max={robust_greens.max():.6f}")
 
@@ -2594,19 +2992,87 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         # Print comparison table
         # =====================================================================
-        print(f"\n" + "=" * 70)
-        print("MAXIMUM PRINCIPLE VALIDATION RESULTS")
+        print(f"\n" + "=" * 90)
+        print("GREEN'S FUNCTION VALIDATION RESULTS")
         print(f"Source vertex: {source_vertex_idx}")
-        print("=" * 70)
-        print(f"{'Method':<12} {'Min Value':>12} {'Max Value':>12} {'Negative':>15} {'Max@Source':^10} {'Status':^8}")
-        print("-" * 70)
+        print("=" * 90)
 
+        # Primary test: Maximum principle
+        print("\n[1] MAXIMUM PRINCIPLE TEST (Primary)")
+        print(f"{'Method':<14} {'Val@Source':>10} {'Max Val':>10} {'Max@Source':^12} {'#Viol':>6} {'Status':>10}")
+        print("-" * 74)
         for method_name, result in results.items():
             print(result)
 
-        print("-" * 70)
+        # Source-centered check (Sharp & Crane style)
+        print("\n[1b] SOURCE-CENTERED CHECK (Sharp & Crane style: g - g_source <= 0?)")
+        print(f"{'Method':<14} {'#Positive':>10} {'Max(g-g_src)':>14} {'Worst Vtx':>10} {'Status':>10}")
+        print("-" * 62)
+        for method_name, result in results.items():
+            if result.num_positive_vertices == 0:
+                status = "✓ PASS"
+            else:
+                status = "✗ FAIL"
+            print(f"{result.method_name:<14} {result.num_positive_vertices:>10} {result.max_positive_value:>14.6f} "
+                  f"{result.positive_vertex_idx:>10} {status:>10}")
 
-        # Summary
+        # Secondary test: Monotonicity (using geodesic distances)
+        print("\n[2] MONOTONICITY TEST (Does value decrease with GEODESIC distance from source?)")
+        print(f"{'Method':<14} {'Geo Corr':>12} {'Mono Score':>12} {'Quality':>12}")
+        print("-" * 54)
+        for method_name, result in results.items():
+            # Distance correlation should be positive (g correlates with -distance)
+            corr = result.distance_correlation
+            mono = result.monotonicity_score
+
+            if corr > 0.8 and mono > 0.8:
+                quality = "Excellent"
+            elif corr > 0.5 and mono > 0.6:
+                quality = "Good"
+            elif corr > 0.2 and mono > 0.5:
+                quality = "Fair"
+            else:
+                quality = "Poor"
+
+            print(f"{result.method_name:<14} {corr:>12.4f} {mono:>12.4f} {quality:>12}")
+
+        # Tertiary test: Laplacian residual
+        print("\n[3] SMOOTHNESS TEST (Laplacian residual ||Lg - δ|| / ||δ||)")
+        print(f"{'Method':<14} {'Residual':>12} {'Quality':>12}")
+        print("-" * 40)
+        for method_name, result in results.items():
+            res = result.laplacian_residual_norm
+            if res < 0.01:
+                quality = "Excellent"
+            elif res < 0.1:
+                quality = "Good"
+            elif res < 1.0:
+                quality = "Fair"
+            else:
+                quality = "Poor"
+            print(f"{result.method_name:<14} {res:>12.6f} {quality:>12}")
+
+        # Comparison with GT
+        if gt_greens is not None:
+            print("\n[4] CORRELATION WITH GT")
+            print(f"{'Method':<14} {'Correlation':>12}")
+            print("-" * 28)
+            for method_name, result in results.items():
+                if method_name != 'GT':
+                    print(f"{result.method_name:<14} {result.correlation_with_gt:>12.4f}")
+
+        # Diagnostic: Min location geodesic distance
+        print("\n[5] MIN LOCATION DIAGNOSTIC (Is minimum at geodesically farthest point?)")
+        print(f"{'Method':<14} {'Min Vertex':>10} {'Geo Dist':>12} {'Max Geo Dist':>12} {'Ratio':>10}")
+        print("-" * 62)
+        for method_name, result in results.items():
+            ratio = result.geodesic_dist_to_min / result.max_geodesic_dist if result.max_geodesic_dist > 0 else 0.0
+            print(f"{result.method_name:<14} {result.min_vertex_idx:>10} {result.geodesic_dist_to_min:>12.4f} "
+                  f"{result.max_geodesic_dist:>12.4f} {ratio:>10.2%}")
+
+        print("\n" + "=" * 90)
+
+        # Overall summary
         all_pass = all(r.satisfies_maximum_principle for r in results.values())
         if all_pass:
             print("✓ All methods satisfy the discrete maximum principle")
@@ -2614,12 +3080,10 @@ class RealTimeEigenanalysisVisualizer:
             print("✗ Some methods VIOLATE the discrete maximum principle:")
             for method_name, result in results.items():
                 if not result.satisfies_maximum_principle:
-                    if result.num_negative > 0:
-                        print(f"  - {method_name}: {result.num_negative} negative values (most negative: {result.most_negative_value:.2e} at vertex {result.most_negative_vertex_idx})")
-                    if not result.max_at_source:
-                        print(f"  - {method_name}: Maximum not at source vertex")
+                    print(f"  - {result.method_name}: Max value {result.max_value:.4f} at vertex {result.worst_violation_vertex}, "
+                          f"but source has only {result.value_at_source:.4f}")
 
-        print("=" * 70)
+        print("=" * 90)
 
         # =====================================================================
         # Add visualizations to mesh structure
@@ -2637,36 +3101,77 @@ class RealTimeEigenanalysisVisualizer:
                 enabled=True
             )
 
+            # Add boundary vertices visualization
+            try:
+                # Find boundary vertices
+                edge_count = {}
+                for f in faces:
+                    for i in range(3):
+                        e = tuple(sorted([f[i], f[(i + 1) % 3]]))
+                        edge_count[e] = edge_count.get(e, 0) + 1
+
+                boundary_verts = set()
+                for e, count in edge_count.items():
+                    if count == 1:  # Boundary edge
+                        boundary_verts.add(e[0])
+                        boundary_verts.add(e[1])
+
+                if len(boundary_verts) > 0:
+                    boundary_indices = np.array(list(boundary_verts))
+                    boundary_points = vertices[boundary_indices]
+                    ps.register_point_cloud(
+                        name="Boundary Vertices",
+                        points=boundary_points,
+                        radius=0.005,
+                        color=(1.0, 1.0, 0.0),  # Yellow
+                        enabled=False  # Disabled by default
+                    )
+                    print(f"    Added boundary visualization: {len(boundary_verts)} vertices")
+
+                    # Also add boundary as scalar on mesh
+                    boundary_mask = np.zeros(n, dtype=np.float32)
+                    boundary_mask[boundary_indices] = 1.0
+                    mesh_structure.add_scalar_quantity(
+                        name="J0 Boundary Vertices",
+                        values=boundary_mask,
+                        enabled=False,
+                        cmap='reds'
+                    )
+            except Exception as e:
+                print(f"    [!] Could not add boundary visualization: {e}")
+
             # Add Green's function scalar fields
             for method_name, g in greens_functions.items():
-                # Main Green's function visualization
+                # Main Green's function visualization (mean-centered values)
                 mesh_structure.add_scalar_quantity(
                     name=f"J1 Green's Function - {method_name}",
                     values=g,
                     enabled=(method_name == "GT"),  # Enable GT by default
-                    cmap='viridis'
+                    cmap='coolwarm'  # Diverging colormap since values are centered around 0
                 )
 
-                # Log-scale visualization (better for seeing decay)
-                g_positive = np.maximum(g, 1e-10)  # Avoid log(0)
+                # Shifted version for easier viewing (min=0)
+                g_shifted = g - g.min()
                 mesh_structure.add_scalar_quantity(
-                    name=f"J2 Green's Function (log) - {method_name}",
-                    values=np.log10(g_positive),
+                    name=f"J2 Green's Function (shifted) - {method_name}",
+                    values=g_shifted,
                     enabled=False,
                     cmap='viridis'
                 )
 
-                # Highlight violations (if any)
+                # Highlight violations: vertices with value > source value
                 result = results.get(method_name)
-                if result is not None and result.num_negative > 0:
-                    violation_mask = (g < -1e-10).astype(np.float32)
-                    mesh_structure.add_scalar_quantity(
-                        name=f"J3 Green's Fn Violations - {method_name}",
-                        values=violation_mask,
-                        enabled=False,
-                        cmap='reds'
-                    )
-
+                if result is not None:
+                    source_val = g[source_vertex_idx]
+                    violation_mask = (g > source_val + 1e-10).astype(np.float32)
+                    if violation_mask.sum() > 0:
+                        mesh_structure.add_scalar_quantity(
+                            name=f"J3 Max Principle Violations - {method_name}",
+                            values=violation_mask,
+                            enabled=False,
+                            cmap='reds'
+                        )
+                        print(f"    [{method_name}] Added violation visualization: {int(violation_mask.sum())} vertices")
             # Add pairwise difference visualizations
             if 'GT' in greens_functions and 'PRED' in greens_functions:
                 diff = greens_functions['PRED'] - greens_functions['GT']

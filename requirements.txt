@@ -32,3 +32,4 @@ pandas
 meshio
 trimesh
 kornia
+pcdiff
