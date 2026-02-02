@@ -43,6 +43,11 @@ from pyFM.mesh import TriMesh
 # neural laplacian
 from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, compute_laplacian_eigendecomposition
 from neural_local_laplacian.modules.losses import LossConfig
+from neural_local_laplacian.utils.geodesic_utils import (
+    compute_heat_geodesic_pointcloud,
+    compute_geodesic_metrics,
+    compute_multisource_geodesic_metrics
+)
 
 
 class LaplacianModuleBase(lightning.pytorch.LightningModule):
@@ -502,7 +507,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # === Scale areas back to original geometry ===
         if self._scale_areas_by_patch_size:
-            # A = A' * d² (area scales as length²)
+            # A = A' * dÂ² (area scales as lengthÂ²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
@@ -528,7 +533,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         - Normalizes patch positions to unit sphere before transformer
 
         If scale_areas_by_patch_size=True:
-        - Scales output areas by dÂ² to restore original geometry scale
+        - Scales output areas by dÃ‚Â² to restore original geometry scale
 
         Args:
             batch: PyTorch Geometric batch
@@ -609,7 +614,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # === Scale areas back to original geometry ===
         if self._scale_areas_by_patch_size:
-            # A = A' * dÂ² (area scales as lengthÂ²)
+            # A = A' * dÃ‚Â² (area scales as lengthÃ‚Â²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
@@ -753,7 +758,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
     def _validate_single_mesh(self, mesh_data: BaseData) -> Dict[str, float]:
         """
-        Validate a single mesh by comparing predicted vs ground-truth eigendecomposition.
+        Validate a single mesh by comparing predicted vs ground-truth eigendecomposition
+        and geodesic distances.
 
         Uses the generalized eigenvalue problem S @ v = lambda * M @ v where:
         - S is the symmetric stiffness matrix
@@ -795,11 +801,81 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Get ground-truth eigendecomposition (stored as tuple to avoid PyG batching issues)
         gt_eigenvalues, gt_eigenvectors = mesh_data.gt_eigen
 
-        # Compute comparison metrics
-        return self._compute_spectral_comparison_metrics(
+        # Compute spectral comparison metrics
+        metrics = self._compute_spectral_comparison_metrics(
             pred_eigenvalues, pred_eigenvectors,
             gt_eigenvalues, gt_eigenvectors
         )
+
+        # Compute geodesic validation metrics if geodesic data is available
+        geodesic_metrics = self._compute_geodesic_validation_metrics(
+            mesh_data, stiffness_matrix, mass_matrix
+        )
+        metrics.update(geodesic_metrics)
+
+        return metrics
+
+    def _compute_geodesic_validation_metrics(
+            self,
+            mesh_data: BaseData,
+            stiffness_matrix: scipy.sparse.spmatrix,
+            mass_matrix: scipy.sparse.spmatrix
+    ) -> Dict[str, float]:
+        """
+        Compute geodesic validation metrics using Heat Method with multiple sources.
+
+        Compares geodesics computed from the predicted Laplacian against
+        exact geodesics computed from the mesh, averaged over multiple source vertices.
+
+        Args:
+            mesh_data: PyTorch Geometric Data object with geodesic_data
+            stiffness_matrix: Assembled stiffness matrix from PRED
+            mass_matrix: Assembled mass matrix from PRED
+
+        Returns:
+            Dictionary with geodesic validation metrics (averaged over sources)
+        """
+        # Check if geodesic data is available
+        geodesic_data = getattr(mesh_data, 'geodesic_data', None)
+        if geodesic_data is None or not geodesic_data.get('has_geodesic_data', False):
+            return {}
+
+        try:
+            source_indices = geodesic_data['source_indices']
+            exact_geodesics_dict = geodesic_data['exact_geodesics']  # Dict: source_idx -> distances
+            pc_grad_op = geodesic_data['pc_grad_op']
+            pc_div_op = geodesic_data['pc_div_op']
+
+            n_vertices = stiffness_matrix.shape[0]
+
+            # Define functions for computing geodesics from each source
+            def compute_pred_geodesics(source_idx):
+                return compute_heat_geodesic_pointcloud(
+                    L=stiffness_matrix,
+                    M=mass_matrix,
+                    grad_op=pc_grad_op,
+                    div_op=pc_div_op,
+                    source_idx=source_idx,
+                    n_vertices=n_vertices
+                )
+
+            def get_exact_geodesics(source_idx):
+                return exact_geodesics_dict.get(source_idx, None)
+
+            # Compute multi-source metrics
+            multi_metrics = compute_multisource_geodesic_metrics(
+                computed_func=compute_pred_geodesics,
+                exact_func=get_exact_geodesics,
+                source_indices=source_indices
+            )
+
+            # Return as dictionary for logging
+            return multi_metrics.to_dict(prefix="")
+
+        except Exception as e:
+            # Silently skip geodesic validation if it fails
+            # (don't want to break training on geodesic errors)
+            return {}
 
     def _compute_spectral_comparison_metrics(
             self,

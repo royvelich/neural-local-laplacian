@@ -8,6 +8,7 @@ import torch
 from torch_geometric.data import Dataset, Data
 from sklearn.neighbors import NearestNeighbors
 import robust_laplacian
+import scipy.sparse
 
 # Trimesh for mesh loading
 import trimesh
@@ -17,6 +18,13 @@ from neural_local_laplacian.datasets.base_datasets import PoseType
 from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 from neural_local_laplacian.utils import utils
+from neural_local_laplacian.utils.geodesic_utils import (
+    build_pointcloud_grad_div_operators,
+    edge_index_from_knn_indices,
+    compute_exact_geodesics,
+    select_multiple_geodesic_sources,
+    HAS_PCDIFF
+)
 
 
 class MeshPatchData(Data):
@@ -57,7 +65,9 @@ class MeshDataset(Dataset):
             k: int,
             num_eigenvalues: int = 20,
             feature_extractor: Optional[FeatureExtractor] = None,
-            pose_transformers: Optional[List[PoseTransformer]] = None
+            pose_transformers: Optional[List[PoseTransformer]] = None,
+            num_geodesic_sources: int = 5,
+            geodesic_source_method: str = "farthest_point_sampling"
     ):
         """
         Initialize the MeshDataset.
@@ -68,6 +78,11 @@ class MeshDataset(Dataset):
             num_eigenvalues: Number of eigenvalues/eigenvectors to compute for ground truth
             feature_extractor: Feature extractor to apply to patch points
             pose_transformers: Optional list of pose transformations to apply sequentially
+            num_geodesic_sources: Number of source vertices for geodesic validation (default: 5)
+            geodesic_source_method: Method for selecting sources:
+                - "farthest_point_sampling": Well-distributed sources (default)
+                - "random": Random vertices
+                - "mixed": Centroid + random
         """
         super().__init__()
 
@@ -76,6 +91,8 @@ class MeshDataset(Dataset):
         self._num_eigenvalues = num_eigenvalues
         self._feature_extractor = feature_extractor
         self._pose_transformers = pose_transformers if pose_transformers is not None else []
+        self._num_geodesic_sources = num_geodesic_sources
+        self._geodesic_source_method = geodesic_source_method
 
         # Validate inputs
         self._validate_inputs()
@@ -193,6 +210,12 @@ class MeshDataset(Dataset):
         # Store ground-truth eigendecomposition as a tuple (PyG doesn't concatenate tuples)
         patches_data.gt_eigen = (gt_eigenvalues, gt_eigenvectors)
 
+        # Compute and store geodesic validation data
+        geodesic_data = self._compute_geodesic_validation_data(
+            vertices, faces, patches_data.vertex_indices.numpy()
+        )
+        patches_data.geodesic_data = geodesic_data
+
         return patches_data
 
     def _compute_ground_truth_eigendecomposition(
@@ -219,6 +242,84 @@ class MeshDataset(Dataset):
         return utils.compute_laplacian_eigendecomposition(
             L, self._num_eigenvalues, mass_matrix=M
         )
+
+    def _compute_geodesic_validation_data(
+            self,
+            vertices: np.ndarray,
+            faces: np.ndarray,
+            vertex_indices: np.ndarray
+    ) -> dict:
+        """
+        Compute geodesic validation data: exact geodesics and point cloud grad/div operators.
+
+        The grad/div operators are built from the same k-NN connectivity used for patches,
+        ensuring they match the PRED Laplacian topology.
+
+        Args:
+            vertices: Mesh vertices of shape (N, 3)
+            faces: Mesh faces of shape (F, 3)
+            vertex_indices: Flat k-NN neighbor indices (N*k,) from patch extraction
+
+        Returns:
+            Dictionary with:
+            - source_indices: Array of source vertex indices (num_sources,)
+            - exact_geodesics: Dict mapping source_idx -> exact distances (N,)
+            - pc_grad_op: Point cloud gradient operator (sparse matrix)
+            - pc_div_op: Point cloud divergence operator (sparse matrix)
+            - has_geodesic_data: Whether geodesic data was successfully computed
+        """
+        n_vertices = len(vertices)
+        result = {
+            'source_indices': None,
+            'exact_geodesics': None,
+            'pc_grad_op': None,
+            'pc_div_op': None,
+            'has_geodesic_data': False
+        }
+
+        # Select multiple source vertices using configured method
+        source_indices = select_multiple_geodesic_sources(
+            vertices,
+            num_sources=self._num_geodesic_sources,
+            method=self._geodesic_source_method,
+            seed=42  # For reproducibility
+        )
+        result['source_indices'] = source_indices
+
+        # Compute exact geodesics for each source
+        exact_geodesics = {}
+        for source_idx in source_indices:
+            geodesics = compute_exact_geodesics(vertices, faces, int(source_idx))
+            if geodesics is not None:
+                exact_geodesics[int(source_idx)] = geodesics
+
+        if len(exact_geodesics) == 0:
+            print(f"Warning: Could not compute exact geodesics for any source, skipping geodesic validation")
+            return result
+
+        result['exact_geodesics'] = exact_geodesics
+
+        # Build point cloud grad/div operators from the same k-NN used for patches
+        if not HAS_PCDIFF:
+            print(f"Warning: pcdiff not available, skipping geodesic validation operators")
+            return result
+
+        try:
+            # Convert vertex_indices to edge_index format
+            center_indices = np.arange(n_vertices)
+            edge_index = edge_index_from_knn_indices(vertex_indices, center_indices, self._k)
+
+            # Build grad/div operators using the exact same connectivity
+            pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
+
+            result['pc_grad_op'] = pc_grad_op
+            result['pc_div_op'] = pc_div_op
+            result['has_geodesic_data'] = True
+
+        except Exception as e:
+            print(f"Warning: Failed to build geodesic operators: {e}")
+
+        return result
 
     def _extract_all_patches(self, vertices: np.ndarray, vertex_normals: np.ndarray) -> Data:
         """

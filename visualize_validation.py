@@ -46,6 +46,16 @@ import robust_laplacian
 import scipy.sparse
 import scipy.sparse.linalg
 
+# For point cloud gradient/divergence operators (Heat Method geodesics)
+try:
+    from pcdiff import knn_graph
+
+    HAS_PCDIFF = True
+except ImportError:
+    HAS_PCDIFF = False
+    print("Warning: pcdiff not available, Heat Method geodesics will not be computed")
+    print("Install with: pip install pcdiff")
+
 # Hydra
 import hydra
 from omegaconf import DictConfig
@@ -59,6 +69,18 @@ from neural_local_laplacian.utils.utils import (
     normalize_mesh_vertices,
     assemble_stiffness_and_mass_matrices,
     compute_laplacian_eigendecomposition
+)
+from neural_local_laplacian.utils.geodesic_utils import (
+    compute_heat_geodesic_pointcloud,
+    compute_heat_geodesic_mesh,
+    compute_geodesic_metrics,
+    compute_exact_geodesics,
+    normalize_distances,
+    build_pointcloud_grad_div_operators,
+    edge_index_from_knn_indices,
+    select_geodesic_source_vertex,
+    select_multiple_geodesic_sources,
+    compute_multisource_geodesic_metrics,
 )
 from torch_geometric.data import Data, Batch
 
@@ -218,6 +240,46 @@ class GreensFunctionValidationResult:
                 f"{max_status:^12} {self.num_violations:>6} {status:>10}")
 
 
+@dataclass
+class HeatMethodGeodesicResult:
+    """Results from Heat Method geodesic distance computation.
+
+    The Heat Method (Crane et al. 2013) computes geodesic distances by:
+    1. Solving heat equation: (M + t*L) u = delta_source
+    2. Normalizing the gradient: X = -grad(u) / |grad(u)|
+    3. Solving Poisson: L @ phi = div(X)
+
+    This tests the Laplacian's ability to produce correct geodesic distances
+    via the diffusion-based approach.
+    """
+    method_name: str  # "GT", "PRED", "Robust", "potpourri3d" (reference)
+    source_vertex_idx: int
+    num_vertices: int
+    time_step: float = 0.0  # t = h^2 typically
+
+    # Distance statistics
+    min_distance: float = 0.0
+    max_distance: float = 0.0
+    mean_distance: float = 0.0
+    distance_at_source: float = 0.0  # Should be ~0
+
+    # Quality metrics
+    correlation_with_reference: float = 0.0  # Correlation with exact/reference geodesic
+    mean_absolute_error: float = 0.0  # MAE vs reference
+    max_absolute_error: float = 0.0  # Max error vs reference
+    relative_error_percent: float = 0.0  # (mean error / mean distance) * 100
+
+    # Monotonicity: does distance increase away from source?
+    monotonicity_score: float = 0.0  # Fraction of pairs where farther point has larger distance
+
+    # Timing
+    computation_time_ms: float = 0.0
+
+    def __str__(self) -> str:
+        return (f"{self.method_name:<14} {self.correlation_with_reference:>8.4f} "
+                f"{self.mean_absolute_error:>10.6f} {self.relative_error_percent:>8.2f}%")
+
+
 class RealTimeEigenanalysisVisualizer:
     """Real-time eigenanalysis visualizer using MeshDataset and model inference."""
 
@@ -261,6 +323,9 @@ class RealTimeEigenanalysisVisualizer:
 
         # NEW: Green's function validation results
         self.current_greens_results = None
+
+        # NEW: Heat Method geodesic validation results
+        self.current_heat_geodesic_results = None
 
         # Debug flags (set from config in run_dataset_iteration)
         self._diagnostic_mode = False
@@ -3195,6 +3260,326 @@ class RealTimeEigenanalysisVisualizer:
 
         return results
 
+    def validate_heat_method_geodesics_step9(
+            self,
+            vertices: np.ndarray,
+            faces: np.ndarray,
+            L_gt: scipy.sparse.spmatrix,
+            M_gt: scipy.sparse.spmatrix,
+            L_pred: scipy.sparse.spmatrix,
+            M_pred: scipy.sparse.spmatrix,
+            L_robust: scipy.sparse.spmatrix,
+            M_robust: scipy.sparse.spmatrix,
+            source_vertex_idx: int = None,
+            mesh_structure=None,
+            k_neighbors: int = 20
+    ) -> Dict[str, HeatMethodGeodesicResult]:
+        """
+        STEP 9: Heat Method Geodesic Distance Validation
+
+        Computes geodesic distances using the Heat Method (Crane et al. 2013)
+        with different Laplacians and compares them.
+
+        The Heat Method:
+        1. Solve heat equation: (M + t*L) u = delta_source
+        2. Compute normalized gradient: X = -grad(u) / |grad(u)|
+        3. Solve Poisson: L @ phi = div(X)
+
+        We use pcdiff for gradient/divergence operators and compare:
+        - GT (cotangent Laplacian)
+        - PRED (your neural network)
+        - Robust (tufted cover)
+        - Reference (potpourri3d or exact geodesic)
+        """
+        print("\n" + "=" * 70)
+        print("STEP 9: HEAT METHOD GEODESIC DISTANCE VALIDATION")
+        print("=" * 70)
+
+        if not HAS_PCDIFF:
+            print("[!] pcdiff not available - skipping Heat Method geodesics")
+            print("    Install with: pip install pcdiff")
+            return {}
+
+        n = len(vertices)
+        vertices = vertices.astype(np.float64)
+
+        # Select source vertex using shared function
+        if source_vertex_idx is None:
+            source_vertex_idx = select_geodesic_source_vertex(vertices, method="centroid")
+
+        source_pos = vertices[source_vertex_idx]
+        print(f"Source vertex: {source_vertex_idx} at ({source_pos[0]:.4f}, {source_pos[1]:.4f}, {source_pos[2]:.4f})")
+
+        # =====================================================================
+        # Build gradient and divergence operators
+        # IMPORTANT: We need DIFFERENT operators for mesh vs point cloud methods!
+        # - GT (cotangent): Uses mesh topology -> igl.grad()
+        # - PRED/Robust: Uses point cloud topology -> pcdiff
+        # =====================================================================
+
+        # Build MESH-based gradient operator using igl (for GT Laplacian)
+        mesh_grad_op = None
+        mesh_face_areas = None
+        if HAS_IGL:
+            try:
+                V = vertices.astype(np.float64)
+                F = faces.astype(np.int32)
+                mesh_grad_op = igl.grad(V, F)  # (3*nF x nV) matrix
+                mesh_face_areas = igl.doublearea(V, F).flatten() / 2.0  # (nF,)
+                print(f"  Mesh gradient operator (igl): {mesh_grad_op.shape}")
+            except Exception as e:
+                print(f"  [!] igl.grad() failed: {e}")
+
+        # Build POINT CLOUD gradient/divergence operators using shared function
+        # IMPORTANT: Use the SAME k-NN connectivity as PRED's Laplacian!
+        pc_grad_op = None
+        pc_div_op = None
+        if HAS_PCDIFF and self.current_vertex_indices is not None:
+            try:
+                print("\nBuilding point cloud gradient/divergence operators from PRED's k-NN...")
+
+                # Use shared function to convert k-NN indices to edge_index
+                vertex_indices_np = self.current_vertex_indices.cpu().numpy()
+                center_indices_np = self.current_center_indices.cpu().numpy()
+                k = len(vertex_indices_np) // len(center_indices_np)
+
+                edge_index = edge_index_from_knn_indices(vertex_indices_np, center_indices_np, k)
+                print(f"  Extracted edge_index: {edge_index.shape} (k={k})")
+
+                # Use shared function to build operators
+                pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
+                print(f"  Point cloud gradient operator: {pc_grad_op.shape}")
+                print(f"  Point cloud divergence operator: {pc_div_op.shape}")
+            except Exception as e:
+                print(f"  [!] pcdiff operators failed: {e}")
+                import traceback
+                traceback.print_exc()
+        elif HAS_PCDIFF:
+            # Fallback: build k-NN from scratch (won't match PRED exactly)
+            try:
+                print("\nBuilding point cloud gradient/divergence operators (fresh k-NN)...")
+                edge_index = knn_graph(vertices, k=k_neighbors)
+                pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
+                print(f"  Point cloud gradient operator: {pc_grad_op.shape}")
+                print(f"  Point cloud divergence operator: {pc_div_op.shape}")
+                print(f"  WARNING: Using fresh k-NN, may not match PRED's connectivity!")
+            except Exception as e:
+                print(f"  [!] pcdiff operators failed: {e}")
+
+        # =====================================================================
+        # Compute EXACT geodesic distances (TRUE ground truth)
+        # =====================================================================
+        print("\nComputing EXACT geodesic distances (ground truth)...")
+
+        # Use shared function for exact geodesics
+        exact_distances = compute_exact_geodesics(vertices, faces, source_vertex_idx)
+
+        if exact_distances is not None:
+            exact_method = "pygeodesic/igl"
+            print(f"  Exact geodesics computed successfully")
+        else:
+            # Fallback to potpourri3d heat method (approximate)
+            try:
+                import potpourri3d as pp3d
+                solver = pp3d.MeshHeatMethodDistanceSolver(vertices, faces.astype(np.int32))
+                exact_distances = solver.compute_distance(source_vertex_idx)
+                exact_method = "potpourri3d (approximate)"
+                print(f"  Exact geodesics: potpourri3d heat method (approximate)")
+            except Exception as e:
+                print(f"  [!] potpourri3d failed: {e}")
+                # Final fallback: Euclidean
+                exact_distances = np.linalg.norm(vertices - vertices[source_vertex_idx], axis=1)
+                exact_method = "euclidean"
+                print("  [!] Using Euclidean distance as fallback")
+
+        print(f"  Exact geodesic range: [{exact_distances.min():.4f}, {exact_distances.max():.4f}]")
+
+        # Store for comparison
+        reference_distances = exact_distances
+        reference_method = exact_method
+
+        # =====================================================================
+        # NOTE: normalize_distances and compute_geodesic_metrics are imported
+        # from geodesic_utils - no local definitions needed
+        # =====================================================================
+
+        # =====================================================================
+        # Helper functions for Heat Method with different topologies
+        # These wrap the shared functions from geodesic_utils with timing/logging
+        # =====================================================================
+
+        def compute_heat_geodesic_mesh_local(L, M, grad_op, face_areas, method_name, t=None):
+            """Wrapper around shared compute_heat_geodesic_mesh with timing."""
+            start_time = time.time()
+
+            # Use shared function from geodesic_utils
+            distances = compute_heat_geodesic_mesh(
+                L=L, M=M, grad_op=grad_op, face_areas=face_areas,
+                source_idx=source_vertex_idx, n_vertices=n, t=t
+            )
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            return distances, t, elapsed_ms
+
+        def compute_heat_geodesic_pointcloud_local(L, M, grad_op, div_op, method_name, t=None):
+            """Wrapper around shared compute_heat_geodesic_pointcloud with timing."""
+            start_time = time.time()
+
+            # Use shared function from geodesic_utils
+            distances = compute_heat_geodesic_pointcloud(
+                L=L, M=M, grad_op=grad_op, div_op=div_op,
+                source_idx=source_vertex_idx, n_vertices=n, t=t
+            )
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            return distances, t, elapsed_ms
+
+        # =====================================================================
+        # Compute geodesics with each Laplacian
+        # =====================================================================
+        geodesic_distances = {}
+
+        # GT Laplacian: Use mesh-based gradient (igl.grad)
+        if L_gt is not None and M_gt is not None and mesh_grad_op is not None:
+            print(f"\nComputing Heat Method geodesic with GT Laplacian (mesh gradient)...")
+            distances, t, elapsed_ms = compute_heat_geodesic_mesh_local(
+                L_gt, M_gt, mesh_grad_op, mesh_face_areas, "GT"
+            )
+            if distances is not None:
+                geodesic_distances["GT"] = distances
+                print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
+                print(f"  Time: {elapsed_ms:.1f} ms")
+        else:
+            print(f"\n[GT] Mesh gradient not available, skipping")
+
+        # PRED Laplacian: Use point cloud gradient with MATCHED k-NN connectivity
+        if L_pred is not None and M_pred is not None:
+            if pc_grad_op is not None and pc_div_op is not None:
+                print(f"\nComputing Heat Method geodesic with PRED Laplacian (matched k-NN)...")
+                distances, t, elapsed_ms = compute_heat_geodesic_pointcloud_local(
+                    L_pred, M_pred, pc_grad_op, pc_div_op, "PRED"
+                )
+                if distances is not None:
+                    geodesic_distances["PRED"] = distances
+                    print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
+                    print(f"  Time: {elapsed_ms:.1f} ms")
+            else:
+                print(f"\n[PRED] Point cloud gradient not available, skipping Heat Method")
+
+        # Robust Laplacian: Cannot use matched k-NN (Robust builds its own tufted cover)
+        # Use potpourri3d point cloud solver for visualization instead
+        if L_robust is not None and M_robust is not None:
+            print(f"\n[Robust] Heat Method skipped (uses internal tufted cover, not k-NN)")
+            print(f"         Using potpourri3d point cloud solver for visualization...")
+            try:
+                import potpourri3d as pp3d
+                pc_solver = pp3d.PointCloudHeatSolver(vertices)
+                robust_distances = pc_solver.compute_distance(source_vertex_idx)
+                geodesic_distances["Robust (pp3d)"] = robust_distances
+                print(f"  Distance range: [{robust_distances.min():.4f}, {robust_distances.max():.4f}]")
+            except Exception as e:
+                print(f"  [!] potpourri3d point cloud solver failed: {e}")
+
+        # Add exact geodesics to the comparison set
+        geodesic_distances["Exact"] = exact_distances
+
+        # =====================================================================
+        # Compute quality metrics for each method vs EXACT geodesics
+        # All comparisons use NORMALIZED distances for fair comparison
+        # =====================================================================
+        print("\n" + "=" * 70)
+        print("GEODESIC QUALITY METRICS (vs Exact Geodesics)")
+        print(f"Ground truth: {exact_method}")
+        print("All metrics computed on NORMALIZED [0,1] distances")
+        print("=" * 70)
+
+        results = {}
+
+        for method_name, distances in geodesic_distances.items():
+            if method_name == "Exact":
+                continue  # Don't compare exact to itself
+
+            # Use the shared metrics function (returns GeodesicMetrics dataclass)
+            metrics = compute_geodesic_metrics(distances, exact_distances)
+
+            result = HeatMethodGeodesicResult(
+                method_name=method_name,
+                source_vertex_idx=source_vertex_idx,
+                num_vertices=n,
+                time_step=0.0,
+                min_distance=float(distances.min()),
+                max_distance=float(distances.max()),
+                mean_distance=float(distances.mean()),
+                distance_at_source=float(distances[source_vertex_idx]),
+                correlation_with_reference=float(metrics.correlation),
+                mean_absolute_error=float(metrics.mae_normalized),
+                max_absolute_error=float(metrics.max_error_normalized),
+                relative_error_percent=float(metrics.mae_normalized * 100),  # As percentage of [0,1] range
+                monotonicity_score=float(metrics.monotonicity),
+                computation_time_ms=0.0
+            )
+            results[method_name] = result
+
+        # Print summary table
+        print(f"\n{'Method':<20} {'Corr':>8} {'MAE':>8} {'MaxErr':>8} {'Mono':>8} {'Range':<20}")
+        print("-" * 76)
+        for method_name, distances in geodesic_distances.items():
+            if method_name == "Exact":
+                d_range = f"[{distances.min():.3f}, {distances.max():.3f}]"
+                print(f"{method_name:<20} {'1.0000':>8} {'0.0000':>8} {'0.0000':>8} {'1.0000':>8} {d_range:<20}")
+            else:
+                r = results[method_name]
+                d_range = f"[{distances.min():.3f}, {distances.max():.3f}]"
+                print(f"{method_name:<20} {r.correlation_with_reference:>8.4f} {r.mean_absolute_error:>8.4f} "
+                      f"{r.max_absolute_error:>8.4f} {r.monotonicity_score:>8.4f} {d_range:<20}")
+
+        # =====================================================================
+        # Add visualizations
+        # =====================================================================
+        if mesh_structure is not None and not self._skip_visualization:
+            print("\nAdding geodesic visualizations...")
+
+            # Add source vertex indicator
+            source_point = vertices[source_vertex_idx:source_vertex_idx + 1]
+            ps.register_point_cloud(
+                name="K0 Geodesic Source",
+                points=source_point,
+                radius=0.02,
+                color=(0.0, 1.0, 0.0),  # Green
+                enabled=True
+            )
+
+            # Add geodesic distance visualizations (all normalized to [0,1])
+            for method_name, distances in geodesic_distances.items():
+                # Normalized distances (0 to 1) for fair visual comparison
+                d_norm = normalize_distances(distances)
+
+                mesh_structure.add_scalar_quantity(
+                    name=f"K1 Geodesic (norm) - {method_name}",
+                    values=d_norm,
+                    enabled=(method_name == "Exact"),
+                    cmap='viridis'
+                )
+
+            # Add error visualizations (normalized error vs exact)
+            exact_norm = normalize_distances(exact_distances)
+            for method_name, distances in geodesic_distances.items():
+                if method_name == 'Exact':
+                    continue
+
+                d_norm = normalize_distances(distances)
+                error = np.abs(d_norm - exact_norm)
+                mesh_structure.add_scalar_quantity(
+                    name=f"K2 Geodesic Error - {method_name}",
+                    values=error,
+                    enabled=False,
+                    cmap='reds'
+                )
+
+            print(f"  Added {len(geodesic_distances)} geodesic visualizations")
+
+        return results
+
     def process_batch(self, model: LaplacianTransformerModule, batch_data, batch_idx: int, device: torch.device):
         """Process a single batch through the complete pipeline."""
         print(f"\n{'=' * 80}")
@@ -3375,14 +3760,68 @@ class RealTimeEigenanalysisVisualizer:
 
         # STEP 8: Green's function maximum principle validation
         print(f"\nSTEP 8: Green's function maximum principle validation")
+        L_gt = None
+        M_gt = None
+        L_pred = None
+        M_pred = None
+        L_robust = None
+        M_robust = None
         try:
             greens_results = self.compute_and_visualize_greens_functions(
                 mesh_structure, gt_data, inference_result
             )
             # Store results for potential UI display
             self.current_greens_results = greens_results
+
+            # Extract Laplacians for Step 9 (they're built in step 8)
+            # We'll rebuild them here for Step 9 since they're local to compute_and_visualize_greens_functions
         except Exception as e:
             print(f"  [!] Green's function validation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # STEP 9: Heat Method Geodesic Distance Validation
+        print(f"\nSTEP 9: Heat Method geodesic distance validation")
+        try:
+            vertices = gt_data['vertices']
+            faces = gt_data['faces']
+
+            # Build Laplacians for Step 9
+            # GT Laplacian
+            if HAS_IGL:
+                V = vertices.astype(np.float64)
+                F = faces.astype(np.int32)
+                L_gt = -igl.cotmatrix(V, F)  # Negate for positive semi-definite
+                M_gt = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+
+            # PRED Laplacian
+            if inference_result.get('stiffness_matrix') is not None:
+                L_pred = inference_result['stiffness_matrix']
+                M_pred = inference_result.get('mass_matrix')
+
+            # Robust Laplacian
+            if not self._skip_robust:
+                k = self.original_k if self.original_k is not None else 30
+                L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
+
+            # Run Heat Method geodesic validation
+            heat_geodesic_results = self.validate_heat_method_geodesics_step9(
+                vertices=vertices,
+                faces=faces,
+                L_gt=L_gt,
+                M_gt=M_gt,
+                L_pred=L_pred,
+                M_pred=M_pred,
+                L_robust=L_robust,
+                M_robust=M_robust,
+                source_vertex_idx=None,  # Will auto-select centroid
+                mesh_structure=mesh_structure,
+                k_neighbors=self.original_k if self.original_k else 20
+            )
+            self.current_heat_geodesic_results = heat_geodesic_results
+
+        except Exception as e:
+            print(f"  [!] Heat Method geodesic validation failed: {e}")
             import traceback
             traceback.print_exc()
 
