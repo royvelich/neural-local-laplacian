@@ -17,7 +17,7 @@ callbacks:
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: "./checkpoints"
     filename: "model-{epoch:010d}"
-    monitor: "train/cosine_similarity"
+    monitor: "val/geodesic_correlation_mean"
     mode: "max"
     save_top_k: 1
     save_last: False
