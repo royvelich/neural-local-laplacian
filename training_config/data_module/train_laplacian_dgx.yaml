@@ -42,8 +42,8 @@ module:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
         pose_transformers:
           - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
-        num_geodesic_sources: 5
+        num_geodesic_sources: 3
         geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
-      num_workers: 0
+      num_workers: 5
       shuffle: False
