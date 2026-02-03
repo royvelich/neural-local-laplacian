@@ -2,7 +2,7 @@ module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
   d_model: 64
-  nhead: 4
+  nhead: 8
   num_encoder_layers: 6
   dim_feedforward: 64
   num_eigenvalues: ${globals.num_eigenvalues}

@@ -7,7 +7,7 @@ module:
       seed: ${globals.training_seed}
       epoch_size: 32000
       grid_radius_range: [1.0]
-      polynomial_offset_range: [0.0, 0.02]
+      polynomial_offset_range: [0.0, 0.1]
       points_scale_range: [1.0]
       coefficient_scale_range: [1.0]
       order_range: [2, 3]
