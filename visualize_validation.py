@@ -128,7 +128,7 @@ class VectorScales:
 
     # Mean curvature vector scales
     GT_MEAN_CURVATURE_VECTOR = 0.005
-    PREDICTED_MEAN_CURVATURE_VECTOR = 0.005
+    PREDICTED_MEAN_CURVATURE_VECTOR = 0.001
 
     # Normal vector scales
     GT_NORMALS = 0.05
