@@ -336,7 +336,7 @@ def compute_heat_geodesic_mesh(
     M = M.astype(np.float64)
 
     # Time step: t = h^2 where h is mean edge length
-    # For equilateral triangle: area = sqrt(3)/4 * h^2, so h ≈ 1.52 * sqrt(area)
+    # For equilateral triangle: area = sqrt(3)/4 * h^2, so h â‰ˆ 1.52 * sqrt(area)
     if t is None:
         h = 1.52 * np.sqrt(face_areas.mean())
         t = h ** 2
@@ -364,9 +364,9 @@ def compute_heat_geodesic_mesh(
 
         # Step III: Compute integrated divergence
         # For igl.grad(), the discrete divergence is:
-        # div(X) = -G^T @ (A ⊗ I_3) @ X
-        # But we need to solve: Δφ = ∇·X, and since L = -Δ, we have Lφ = -∇·X
-        # So: Lφ = -div(X) = G^T @ (A ⊗ I_3) @ X
+        # div(X) = -G^T @ (A âŠ— I_3) @ X
+        # But we need to solve: Î”Ï† = âˆ‡Â·X, and since L = -Î”, we have LÏ† = -âˆ‡Â·X
+        # So: LÏ† = -div(X) = G^T @ (A âŠ— I_3) @ X
 
         # Create area-weighted X
         X_weighted = X * face_areas[:, np.newaxis]  # (nF, 3)
@@ -391,6 +391,107 @@ def compute_heat_geodesic_mesh(
 
     except Exception as e:
         print(f"Heat Method (mesh) failed: {e}")
+        return None
+
+
+def compute_heat_geodesic_learned(
+    S: scipy.sparse.spmatrix,
+    M: scipy.sparse.spmatrix,
+    G: scipy.sparse.spmatrix,
+    source_idx: int,
+    n_vertices: int,
+    t: Optional[float] = None
+) -> Optional[np.ndarray]:
+    """
+    Compute geodesic distances using Heat Method with fully learned operators.
+
+    All operators (S, M, G) come from the same learned gradient coefficients g_ij
+    and vertex areas A_i. No external dependencies (no pcdiff).
+
+    The gradient operator G is (3N, N) and maps vertex scalars to 3D vertex vectors:
+        (∇f)_i = Σ_j g_ij (f_j - f_i)
+
+    The divergence is the adjoint of G w.r.t. the M-weighted inner product:
+        div(X) = -M^{-1} G^T M_3 X_flat
+    where M_3 repeats vertex areas 3x (once per spatial component).
+
+    Heat Method steps:
+        1. Solve (M + tS) u = δ_source  — heat diffusion
+        2. X = -∇u / |∇u|               — normalized gradient (using G)
+        3. Solve S φ = G^T M_3 X_flat    — Poisson (RHS = -M · div(X))
+
+    Note on Step 3 sign: We solve S φ = -M div(X).
+        -M div(X) = -M · (-M^{-1} G^T M_3 X) = G^T M_3 X
+    So the RHS is simply G^T M_3 X_flat — no sign ambiguity.
+
+    Args:
+        S: One-ring stiffness matrix (N, N) — assembled from ‖g_ij‖²
+        M: Diagonal vertex mass matrix (N, N) — assembled from A_i
+        G: Gradient operator (3N, N) — assembled from g_ij vectors
+        source_idx: Source vertex index for geodesic computation
+        n_vertices: Number of vertices
+        t: Diffusion time step (auto-computed from M if None)
+
+    Returns:
+        Geodesic distances (N,) or None if computation fails
+    """
+    n = n_vertices
+
+    # Ensure float64 for numerical stability
+    S = S.astype(np.float64)
+    M = M.astype(np.float64)
+    G = G.astype(np.float64)
+
+    # Auto time step: t = h^2 where h = sqrt(mean vertex area)
+    if t is None:
+        if scipy.sparse.issparse(M):
+            areas = np.array(M.diagonal()).flatten()
+        else:
+            areas = np.diag(M)
+        h = np.sqrt(areas.mean())
+        t = h ** 2
+
+    try:
+        # Step 1: Heat diffusion — solve (M + tS) u = δ_source
+        delta = np.zeros(n)
+        delta[source_idx] = 1.0
+
+        A = M + t * S
+        u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
+
+        if not np.all(np.isfinite(u)):
+            return None
+
+        # Step 2: Compute gradient and normalize to unit vectors
+        # G maps scalars to 3D vectors (unlike pcdiff which uses 2D tangent frames)
+        grad_u_flat = G @ u             # (3N,)
+        grad_u = grad_u_flat.reshape(-1, 3)  # (N, 3)
+
+        norms = np.linalg.norm(grad_u, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        X = -grad_u / norms  # Negative: point toward source
+
+        # Step 3: Poisson solve — S φ = G^T M_3 X_flat
+        # Build area-weighted X: multiply each vertex's vector by its area
+        areas_diag = np.array(M.diagonal()).flatten()
+        M_3 = np.repeat(areas_diag, 3)  # (3N,) — area_i repeated for x,y,z
+        rhs = G.T @ (M_3 * X.flatten())  # (N,) — this is -M · div(X)
+
+        eps = 1e-8
+        S_reg = S + eps * scipy.sparse.eye(n)
+        phi = scipy.sparse.linalg.spsolve(S_reg.tocsc(), rhs)
+
+        if not np.all(np.isfinite(phi)):
+            return None
+
+        # Shift so source has distance 0, minimum is 0
+        phi = phi - phi[source_idx]
+        phi = phi - phi.min()
+
+        return phi
+
+    except Exception as e:
+        print(f"Heat Method (learned) failed: {e}")
         return None
 
 

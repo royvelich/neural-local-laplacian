@@ -41,10 +41,11 @@ import trimesh
 from pyFM.mesh import TriMesh
 
 # neural laplacian
-from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, compute_laplacian_eigendecomposition
+from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, assemble_gradient_operator, compute_laplacian_eigendecomposition
 from neural_local_laplacian.modules.losses import LossConfig
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_pointcloud,
+    compute_heat_geodesic_learned,
     compute_geodesic_metrics,
     compute_multisource_geodesic_metrics
 )
@@ -130,6 +131,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  output_projection_hidden_dims: Optional[List[int]] = None,
                  normalize_patch_features: bool = True,
                  scale_areas_by_patch_size: bool = True,
+                 operator_mode: str = "gradient",
+                 gradient_loss_weight: float = 1.0,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -154,11 +157,17 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         if input_dim is None or input_dim <= 0:
             raise ValueError(f"input_dim must be a positive integer, got: {input_dim}")
 
+        # Validate operator_mode
+        if operator_mode not in ("stiffness", "gradient"):
+            raise ValueError(f"operator_mode must be 'stiffness' or 'gradient', got: {operator_mode}")
+
         self._d_model = d_model
         self._input_dim = input_dim
         self._num_eigenvalues = num_eigenvalues
         self._normalize_patch_features = normalize_patch_features
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
+        self._operator_mode = operator_mode
+        self._gradient_loss_weight = gradient_loss_weight
 
         # Store loss configs (optionally normalized)
         if normalize_loss_weights:
@@ -183,10 +192,15 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             num_layers=num_encoder_layers
         )
 
-        # Stiffness projection: per-token -> scalar stiffness weight s_ij
-        self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
+        # Output head: depends on operator_mode
+        if self._operator_mode == "stiffness":
+            # Per-token → scalar stiffness weight s_ij (current behavior)
+            self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
+        elif self._operator_mode == "gradient":
+            # Per-token → 3D gradient coefficient g_ij
+            self.grad_projection = self._build_projection(d_model, 3, output_projection_hidden_dims)
 
-        # Area head: aggregated features -> scalar area A_i
+        # Area head: aggregated features -> scalar area A_i (shared across modes)
         # Uses mean pooling of token features followed by MLP
         self.area_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -407,6 +421,82 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         return predicted_mean_curvature_vectors
 
+    def _compute_gradient_loss(self, forward_result: Dict[str, torch.Tensor],
+                               batch_data: Batch) -> torch.Tensor:
+        """
+        Compute gradient supervision loss via the tangent plane projector.
+
+        For coordinate functions x, y, z the surface gradient at the origin is:
+            (∇_S x^c) = e_c - (e_c · n̂)n̂
+
+        As a matrix this is the tangent plane projector P = I - n̂n̂^T.
+
+        The predicted gradient of coordinates is:
+            predicted_P[d, c] = Σ_j g_ij[d] * p_j[c]
+
+        where g_ij are the learned gradient coefficients and p_j are neighbor positions.
+
+        This gives 9 constraints (6 independent) on 3k unknowns per patch.
+        The system is underdetermined — the model has freedom to arrange coefficients
+        optimally while satisfying the tangent plane constraint.
+
+        Args:
+            forward_result: Forward pass output containing grad_coeffs, attention_mask, batch_sizes
+            batch_data: PyTorch Geometric batch containing positions and surface normals
+
+        Returns:
+            Scalar MSE loss between predicted and target tangent plane projectors
+        """
+        grad_coeffs = forward_result['grad_coeffs']      # (batch_size, max_k, 3)
+        attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
+        batch_sizes = forward_result['batch_sizes']        # (batch_size,)
+
+        # Get positions reshaped to (batch_size, max_k, 3)
+        positions = self._reshape_positions_to_batched(batch_data.pos, batch_sizes)
+
+        # Mask grad_coeffs at padded positions (already done in forward, but be safe)
+        mask_3d = attention_mask.unsqueeze(-1).float()  # (batch_size, max_k, 1)
+        grad_masked = grad_coeffs * mask_3d
+
+        # predicted_P[b, d, c] = Σ_k grad_masked[b, k, d] * positions[b, k, c]
+        predicted_P = torch.einsum('bkd,bkc->bdc', grad_masked, positions)  # (batch_size, 3, 3)
+
+        # Target: P = I - n̂n̂^T (tangent plane projector from surface normal)
+        normals = F.normalize(batch_data.normal, p=2, dim=1)  # (batch_size, 3)
+        I = torch.eye(3, device=normals.device, dtype=normals.dtype).unsqueeze(0)  # (1, 3, 3)
+        target_P = I - torch.einsum('bi,bj->bij', normals, normals)  # (batch_size, 3, 3)
+
+        return F.mse_loss(predicted_P, target_P)
+
+    def _reshape_positions_to_batched(self, pos_flat: torch.Tensor,
+                                      batch_sizes: torch.Tensor) -> torch.Tensor:
+        """
+        Reshape flat positions to padded batched format.
+
+        Args:
+            pos_flat: Flat positions (total_points, 3) from batch_data.pos
+            batch_sizes: Number of points per patch (batch_size,)
+
+        Returns:
+            Padded positions (batch_size, max_k, 3) with zeros for padding
+        """
+        batch_size = len(batch_sizes)
+        max_k = batch_sizes.max().item()
+        device = pos_flat.device
+
+        # Check if all patches have the same size (fixed-k fast path)
+        if torch.all(batch_sizes == batch_sizes[0]):
+            return pos_flat.view(batch_size, max_k, 3)
+
+        # Variable-k: pad each patch
+        positions = torch.zeros(batch_size, max_k, 3, device=device, dtype=pos_flat.dtype)
+        offset = 0
+        for i in range(batch_size):
+            size = batch_sizes[i].item()
+            positions[i, :size] = pos_flat[offset:offset + size]
+            offset += size
+        return positions
+
     def _forward_pass(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """
         Internal forward pass method that can be called from both forward() and validation_step().
@@ -491,12 +581,15 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # src_key_padding_mask=None means no masking, which is correct for fixed k
         encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=None)
 
-        # === Stiffness weights (per token) ===
-        stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, k, 1)
-        stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, k)
-
-        # Apply exp to ensure positive weights (no masking needed)
-        stiffness_weights = torch.exp(stiffness_weights)
+        # === Output head: depends on operator_mode ===
+        if self._operator_mode == "stiffness":
+            stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, k, 1)
+            stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, k)
+            stiffness_weights = torch.exp(stiffness_weights)  # Ensure positive
+            grad_coeffs = None
+        elif self._operator_mode == "gradient":
+            grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, k, 3)
+            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, k) — structural positivity
 
         # === Area prediction (per patch) ===
         # OPTIMIZED: Simple mean pooling (no mask needed)
@@ -507,7 +600,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # === Scale areas back to original geometry ===
         if self._scale_areas_by_patch_size:
-            # A = A' * dÂ² (area scales as lengthÂ²)
+            # A = A' * dÃ‚Â² (area scales as lengthÃ‚Â²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
@@ -520,7 +613,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             'areas': areas,
             'attention_mask': attention_mask,
             'batch_sizes': batch_sizes,
-            'scale_factors': scale_factors
+            'scale_factors': scale_factors,
+            'grad_coeffs': grad_coeffs,  # None in stiffness mode, (batch_size, k, 3) in gradient mode
         }
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -533,7 +627,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         - Normalizes patch positions to unit sphere before transformer
 
         If scale_areas_by_patch_size=True:
-        - Scales output areas by dÃ‚Â² to restore original geometry scale
+        - Scales output areas by dÃƒâ€šÃ‚Â² to restore original geometry scale
 
         Args:
             batch: PyTorch Geometric batch
@@ -589,15 +683,17 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Note: src_key_padding_mask expects True for positions to IGNORE
         encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=~attention_mask)
 
-        # === Stiffness weights (per token) ===
-        stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, max_k, 1)
-        stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, max_k)
-
-        # Apply exp to ensure positive weights
-        stiffness_weights = torch.exp(stiffness_weights)
-
-        # Mask out padded positions
-        stiffness_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)
+        # === Output head: depends on operator_mode ===
+        if self._operator_mode == "stiffness":
+            stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, max_k, 1)
+            stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, max_k)
+            stiffness_weights = torch.exp(stiffness_weights)  # Ensure positive
+            stiffness_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)  # Mask padding
+            grad_coeffs = None
+        elif self._operator_mode == "gradient":
+            grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, max_k, 3)
+            grad_coeffs = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)  # Mask padding
+            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, max_k) — structural positivity
 
         # === Area prediction (per patch) ===
         # Mean pooling of encoded features (excluding padding)
@@ -614,7 +710,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # === Scale areas back to original geometry ===
         if self._scale_areas_by_patch_size:
-            # A = A' * dÃ‚Â² (area scales as lengthÃ‚Â²)
+            # A = A' * dÃƒâ€šÃ‚Â² (area scales as lengthÃƒâ€šÃ‚Â²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
@@ -624,7 +720,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             'areas': areas,
             'attention_mask': attention_mask,
             'batch_sizes': batch_sizes,
-            'scale_factors': scale_factors
+            'scale_factors': scale_factors,
+            'grad_coeffs': grad_coeffs,  # None in stiffness mode, (batch_size, max_k, 3) in gradient mode
         }
 
     def training_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
@@ -678,6 +775,11 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         if not isinstance(total_loss, torch.Tensor):
             raise ValueError("At least one loss must have a non-None weight for training")
 
+        # === Gradient loss (only in gradient mode) ===
+        if self._operator_mode == "gradient":
+            grad_loss = self._compute_gradient_loss(forward_result, batch_data)
+            total_loss = total_loss + self._gradient_loss_weight * grad_loss
+
         # Compute average cosine similarity between predicted and target mean curvature vectors
         cosine_sim = F.cosine_similarity(predicted_mean_curvature_vectors, target_mean_curvature_vectors, dim=1)
         avg_cosine_sim = cosine_sim.mean()
@@ -700,6 +802,13 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  logger=True, batch_size=batch_size, sync_dist=True)
         self.log('train/area_std', area_std.item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Log gradient loss (only in gradient mode)
+        if self._operator_mode == "gradient":
+            self.log('train/gradient_loss', grad_loss.item(), on_step=False, on_epoch=True,
+                     prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+            self.log('train/gradient_loss_weighted', (self._gradient_loss_weight * grad_loss).item(),
+                     on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
         for loss_name, loss_value in loss_components_unweighted.items():
@@ -809,7 +918,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # Compute geodesic validation metrics if geodesic data is available
         geodesic_metrics = self._compute_geodesic_validation_metrics(
-            mesh_data, stiffness_matrix, mass_matrix
+            mesh_data, stiffness_matrix, mass_matrix, forward_result, mesh_batch
         )
         metrics.update(geodesic_metrics)
 
@@ -819,18 +928,23 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             self,
             mesh_data: BaseData,
             stiffness_matrix: scipy.sparse.spmatrix,
-            mass_matrix: scipy.sparse.spmatrix
+            mass_matrix: scipy.sparse.spmatrix,
+            forward_result: Optional[Dict[str, torch.Tensor]] = None,
+            mesh_batch: Optional[Batch] = None
     ) -> Dict[str, float]:
         """
         Compute geodesic validation metrics using Heat Method with multiple sources.
 
-        Compares geodesics computed from the predicted Laplacian against
-        exact geodesics computed from the mesh, averaged over multiple source vertices.
+        In stiffness mode (frankenstein): uses pcdiff grad/div operators from precomputed data.
+        In gradient mode (self-consistent): assembles G from learned grad_coeffs and uses
+        the formal adjoint divergence.
 
         Args:
             mesh_data: PyTorch Geometric Data object with geodesic_data
-            stiffness_matrix: Assembled stiffness matrix from PRED
-            mass_matrix: Assembled mass matrix from PRED
+            stiffness_matrix: Assembled stiffness matrix from predicted weights
+            mass_matrix: Assembled mass matrix from predicted areas
+            forward_result: Forward pass output (needed for gradient mode to get grad_coeffs)
+            mesh_batch: Batched mesh data (needed for gradient mode to get vertex/center indices)
 
         Returns:
             Dictionary with geodesic validation metrics (averaged over sources)
@@ -843,21 +957,42 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         try:
             source_indices = geodesic_data['source_indices']
             exact_geodesics_dict = geodesic_data['exact_geodesics']  # Dict: source_idx -> distances
-            pc_grad_op = geodesic_data['pc_grad_op']
-            pc_div_op = geodesic_data['pc_div_op']
-
             n_vertices = stiffness_matrix.shape[0]
 
-            # Define functions for computing geodesics from each source
-            def compute_pred_geodesics(source_idx):
-                return compute_heat_geodesic_pointcloud(
-                    L=stiffness_matrix,
-                    M=mass_matrix,
-                    grad_op=pc_grad_op,
-                    div_op=pc_div_op,
-                    source_idx=source_idx,
-                    n_vertices=n_vertices
+            if self._operator_mode == "gradient" and forward_result is not None and mesh_batch is not None:
+                # === Gradient mode: self-consistent heat method ===
+                # Assemble G from learned grad_coeffs
+                batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
+                gradient_operator = assemble_gradient_operator(
+                    grad_coeffs=forward_result['grad_coeffs'],
+                    attention_mask=forward_result['attention_mask'],
+                    vertex_indices=mesh_batch.vertex_indices,
+                    center_indices=mesh_batch.center_indices,
+                    batch_indices=batch_indices
                 )
+
+                def compute_pred_geodesics(source_idx):
+                    return compute_heat_geodesic_learned(
+                        S=stiffness_matrix,
+                        M=mass_matrix,
+                        G=gradient_operator,
+                        source_idx=source_idx,
+                        n_vertices=n_vertices
+                    )
+            else:
+                # === Stiffness mode: frankenstein heat method (pcdiff grad/div) ===
+                pc_grad_op = geodesic_data['pc_grad_op']
+                pc_div_op = geodesic_data['pc_div_op']
+
+                def compute_pred_geodesics(source_idx):
+                    return compute_heat_geodesic_pointcloud(
+                        L=stiffness_matrix,
+                        M=mass_matrix,
+                        grad_op=pc_grad_op,
+                        div_op=pc_div_op,
+                        source_idx=source_idx,
+                        n_vertices=n_vertices
+                    )
 
             def get_exact_geodesics(source_idx):
                 return exact_geodesics_dict.get(source_idx, None)

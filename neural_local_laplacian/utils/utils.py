@@ -336,6 +336,121 @@ def assemble_stiffness_and_mass_matrices(
     return stiffness_csr, mass_csr
 
 
+def assemble_gradient_operator(
+        grad_coeffs: torch.Tensor,
+        attention_mask: torch.Tensor,
+        vertex_indices: torch.Tensor,
+        center_indices: torch.Tensor,
+        batch_indices: torch.Tensor
+) -> scipy.sparse.csr_matrix:
+    """
+    Assemble sparse gradient operator G from learned gradient coefficients.
+
+    G is a (3N, N) sparse matrix. For each patch centered at vertex i with neighbor j:
+        G[3i:3i+3, j] = +g_ij        (neighbor contribution)
+        G[3i:3i+3, i] = -Σ_j g_ij   (center, ensures G @ const = 0)
+
+    The gradient of a scalar function f is computed as:
+        (∇f)_flat = G @ f   →   reshape to (N, 3)
+
+    This gives the vertex-based gradient:
+        (∇f)_i = Σ_j g_ij (f_j - f_i)
+
+    The divergence (adjoint w.r.t. vertex-area inner product) is:
+        div(X) = -(1/A) * G^T @ (A_3d * X_flat)
+    where A_3d repeats vertex areas 3x (once per spatial component).
+
+    Uses the same GPU-optimized patch indexing pattern as
+    assemble_stiffness_and_mass_matrices for consistency.
+
+    Args:
+        grad_coeffs: Gradient coefficients (num_patches, max_k, 3)
+        attention_mask: Valid token mask (num_patches, max_k) - True for real tokens
+        vertex_indices: Flat neighbor vertex indices (total_points,)
+        center_indices: Center vertex per patch (num_patches,)
+        batch_indices: Batch/patch index per point (total_points,)
+
+    Returns:
+        G: Sparse gradient operator (3*num_vertices, num_vertices) as CSR matrix
+    """
+    device = grad_coeffs.device
+    num_patches = grad_coeffs.shape[0]
+    max_k = grad_coeffs.shape[1]
+
+    num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
+
+    # === STEP 1: Flatten and filter valid entries ===
+    coeffs_flat = grad_coeffs.reshape(-1, 3)  # (num_patches * max_k, 3)
+    mask_flat = attention_mask.flatten()  # (num_patches * max_k,)
+
+    patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)
+
+    valid_coeffs = coeffs_flat[mask_flat]         # (num_valid, 3)
+    valid_patch_indices = patch_indices_flat[mask_flat]  # (num_valid,)
+
+    # === STEP 2: Compute positions within each patch (same pattern as stiffness assembly) ===
+    num_valid = len(valid_patch_indices)
+
+    if num_valid == 0:
+        return scipy.sparse.csr_matrix((3 * num_vertices, num_vertices))
+
+    patch_changes = torch.ones(num_valid, dtype=torch.bool, device=device)
+    if num_valid > 1:
+        patch_changes[1:] = valid_patch_indices[1:] != valid_patch_indices[:-1]
+
+    group_ids = torch.cumsum(patch_changes.long(), dim=0) - 1
+    change_indices = torch.where(patch_changes)[0]
+    group_starts = change_indices[group_ids]
+    positions_in_patch = torch.arange(num_valid, device=device, dtype=torch.long) - group_starts
+
+    # === STEP 3: Get vertex indices ===
+    batch_sizes = batch_indices.bincount(minlength=num_patches)
+    cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
+    starts = torch.cat([torch.tensor([0], device=device, dtype=torch.long), cumsum_sizes[:-1]])
+
+    valid_center_vertices = center_indices[valid_patch_indices]
+    valid_neighbor_vertices = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
+
+    # === STEP 4: Transfer to CPU/numpy for COO construction ===
+    centers_np = valid_center_vertices.cpu().numpy()
+    neighbors_np = valid_neighbor_vertices.cpu().numpy()
+    coeffs_np = valid_coeffs.detach().float().cpu().numpy().astype(np.float64)  # (num_valid, 3)
+
+    num_valid_np = len(centers_np)
+
+    # === STEP 5: Build off-diagonal entries: G[3*center+d, neighbor] = g_ij[d] ===
+    # Each valid edge contributes 3 entries (one per spatial dimension)
+    rows_neighbor = np.repeat(3 * centers_np, 3) + np.tile(np.arange(3), num_valid_np)
+    cols_neighbor = np.repeat(neighbors_np, 3)
+    data_neighbor = coeffs_np.flatten()  # (num_valid * 3,)
+
+    # === STEP 6: Build diagonal entries: G[3*center+d, center] = -Σ_j g_ij[d] ===
+    # Accumulate gradient coefficient sums per center vertex
+    center_sums = np.zeros((num_vertices, 3), dtype=np.float64)
+    np.add.at(center_sums, centers_np, coeffs_np)
+
+    # Only create entries for vertices that are patch centers
+    active_centers = np.where(np.any(center_sums != 0, axis=1))[0]
+    num_active = len(active_centers)
+
+    rows_diag = np.repeat(3 * active_centers, 3) + np.tile(np.arange(3), num_active)
+    cols_diag = np.repeat(active_centers, 3)
+    data_diag = -center_sums[active_centers].flatten()
+
+    # === STEP 7: Combine and create sparse matrix ===
+    all_rows = np.concatenate([rows_neighbor, rows_diag])
+    all_cols = np.concatenate([cols_neighbor, cols_diag])
+    all_data = np.concatenate([data_neighbor, data_diag])
+
+    G = scipy.sparse.coo_matrix(
+        (all_data, (all_rows, all_cols)),
+        shape=(3 * num_vertices, num_vertices)
+    ).tocsr()
+    G.sum_duplicates()
+
+    return G
+
+
 def split_results_by_nodes(results: torch.Tensor, batch: Batch) -> List[torch.Tensor]:
     return [results[batch.batch == i] for i in range(batch.num_graphs)]
 

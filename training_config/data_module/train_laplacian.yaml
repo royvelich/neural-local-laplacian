@@ -5,9 +5,9 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
       seed: ${globals.training_seed}
-      epoch_size: 200
+      epoch_size: 2000
       grid_radius_range: [1.0]
-      polynomial_offset_range: [0.0]
+      polynomial_offset_range: [0.0, 0.1]
       points_scale_range: [1.0]
       coefficient_scale_range: [1.0]
       order_range: [2, 3]
@@ -17,8 +17,8 @@ module:
       feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
       conv_k_nearest: null
-      pose_transformers:
-        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      pose_transformers: null
+#        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
       coeff_generation_method:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
         _args_: ['uniform']
@@ -28,20 +28,22 @@ module:
       diff_geom_at_origin_only: True
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
-      normalize_to_unit_area: True
+      normalize_to_unit_area: False
     batch_size: 200
-    num_workers: 0
+    num_workers: 5
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        mesh_folder_path: './assets/meshes'
-        k: 15
+        mesh_folder_path: './assets/meshes5'
+        k: 20
         feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
         pose_transformers:
           - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+        num_geodesic_sources: 3
+        geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
-      num_workers: 0
+      num_workers: 5
       shuffle: False
