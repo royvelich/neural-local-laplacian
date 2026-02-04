@@ -42,7 +42,7 @@ from pyFM.mesh import TriMesh
 
 # neural laplacian
 from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, assemble_gradient_operator, compute_laplacian_eigendecomposition
-from neural_local_laplacian.modules.losses import LossConfig
+from neural_local_laplacian.modules.losses import LossConfig, LossContext
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_pointcloud,
     compute_heat_geodesic_learned,
@@ -132,7 +132,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  normalize_patch_features: bool = True,
                  scale_areas_by_patch_size: bool = True,
                  operator_mode: str = "gradient",
-                 gradient_loss_weight: float = 1.0,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -167,7 +166,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._normalize_patch_features = normalize_patch_features
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
         self._operator_mode = operator_mode
-        self._gradient_loss_weight = gradient_loss_weight
 
         # Store loss configs (optionally normalized)
         if normalize_loss_weights:
@@ -420,53 +418,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         predicted_mean_curvature_vectors = stiffness_sum / areas.unsqueeze(-1)
 
         return predicted_mean_curvature_vectors
-
-    def _compute_gradient_loss(self, forward_result: Dict[str, torch.Tensor],
-                               batch_data: Batch) -> torch.Tensor:
-        """
-        Compute gradient supervision loss via the tangent plane projector.
-
-        For coordinate functions x, y, z the surface gradient at the origin is:
-            (∇_S x^c) = e_c - (e_c · n̂)n̂
-
-        As a matrix this is the tangent plane projector P = I - n̂n̂^T.
-
-        The predicted gradient of coordinates is:
-            predicted_P[d, c] = Σ_j g_ij[d] * p_j[c]
-
-        where g_ij are the learned gradient coefficients and p_j are neighbor positions.
-
-        This gives 9 constraints (6 independent) on 3k unknowns per patch.
-        The system is underdetermined — the model has freedom to arrange coefficients
-        optimally while satisfying the tangent plane constraint.
-
-        Args:
-            forward_result: Forward pass output containing grad_coeffs, attention_mask, batch_sizes
-            batch_data: PyTorch Geometric batch containing positions and surface normals
-
-        Returns:
-            Scalar MSE loss between predicted and target tangent plane projectors
-        """
-        grad_coeffs = forward_result['grad_coeffs']      # (batch_size, max_k, 3)
-        attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
-        batch_sizes = forward_result['batch_sizes']        # (batch_size,)
-
-        # Get positions reshaped to (batch_size, max_k, 3)
-        positions = self._reshape_positions_to_batched(batch_data.pos, batch_sizes)
-
-        # Mask grad_coeffs at padded positions (already done in forward, but be safe)
-        mask_3d = attention_mask.unsqueeze(-1).float()  # (batch_size, max_k, 1)
-        grad_masked = grad_coeffs * mask_3d
-
-        # predicted_P[b, d, c] = Σ_k grad_masked[b, k, d] * positions[b, k, c]
-        predicted_P = torch.einsum('bkd,bkc->bdc', grad_masked, positions)  # (batch_size, 3, 3)
-
-        # Target: P = I - n̂n̂^T (tangent plane projector from surface normal)
-        normals = F.normalize(batch_data.normal, p=2, dim=1)  # (batch_size, 3)
-        I = torch.eye(3, device=normals.device, dtype=normals.dtype).unsqueeze(0)  # (1, 3, 3)
-        target_P = I - torch.einsum('bi,bj->bij', normals, normals)  # (batch_size, 3, 3)
-
-        return F.mse_loss(predicted_P, target_P)
 
     def _reshape_positions_to_batched(self, pos_flat: torch.Tensor,
                                       batch_sizes: torch.Tensor) -> torch.Tensor:
@@ -752,14 +703,25 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Target: 2 * H * n_hat (mean curvature times unit normal at origin)
         target_mean_curvature_vectors = 2.0 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
 
-        # Compute weighted combination of losses
+        # Build LossContext with all fields any loss might need
+        loss_context = LossContext(
+            predicted_mcv=predicted_mean_curvature_vectors,
+            target_mcv=target_mean_curvature_vectors,
+            grad_coeffs=forward_result.get('grad_coeffs'),
+            positions=self._reshape_positions_to_batched(batch_data.pos, forward_result['batch_sizes'])
+                      if forward_result.get('grad_coeffs') is not None else None,
+            normals=getattr(batch_data, 'normal', None),
+            attention_mask=forward_result['attention_mask'],
+        )
+
+        # Apply all losses through unified loss_configs pipeline
         total_loss = 0.0
         loss_components_weighted = {}
         loss_components_unweighted = {}
 
         for i, loss_config in enumerate(self._loss_configs):
-            # Compute unweighted loss
-            unweighted_loss = loss_config.loss_module(predicted_mean_curvature_vectors, target_mean_curvature_vectors)
+            # Compute unweighted loss — every loss takes the same LossContext
+            unweighted_loss = loss_config.loss_module(loss_context)
 
             # Store unweighted loss for logging
             loss_name = f"{loss_config.loss_module.__class__.__name__}"
@@ -774,11 +736,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Ensure total_loss is a tensor (at least one loss must have non-None weight)
         if not isinstance(total_loss, torch.Tensor):
             raise ValueError("At least one loss must have a non-None weight for training")
-
-        # === Gradient loss (only in gradient mode) ===
-        if self._operator_mode == "gradient":
-            grad_loss = self._compute_gradient_loss(forward_result, batch_data)
-            total_loss = total_loss + self._gradient_loss_weight * grad_loss
 
         # Compute average cosine similarity between predicted and target mean curvature vectors
         cosine_sim = F.cosine_similarity(predicted_mean_curvature_vectors, target_mean_curvature_vectors, dim=1)
@@ -802,13 +759,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  logger=True, batch_size=batch_size, sync_dist=True)
         self.log('train/area_std', area_std.item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
-
-        # Log gradient loss (only in gradient mode)
-        if self._operator_mode == "gradient":
-            self.log('train/gradient_loss', grad_loss.item(), on_step=False, on_epoch=True,
-                     prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-            self.log('train/gradient_loss_weighted', (self._gradient_loss_weight * grad_loss).item(),
-                     on_step=False, on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         # Log individual unweighted loss components (these are the main loss values to track)
         for loss_name, loss_value in loss_components_unweighted.items():

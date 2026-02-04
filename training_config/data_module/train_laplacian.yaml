@@ -30,7 +30,7 @@ module:
       flip_normal_if_negative_curvature: False
       normalize_to_unit_area: False
     batch_size: 200
-    num_workers: 5
+    num_workers: 0
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
@@ -45,5 +45,5 @@ module:
         num_geodesic_sources: 3
         geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
-      num_workers: 5
+      num_workers: 0
       shuffle: False

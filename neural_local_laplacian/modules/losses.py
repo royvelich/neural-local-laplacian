@@ -6,6 +6,30 @@ from dataclasses import dataclass
 
 
 @dataclass
+class LossContext:
+    """
+    Bundles all tensors that any loss function might need.
+
+    Built once per training step and passed to every loss module.
+    Each loss reads the fields it needs and ignores the rest.
+
+    Fields:
+        predicted_mcv: Predicted mean curvature vectors (batch_size, 3)
+        target_mcv: Target mean curvature vectors (batch_size, 3)
+        grad_coeffs: Learned gradient coefficients (batch_size, max_k, 3) — gradient mode only
+        positions: Neighbor positions, batched (batch_size, max_k, 3)
+        normals: Surface normals at patch centers (batch_size, 3)
+        attention_mask: Valid token mask (batch_size, max_k)
+    """
+    predicted_mcv: torch.Tensor
+    target_mcv: torch.Tensor
+    grad_coeffs: Optional[torch.Tensor] = None
+    positions: Optional[torch.Tensor] = None
+    normals: Optional[torch.Tensor] = None
+    attention_mask: Optional[torch.Tensor] = None
+
+
+@dataclass
 class LossConfig:
     """Configuration for a loss module with its associated weight.
 
@@ -39,18 +63,17 @@ class VectorMSELoss(nn.Module):
         super().__init__()
         self.reduction = reduction
 
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, ctx: LossContext) -> torch.Tensor:
         """
-        Compute MSE loss between predicted and target vectors.
+        Compute MSE loss between predicted and target mean curvature vectors.
 
         Args:
-            predicted: Predicted vectors of shape (batch_size, 3)
-            target: Target vectors of shape (batch_size, 3)
+            ctx: LossContext containing predicted_mcv and target_mcv of shape (batch_size, 3)
 
         Returns:
             MSE loss between the vectors
         """
-        return F.mse_loss(predicted, target, reduction=self.reduction)
+        return F.mse_loss(ctx.predicted_mcv, ctx.target_mcv, reduction=self.reduction)
 
 
 class DirectionMSELoss(nn.Module):
@@ -72,20 +95,19 @@ class DirectionMSELoss(nn.Module):
         self.reduction = reduction
         self.eps = eps
 
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, ctx: LossContext) -> torch.Tensor:
         """
         Compute MSE loss between normalized vectors (direction only).
 
         Args:
-            predicted: Predicted vectors of shape (batch_size, 3)
-            target: Target vectors of shape (batch_size, 3)
+            ctx: LossContext containing predicted_mcv and target_mcv of shape (batch_size, 3)
 
         Returns:
             MSE loss between normalized vectors
         """
         # Normalize both vectors to unit length
-        predicted_norm = F.normalize(predicted, p=2, dim=1, eps=self.eps)
-        target_norm = F.normalize(target, p=2, dim=1, eps=self.eps)
+        predicted_norm = F.normalize(ctx.predicted_mcv, p=2, dim=1, eps=self.eps)
+        target_norm = F.normalize(ctx.target_mcv, p=2, dim=1, eps=self.eps)
 
         return F.mse_loss(predicted_norm, target_norm, reduction=self.reduction)
 
@@ -110,13 +132,12 @@ class DirectionCosineLoss(nn.Module):
         self.reduction = reduction
         self.eps = eps
 
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, ctx: LossContext) -> torch.Tensor:
         """
         Compute cosine similarity loss between normalized vectors (direction only).
 
         Args:
-            predicted: Predicted vectors of shape (batch_size, 3)
-            target: Target vectors of shape (batch_size, 3)
+            ctx: LossContext containing predicted_mcv and target_mcv of shape (batch_size, 3)
 
         Returns:
             Cosine similarity loss: 1 - cosine_similarity
@@ -125,8 +146,8 @@ class DirectionCosineLoss(nn.Module):
             - Loss = 2 when vectors point in opposite directions (cos = -1)
         """
         # Normalize both vectors to unit length
-        predicted_norm = F.normalize(predicted, p=2, dim=1, eps=self.eps)
-        target_norm = F.normalize(target, p=2, dim=1, eps=self.eps)
+        predicted_norm = F.normalize(ctx.predicted_mcv, p=2, dim=1, eps=self.eps)
+        target_norm = F.normalize(ctx.target_mcv, p=2, dim=1, eps=self.eps)
 
         # Compute cosine similarity: dot product of normalized vectors
         cosine_similarity = torch.sum(predicted_norm * target_norm, dim=1)  # Shape: (batch_size,)
@@ -166,20 +187,19 @@ class MagnitudeMSELoss(nn.Module):
         super().__init__()
         self.reduction = reduction
 
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, ctx: LossContext) -> torch.Tensor:
         """
         Compute MSE loss between vector magnitudes.
 
         Args:
-            predicted: Predicted vectors of shape (batch_size, 3)
-            target: Target vectors of shape (batch_size, 3)
+            ctx: LossContext containing predicted_mcv and target_mcv of shape (batch_size, 3)
 
         Returns:
             MSE loss between vector magnitudes
         """
         # Compute L2 norms (magnitudes) of both vectors
-        predicted_magnitude = torch.norm(predicted, p=2, dim=1)  # (batch_size,)
-        target_magnitude = torch.norm(target, p=2, dim=1)  # (batch_size,)
+        predicted_magnitude = torch.norm(ctx.predicted_mcv, p=2, dim=1)  # (batch_size,)
+        target_magnitude = torch.norm(ctx.target_mcv, p=2, dim=1)  # (batch_size,)
 
         return F.mse_loss(predicted_magnitude, target_magnitude, reduction=self.reduction)
 
@@ -207,19 +227,18 @@ class RelativeMagnitudeLoss(nn.Module):
         self.reduction = reduction
         self.eps = eps
 
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, ctx: LossContext) -> torch.Tensor:
         """
         Compute relative MSE loss between vector magnitudes.
 
         Args:
-            predicted: Predicted vectors of shape (batch_size, 3)
-            target: Target vectors of shape (batch_size, 3)
+            ctx: LossContext containing predicted_mcv and target_mcv of shape (batch_size, 3)
 
         Returns:
             Relative MSE loss: mean/sum of ((||pred|| - ||target||) / ||target||)^2
         """
-        predicted_magnitude = torch.norm(predicted, p=2, dim=1)  # (batch_size,)
-        target_magnitude = torch.norm(target, p=2, dim=1)  # (batch_size,)
+        predicted_magnitude = torch.norm(ctx.predicted_mcv, p=2, dim=1)  # (batch_size,)
+        target_magnitude = torch.norm(ctx.target_mcv, p=2, dim=1)  # (batch_size,)
 
         # Relative error: (pred - target) / target
         relative_error = (predicted_magnitude - target_magnitude) / (target_magnitude + self.eps)
@@ -258,19 +277,18 @@ class LogMagnitudeLoss(nn.Module):
         self.reduction = reduction
         self.eps = eps
 
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, ctx: LossContext) -> torch.Tensor:
         """
         Compute log-space MSE loss between vector magnitudes.
 
         Args:
-            predicted: Predicted vectors of shape (batch_size, 3)
-            target: Target vectors of shape (batch_size, 3)
+            ctx: LossContext containing predicted_mcv and target_mcv of shape (batch_size, 3)
 
         Returns:
             Log-space MSE loss: mean/sum of (log(||pred||) - log(||target||))^2
         """
-        predicted_magnitude = torch.norm(predicted, p=2, dim=1)  # (batch_size,)
-        target_magnitude = torch.norm(target, p=2, dim=1)  # (batch_size,)
+        predicted_magnitude = torch.norm(ctx.predicted_mcv, p=2, dim=1)  # (batch_size,)
+        target_magnitude = torch.norm(ctx.target_mcv, p=2, dim=1)  # (batch_size,)
 
         # Log-space difference: log(pred) - log(target) = log(pred/target)
         log_pred = torch.log(predicted_magnitude + self.eps)
@@ -285,3 +303,55 @@ class LogMagnitudeLoss(nn.Module):
             return log_error_sq
         else:
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class TangentPlaneProjectorLoss(nn.Module):
+    """
+    Gradient supervision loss via the tangent plane projector.
+
+    For a surface with normal n̂ at vertex i, the surface gradient of coordinate
+    functions x, y, z gives the tangent plane projector P = I - n̂n̂^T.
+
+    The predicted gradient of coordinates is:
+        predicted_P[d, c] = Σ_j g_ij[d] * p_j[c]
+
+    where g_ij ∈ ℝ³ are the learned gradient coefficients and p_j ∈ ℝ³ are
+    neighbor positions (relative to the patch center).
+
+    This gives 9 constraints (6 independent due to symmetry of P) on 3k unknowns
+    per patch. The system is underdetermined — the model has freedom to arrange
+    coefficients optimally while satisfying the tangent plane constraint.
+
+    Args:
+        reduction: 'mean' | 'sum' | 'none'
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        """
+        Compute MSE between predicted and target tangent plane projectors.
+
+        Reads from ctx: grad_coeffs, positions, normals, attention_mask.
+
+        Args:
+            ctx: LossContext with gradient-mode fields populated
+
+        Returns:
+            Scalar loss (or per-sample if reduction='none')
+        """
+        # Mask gradient coefficients at padded positions
+        mask_3d = ctx.attention_mask.unsqueeze(-1).float()  # (batch_size, max_k, 1)
+        grad_masked = ctx.grad_coeffs * mask_3d
+
+        # Predicted projector: P_pred[b, d, c] = Σ_k g[b,k,d] * pos[b,k,c]
+        predicted_P = torch.einsum('bkd,bkc->bdc', grad_masked, ctx.positions)  # (batch_size, 3, 3)
+
+        # Target projector: P = I - n̂n̂^T
+        normals = F.normalize(ctx.normals, p=2, dim=1)  # (batch_size, 3)
+        I = torch.eye(3, device=normals.device, dtype=normals.dtype).unsqueeze(0)  # (1, 3, 3)
+        target_P = I - torch.einsum('bi,bj->bij', normals, normals)  # (batch_size, 3, 3)
+
+        return F.mse_loss(predicted_P, target_P, reduction=self.reduction)
