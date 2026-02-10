@@ -5,7 +5,7 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
       seed: ${globals.training_seed}
-      epoch_size: 2000
+      epoch_size: 200
       grid_radius_range: [1.0]
       polynomial_offset_range: [0.0, 0.1]
       points_scale_range: [1.0]
@@ -42,7 +42,7 @@ module:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
         pose_transformers:
           - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
-        num_geodesic_sources: 3
+        num_geodesic_sources: 1
         geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
       num_workers: 0

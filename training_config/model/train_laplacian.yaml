@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 128
-  nhead: 8
+  d_model: 256
+  nhead: 32
   num_encoder_layers: 6
-  dim_feedforward: 128
+  dim_feedforward: 256
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.0
   normalize_loss_weights: True
@@ -16,14 +16,18 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 10
+      weight: 16000.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
-      weight: 1
+      weight: 1.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-      weight: 100
-
-
+      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
+        num_random_probes: 100
+        probe_mode: 'coordinates'
+      weight: 1.0

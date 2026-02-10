@@ -29,8 +29,8 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_area: False
-    batch_size: 500
-    num_workers: 5
+    batch_size: 1000
+    num_workers: 0
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
@@ -42,8 +42,8 @@ module:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
         pose_transformers:
           - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
-        num_geodesic_sources: 3
+        num_geodesic_sources: 1
         geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
-      num_workers: 2
+      num_workers: 0
       shuffle: False

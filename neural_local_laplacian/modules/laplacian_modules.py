@@ -192,10 +192,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # Output head: depends on operator_mode
         if self._operator_mode == "stiffness":
-            # Per-token → scalar stiffness weight s_ij (current behavior)
+            # Per-token â†’ scalar stiffness weight s_ij (current behavior)
             self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
         elif self._operator_mode == "gradient":
-            # Per-token → 3D gradient coefficient g_ij
+            # Per-token â†’ 3D gradient coefficient g_ij
             self.grad_projection = self._build_projection(d_model, 3, output_projection_hidden_dims)
 
         # Area head: aggregated features -> scalar area A_i (shared across modes)
@@ -540,7 +540,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             grad_coeffs = None
         elif self._operator_mode == "gradient":
             grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, k, 3)
-            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, k) — structural positivity
+            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, k) â€” structural positivity
 
         # === Area prediction (per patch) ===
         # OPTIMIZED: Simple mean pooling (no mask needed)
@@ -551,7 +551,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # === Scale areas back to original geometry ===
         if self._scale_areas_by_patch_size:
-            # A = A' * dÃ‚Â² (area scales as lengthÃ‚Â²)
+            # A = A' * dÃƒâ€šÃ‚Â² (area scales as lengthÃƒâ€šÃ‚Â²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
@@ -578,7 +578,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         - Normalizes patch positions to unit sphere before transformer
 
         If scale_areas_by_patch_size=True:
-        - Scales output areas by dÃƒâ€šÃ‚Â² to restore original geometry scale
+        - Scales output areas by dÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â² to restore original geometry scale
 
         Args:
             batch: PyTorch Geometric batch
@@ -644,7 +644,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         elif self._operator_mode == "gradient":
             grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, max_k, 3)
             grad_coeffs = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)  # Mask padding
-            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, max_k) — structural positivity
+            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, max_k) â€” structural positivity
 
         # === Area prediction (per patch) ===
         # Mean pooling of encoded features (excluding padding)
@@ -661,7 +661,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # === Scale areas back to original geometry ===
         if self._scale_areas_by_patch_size:
-            # A = A' * dÃƒâ€šÃ‚Â² (area scales as lengthÃƒâ€šÃ‚Â²)
+            # A = A' * dÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â² (area scales as lengthÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
@@ -712,6 +712,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                       if forward_result.get('grad_coeffs') is not None else None,
             normals=getattr(batch_data, 'normal', None),
             attention_mask=forward_result['attention_mask'],
+            areas=forward_result['areas'],
         )
 
         # Apply all losses through unified loss_configs pipeline
@@ -720,7 +721,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         loss_components_unweighted = {}
 
         for i, loss_config in enumerate(self._loss_configs):
-            # Compute unweighted loss — every loss takes the same LossContext
+            # Compute unweighted loss â€” every loss takes the same LossContext
             unweighted_loss = loss_config.loss_module(loss_context)
 
             # Store unweighted loss for logging
