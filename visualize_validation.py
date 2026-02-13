@@ -183,6 +183,25 @@ class LaplacianTimingResults:
 
 
 @dataclass
+class LaplacianSparsityStats:
+    """Sparsity statistics for a single Laplacian matrix."""
+    method_name: str = ""
+    num_vertices: int = 0
+    nnz: int = 0  # Number of non-zero entries
+    total_entries: int = 0  # n * n
+    sparsity_ratio: float = 0.0  # nnz / (n * n)
+    density_percent: float = 0.0  # sparsity_ratio * 100
+    avg_nnz_per_row: float = 0.0  # nnz / n
+    max_nnz_per_row: int = 0
+    min_nnz_per_row: int = 0
+
+    def __str__(self) -> str:
+        return (f"{self.method_name:<14} {self.num_vertices:>8} {self.nnz:>10} "
+                f"{self.density_percent:>8.4f}% {self.avg_nnz_per_row:>8.1f} "
+                f"[{self.min_nnz_per_row}, {self.max_nnz_per_row}]")
+
+
+@dataclass
 class GreensFunctionValidationResult:
     """Results from Green's function maximum principle validation.
 
@@ -223,7 +242,7 @@ class GreensFunctionValidationResult:
     # === SECONDARY TEST: Monotonic Decay ===
     # Green's function should decrease with distance from source
     distance_correlation: float = 0.0  # Correlation(g, -distance), should be positive
-    monotonicity_score: float = 0.0  # Fraction of vertex pairs where closerÃ¢â€ â€™higher value
+    monotonicity_score: float = 0.0  # Fraction of vertex pairs where closerÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢higher value
 
     # === TERTIARY TEST: Smoothness ===
     laplacian_residual_norm: float = 0.0  # ||Lg - delta|| / ||delta|| (should be small)
@@ -237,8 +256,8 @@ class GreensFunctionValidationResult:
     max_geodesic_dist: float = 0.0  # Maximum geodesic distance from source (for reference)
 
     def __str__(self) -> str:
-        status = "Ã¢Å“â€œ PASS" if self.satisfies_maximum_principle else "Ã¢Å“â€” FAIL"
-        max_status = "Ã¢Å“â€œ" if self.max_at_source else "Ã¢Å“â€”"
+        status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ PASS" if self.satisfies_maximum_principle else "ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ FAIL"
+        max_status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“" if self.max_at_source else "ÃƒÂ¢Ã…â€œÃ¢â‚¬â€"
         return (f"{self.method_name:<14} {self.value_at_source:>10.4f} {self.max_value:>10.4f} "
                 f"{max_status:^12} {self.num_violations:>6} {status:>10}")
 
@@ -336,6 +355,9 @@ class RealTimeEigenanalysisVisualizer:
 
         # NEW: Heat Method geodesic validation results
         self.current_heat_geodesic_results = None
+
+        # NEW: Laplacian sparsity comparison stats
+        self.current_sparsity_stats: Dict[str, LaplacianSparsityStats] = {}
 
         # Debug flags (set from config in run_dataset_iteration)
         self._diagnostic_mode = False
@@ -502,9 +524,9 @@ class RealTimeEigenanalysisVisualizer:
             # Show results for each method
             for method_name, result in self.current_greens_results.items():
                 if result.satisfies_maximum_principle:
-                    psim.TextColored((0.0, 1.0, 0.0, 1.0), f"  {method_name}: Ã¢Å“â€œ PASS")
+                    psim.TextColored((0.0, 1.0, 0.0, 1.0), f"  {method_name}: ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ PASS")
                 else:
-                    psim.TextColored((1.0, 0.0, 0.0, 1.0), f"  {method_name}: Ã¢Å“â€” FAIL")
+                    psim.TextColored((1.0, 0.0, 0.0, 1.0), f"  {method_name}: ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ FAIL")
                     if result.num_violations > 0:
                         psim.Text(f"    {result.num_violations} vertices above source")
                     if not result.max_at_source:
@@ -594,6 +616,28 @@ class RealTimeEigenanalysisVisualizer:
         else:
             psim.Text("(Not computed yet)")
 
+        # === LAPLACIAN SPARSITY COMPARISON ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Laplacian Sparsity Comparison:")
+
+        if self.current_sparsity_stats:
+            # Header
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<20} {'NNZ':>10} {'Density':>10} {'Avg/row':>8} {'Range'}")
+            psim.Separator()
+
+            for method_key, s in self.current_sparsity_stats.items():
+                if method_key == 'GT':
+                    color = (0.0, 1.0, 0.0, 1.0)  # Green
+                elif method_key == 'PRED':
+                    color = (1.0, 0.5, 0.0, 1.0)  # Orange
+                else:
+                    color = (0.0, 0.7, 1.0, 1.0)  # Blue
+
+                psim.TextColored(color, f"  {s.method_name:<20} {s.nnz:>10} {s.density_percent:>9.4f}% {s.avg_nnz_per_row:>8.1f} [{s.min_nnz_per_row}-{s.max_nnz_per_row}]")
+        else:
+            psim.Text("(Not computed yet)")
+
     def _has_current_batch_data(self) -> bool:
         """Check if we have current batch data available for re-computation."""
         return (self.current_gt_data is not None and
@@ -602,6 +646,148 @@ class RealTimeEigenanalysisVisualizer:
                 self.current_stiffness_weights is not None and
                 self.current_areas is not None and
                 self.current_original_vertices is not None)
+
+    def _compute_sparsity_for_matrix(self, matrix: scipy.sparse.spmatrix,
+                                      method_name: str) -> LaplacianSparsityStats:
+        """Compute sparsity statistics for a sparse matrix."""
+        n = matrix.shape[0]
+        csr = matrix.tocsr()
+        nnz = csr.nnz
+        total = n * n
+        nnz_per_row = np.diff(csr.indptr)  # number of non-zeros per row
+
+        return LaplacianSparsityStats(
+            method_name=method_name,
+            num_vertices=n,
+            nnz=nnz,
+            total_entries=total,
+            sparsity_ratio=nnz / total if total > 0 else 0.0,
+            density_percent=(nnz / total * 100) if total > 0 else 0.0,
+            avg_nnz_per_row=nnz / n if n > 0 else 0.0,
+            max_nnz_per_row=int(nnz_per_row.max()) if len(nnz_per_row) > 0 else 0,
+            min_nnz_per_row=int(nnz_per_row.min()) if len(nnz_per_row) > 0 else 0
+        )
+
+    def _compute_and_store_all_sparsity_stats(self):
+        """Compute and store sparsity stats for all available Laplacians, and print to console."""
+        stats = {}
+
+        # GT Laplacian (rebuild from igl)
+        if HAS_IGL and self.current_gt_data is not None:
+            try:
+                V = self.current_gt_data['vertices'].astype(np.float64)
+                F = self.current_gt_data['faces'].astype(np.int32)
+                L_gt = igl.cotmatrix(V, F)
+                stats['GT'] = self._compute_sparsity_for_matrix(L_gt, "GT (Cotangent)")
+            except Exception as e:
+                print(f"  [!] Failed to compute GT sparsity: {e}")
+
+        # PRED Laplacian
+        if self.current_inference_result is not None and self.current_inference_result.get('stiffness_matrix') is not None:
+            stats['PRED'] = self._compute_sparsity_for_matrix(
+                self.current_inference_result['stiffness_matrix'], "PRED (Neural)"
+            )
+
+        # Robust Laplacian (rebuild with current k)
+        if not self._skip_robust and self.current_original_vertices is not None:
+            try:
+                k = self.reconstruction_settings.current_robust_k
+                L_robust, _ = robust_laplacian.point_cloud_laplacian(
+                    self.current_original_vertices, n_neighbors=k
+                )
+                stats['Robust'] = self._compute_sparsity_for_matrix(L_robust, f"Robust (k={k})")
+            except Exception as e:
+                print(f"  [!] Failed to compute Robust sparsity: {e}")
+
+        self.current_sparsity_stats = stats
+        self._print_sparsity_comparison()
+
+    def _print_sparsity_comparison(self):
+        """Print sparsity comparison table to console."""
+        stats = self.current_sparsity_stats
+        if not stats:
+            return
+
+        print(f"\n{'=' * 85}")
+        print("LAPLACIAN SPARSITY COMPARISON")
+        print(f"{'=' * 85}")
+        print(f"{'Method':<20} {'N':>8} {'NNZ':>10} {'Density':>10} {'Avg NNZ/row':>12} {'Range NNZ/row'}")
+        print(f"{'-' * 85}")
+
+        for method_name, s in stats.items():
+            print(f"{s.method_name:<20} {s.num_vertices:>8} {s.nnz:>10} "
+                  f"{s.density_percent:>9.4f}% {s.avg_nnz_per_row:>12.1f} "
+                  f"[{s.min_nnz_per_row}, {s.max_nnz_per_row}]")
+
+        print(f"{'=' * 85}\n")
+
+    def _recompute_validations_after_k_change(self):
+        """Recompute all downstream validations after a k change.
+
+        This re-runs Green's function validation (step 8), heat method geodesics (step 9),
+        sparsity stats, and updates all UI-facing results.
+        """
+        if self.current_gt_data is None or self.current_inference_result is None:
+            print("[!] No current data available for validation recomputation")
+            return
+
+        vertices = self.current_gt_data['vertices']
+        faces = self.current_gt_data['faces']
+        mesh_structure = self.current_mesh_structure
+
+        # --- Recompute sparsity stats ---
+        print("\nRecomputing sparsity stats...")
+        self._compute_and_store_all_sparsity_stats()
+
+        # --- Recompute Green's function validation (Step 8) ---
+        print("\nRecomputing Green's function validation...")
+        try:
+            greens_results = self.compute_and_visualize_greens_functions(
+                mesh_structure, self.current_gt_data, self.current_inference_result
+            )
+            self.current_greens_results = greens_results
+        except Exception as e:
+            print(f"  [!] Green's function recomputation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # --- Recompute Heat Method geodesics (Step 9) ---
+        print("\nRecomputing Heat Method geodesics...")
+        try:
+            # Build Laplacians
+            L_gt, M_gt = None, None
+            L_pred, M_pred = None, None
+            L_robust, M_robust = None, None
+
+            if HAS_IGL:
+                V = vertices.astype(np.float64)
+                F = faces.astype(np.int32)
+                L_gt = -igl.cotmatrix(V, F)
+                M_gt = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+
+            if self.current_inference_result.get('stiffness_matrix') is not None:
+                L_pred = self.current_inference_result['stiffness_matrix']
+                M_pred = self.current_inference_result.get('mass_matrix')
+
+            if not self._skip_robust:
+                k = self.reconstruction_settings.current_robust_k
+                L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
+
+            heat_geodesic_results = self.validate_heat_method_geodesics_step9(
+                vertices=vertices,
+                faces=faces,
+                L_gt=L_gt, M_gt=M_gt,
+                L_pred=L_pred, M_pred=M_pred,
+                L_robust=L_robust, M_robust=M_robust,
+                source_vertex_idx=None,
+                mesh_structure=mesh_structure,
+                k_neighbors=self.original_k if self.original_k else 20
+            )
+            self.current_heat_geodesic_results = heat_geodesic_results
+        except Exception as e:
+            print(f"  [!] Heat Method geodesic recomputation failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _clear_stored_references(self):
         """Clear stored references from previous batch to free memory.
@@ -621,6 +807,7 @@ class RealTimeEigenanalysisVisualizer:
         self.current_inference_result = None
         self.current_predicted_data = None
         self.current_original_vertices = None
+        self.current_sparsity_stats = {}
 
         # Force garbage collection
         import gc
@@ -1051,6 +1238,13 @@ class RealTimeEigenanalysisVisualizer:
         print(f"  Extracted {len(new_patch_data.center_indices)} patches with {new_k} neighbors each")
         print(f"  [TIMING] PRED patch extraction: {pred_extraction_time * 1000:.2f} ms")
 
+        # Update stored k-NN connectivity to match new k
+        # (critical: downstream code like gradient operator assembly uses these)
+        # Move to device since forward_result tensors (grad_coeffs etc.) live on GPU
+        self.current_vertex_indices = new_patch_data.vertex_indices.to(self.current_device)
+        self.current_center_indices = new_patch_data.center_indices.to(self.current_device)
+        self.current_batch_indices = new_patch_data.patch_idx.to(self.current_device)
+
         # STEP 2: Re-run model inference (timing is inside perform_model_inference)
         print(f"STEP 2: Re-running model inference...")
         new_inference_result = self.perform_model_inference(
@@ -1063,6 +1257,29 @@ class RealTimeEigenanalysisVisualizer:
 
         self.current_inference_result = new_inference_result
         print(f"  PRED eigenvalue range: [{new_inference_result['predicted_eigenvalues'][0]:.2e}, {new_inference_result['predicted_eigenvalues'][-1]:.6f}]")
+
+        # Update stored raw weights and areas to stay in sync
+        self.current_stiffness_weights = torch.from_numpy(new_inference_result['stiffness_weights'])
+        self.current_areas = torch.from_numpy(new_inference_result['areas'])
+
+        # Reassemble learned gradient operator if in gradient mode
+        operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness')
+        new_forward_result = new_inference_result.get('forward_result')
+        if operator_mode == "gradient" and new_forward_result is not None and new_forward_result.get('grad_coeffs') is not None:
+            try:
+                print("  Reassembling learned gradient operator G for new k...")
+                batch_indices_for_g = self.current_batch_indices.clone()
+                self.current_learned_gradient_op = assemble_gradient_operator(
+                    grad_coeffs=new_forward_result['grad_coeffs'],
+                    attention_mask=new_forward_result['attention_mask'],
+                    vertex_indices=self.current_vertex_indices,
+                    center_indices=self.current_center_indices,
+                    batch_indices=batch_indices_for_g
+                )
+                print(f"  Updated learned G: {self.current_learned_gradient_op.shape} ({self.current_learned_gradient_op.nnz} non-zeros)")
+            except Exception as e:
+                print(f"  [!] Failed to reassemble learned gradient operator: {e}")
+                self.current_learned_gradient_op = None
 
         # Compute PRED total time
         pred_total_time = (self.timing_results.pred_patch_extraction_time +
@@ -1086,6 +1303,10 @@ class RealTimeEigenanalysisVisualizer:
 
         # Update eigenvector visualizations on the mesh
         self._update_eigenvector_visualizations()
+
+        # STEP 5: Recompute all downstream validations (Green's fn, geodesics, sparsity)
+        print(f"STEP 5: Recomputing downstream validations...")
+        self._recompute_validations_after_k_change()
 
         # Print timing summary
         self._print_timing_summary()
@@ -1126,6 +1347,10 @@ class RealTimeEigenanalysisVisualizer:
 
         # Update eigenvector visualizations on the mesh
         self._update_eigenvector_visualizations()
+
+        # Recompute all downstream validations (Green's fn, geodesics, sparsity)
+        print(f"Recomputing downstream validations...")
+        self._recompute_validations_after_k_change()
 
         print(f"\n[OK] Updated Robust with k={new_k}")
         print('=' * 60)
@@ -1401,7 +1626,7 @@ class RealTimeEigenanalysisVisualizer:
         """
         try:
             # Use the centralized eigendecomposition function from utils
-            # Note: eigsh returns M-orthonormal eigenvectors (ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦ = I)
+            # Note: eigsh returns M-orthonormal eigenvectors (ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ = I)
             # We preserve this property for correct area-weighted reconstruction
             eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
                 stiffness_matrix, k, mass_matrix=mass_matrix
@@ -1511,7 +1736,7 @@ class RealTimeEigenanalysisVisualizer:
             print(f"[TIMING] GT (PyFM) Laplacian + eigen: {gt_laplacian_time * 1000:.2f} ms")
 
             # Retrieve eigenvalues, eigenfunctions, and vertex areas
-            # Note: PyFM returns M-orthonormal eigenvectors (ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦ = I)
+            # Note: PyFM returns M-orthonormal eigenvectors (ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ = I)
             # We preserve this property for correct area-weighted reconstruction
             gt_eigenvalues = pyfm_mesh.eigenvalues
             gt_eigenvectors = pyfm_mesh.eigenvectors
@@ -1829,7 +2054,7 @@ class RealTimeEigenanalysisVisualizer:
         """
         Compute surface gradient of a scalar field using the learned gradient operator G.
 
-        G is (3N, N). G @ f gives a (3N,) vector that reshapes to (N, 3) — per-vertex gradients.
+        G is (3N, N). G @ f gives a (3N,) vector that reshapes to (N, 3) â€” per-vertex gradients.
 
         Args:
             scalar_field: Per-vertex scalar (N,)
@@ -1887,18 +2112,18 @@ class RealTimeEigenanalysisVisualizer:
         """
         Compute mesh reconstruction using area-weighted inner products (fully vectorized).
 
-        For M-orthonormal eigenvectors from generalized eigenvalue problem (S v = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â» M v),
-        the Gram matrix G = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦ = I, so projection coefficients simplify to:
-            c = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T M f
+        For M-orthonormal eigenvectors from generalized eigenvalue problem (S v = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â» M v),
+        the Gram matrix G = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ = I, so projection coefficients simplify to:
+            c = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M f
         and reconstruction is:
-            f_l = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦_l c_l = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â£_{i=0}^{l-1} ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã‚Â _i (ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã‚Â _i^T M f)
+            f_l = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦_l c_l = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£_{i=0}^{l-1} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â _i (ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â _i^T M f)
 
         This vectorized implementation computes all progressive reconstructions efficiently
         using cumulative sums, avoiding Python loops entirely.
 
         Args:
             original_vertices: Original mesh vertices f in R^{n x 3}
-            eigenvectors: Eigenvectors Phi in R^{n x k} (M-orthonormal: ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦ = I)
+            eigenvectors: Eigenvectors Phi in R^{n x k} (M-orthonormal: ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ = I)
             num_available: Number of available eigenvectors to use
             vertex_areas: Vertex areas a in R^n (diagonal of mass matrix M)
 
@@ -1909,21 +2134,21 @@ class RealTimeEigenanalysisVisualizer:
             return []
 
         # Apply diagonal mass matrix efficiently: M @ f = diag(areas) @ f
-        # No need to form full nÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Ân matrix - just element-wise multiplication
+        # No need to form full nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Ân matrix - just element-wise multiplication
         M_f = vertex_areas[:, np.newaxis] * original_vertices  # (n, 3)
 
-        # Compute all M-weighted coefficients at once: c = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T M f
-        # Since ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦ is M-orthonormal, these are the exact projection coefficients
+        # Compute all M-weighted coefficients at once: c = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M f
+        # Since ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ is M-orthonormal, these are the exact projection coefficients
         Phi = eigenvectors[:, :num_available]  # (n, L)
         coefficients = Phi.T @ M_f  # (L, 3)
 
         # Compute contribution from each eigenvector via broadcasting:
-        # contribution_i = ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã‚Â _i ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â c_i^T (outer product, but c_i is a row vector)
-        # Shape: (n, L, 1) * (1, L, 3) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ (n, L, 3)
+        # contribution_i = ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â _i ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â c_i^T (outer product, but c_i is a row vector)
+        # Shape: (n, L, 1) * (1, L, 3) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ (n, L, 3)
         contributions = Phi[:, :, np.newaxis] * coefficients[np.newaxis, :, :]
 
         # Cumulative sum along eigenvector axis gives progressive reconstructions:
-        # cumulative[:, l, :] = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â£_{i=0}^{l} contribution_i = reconstruction using (l+1) eigenvectors
+        # cumulative[:, l, :] = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£_{i=0}^{l} contribution_i = reconstruction using (l+1) eigenvectors
         cumulative = np.cumsum(contributions, axis=1)  # (n, L, 3)
 
         # Convert to list of (n, 3) arrays
@@ -1935,15 +2160,15 @@ class RealTimeEigenanalysisVisualizer:
         Compute mesh reconstruction using standard Euclidean inner products (optimized).
 
         Solves the least squares problem for each l:
-            min_c ||f - ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦_l c||_2^2
+            min_c ||f - ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦_l c||_2^2
 
-        Solution: c = (ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦_l^T ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦_l)^{-1} ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦_l^T f, then f_l = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦_l c
+        Solution: c = (ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦_l^T ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦_l)^{-1} ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦_l^T f, then f_l = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦_l c
 
         Note: Eigenvectors from generalized EVP are M-orthonormal, not L2-orthonormal.
         Even after L2-renormalization, they are L2-normalized but NOT L2-orthogonal.
-        So we must compute the actual Gram matrix G = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦.
+        So we must compute the actual Gram matrix G = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦.
 
-        Optimized by precomputing ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦ and ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T f once, then extracting submatrices.
+        Optimized by precomputing ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ and ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T f once, then extracting submatrices.
 
         Args:
             original_vertices: Original mesh vertices of shape (N, 3)
@@ -1958,13 +2183,13 @@ class RealTimeEigenanalysisVisualizer:
 
         Phi = eigenvectors[:, :num_available]  # (n, L)
 
-        # Precompute full Gram matrix G_full = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦ and projection target b_full = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦^T f
+        # Precompute full Gram matrix G_full = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ and projection target b_full = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T f
         G_full = Phi.T @ Phi  # (L, L)
         b_full = Phi.T @ original_vertices  # (L, 3)
 
         reconstructed_meshes = []
         for l in range(1, num_available + 1):
-            # Extract lÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Âl submatrix and lÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â3 subvector
+            # Extract lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Âl submatrix and lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â3 subvector
             G_l = G_full[:l, :l]
             b_l = b_full[:l, :]
 
@@ -1974,7 +2199,7 @@ class RealTimeEigenanalysisVisualizer:
             except np.linalg.LinAlgError:
                 c = np.linalg.pinv(G_l) @ b_l
 
-            # Reconstruct: f_l = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â¦_l c
+            # Reconstruct: f_l = ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦_l c
             reconstructed_meshes.append(Phi[:, :l] @ c)
 
         return reconstructed_meshes
@@ -2687,11 +2912,11 @@ class RealTimeEigenanalysisVisualizer:
             regularization: float = 1e-6
     ) -> Optional[Tuple[np.ndarray, float]]:
         """
-        Compute the harmonic Green's function by solving (L + ÃŽÂµM)g = ÃŽÂ´.
+        Compute the harmonic Green's function by solving (L + ÃƒÅ½Ã‚ÂµM)g = ÃƒÅ½Ã‚Â´.
 
-        The Green's function g satisfies Lg = ÃŽÂ´_source, where ÃŽÂ´ is a delta function
+        The Green's function g satisfies Lg = ÃƒÅ½Ã‚Â´_source, where ÃƒÅ½Ã‚Â´ is a delta function
         at the source vertex. Since L is singular (constant null space), we use
-        regularization: (L + ÃŽÂµM)g = ÃŽÂ´.
+        regularization: (L + ÃƒÅ½Ã‚ÂµM)g = ÃƒÅ½Ã‚Â´.
 
         After solving:
         1. Compute Laplacian residual on RAW solution (before normalization)
@@ -2708,12 +2933,12 @@ class RealTimeEigenanalysisVisualizer:
             laplacian_matrix: Sparse Laplacian matrix L (n x n), should be positive semi-definite
             mass_matrix: Sparse diagonal mass matrix M (n x n), or None for identity
             source_vertex_idx: Index of the source vertex
-            regularization: Regularization parameter ÃŽÂµ (default 1e-6)
+            regularization: Regularization parameter ÃƒÅ½Ã‚Âµ (default 1e-6)
 
         Returns:
             Tuple of (g, residual_norm) where:
             - g: Normalized Green's function values in [0, 1] range
-            - residual_norm: ||Lg_raw - ÃŽÂ´|| / ||ÃŽÂ´|| computed before normalization
+            - residual_norm: ||Lg_raw - ÃƒÅ½Ã‚Â´|| / ||ÃƒÅ½Ã‚Â´|| computed before normalization
             Returns None on failure.
         """
         n = laplacian_matrix.shape[0]
@@ -2747,7 +2972,7 @@ class RealTimeEigenanalysisVisualizer:
 
             print(f"    Using regularization: {adaptive_reg:.2e} (scale={L_scale:.2e})")
 
-            # Regularized system: (L + ÃŽÂµM)g = ÃŽÂ´
+            # Regularized system: (L + ÃƒÅ½Ã‚ÂµM)g = ÃƒÅ½Ã‚Â´
             A = L + adaptive_reg * M
 
             # Solve the linear system
@@ -2773,7 +2998,7 @@ class RealTimeEigenanalysisVisualizer:
 
             # =========================================================
             # Compute Laplacian residual BEFORE normalization
-            # This measures how well Lg Ã¢â€°Ë† ÃŽÂ´
+            # This measures how well Lg ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  ÃƒÅ½Ã‚Â´
             # =========================================================
             Lg = L @ g_raw
             residual = Lg - delta
@@ -2842,7 +3067,7 @@ class RealTimeEigenanalysisVisualizer:
             method_name: Name of the method ("GT", "PRED", or "Robust")
             vertices: Mesh vertices (n, 3) for computing distances
             faces: Mesh faces (m, 3) for geodesic distance computation
-            laplacian_residual_norm: Pre-computed ||Lg - ÃŽÂ´|| / ||ÃŽÂ´|| (before normalization)
+            laplacian_residual_norm: Pre-computed ||Lg - ÃƒÅ½Ã‚Â´|| / ||ÃƒÅ½Ã‚Â´|| (before normalization)
             gt_greens_function: Optional GT Green's function for comparison (also normalized)
 
         Returns:
@@ -3128,7 +3353,7 @@ class RealTimeEigenanalysisVisualizer:
         Compute and visualize Green's functions for GT, PRED, and Robust Laplacians.
 
         This validates the discrete maximum principle for each Laplacian:
-        - Solves Lg = ÃŽÂ´_source for each method
+        - Solves Lg = ÃƒÅ½Ã‚Â´_source for each method
         - Checks that g >= 0 everywhere (no negative values)
         - Checks that max(g) is at the source vertex
 
@@ -3426,9 +3651,9 @@ class RealTimeEigenanalysisVisualizer:
         print("-" * 62)
         for method_name, result in results.items():
             if result.num_positive_vertices == 0:
-                status = "Ã¢Å“â€œ PASS"
+                status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ PASS"
             else:
-                status = "Ã¢Å“â€” FAIL"
+                status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ FAIL"
             print(f"{result.method_name:<14} {result.num_positive_vertices:>10} {result.max_positive_value:>14.6f} "
                   f"{result.positive_vertex_idx:>10} {status:>10}")
 
@@ -3453,7 +3678,7 @@ class RealTimeEigenanalysisVisualizer:
             print(f"{result.method_name:<14} {corr:>12.4f} {mono:>12.4f} {quality:>12}")
 
         # Tertiary test: Laplacian residual
-        print("\n[3] SMOOTHNESS TEST (Laplacian residual ||Lg - ÃŽÂ´|| / ||ÃŽÂ´||)")
+        print("\n[3] SMOOTHNESS TEST (Laplacian residual ||Lg - ÃƒÅ½Ã‚Â´|| / ||ÃƒÅ½Ã‚Â´||)")
         print(f"{'Method':<14} {'Residual':>12} {'Quality':>12}")
         print("-" * 40)
         for method_name, result in results.items():
@@ -3491,9 +3716,9 @@ class RealTimeEigenanalysisVisualizer:
         # Overall summary
         all_pass = all(r.satisfies_maximum_principle for r in results.values())
         if all_pass:
-            print("Ã¢Å“â€œ All methods satisfy the discrete maximum principle")
+            print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ All methods satisfy the discrete maximum principle")
         else:
-            print("Ã¢Å“â€” Some methods VIOLATE the discrete maximum principle:")
+            print("ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ Some methods VIOLATE the discrete maximum principle:")
             for method_name, result in results.items():
                 if not result.satisfies_maximum_principle:
                     print(f"  - {result.method_name}: Max value {result.max_value:.4f} at vertex {result.worst_violation_vertex}, "
@@ -4079,9 +4304,9 @@ class RealTimeEigenanalysisVisualizer:
         self.current_areas = torch.from_numpy(inference_result['areas'])
         self.current_original_vertices = gt_data['vertices']
         self.original_k = original_k  # Use the k calculated earlier
-        self.current_vertex_indices = patch_data.vertex_indices
-        self.current_center_indices = patch_data.center_indices
-        self.current_batch_indices = patch_data.patch_idx  # MeshPatchData uses patch_idx
+        self.current_vertex_indices = patch_data.vertex_indices.to(device)
+        self.current_center_indices = patch_data.center_indices.to(device)
+        self.current_batch_indices = patch_data.patch_idx.to(device)  # MeshPatchData uses patch_idx
 
         # Store model, device, and mesh info for k updates
         self.current_model = model
@@ -4096,7 +4321,7 @@ class RealTimeEigenanalysisVisualizer:
         if operator_mode == "gradient" and forward_result is not None and forward_result.get('grad_coeffs') is not None:
             try:
                 print("Assembling learned gradient operator G...")
-                batch_indices_for_g = patch_data.patch_idx.clone() if torch.is_tensor(patch_data.patch_idx) else torch.tensor(patch_data.patch_idx)
+                batch_indices_for_g = self.current_batch_indices.clone()
                 self.current_learned_gradient_op = assemble_gradient_operator(
                     grad_coeffs=forward_result['grad_coeffs'],
                     attention_mask=forward_result['attention_mask'],
@@ -4127,6 +4352,10 @@ class RealTimeEigenanalysisVisualizer:
         gt_data['robust_eigenvalues'] = robust_eigenvalues
         gt_data['robust_eigenvectors'] = robust_eigenvectors
         gt_data['robust_vertex_areas'] = robust_vertex_areas
+
+        # STEP 5.6: Compute Laplacian sparsity comparison
+        print(f"\nSTEP 5.6: Computing Laplacian sparsity comparison...")
+        self._compute_and_store_all_sparsity_stats()
 
         # STEP 6: Visualization (skip if not needed)
         if not self._skip_visualization:

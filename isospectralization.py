@@ -10,8 +10,8 @@ internal consistency. This demonstrates end-to-end differentiability of the
 neural Laplacian pipeline for inverse spectral geometry.
 
 The gradient chain:
-    positions → k-NN patches → frozen model → (S_weights, areas)
-    → differentiable assembly (S, M) → eigvalsh → loss → ∂loss/∂positions
+    positions â†’ k-NN patches â†’ frozen model â†’ (S_weights, areas)
+    â†’ differentiable assembly (S, M) â†’ eigvalsh â†’ loss â†’ âˆ‚loss/âˆ‚positions
 
 Usage:
     python isospectralization.py \
@@ -32,6 +32,7 @@ import polyscope as ps
 import polyscope.imgui as psim
 import trimesh
 from sklearn.neighbors import NearestNeighbors
+import robust_laplacian
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
 from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
@@ -69,13 +70,15 @@ def load_model(ckpt_path: str, device: torch.device) -> LaplacianTransformerModu
 # Shape loading
 # ---------------------------------------------------------------------------
 
-def load_shape(mesh_path: str) -> np.ndarray:
-    """Load a mesh and return normalized vertices."""
+def load_shape(mesh_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load a mesh and return (normalized vertices, faces)."""
     mesh = trimesh.load(str(mesh_path))
     vertices = np.array(mesh.vertices, dtype=np.float32)
     vertices = normalize_mesh_vertices(vertices)
-    print(f"  Loaded {mesh_path}: {len(vertices)} vertices")
-    return vertices
+    faces = np.array(mesh.faces, dtype=np.int64) if hasattr(mesh, 'faces') else None
+    n_faces = len(faces) if faces is not None else 0
+    print(f"  Loaded {mesh_path}: {len(vertices)} vertices, {n_faces} faces")
+    return vertices, faces
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +111,27 @@ def compute_knn(vertices_np: np.ndarray, k: int) -> np.ndarray:
     return neighbor_indices_flat.reshape(num_vertices, k)
 
 
+def chamfer_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Differentiable Chamfer distance between two point sets.
+
+    CD(X, Y) = (1/|X|) Σ min_j ||x_i - y_j||² + (1/|Y|) Σ min_i ||y_j - x_i||²
+
+    Args:
+        x: (N, 3) point set
+        y: (M, 3) point set
+
+    Returns:
+        Scalar Chamfer distance (mean of both directions)
+    """
+    # (N, M) pairwise squared distance matrix
+    dists = torch.cdist(x, y, p=2).pow(2)
+    # For each point in x, min distance to y (and vice versa)
+    min_x_to_y = dists.min(dim=1).values.mean()
+    min_y_to_x = dists.min(dim=0).values.mean()
+    return min_x_to_y + min_y_to_x
+
+
 def build_patch_data(
     vertices: torch.Tensor,
     neighbor_indices: np.ndarray,
@@ -116,7 +140,7 @@ def build_patch_data(
     """
     Build MeshPatchData from vertex positions and precomputed k-NN.
 
-    Gradient flows through vertex positions → patch positions → features.
+    Gradient flows through vertex positions â†’ patch positions â†’ features.
 
     Args:
         vertices: (N, 3) torch tensor WITH gradient tracking
@@ -309,7 +333,7 @@ def compute_spectrum(
         batch_indices=batch_idx,
     )
 
-    # Generalized EVP: S v = λ M v  →  M^{-1/2} S M^{-1/2} w = λ w
+    # Generalized EVP: S v = Î» M v  â†’  M^{-1/2} S M^{-1/2} w = Î» w
     M_inv_sqrt = 1.0 / torch.sqrt(M_diag.clamp(min=1e-8))
     M_inv_sqrt_diag = torch.diag(M_inv_sqrt)
 
@@ -372,6 +396,23 @@ def compute_spectrum_numpy(
     return eigenvalues
 
 
+def compute_robust_spectrum(
+    vertices_np: np.ndarray,
+    faces: np.ndarray,
+    num_eigenvalues: int,
+) -> np.ndarray:
+    """
+    Compute eigenvalue spectrum using robust-laplacian (non-differentiable).
+    Uses mesh Laplacian if faces are available, otherwise point cloud Laplacian.
+    """
+    if faces is not None and len(faces) > 0:
+        L, M = robust_laplacian.mesh_laplacian(vertices_np, faces)
+    else:
+        L, M = robust_laplacian.point_cloud_laplacian(vertices_np)
+    eigenvalues, _ = compute_laplacian_eigendecomposition(L, num_eigenvalues, mass_matrix=M)
+    return eigenvalues
+
+
 # ---------------------------------------------------------------------------
 # Polyscope visualization
 # ---------------------------------------------------------------------------
@@ -380,12 +421,22 @@ class IsospectralizationVisualizer:
     """Manages polyscope visualization during optimization."""
 
     def __init__(self, target_verts: np.ndarray, source_verts: np.ndarray,
-                 target_spectrum: np.ndarray, num_eigenvalues: int):
+                 target_spectrum: np.ndarray, num_eigenvalues: int,
+                 source_pred_spectrum: np.ndarray = None,
+                 source_robust_spectrum: np.ndarray = None,
+                 target_robust_spectrum: np.ndarray = None):
         self.target_spectrum = target_spectrum
+        self.source_pred_spectrum = source_pred_spectrum if source_pred_spectrum is not None else np.zeros(num_eigenvalues)
+        self.source_robust_spectrum = source_robust_spectrum if source_robust_spectrum is not None else np.zeros(num_eigenvalues)
+        self.target_robust_spectrum = target_robust_spectrum if target_robust_spectrum is not None else np.zeros(num_eigenvalues)
+        self.current_robust_spectrum = np.zeros(num_eigenvalues)
         self.num_eigenvalues = num_eigenvalues
         self.loss_history = []
         self.current_step = 0
         self.current_loss = float('inf')
+        self.current_spectral_loss = 0.0
+        self.current_proximity_loss = 0.0
+        self.current_alpha = 0.0
         self.current_spectrum = np.zeros(num_eigenvalues)
         self.running = True
 
@@ -423,36 +474,47 @@ class IsospectralizationVisualizer:
 
     def _ui_callback(self):
         """ImGui callback for optimization info display."""
-        # Scale window height: ~150px base + ~20px per eigenvalue row
-        window_height = 200 + 20 * self.num_eigenvalues
-        psim.SetNextWindowSize((420, window_height))
+        # Scale window height: ~220px base + ~20px per eigenvalue row
+        window_height = 220 + 20 * self.num_eigenvalues
+        psim.SetNextWindowSize((820, window_height))
         psim.SetNextWindowPos((10, 10))
 
         opened = psim.Begin("Isospectralization", True)
         if opened:
             psim.Text(f"Step: {self.current_step}")
-            psim.Text(f"Loss: {self.current_loss:.6e}")
+            psim.Text(f"Total Loss: {self.current_loss:.6e}")
+            psim.Text(f"  Spectral:  {self.current_spectral_loss:.6e}")
+            if self.current_alpha > 0:
+                psim.Text(f"  Proximity: {self.current_proximity_loss:.6e} (alpha={self.current_alpha:.1f})")
             psim.Separator()
 
             # Eigenvalue comparison table
             psim.Text("Eigenvalue Comparison (skip lambda_0):")
-            psim.Columns(3, "eig_table")
+            psim.Columns(7, "eig_table")
             psim.Separator()
             psim.Text("Index"); psim.NextColumn()
-            psim.Text("Target"); psim.NextColumn()
-            psim.Text("Current"); psim.NextColumn()
+            psim.Text("Tgt PRED"); psim.NextColumn()
+            psim.Text("Tgt Robust"); psim.NextColumn()
+            psim.Text("Cur PRED"); psim.NextColumn()
+            psim.Text("Cur Robust"); psim.NextColumn()
+            psim.Text("Src PRED"); psim.NextColumn()
+            psim.Text("Src Robust"); psim.NextColumn()
             psim.Separator()
 
             n_show = self.num_eigenvalues
-            for i in range(1, n_show):  # Skip λ₀
+            for i in range(1, n_show):
                 psim.Text(f"{i}"); psim.NextColumn()
                 psim.Text(f"{self.target_spectrum[i]:.4f}"); psim.NextColumn()
+                psim.Text(f"{self.target_robust_spectrum[i]:.4f}"); psim.NextColumn()
                 psim.Text(f"{self.current_spectrum[i]:.4f}"); psim.NextColumn()
+                psim.Text(f"{self.current_robust_spectrum[i]:.4f}"); psim.NextColumn()
+                psim.Text(f"{self.source_pred_spectrum[i]:.4f}"); psim.NextColumn()
+                psim.Text(f"{self.source_robust_spectrum[i]:.4f}"); psim.NextColumn()
             psim.Columns(1, "")
 
             psim.Separator()
             if len(self.loss_history) > 1:
-                psim.Text(f"Loss reduction: {self.loss_history[0]:.4e} → {self.current_loss:.4e}")
+                psim.Text(f"Loss reduction: {self.loss_history[0]:.4e} â†’ {self.current_loss:.4e}")
                 ratio = self.current_loss / (self.loss_history[0] + 1e-12)
                 psim.Text(f"  ({ratio:.2%} of initial)")
 
@@ -463,11 +525,18 @@ class IsospectralizationVisualizer:
         psim.End()
 
     def update(self, step: int, loss: float, source_verts: np.ndarray,
-               current_spectrum: np.ndarray):
+               current_spectrum: np.ndarray, spectral_loss: float = 0.0,
+               proximity_loss: float = 0.0, alpha: float = 0.0,
+               current_robust_spectrum: np.ndarray = None):
         """Update visualization with current optimization state."""
         self.current_step = step
         self.current_loss = loss
+        self.current_spectral_loss = spectral_loss
+        self.current_proximity_loss = proximity_loss
+        self.current_alpha = alpha
         self.current_spectrum = current_spectrum
+        if current_robust_spectrum is not None:
+            self.current_robust_spectrum = current_robust_spectrum
         self.loss_history.append(loss)
 
         # Update source point cloud positions
@@ -503,12 +572,20 @@ def run_isospectralization(
     recompute_knn_every: int = 50,
     vis_every: int = 10,
     scheduler_type: str = None,
+    alpha: float = 0.0,
 ):
     """
     Run isospectralization optimization.
 
     Optimizes source vertex positions so its neural Laplacian spectrum
     matches the target's neural Laplacian spectrum.
+
+    When alpha > 0, adds a Chamfer distance regularizer to keep the deformed
+    shape visually close to the original source geometry. Unlike L2, Chamfer
+    allows vertices to slide along the surface without penalty — it only
+    penalizes deviation from the original point set. This enables adversarial
+    spectral perturbation: the result looks like the source but has the
+    spectral signature of the target.
     """
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -518,19 +595,38 @@ def run_isospectralization(
 
     # Load shapes
     print("Loading shapes...")
-    target_verts = load_shape(target_path)
-    source_verts = load_shape(source_path)
+    target_verts, target_faces = load_shape(target_path)
+    source_verts, source_faces = load_shape(source_path)
 
     print(f"  Target: {len(target_verts)} vertices")
     print(f"  Source: {len(source_verts)} vertices")
 
     # --- Compute target spectrum (no grad, scipy for robustness) ---
-    print("\nComputing target spectrum...")
+    print("\nComputing target spectrum (PRED)...")
     target_spectrum_np = compute_spectrum_numpy(
         model, target_verts, k, num_eigenvalues, device
     )
     target_spectrum = torch.from_numpy(target_spectrum_np).float().to(device)
     print(f"  Target eigenvalues (first 5): {target_spectrum_np[:5]}")
+
+    # --- Compute source initial spectra for reference ---
+    print("Computing source initial spectrum (PRED)...")
+    source_pred_spectrum_np = compute_spectrum_numpy(
+        model, source_verts, k, num_eigenvalues, device
+    )
+    print(f"  Source PRED eigenvalues (first 5): {source_pred_spectrum_np[:5]}")
+
+    print("Computing source initial spectrum (Robust)...")
+    source_robust_spectrum_np = compute_robust_spectrum(
+        source_verts, source_faces, num_eigenvalues
+    )
+    print(f"  Source Robust eigenvalues (first 5): {source_robust_spectrum_np[:5]}")
+
+    print("Computing target spectrum (Robust)...")
+    target_robust_spectrum_np = compute_robust_spectrum(
+        target_verts, target_faces, num_eigenvalues
+    )
+    print(f"  Target Robust eigenvalues (first 5): {target_robust_spectrum_np[:5]}")
 
     # --- Initialize source as optimizable parameter ---
     source_verts_param = nn.Parameter(
@@ -549,14 +645,22 @@ def run_isospectralization(
 
     # --- Initialize visualization ---
     visualizer = IsospectralizationVisualizer(
-        target_verts, source_verts, target_spectrum_np, num_eigenvalues
+        target_verts, source_verts, target_spectrum_np, num_eigenvalues,
+        source_pred_spectrum=source_pred_spectrum_np,
+        source_robust_spectrum=source_robust_spectrum_np,
+        target_robust_spectrum=target_robust_spectrum_np,
     )
 
     # --- Optimization loop ---
     print(f"\nStarting optimization: {num_steps} steps, lr={lr}, k={k}")
+    if alpha > 0:
+        print(f"Chamfer proximity regularizer: alpha={alpha}")
     print(f"Recomputing k-NN every {recompute_knn_every} steps")
     print(f"Updating visualization every {vis_every} steps")
     print("-" * 60)
+
+    # Store initial positions for proximity regularizer
+    initial_positions = source_verts_param.detach().clone()
 
     for step in range(num_steps):
         if not visualizer.running:
@@ -577,10 +681,19 @@ def run_isospectralization(
             model, source_verts_param, knn_indices, num_eigenvalues, device
         )
 
-        # Loss: MSE on eigenvalues, skip λ₀ ≈ 0
-        loss = torch.nn.functional.mse_loss(
+        # Spectral loss: MSE on eigenvalues, skip Î»â‚€ â‰ˆ 0
+        spectral_loss = torch.nn.functional.mse_loss(
             current_spectrum[1:], target_spectrum[1:]
         )
+
+        # Proximity regularizer: Chamfer distance to initial positions
+        # (unlike L2/MSE, Chamfer doesn't penalize vertex sliding along the surface)
+        if alpha > 0:
+            proximity_loss = chamfer_distance(source_verts_param, initial_positions)
+            loss = spectral_loss + alpha * proximity_loss
+        else:
+            proximity_loss = torch.tensor(0.0, device=device)
+            loss = spectral_loss
 
         # Backward
         loss.backward()
@@ -594,20 +707,41 @@ def run_isospectralization(
 
         # --- Logging & visualization ---
         loss_val = loss.item()
+        spectral_loss_val = spectral_loss.item()
+        proximity_loss_val = proximity_loss.item()
         current_spec_np = current_spectrum.detach().cpu().numpy()
         current_verts_np = source_verts_param.detach().cpu().numpy()
 
         if step % 10 == 0 or step == num_steps - 1:
             lr_current = scheduler.get_last_lr()[0] if scheduler else lr
-            print(
-                f"  Step {step:4d} | Loss: {loss_val:.6e} | "
-                f"lr: {lr_current:.2e} | "
-                f"λ₁ target: {target_spectrum_np[1]:.4f} current: {current_spec_np[1]:.4f}"
+            log_str = (
+                f"  Step {step:4d} | Loss: {loss_val:.6e} "
+                f"(spec: {spectral_loss_val:.6e}"
             )
+            if alpha > 0:
+                log_str += f", prox: {proximity_loss_val:.6e}"
+            log_str += (
+                f") | lr: {lr_current:.2e} | "
+                f"l1 target: {target_spectrum_np[1]:.4f} current: {current_spec_np[1]:.4f}"
+            )
+            print(log_str)
 
-        # Update polyscope periodically (not every step — rendering is expensive)
+        # Update polyscope periodically
         if step % vis_every == 0 or step == num_steps - 1:
-            visualizer.update(step, loss_val, current_verts_np, current_spec_np)
+            # Compute current robust spectrum for monitoring (non-differentiable)
+            try:
+                current_robust_spec_np = compute_robust_spectrum(
+                    current_verts_np, source_faces, num_eigenvalues
+                )
+            except Exception:
+                current_robust_spec_np = None
+            visualizer.update(
+                step, loss_val, current_verts_np, current_spec_np,
+                spectral_loss=spectral_loss_val,
+                proximity_loss=proximity_loss_val,
+                alpha=alpha,
+                current_robust_spectrum=current_robust_spec_np,
+            )
 
     # --- Final results ---
     print("\n" + "=" * 60)
@@ -615,15 +749,37 @@ def run_isospectralization(
     print("=" * 60)
 
     final_spectrum = current_spectrum.detach().cpu().numpy()
-    print(f"\nFinal loss: {loss.item():.6e}")
-    print(f"\nEigenvalue comparison (skip λ₀):")
-    print(f"  {'Index':>5} | {'Target':>10} | {'Final':>10} | {'Rel Error':>10}")
-    print(f"  {'-' * 5} | {'-' * 10} | {'-' * 10} | {'-' * 10}")
+    final_verts_np = source_verts_param.detach().cpu().numpy()
+
+    # Compute final robust spectrum
+    try:
+        final_robust_spectrum = compute_robust_spectrum(
+            final_verts_np, source_faces, num_eigenvalues
+        )
+    except Exception:
+        final_robust_spectrum = np.zeros(num_eigenvalues)
+
+    print(f"\nFinal total loss: {loss.item():.6e}")
+    print(f"  Spectral loss: {spectral_loss.item():.6e}")
+    if alpha > 0:
+        print(f"  Proximity loss: {proximity_loss.item():.6e} (alpha={alpha})")
+    print(f"\nEigenvalue comparison (skip lambda_0):")
+    header = (f"  {'Idx':>3} | {'Tgt PRED':>10} | {'Tgt Robust':>10} | "
+              f"{'Cur PRED':>10} | {'Cur Robust':>10} | "
+              f"{'Src PRED':>10} | {'Src Robust':>10} | {'Rel Err':>8}")
+    print(header)
+    print(f"  {'-' * len(header)}")
     for i in range(1, min(num_eigenvalues, 15)):
         t_val = target_spectrum_np[i]
+        tr_val = target_robust_spectrum_np[i]
         f_val = final_spectrum[i]
+        fr_val = final_robust_spectrum[i]
+        sp_val = source_pred_spectrum_np[i]
+        sr_val = source_robust_spectrum_np[i]
         rel_err = abs(f_val - t_val) / (abs(t_val) + 1e-8)
-        print(f"  {i:>5} | {t_val:>10.4f} | {f_val:>10.4f} | {rel_err:>10.2%}")
+        print(f"  {i:>3} | {t_val:>10.4f} | {tr_val:>10.4f} | "
+              f"{f_val:>10.4f} | {fr_val:>10.4f} | "
+              f"{sp_val:>10.4f} | {sr_val:>10.4f} | {rel_err:>8.2%}")
 
     # Show final visualization interactively
     print("\nShowing final result. Close the polyscope window to exit.")
@@ -645,22 +801,25 @@ def main():
                         help="Path to source shape mesh file")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint (.ckpt)")
-    parser.add_argument("--k", type=int, default=6,
+    parser.add_argument("--k", type=int, default=30,
                         help="Number of k-NN neighbors")
-    parser.add_argument("--num_eigenvalues", type=int, default=600,
+    parser.add_argument("--num_eigenvalues", type=int, default=20,
                         help="Number of eigenvalues to match")
-    parser.add_argument("--lr", type=float, default=1e-3,
+    parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate for Adam optimizer")
     parser.add_argument("--num_steps", type=int, default=500000,
                         help="Number of optimization steps")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device (cuda or cpu)")
-    parser.add_argument("--recompute_knn_every", type=int, default=1,
+    parser.add_argument("--recompute_knn_every", type=int, default=100,
                         help="Recompute k-NN topology every N steps")
     parser.add_argument("--vis_every", type=int, default=1,
                         help="Update polyscope visualization every N steps")
     parser.add_argument("--scheduler", type=str, default=None, choices=["cosine"],
                         help="LR scheduler type (default: none)")
+    parser.add_argument("--alpha", type=float, default=10000.0,
+                        help="Chamfer distance regularizer weight. 0 = pure isospectralization. "
+                             ">0 keeps shape close to original (adversarial mode)")
     args = parser.parse_args()
 
     run_isospectralization(
@@ -675,6 +834,7 @@ def main():
         recompute_knn_every=args.recompute_knn_every,
         vis_every=args.vis_every,
         scheduler_type=args.scheduler,
+        alpha=args.alpha,
     )
 
 

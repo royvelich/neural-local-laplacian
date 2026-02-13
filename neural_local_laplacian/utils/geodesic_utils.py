@@ -55,16 +55,28 @@ def normalize_distances(distances: np.ndarray) -> np.ndarray:
     """
     Normalize distances to [0, 1] range.
 
+    Handles NaN and Inf values gracefully by treating them as missing data.
+
     Args:
         distances: Array of distances
 
     Returns:
-        Normalized distances with min=0, max=1
+        Normalized distances with min=0, max=1. NaN/Inf inputs remain NaN.
     """
-    d_min, d_max = distances.min(), distances.max()
-    if d_max - d_min < 1e-10:
+    finite_mask = np.isfinite(distances)
+    if not finite_mask.any():
         return np.zeros_like(distances)
-    return (distances - d_min) / (d_max - d_min)
+
+    d_min = distances[finite_mask].min()
+    d_max = distances[finite_mask].max()
+    if d_max - d_min < 1e-10:
+        result = np.zeros_like(distances)
+        result[~finite_mask] = np.nan
+        return result
+
+    result = (distances - d_min) / (d_max - d_min)
+    result[~finite_mask] = np.nan
+    return result
 
 
 def compute_geodesic_metrics(
@@ -127,10 +139,16 @@ def compute_geodesic_metrics(
             e1, e2 = exact[idx1], exact[idx2]
             c1, c2 = computed[idx1], computed[idx2]
 
-            # If e1 > e2 (farther in exact), then c1 should be > c2
-            correct = ((e1 > e2) & (c1 > c2)) | ((e2 > e1) & (c2 > c1))
-            not_tie = np.abs(e1 - e2) > 1e-8
-            mono_score = float(correct[not_tie].mean()) if not_tie.sum() > 0 else 0.0
+            # Filter out pairs with NaN/Inf in either array
+            finite_pairs = np.isfinite(e1) & np.isfinite(e2) & np.isfinite(c1) & np.isfinite(c2)
+            e1, e2 = e1[finite_pairs], e2[finite_pairs]
+            c1, c2 = c1[finite_pairs], c2[finite_pairs]
+
+            if len(e1) > 0:
+                # If e1 > e2 (farther in exact), then c1 should be > c2
+                correct = ((e1 > e2) & (c1 > c2)) | ((e2 > e1) & (c2 > c1))
+                not_tie = np.abs(e1 - e2) > 1e-8
+                mono_score = float(correct[not_tie].mean()) if not_tie.sum() > 0 else 0.0
 
     return GeodesicMetrics(
         correlation=corr,
@@ -336,7 +354,7 @@ def compute_heat_geodesic_mesh(
     M = M.astype(np.float64)
 
     # Time step: t = h^2 where h is mean edge length
-    # For equilateral triangle: area = sqrt(3)/4 * h^2, so h â‰ˆ 1.52 * sqrt(area)
+    # For equilateral triangle: area = sqrt(3)/4 * h^2, so h Ã¢â€°Ë† 1.52 * sqrt(area)
     if t is None:
         h = 1.52 * np.sqrt(face_areas.mean())
         t = h ** 2
@@ -364,9 +382,9 @@ def compute_heat_geodesic_mesh(
 
         # Step III: Compute integrated divergence
         # For igl.grad(), the discrete divergence is:
-        # div(X) = -G^T @ (A âŠ— I_3) @ X
-        # But we need to solve: Î”Ï† = âˆ‡Â·X, and since L = -Î”, we have LÏ† = -âˆ‡Â·X
-        # So: LÏ† = -div(X) = G^T @ (A âŠ— I_3) @ X
+        # div(X) = -G^T @ (A Ã¢Å â€” I_3) @ X
+        # But we need to solve: ÃŽâ€Ãâ€  = Ã¢Ë†â€¡Ã‚Â·X, and since L = -ÃŽâ€, we have LÃâ€  = -Ã¢Ë†â€¡Ã‚Â·X
+        # So: LÃâ€  = -div(X) = G^T @ (A Ã¢Å â€” I_3) @ X
 
         # Create area-weighted X
         X_weighted = X * face_areas[:, np.newaxis]  # (nF, 3)
@@ -409,25 +427,25 @@ def compute_heat_geodesic_learned(
     and vertex areas A_i. No external dependencies (no pcdiff).
 
     The gradient operator G is (3N, N) and maps vertex scalars to 3D vertex vectors:
-        (∇f)_i = Σ_j g_ij (f_j - f_i)
+        (âˆ‡f)_i = Î£_j g_ij (f_j - f_i)
 
     The divergence is the adjoint of G w.r.t. the M-weighted inner product:
         div(X) = -M^{-1} G^T M_3 X_flat
     where M_3 repeats vertex areas 3x (once per spatial component).
 
     Heat Method steps:
-        1. Solve (M + tS) u = δ_source  — heat diffusion
-        2. X = -∇u / |∇u|               — normalized gradient (using G)
-        3. Solve S φ = G^T M_3 X_flat    — Poisson (RHS = -M · div(X))
+        1. Solve (M + tS) u = Î´_source  â€” heat diffusion
+        2. X = -âˆ‡u / |âˆ‡u|               â€” normalized gradient (using G)
+        3. Solve S Ï† = G^T M_3 X_flat    â€” Poisson (RHS = -M Â· div(X))
 
-    Note on Step 3 sign: We solve S φ = -M div(X).
-        -M div(X) = -M · (-M^{-1} G^T M_3 X) = G^T M_3 X
-    So the RHS is simply G^T M_3 X_flat — no sign ambiguity.
+    Note on Step 3 sign: We solve S Ï† = -M div(X).
+        -M div(X) = -M Â· (-M^{-1} G^T M_3 X) = G^T M_3 X
+    So the RHS is simply G^T M_3 X_flat â€” no sign ambiguity.
 
     Args:
-        S: One-ring stiffness matrix (N, N) — assembled from ‖g_ij‖²
-        M: Diagonal vertex mass matrix (N, N) — assembled from A_i
-        G: Gradient operator (3N, N) — assembled from g_ij vectors
+        S: One-ring stiffness matrix (N, N) â€” assembled from â€–g_ijâ€–Â²
+        M: Diagonal vertex mass matrix (N, N) â€” assembled from A_i
+        G: Gradient operator (3N, N) â€” assembled from g_ij vectors
         source_idx: Source vertex index for geodesic computation
         n_vertices: Number of vertices
         t: Diffusion time step (auto-computed from M if None)
@@ -452,7 +470,7 @@ def compute_heat_geodesic_learned(
         t = h ** 2
 
     try:
-        # Step 1: Heat diffusion — solve (M + tS) u = δ_source
+        # Step 1: Heat diffusion â€” solve (M + tS) u = Î´_source
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
@@ -471,11 +489,11 @@ def compute_heat_geodesic_learned(
         norms = np.maximum(norms, 1e-10)
         X = -grad_u / norms  # Negative: point toward source
 
-        # Step 3: Poisson solve — S φ = G^T M_3 X_flat
+        # Step 3: Poisson solve â€” S Ï† = G^T M_3 X_flat
         # Build area-weighted X: multiply each vertex's vector by its area
         areas_diag = np.array(M.diagonal()).flatten()
-        M_3 = np.repeat(areas_diag, 3)  # (3N,) — area_i repeated for x,y,z
-        rhs = G.T @ (M_3 * X.flatten())  # (N,) — this is -M · div(X)
+        M_3 = np.repeat(areas_diag, 3)  # (3N,) â€” area_i repeated for x,y,z
+        rhs = G.T @ (M_3 * X.flatten())  # (N,) â€” this is -M Â· div(X)
 
         eps = 1e-8
         S_reg = S + eps * scipy.sparse.eye(n)

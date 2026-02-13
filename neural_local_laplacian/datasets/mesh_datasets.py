@@ -1,6 +1,7 @@
 # Standard library
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
+import random
 
 # Third-party libraries
 import numpy as np
@@ -61,19 +62,25 @@ class MeshDataset(Dataset):
 
     def __init__(
             self,
-            mesh_folder_path: Union[str, Path],
-            k: int,
+            mesh_folder_paths: Union[str, Path, List[Union[str, Path]]] = None,
+            k: int = 20,
             num_eigenvalues: int = 20,
             feature_extractor: Optional[FeatureExtractor] = None,
             pose_transformers: Optional[List[PoseTransformer]] = None,
             num_geodesic_sources: int = 5,
-            geodesic_source_method: str = "farthest_point_sampling"
+            geodesic_source_method: str = "farthest_point_sampling",
+            max_meshes: Optional[int] = None,
+            file_size_range_mb: Optional[Tuple[float, float]] = None,
+            shuffle: bool = False,
+            # Backward compatibility: singular form still accepted
+            mesh_folder_path: Union[str, Path] = None
     ):
         """
         Initialize the MeshDataset.
 
         Args:
-            mesh_folder_path: Path to folder containing mesh files
+            mesh_folder_paths: Path or list of paths to folders containing mesh files.
+                Also accepts 'mesh_folder_path' (singular) for backward compatibility.
             k: Number of nearest neighbors to extract (excluding center point)
             num_eigenvalues: Number of eigenvalues/eigenvectors to compute for ground truth
             feature_extractor: Feature extractor to apply to patch points
@@ -83,54 +90,116 @@ class MeshDataset(Dataset):
                 - "farthest_point_sampling": Well-distributed sources (default)
                 - "random": Random vertices
                 - "mixed": Centroid + random
+            max_meshes: Optional maximum number of mesh files to load. Applied after
+                optional shuffling.
+            file_size_range_mb: Optional (min_mb, max_mb) tuple. Mesh files outside this
+                size range on disk are skipped. Use None for no filtering.
+            shuffle: If True, shuffle the mesh file list before applying max_meshes cap.
+                Useful for random subsampling from a large collection.
         """
         super().__init__()
 
-        self._mesh_folder_path = Path(mesh_folder_path)
+        # Backward compatibility: accept mesh_folder_path (singular) as alias
+        if mesh_folder_paths is None and mesh_folder_path is not None:
+            mesh_folder_paths = mesh_folder_path
+        elif mesh_folder_paths is None and mesh_folder_path is None:
+            raise ValueError("Must provide mesh_folder_paths (or mesh_folder_path)")
+
+        # Normalize to list of Paths (support single path for backward compat)
+        if isinstance(mesh_folder_paths, (str, Path)):
+            mesh_folder_paths = [mesh_folder_paths]
+        self._mesh_folder_paths = [Path(p) for p in mesh_folder_paths]
+
         self._k = k
         self._num_eigenvalues = num_eigenvalues
         self._feature_extractor = feature_extractor
         self._pose_transformers = pose_transformers if pose_transformers is not None else []
         self._num_geodesic_sources = num_geodesic_sources
         self._geodesic_source_method = geodesic_source_method
+        self._max_meshes = max_meshes
+        self._file_size_range_mb = file_size_range_mb
+        self._shuffle = shuffle
 
         # Validate inputs
         self._validate_inputs()
 
-        # Scan folder for mesh files
-        self._mesh_file_paths = self._scan_mesh_folder()
+        # Scan all folders for mesh files
+        self._mesh_file_paths = self._scan_mesh_folders()
 
         if len(self._mesh_file_paths) == 0:
-            raise ValueError(f"No mesh files found in {mesh_folder_path}")
+            folders_str = ", ".join(str(p) for p in self._mesh_folder_paths)
+            raise ValueError(f"No mesh files found in: {folders_str}")
 
-        print(f"Found {len(self._mesh_file_paths)} mesh files in {mesh_folder_path}")
+        print(f"Found {len(self._mesh_file_paths)} mesh files across "
+              f"{len(self._mesh_folder_paths)} folder(s):")
+        for i, fp in enumerate(self._mesh_file_paths):
+            size_mb = fp.stat().st_size / (1024 * 1024)
+            print(f"  [{i:>3d}] {fp.name} ({size_mb:.2f} MB)")
 
     def _validate_inputs(self) -> None:
         """Validate input parameters."""
-        if not self._mesh_folder_path.exists():
-            raise ValueError(f"Mesh folder does not exist: {self._mesh_folder_path}")
-
-        if not self._mesh_folder_path.is_dir():
-            raise ValueError(f"Mesh folder path is not a directory: {self._mesh_folder_path}")
+        for folder_path in self._mesh_folder_paths:
+            if not folder_path.exists():
+                raise ValueError(f"Mesh folder does not exist: {folder_path}")
+            if not folder_path.is_dir():
+                raise ValueError(f"Mesh folder path is not a directory: {folder_path}")
 
         if self._k < 1:
             raise ValueError(f"k must be >= 1, got {self._k}")
 
-    def _scan_mesh_folder(self) -> List[Path]:
+        if self._max_meshes is not None and self._max_meshes < 1:
+            raise ValueError(f"max_meshes must be >= 1, got {self._max_meshes}")
+
+        if self._file_size_range_mb is not None:
+            min_mb, max_mb = self._file_size_range_mb
+            if min_mb < 0:
+                raise ValueError(f"file_size_range_mb min must be >= 0, got {min_mb}")
+            if max_mb <= min_mb:
+                raise ValueError(f"file_size_range_mb max ({max_mb}) must be > min ({min_mb})")
+
+    def _scan_mesh_folders(self) -> List[Path]:
         """
-        Scan the mesh folder for supported mesh files.
+        Scan all mesh folders for supported mesh files, applying size filtering,
+        optional shuffling, and max mesh cap.
 
         Returns:
             List of Path objects for found mesh files
         """
         mesh_files = []
 
-        for file_path in self._mesh_folder_path.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in self.SUPPORTED_FORMATS:
-                mesh_files.append(file_path)
+        for folder_path in self._mesh_folder_paths:
+            for file_path in folder_path.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in self.SUPPORTED_FORMATS:
+                    mesh_files.append(file_path)
 
-        # Sort for consistent ordering
+        # Sort for consistent base ordering (before optional shuffle)
         mesh_files.sort()
+
+        # Filter by file size if specified
+        if self._file_size_range_mb is not None:
+            min_bytes = self._file_size_range_mb[0] * 1024 * 1024
+            max_bytes = self._file_size_range_mb[1] * 1024 * 1024
+            before_count = len(mesh_files)
+            mesh_files = [
+                f for f in mesh_files
+                if min_bytes <= f.stat().st_size <= max_bytes
+            ]
+            filtered_count = before_count - len(mesh_files)
+            if filtered_count > 0:
+                print(f"File size filter ({self._file_size_range_mb[0]:.2f}-"
+                      f"{self._file_size_range_mb[1]:.2f} MB): "
+                      f"kept {len(mesh_files)}, skipped {filtered_count}")
+
+        # Shuffle before capping if requested
+        if self._shuffle:
+            random.shuffle(mesh_files)
+
+        # Cap to max_meshes
+        if self._max_meshes is not None and len(mesh_files) > self._max_meshes:
+            print(f"Capping mesh list from {len(mesh_files)} to {self._max_meshes}"
+                  f"{' (shuffled)' if self._shuffle else ''}")
+            mesh_files = mesh_files[:self._max_meshes]
+
         return mesh_files
 
     def len(self) -> int:
