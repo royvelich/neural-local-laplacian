@@ -886,16 +886,18 @@ def evaluate_pair(
                     areas=fwd['areas'],
                     knn=knn_t,
                 )
-            L_np = L.cpu().numpy().astype(np.float64)
-            M_diag = M_diag_t.cpu().numpy().astype(np.float64)
 
-            # Dense generalized eigenvalue problem: L @ v = λ M v
-            M_mat = np.diag(M_diag)
-            from scipy.linalg import eigh as scipy_eigh
-            evals, evecs = scipy_eigh(
-                L_np, M_mat,
-                subset_by_index=[0, num_eigenvectors - 1],
-            )
+                # Generalized eigenproblem L v = λ M v on GPU
+                # Convert to standard form: M^{-1/2} L M^{-1/2} w = λ w
+                M_inv_sqrt = 1.0 / M_diag_t.sqrt().clamp(min=1e-8)
+                L_std = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
+                L_std = 0.5 * (L_std + L_std.T)  # ensure exact symmetry
+
+                all_evals, all_evecs = torch.linalg.eigh(L_std)
+                evals = all_evals[:num_eigenvectors].cpu().numpy()
+                # Transform back: v = M^{-1/2} w
+                evecs = (M_inv_sqrt[:, None] * all_evecs[:, :num_eigenvectors]).cpu().numpy()
+                M_diag = M_diag_t.cpu().numpy()
         else:
             # Stiffness mode: original sparse assembly
             batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
