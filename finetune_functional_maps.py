@@ -608,17 +608,15 @@ class SoftCorrespondenceLoss(torch.nn.Module):
     floor from genuine geometric differences), use descriptors for nearest-neighbor
     correspondence and measure RANKING quality via InfoNCE loss.
 
-    For each vertex v on shape A, its descriptor d_A(v) should be most similar
-    to d_B(v) on shape B (identity correspondence). We don't require d_A(v) = d_B(v) —
-    just that v is the top match. This eliminates the irreducible floor.
-
     Descriptors: diffusion fingerprints from L landmark sources at T scales.
         d(v) = concat over α: row v of (S + αM)^{-1} M E_landmarks
 
     Loss: InfoNCE = -mean_v log softmax(sim(v, v)) over all w
-    where sim(v, w) = d_A(v) · d_B(w) / τ (normalized)
 
-    Gradient: loss → sim → d_A, d_B → torch.linalg.solve → S → model
+    Vertex subsampling: compute descriptors for ALL N vertices (so gradients
+    flow to all parts of S), but subsample V vertices for the contrastive ranking.
+    This makes the classification V-way instead of N-way (much easier to learn),
+    reduces memory, and acts as stochastic regularization.
     """
 
     def __init__(
@@ -626,14 +624,14 @@ class SoftCorrespondenceLoss(torch.nn.Module):
         num_landmarks: int = 128,
         alphas: Tuple[float, ...] = (1.0, 10.0, 100.0),
         temperature: float = 0.07,
-        w_proximity: float = 0.1,
+        num_sample_vertices: int = 512,
         landmark_seed: int = 0,
     ):
         super().__init__()
         self.num_landmarks = num_landmarks
         self.alphas = alphas
         self.temperature = temperature
-        self.w_proximity = w_proximity
+        self.num_sample_vertices = num_sample_vertices
         self.landmark_seed = landmark_seed
         self._landmarks = None
 
@@ -641,7 +639,6 @@ class SoftCorrespondenceLoss(torch.nn.Module):
         """Fixed landmark indices (computed once, reused)."""
         if self._landmarks is None or len(self._landmarks) != self.num_landmarks:
             rng = np.random.RandomState(self.landmark_seed)
-            # Approximately evenly spaced via random selection (good enough)
             idx = rng.choice(N, size=min(self.num_landmarks, N), replace=False)
             idx.sort()
             self._landmarks = torch.from_numpy(idx).long().to(device)
@@ -653,83 +650,74 @@ class SoftCorrespondenceLoss(torch.nn.Module):
         S_B: torch.Tensor,
         M_A: torch.Tensor,
         M_B: torch.Tensor,
-        S_A_ref: torch.Tensor,
-        S_B_ref: torch.Tensor,
+        rng: np.random.RandomState,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         N = S_A.shape[0]
         landmarks = self._get_landmarks(N, S_A.device)
         L = len(landmarks)
+        V = min(self.num_sample_vertices, N)
 
         # Landmark indicator matrix (N, L)
         E = torch.zeros(N, L, device=S_A.device, dtype=S_A.dtype)
         E[landmarks, torch.arange(L, device=S_A.device)] = 1.0
 
-        # Compute descriptors at multiple diffusion scales
+        # Compute descriptors at multiple diffusion scales for ALL vertices
         desc_A_parts = []
         desc_B_parts = []
 
         for alpha in self.alphas:
-            # System matrix: S + α diag(M)
             A_mat = S_A + alpha * torch.diag(M_A)
             B_mat = S_B + alpha * torch.diag(M_B)
 
-            # RHS: M @ E (mass-weighted landmark indicators)
             rhs_A = M_A[:, None] * E
             rhs_B = M_B[:, None] * E
 
-            # Solve: descriptor = (S + αM)^{-1} M E  — shape (N, L)
             D_A = torch.linalg.solve(A_mat, rhs_A)
             D_B = torch.linalg.solve(B_mat, rhs_B)
 
             desc_A_parts.append(D_A)
             desc_B_parts.append(D_B)
 
-        # Concatenate across scales: (N, L * num_scales)
+        # Full descriptors: (N, L * num_scales)
         desc_A = torch.cat(desc_A_parts, dim=1)
         desc_B = torch.cat(desc_B_parts, dim=1)
 
-        # L2-normalize per vertex (crucial for contrastive loss)
+        # L2-normalize per vertex
         desc_A = F.normalize(desc_A, p=2, dim=1)
         desc_B = F.normalize(desc_B, p=2, dim=1)
 
-        # Similarity matrix: (N, N) — cosine similarity / temperature
-        sim = (desc_A @ desc_B.T) / self.temperature
+        # Subsample vertices for contrastive loss (different each step)
+        sample_idx = torch.from_numpy(
+            rng.choice(N, size=V, replace=False)
+        ).long().to(S_A.device)
 
-        # InfoNCE loss: for vertex v on A, correct match is vertex v on B
-        labels = torch.arange(N, device=sim.device)
+        desc_A_sub = desc_A[sample_idx]  # (V, D)
+        desc_B_sub = desc_B[sample_idx]  # (V, D)
+
+        # Similarity matrix: (V, V) — much smaller than (N, N)
+        sim = (desc_A_sub @ desc_B_sub.T) / self.temperature
+
+        # InfoNCE: correct match for sample_idx[i] on A is sample_idx[i] on B
+        labels = torch.arange(V, device=sim.device)
         loss_nce = F.cross_entropy(sim, labels)
-
-        # Also add symmetric direction (B → A)
         loss_nce_rev = F.cross_entropy(sim.T, labels)
         loss_nce = 0.5 * (loss_nce + loss_nce_rev)
 
-        # Correspondence accuracy on training pair (top-1 match)
         with torch.no_grad():
             pred_A2B = sim.argmax(dim=1)
             train_acc = (pred_A2B == labels).float().mean().item()
 
-            # Top-5 accuracy
             _, topk = sim.topk(5, dim=1)
             top5_acc = (topk == labels.unsqueeze(1)).any(dim=1).float().mean().item()
 
-        # --- Proximity loss: keep S close to pretrained ---
-        ref_norm_A = S_A_ref.norm().clamp(min=1e-8)
-        ref_norm_B = S_B_ref.norm().clamp(min=1e-8)
-        loss_prox_A = (S_A - S_A_ref).norm() ** 2 / (ref_norm_A ** 2)
-        loss_prox_B = (S_B - S_B_ref).norm() ** 2 / (ref_norm_B ** 2)
-        loss_prox = 0.5 * (loss_prox_A + loss_prox_B)
-
-        loss_total = loss_nce + self.w_proximity * loss_prox
-
         metrics = {
-            'loss_total': loss_total.item(),
+            'loss_total': loss_nce.item(),
             'loss_nce': loss_nce.item(),
-            'loss_prox': loss_prox.item(),
             'train_acc': train_acc,
             'train_top5': top5_acc,
         }
 
-        return loss_total, metrics
+        return loss_nce, metrics
 
 
 # =============================================================================
@@ -982,14 +970,19 @@ def train(args):
         num_landmarks=args.num_landmarks,
         alphas=tuple(float(a) for a in args.alphas.split(',')),
         temperature=args.temperature,
-        w_proximity=args.w_prox,
+        num_sample_vertices=args.num_sample_vertices,
     )
 
-    # Frozen copy of pretrained model for proximity regularizer
+    # Frozen copy of pretrained model for parameter-space proximity
     model_ref = copy.deepcopy(model)
     model_ref.eval()
     for p in model_ref.parameters():
         p.requires_grad_(False)
+    # Pre-compute reference param vector (flat)
+    ref_params = torch.cat([p.detach().flatten() for p in model_ref.parameters()])
+    ref_norm_sq = (ref_params ** 2).sum().clamp(min=1e-8)
+    del model_ref  # free GPU memory — we only need the flat param vector
+    print(f"  Reference params: {ref_params.numel():,} values, ||θ_ref||²={ref_norm_sq.item():.2e}")
     print(f"  Created frozen reference model for proximity regularizer")
 
     optimizer = torch.optim.Adam(
@@ -1031,7 +1024,7 @@ def train(args):
     print()
     print("=" * 80)
     print(f"TRAINING (InfoNCE contrastive, {args.num_landmarks} landmarks, "
-          f"scales={args.alphas}, τ={args.temperature}, "
+          f"V={args.num_sample_vertices}, scales={args.alphas}, τ={args.temperature}, "
           f"curriculum={args.cross_ratio_start:.0%}→{args.cross_ratio_end:.0%} over {args.curriculum_epochs}ep)")
     print("=" * 80)
 
@@ -1058,13 +1051,16 @@ def train(args):
                 S_A, M_A = compute_laplacian_differentiable(model, verts_a, args.k_pred, device)
                 S_B, M_B = compute_laplacian_differentiable(model, verts_b, args.k_pred, device)
 
-                # Reference Laplacians from frozen pretrained model
-                with torch.no_grad():
-                    S_A_ref, _ = compute_laplacian_differentiable(model_ref, verts_a, args.k_pred, device)
-                    S_B_ref, _ = compute_laplacian_differentiable(model_ref, verts_b, args.k_pred, device)
+                # InfoNCE contrastive loss (vertex-subsampled)
+                loss_nce, metrics = loss_fn(S_A, S_B, M_A, M_B, rng)
 
-                # InfoNCE contrastive loss
-                loss, metrics = loss_fn(S_A, S_B, M_A, M_B, S_A_ref, S_B_ref)
+                # Parameter-space proximity: ||θ - θ_ref||² / ||θ_ref||²
+                cur_params = torch.cat([p.flatten() for p in model.parameters()])
+                loss_prox = ((cur_params - ref_params) ** 2).sum() / ref_norm_sq
+                loss = loss_nce + args.w_prox * loss_prox
+
+                metrics['loss_prox'] = loss_prox.item()
+                metrics['loss_total'] = loss.item()
 
                 if torch.isnan(loss):
                     print(f"  [Step {global_step}, pair {pair_idx}] NaN loss! Skipping pair.")
@@ -1237,8 +1233,8 @@ def main():
 
     # Model
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--k_pred", type=int, default=25)
-    parser.add_argument("--num_eigenvectors", type=int, default=50,
+    parser.add_argument("--k_pred", type=int, default=20)
+    parser.add_argument("--num_eigenvectors", type=int, default=30,
                         help="Number of eigenvectors for evaluation")
     parser.add_argument("--freeze_input_projection", action="store_true")
 
@@ -1263,8 +1259,10 @@ def main():
                         help="Comma-separated diffusion scales (α values)")
     parser.add_argument("--temperature", type=float, default=0.07,
                         help="InfoNCE temperature (lower = sharper ranking)")
-    parser.add_argument("--w_prox", type=float, default=1.0,
-                        help="Weight for proximity regularizer (prevents straying from pretrained)")
+    parser.add_argument("--num_sample_vertices", type=int, default=512,
+                        help="Vertices to subsample for contrastive loss (V-way ranking)")
+    parser.add_argument("--w_prox", type=float, default=10.0,
+                        help="Weight for parameter-space proximity ||θ-θ_ref||²/||θ_ref||²")
 
     # Curriculum: same-family → cross-family
     parser.add_argument("--cross_ratio_start", type=float, default=0.0,
