@@ -6,3 +6,4 @@ wandb/
 local-laplacian-venv/
 checkpoints/
 .venvs/
+fmap_finetune_runs/

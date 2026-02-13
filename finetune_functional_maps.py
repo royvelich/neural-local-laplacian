@@ -299,6 +299,70 @@ def assemble_dense_stiffness_and_mass(
     return S, M_diag
 
 
+def assemble_anisotropic_laplacian(
+    grad_coeffs: torch.Tensor,
+    areas: torch.Tensor,
+    knn: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Differentiable assembly of L = G^T M_3 G from gradient coefficients.
+
+    Instead of collapsing gᵢⱼ ∈ ℝ³ to scalar sᵢⱼ = ‖gᵢⱼ‖², this preserves
+    the full directional structure of the learned gradient operator.
+
+    L(p,q) = Σᵢ aᵢ · G_i[:,p] · G_i[:,q]
+
+    where G_i is the (3×N) block of the gradient operator at vertex i:
+        G_i[:,j] = gᵢⱼ           for neighbor j
+        G_i[:,i] = -Σⱼ gᵢⱼ       (center, ensures G @ const = 0)
+
+    L is guaranteed PSD because L = G^T M_3 G with positive mass.
+    Null space = constant functions (same as standard Laplacian).
+
+    Args:
+        grad_coeffs: (N, k, 3) gradient coefficients per edge
+        areas: (N,) vertex areas (mass)
+        knn: (N, k) neighbor indices (long tensor)
+
+    Returns:
+        L: (N, N) dense PSD Laplacian-like matrix
+        M_diag: (N,) mass diagonal
+    """
+    N, k, _ = grad_coeffs.shape
+    device = grad_coeffs.device
+
+    # Extended coefficients: prepend center coefficient cᵢ = -Σⱼ gᵢⱼ
+    center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)  # (N, 1, 3)
+    ext_coeffs = torch.cat([center_coeffs, grad_coeffs], dim=1)  # (N, k+1, 3)
+
+    # Local Gram matrices: aᵢ * (ext_coeffs @ ext_coeffsᵀ) per vertex
+    # This is the (k+1, k+1) contribution of vertex i to L
+    sqrt_a = areas.sqrt()[:, None, None]  # (N, 1, 1)
+    scaled = sqrt_a * ext_coeffs  # (N, k+1, 3)
+    gram = torch.bmm(scaled, scaled.transpose(1, 2))  # (N, k+1, k+1)
+
+    # Extended index array: [i, j₁, ..., jₖ] per vertex
+    center_idx = torch.arange(N, device=device).unsqueeze(1)  # (N, 1)
+    ext_indices = torch.cat([center_idx, knn], dim=1)  # (N, k+1)
+
+    # Scatter Gram entries into (N, N) matrix
+    kp1 = k + 1
+    row_idx = ext_indices[:, :, None].expand(-1, -1, kp1)  # (N, k+1, k+1)
+    col_idx = ext_indices[:, None, :].expand(-1, kp1, -1)  # (N, k+1, k+1)
+    flat_idx = (row_idx * N + col_idx).reshape(-1)
+
+    L_flat = torch.zeros(N * N, device=device, dtype=grad_coeffs.dtype)
+    L_flat = L_flat.scatter_add(0, flat_idx, gram.reshape(-1))
+    L = L_flat.view(N, N)
+
+    # Symmetrize (should already be symmetric, but scatter from different
+    # patches hitting the same (p,q) may have slight asymmetry from
+    # float accumulation order)
+    L = 0.5 * (L + L.T)
+
+    return L, areas.detach()
+
+
 def compute_laplacian_differentiable(
     model: LaplacianTransformerModule,
     vertices_np: np.ndarray,
@@ -307,31 +371,44 @@ def compute_laplacian_differentiable(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Forward pass through model → dense Laplacian (differentiable).
-    No eigendecomposition — just the raw S and M matrices.
+
+    In gradient mode: builds the full anisotropic L = G^T M_3 G from
+    the predicted 3D gradient coefficients, preserving directional structure.
+
+    In stiffness mode: builds S from scalar edge weights (isotropic).
 
     Returns:
-        S: (N, N) dense stiffness matrix — differentiable w.r.t. model params
+        L: (N, N) dense Laplacian-like matrix — differentiable w.r.t. model params
         M_diag: (N,) mass diagonal — detached (not optimized)
     """
     vertices_t = torch.from_numpy(vertices_np).float().to(device)
     knn = compute_knn(vertices_np, k)
+    knn_t = torch.from_numpy(knn).long().to(device)
 
     batch_data = build_patch_data(vertices_t, knn, device)
     batch_data = Batch.from_data_list([batch_data]).to(device)
 
     fwd = model._forward_pass(batch_data)
-    batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
 
-    S, M_diag = assemble_dense_stiffness_and_mass(
-        stiffness_weights=fwd['stiffness_weights'],
-        areas=fwd['areas'],
-        attention_mask=fwd['attention_mask'],
-        vertex_indices=batch_data.vertex_indices,
-        center_indices=batch_data.center_indices,
-        batch_indices=batch_idx,
-    )
-
-    return S, M_diag.detach()
+    if fwd.get('grad_coeffs') is not None:
+        # Gradient mode: anisotropic L = G^T M_3 G
+        return assemble_anisotropic_laplacian(
+            grad_coeffs=fwd['grad_coeffs'],
+            areas=fwd['areas'],
+            knn=knn_t,
+        )
+    else:
+        # Stiffness mode: isotropic S from scalar weights
+        batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
+        S, M_diag = assemble_dense_stiffness_and_mass(
+            stiffness_weights=fwd['stiffness_weights'],
+            areas=fwd['areas'],
+            attention_mask=fwd['attention_mask'],
+            vertex_indices=batch_data.vertex_indices,
+            center_indices=batch_data.center_indices,
+            batch_indices=batch_idx,
+        )
+        return S, M_diag
 
 
 # =============================================================================
@@ -780,7 +857,10 @@ def evaluate_pair(
     num_eigenvectors: int,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Evaluate correspondence quality using scipy eigenvectors + functional maps."""
+    """Evaluate correspondence quality using functional maps.
+
+    Uses anisotropic L = G^T M_3 G in gradient mode for consistency with training.
+    """
     from neural_local_laplacian.utils.utils import (
         assemble_stiffness_and_mass_matrices,
         compute_laplacian_eigendecomposition,
@@ -791,23 +871,44 @@ def evaluate_pair(
 
     for label, verts in [('A', vertices_a), ('B', vertices_b)]:
         verts_t = torch.from_numpy(verts).float().to(device)
-        knn = compute_knn(verts, k)
-        batch_data = build_patch_data(verts_t, knn, device)
+        knn_np = compute_knn(verts, k)
+        batch_data = build_patch_data(verts_t, knn_np, device)
         batch_data = Batch.from_data_list([batch_data]).to(device)
 
         fwd = model._forward_pass(batch_data)
-        batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
 
-        S, M = assemble_stiffness_and_mass_matrices(
-            stiffness_weights=fwd['stiffness_weights'],
-            areas=fwd['areas'],
-            attention_mask=fwd['attention_mask'],
-            vertex_indices=batch_data.vertex_indices,
-            center_indices=batch_data.center_indices,
-            batch_indices=batch_idx,
-        )
-        evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
-        M_diag = np.array(M.diagonal()).flatten()
+        if fwd.get('grad_coeffs') is not None:
+            # Gradient mode: anisotropic L = G^T M_3 G
+            knn_t = torch.from_numpy(knn_np).long().to(device)
+            with torch.no_grad():
+                L, M_diag_t = assemble_anisotropic_laplacian(
+                    grad_coeffs=fwd['grad_coeffs'],
+                    areas=fwd['areas'],
+                    knn=knn_t,
+                )
+            L_np = L.cpu().numpy().astype(np.float64)
+            M_diag = M_diag_t.cpu().numpy().astype(np.float64)
+
+            # Dense generalized eigenvalue problem: L @ v = λ M v
+            M_mat = np.diag(M_diag)
+            from scipy.linalg import eigh as scipy_eigh
+            evals, evecs = scipy_eigh(
+                L_np, M_mat,
+                subset_by_index=[0, num_eigenvectors - 1],
+            )
+        else:
+            # Stiffness mode: original sparse assembly
+            batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
+            S, M = assemble_stiffness_and_mass_matrices(
+                stiffness_weights=fwd['stiffness_weights'],
+                areas=fwd['areas'],
+                attention_mask=fwd['attention_mask'],
+                vertex_indices=batch_data.vertex_indices,
+                center_indices=batch_data.center_indices,
+                batch_indices=batch_idx,
+            )
+            evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
+            M_diag = np.array(M.diagonal()).flatten()
 
         if label == 'A':
             eigvecs_a, mass_a = evecs, M_diag
@@ -925,6 +1026,19 @@ def train(args):
     with open(output_dir / "args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
+    # Weights & Biases
+    if args.wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            tags=args.wandb_tags.split(",") if args.wandb_tags else None,
+            config=vars(args),
+            dir=str(output_dir),
+        )
+        print(f"  W&B run: {wandb.run.url}")
+
     # Load model
     print(f"Loading model from: {args.checkpoint}")
     model = LaplacianTransformerModule.load_from_checkpoint(
@@ -1020,6 +1134,9 @@ def train(args):
     robust_mean_acc = np.mean(robust_accs)
     robust_mean_err = np.mean(robust_errs)
     print(f"  Robust baseline: Acc={robust_mean_acc*100:.1f}%, Err={robust_mean_err:.4f}")
+
+    if args.wandb:
+        wandb.log({"baseline/val_acc": robust_mean_acc, "baseline/val_err": robust_mean_err}, step=0)
 
     print()
     print("=" * 80)
@@ -1146,6 +1263,19 @@ def train(args):
                   f"grad={avg.get('grad_norm', 0):.2e} | "
                   f"lr={optimizer.param_groups[0]['lr']:.2e} | "
                   f"time={elapsed:.1f}s")
+
+            if args.wandb:
+                wandb.log({
+                    "train/loss": avg['loss_total'],
+                    "train/loss_nce": avg['loss_nce'],
+                    "train/loss_prox": avg['loss_prox'],
+                    "train/acc": avg['train_acc'],
+                    "train/top5": avg['train_top5'],
+                    "train/grad_norm": avg.get('grad_norm', 0),
+                    "train/cross_ratio": cross_ratio,
+                    "train/lr": optimizer.param_groups[0]['lr'],
+                    "train/epoch_time": elapsed,
+                }, step=epoch)
         else:
             print(f"Epoch {epoch:4d} | all steps failed")
 
@@ -1183,6 +1313,16 @@ def train(args):
             print(f"  Val mean: Acc={mean_acc*100:.1f}%, Err={mean_err:.4f}  "
                   f"(robust baseline: Acc={robust_mean_acc*100:.1f}%, Err={robust_mean_err:.4f})")
 
+            if args.wandb:
+                val_wandb = {
+                    "val/acc_mean": mean_acc,
+                    "val/err_mean": mean_err,
+                }
+                for i, (_, _, pair_name) in enumerate(val_pairs):
+                    val_wandb[f"val_pairs/{pair_name}_acc"] = val_accs[i]
+                    val_wandb[f"val_pairs/{pair_name}_err"] = val_errs[i]
+                wandb.log(val_wandb, step=epoch)
+
             if mean_acc > best_val_acc:
                 best_val_acc = mean_acc
                 ckpt_path = output_dir / "best_model.ckpt"
@@ -1191,6 +1331,10 @@ def train(args):
                     'hyper_parameters': dict(model.hparams),
                 }, str(ckpt_path))
                 print(f"  ** New best! Saved to {ckpt_path}")
+                if args.wandb:
+                    wandb.run.summary["best_val_acc"] = best_val_acc
+                    wandb.run.summary["best_val_err"] = mean_err
+                    wandb.run.summary["best_epoch"] = epoch
 
             model.train()
 
@@ -1213,6 +1357,19 @@ def train(args):
     val_log.close()
     print(f"\nTraining complete. Best val accuracy: {best_val_acc*100:.1f}%")
     print(f"Results in: {output_dir}")
+
+    if args.wandb:
+        # Log best model as artifact
+        artifact = wandb.Artifact(
+            name=f"best-model-{wandb.run.id}",
+            type="model",
+            description=f"Best finetuned model (val_acc={best_val_acc*100:.1f}%)",
+        )
+        best_path = output_dir / "best_model.ckpt"
+        if best_path.exists():
+            artifact.add_file(str(best_path))
+            wandb.log_artifact(artifact)
+        wandb.finish()
 
 
 # =============================================================================
@@ -1279,6 +1436,18 @@ def main():
 
     # Device
     parser.add_argument("--device", type=str, default="cuda")
+
+    # Weights & Biases
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="neural-laplacian-finetune",
+                        help="W&B project name")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B entity (team/user). Defaults to your default entity.")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="W&B run name (auto-generated if not set)")
+    parser.add_argument("--wandb_tags", type=str, default=None,
+                        help="Comma-separated W&B tags")
 
     args = parser.parse_args()
     train(args)
