@@ -368,12 +368,14 @@ def compute_laplacian_differentiable(
     vertices_np: np.ndarray,
     k: int,
     device: torch.device,
+    sparsify: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Forward pass through model → dense Laplacian (differentiable).
 
     In gradient mode: builds the full anisotropic L = G^T M_3 G from
     the predicted 3D gradient coefficients, preserving directional structure.
+    If sparsify=True, masks L to the 1-hop kNN sparsity pattern.
 
     In stiffness mode: builds S from scalar edge weights (isotropic).
 
@@ -392,11 +394,14 @@ def compute_laplacian_differentiable(
 
     if fwd.get('grad_coeffs') is not None:
         # Gradient mode: anisotropic L = G^T M_3 G
-        return assemble_anisotropic_laplacian(
+        L, M_diag = assemble_anisotropic_laplacian(
             grad_coeffs=fwd['grad_coeffs'],
             areas=fwd['areas'],
             knn=knn_t,
         )
+        if sparsify:
+            L = _sparsify_L_to_knn(L, knn_t)
+        return L, M_diag
     else:
         # Stiffness mode: isotropic S from scalar weights
         batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
@@ -849,81 +854,61 @@ def evaluate_pair_robust(
 
 
 @torch.no_grad()
-def evaluate_pair(
-    model: LaplacianTransformerModule,
-    vertices_a: np.ndarray,
-    vertices_b: np.ndarray,
-    k: int,
-    num_eigenvectors: int,
-    device: torch.device,
-) -> Dict[str, float]:
-    """Evaluate correspondence quality using functional maps.
+def _eigh_from_dense_L(L, M_diag_t, num_eigenvectors):
+    """Generalized eigenproblem on GPU: L v = λ M v → evals, evecs (numpy)."""
+    M_inv_sqrt = 1.0 / M_diag_t.sqrt().clamp(min=1e-8)
+    L_std = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
+    L_std = 0.5 * (L_std + L_std.T)
+    all_evals, all_evecs = torch.linalg.eigh(L_std)
+    evals = all_evals[:num_eigenvectors].cpu().numpy()
+    evecs = (M_inv_sqrt[:, None] * all_evecs[:, :num_eigenvectors]).cpu().numpy()
+    return evals, evecs
 
-    Uses anisotropic L = G^T M_3 G in gradient mode for consistency with training.
+
+def _sparsify_L_to_knn(L, knn_t):
+    """Zero out entries of L not in the 1-hop kNN graph, fix diagonal.
+
+    Differentiable: uses element-wise multiplication with a constant mask
+    so gradients flow through the retained entries.
+
+    Args:
+        L: (N, N) dense Laplacian
+        knn_t: (N, k) neighbor indices
+
+    Returns:
+        L_sparse: (N, N) dense tensor with kNN sparsity pattern
     """
-    from neural_local_laplacian.utils.utils import (
-        assemble_stiffness_and_mass_matrices,
-        compute_laplacian_eigendecomposition,
-    )
+    N = L.shape[0]
+    device = L.device
 
-    metrics = {}
-    n = len(vertices_a)
+    # Build kNN mask: mask[i, j] = True if j ∈ kNN(i) or i ∈ kNN(j)
+    mask = torch.zeros(N, N, dtype=torch.bool, device=device)
+    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn_t)
+    mask[row_idx, knn_t] = True
+    mask = mask | mask.T  # symmetrize
 
-    for label, verts in [('A', vertices_a), ('B', vertices_b)]:
-        verts_t = torch.from_numpy(verts).float().to(device)
-        knn_np = compute_knn(verts, k)
-        batch_data = build_patch_data(verts_t, knn_np, device)
-        batch_data = Batch.from_data_list([batch_data]).to(device)
+    # Apply mask to off-diagonal entries (differentiable: multiply by float mask)
+    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+    keep = (mask | diag_mask).float()  # 1.0 for kNN + diagonal, 0.0 elsewhere
+    L_sp = L * keep
 
-        fwd = model._forward_pass(batch_data)
+    # Fix diagonal: zero it out then set to -row_sum of off-diagonals
+    off_diag = L_sp * (1.0 - diag_mask.float())
+    row_sums = off_diag.sum(dim=1)
+    L_sp = off_diag - torch.diag(row_sums)
 
-        if fwd.get('grad_coeffs') is not None:
-            # Gradient mode: anisotropic L = G^T M_3 G
-            knn_t = torch.from_numpy(knn_np).long().to(device)
-            with torch.no_grad():
-                L, M_diag_t = assemble_anisotropic_laplacian(
-                    grad_coeffs=fwd['grad_coeffs'],
-                    areas=fwd['areas'],
-                    knn=knn_t,
-                )
+    return L_sp
 
-                # Generalized eigenproblem L v = λ M v on GPU
-                # Convert to standard form: M^{-1/2} L M^{-1/2} w = λ w
-                M_inv_sqrt = 1.0 / M_diag_t.sqrt().clamp(min=1e-8)
-                L_std = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
-                L_std = 0.5 * (L_std + L_std.T)  # ensure exact symmetry
 
-                all_evals, all_evecs = torch.linalg.eigh(L_std)
-                evals = all_evals[:num_eigenvectors].cpu().numpy()
-                # Transform back: v = M^{-1/2} w
-                evecs = (M_inv_sqrt[:, None] * all_evecs[:, :num_eigenvectors]).cpu().numpy()
-                M_diag = M_diag_t.cpu().numpy()
-        else:
-            # Stiffness mode: original sparse assembly
-            batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
-            S, M = assemble_stiffness_and_mass_matrices(
-                stiffness_weights=fwd['stiffness_weights'],
-                areas=fwd['areas'],
-                attention_mask=fwd['attention_mask'],
-                vertex_indices=batch_data.vertex_indices,
-                center_indices=batch_data.center_indices,
-                batch_indices=batch_idx,
-            )
-            evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
-            M_diag = np.array(M.diagonal()).flatten()
-
-        if label == 'A':
-            eigvecs_a, mass_a = evecs, M_diag
-        else:
-            eigvecs_b, mass_b = evecs, M_diag
-
-    # Functional map (identity GT for SMAL)
+def _correspondence_metrics(eigvecs_a, eigvecs_b, mass_a, mass_b, vertices_b, n):
+    """Compute functional map correspondence metrics from eigenbases."""
     weighted_phi_b = eigvecs_b * mass_b[:, None]
     C = weighted_phi_b.T @ eigvecs_a
 
     k_fm = C.shape[0]
     I = np.eye(k_fm)
 
+    metrics = {}
     metrics['ortho_error'] = float(np.linalg.norm(C.T @ C - I, 'fro'))
     metrics['biject_error'] = float(np.linalg.norm(C @ C.T - I, 'fro'))
     metrics['corr_error'] = float(np.linalg.norm(C - I, 'fro'))
@@ -946,6 +931,89 @@ def evaluate_pair(
     bb_diag = np.linalg.norm(vertices_b.max(0) - vertices_b.min(0))
     metrics['mean_error'] = float(errors.mean() / bb_diag)
     metrics['median_error'] = float(np.median(errors) / bb_diag)
+
+    return metrics
+
+
+def evaluate_pair(
+    model: LaplacianTransformerModule,
+    vertices_a: np.ndarray,
+    vertices_b: np.ndarray,
+    k: int,
+    num_eigenvectors: int,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Evaluate correspondence quality using functional maps.
+
+    Uses anisotropic L = G^T M_3 G in gradient mode for consistency with training.
+    Also evaluates a kNN-sparsified variant of L (1-hop only, 2-hop entries zeroed).
+    """
+    from neural_local_laplacian.utils.utils import (
+        assemble_stiffness_and_mass_matrices,
+        compute_laplacian_eigendecomposition,
+    )
+
+    n = len(vertices_a)
+    is_gradient_mode = False
+
+    # --- Per-shape: compute eigenbases for dense L, sparse L, and (fallback) S ---
+    dense_bases = {}
+    sparse_bases = {}
+
+    for label, verts in [('A', vertices_a), ('B', vertices_b)]:
+        verts_t = torch.from_numpy(verts).float().to(device)
+        knn_np = compute_knn(verts, k)
+        batch_data = build_patch_data(verts_t, knn_np, device)
+        batch_data = Batch.from_data_list([batch_data]).to(device)
+
+        fwd = model._forward_pass(batch_data)
+
+        if fwd.get('grad_coeffs') is not None:
+            is_gradient_mode = True
+            knn_t = torch.from_numpy(knn_np).long().to(device)
+            with torch.no_grad():
+                L, M_diag_t = assemble_anisotropic_laplacian(
+                    grad_coeffs=fwd['grad_coeffs'],
+                    areas=fwd['areas'],
+                    knn=knn_t,
+                )
+
+                # Dense L eigenbasis
+                evals_d, evecs_d = _eigh_from_dense_L(L, M_diag_t, num_eigenvectors)
+                M_diag = M_diag_t.cpu().numpy()
+                dense_bases[label] = (evecs_d, M_diag)
+
+                # kNN-sparsified L eigenbasis
+                L_sp = _sparsify_L_to_knn(L, knn_t)
+                evals_sp, evecs_sp = _eigh_from_dense_L(L_sp, M_diag_t, num_eigenvectors)
+                sparse_bases[label] = (evecs_sp, M_diag)
+        else:
+            batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
+            S, M = assemble_stiffness_and_mass_matrices(
+                stiffness_weights=fwd['stiffness_weights'],
+                areas=fwd['areas'],
+                attention_mask=fwd['attention_mask'],
+                vertex_indices=batch_data.vertex_indices,
+                center_indices=batch_data.center_indices,
+                batch_indices=batch_idx,
+            )
+            evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
+            M_diag = np.array(M.diagonal()).flatten()
+            dense_bases[label] = (evecs, M_diag)
+
+    # --- Compute metrics for dense L ---
+    evA_d, mA = dense_bases['A']
+    evB_d, mB = dense_bases['B']
+    metrics = _correspondence_metrics(evA_d, evB_d, mA, mB, vertices_b, n)
+
+    # --- Compute metrics for kNN-sparsified L ---
+    if is_gradient_mode and sparse_bases:
+        evA_sp, _ = sparse_bases['A']
+        evB_sp, _ = sparse_bases['B']
+        sp_metrics = _correspondence_metrics(evA_sp, evB_sp, mA, mB, vertices_b, n)
+        metrics['sp_accuracy'] = sp_metrics['accuracy']
+        metrics['sp_mean_error'] = sp_metrics['mean_error']
+        metrics['sp_corr_error'] = sp_metrics['corr_error']
 
     return metrics
 
@@ -1142,9 +1210,11 @@ def train(args):
 
     print()
     print("=" * 80)
+    lap_mode = "sparse (kNN-masked GᵀMG)" if args.sparsify_laplacian else "dense (full GᵀMG)"
     print(f"TRAINING (InfoNCE contrastive, {args.num_landmarks} landmarks, "
           f"V={args.num_sample_vertices}, scales={args.alphas}, τ={args.temperature}, "
           f"curriculum={args.cross_ratio_start:.0%}→{args.cross_ratio_end:.0%} over {args.curriculum_epochs}ep)")
+    print(f"  Laplacian: {lap_mode}")
     print("=" * 80)
 
     for epoch in range(1, args.epochs + 1):
@@ -1167,8 +1237,8 @@ def train(args):
                 verts_a, verts_b, pair_name = pair_gen.sample_train_pair(rng, cross_ratio)
 
                 # Forward: differentiable Laplacians (NO eigendecomposition)
-                S_A, M_A = compute_laplacian_differentiable(model, verts_a, args.k_pred, device)
-                S_B, M_B = compute_laplacian_differentiable(model, verts_b, args.k_pred, device)
+                S_A, M_A = compute_laplacian_differentiable(model, verts_a, args.k_pred, device, sparsify=args.sparsify_laplacian)
+                S_B, M_B = compute_laplacian_differentiable(model, verts_b, args.k_pred, device, sparsify=args.sparsify_laplacian)
 
                 # InfoNCE contrastive loss (vertex-subsampled)
                 loss_nce, metrics = loss_fn(S_A, S_B, M_A, M_B, rng)
@@ -1287,6 +1357,8 @@ def train(args):
             val_pairs = pair_gen.get_val_pairs(rng)
             val_accs = []
             val_errs = []
+            val_sp_accs = []
+            val_sp_errs = []
 
             print(f"  --- Validation (epoch {epoch}) ---")
             for verts_a, verts_b, pair_name in val_pairs:
@@ -1306,23 +1378,43 @@ def train(args):
                               f"{val_metrics['corr_error']:.6f},"
                               f"{val_metrics['diag_ratio']:.6f}\n")
 
+                sp_str = ""
+                if 'sp_accuracy' in val_metrics:
+                    val_sp_accs.append(val_metrics['sp_accuracy'])
+                    val_sp_errs.append(val_metrics['sp_mean_error'])
+                    sp_str = (f" | sp: Acc={val_metrics['sp_accuracy']*100:.1f}% "
+                              f"Err={val_metrics['sp_mean_error']:.4f}")
+
                 print(f"    {pair_name}: Acc={val_metrics['accuracy']*100:.1f}% "
                       f"Err={val_metrics['mean_error']:.4f} "
-                      f"||C-I||={val_metrics['corr_error']:.3f}")
+                      f"||C-I||={val_metrics['corr_error']:.3f}{sp_str}")
 
             mean_acc = np.mean(val_accs)
             mean_err = np.mean(val_errs)
+            sp_summary = ""
+            if val_sp_accs:
+                sp_mean_acc = np.mean(val_sp_accs)
+                sp_mean_err = np.mean(val_sp_errs)
+                sp_summary = f"  Sparse mean: Acc={sp_mean_acc*100:.1f}%, Err={sp_mean_err:.4f}"
             print(f"  Val mean: Acc={mean_acc*100:.1f}%, Err={mean_err:.4f}  "
                   f"(robust baseline: Acc={robust_mean_acc*100:.1f}%, Err={robust_mean_err:.4f})")
+            if sp_summary:
+                print(sp_summary)
 
             if args.wandb:
                 val_wandb = {
                     "val/acc_mean": mean_acc,
                     "val/err_mean": mean_err,
                 }
+                if val_sp_accs:
+                    val_wandb["val/sp_acc_mean"] = sp_mean_acc
+                    val_wandb["val/sp_err_mean"] = sp_mean_err
                 for i, (_, _, pair_name) in enumerate(val_pairs):
                     val_wandb[f"val_pairs/{pair_name}_acc"] = val_accs[i]
                     val_wandb[f"val_pairs/{pair_name}_err"] = val_errs[i]
+                    if val_sp_accs:
+                        val_wandb[f"val_pairs/{pair_name}_sp_acc"] = val_sp_accs[i]
+                        val_wandb[f"val_pairs/{pair_name}_sp_err"] = val_sp_errs[i]
                 wandb.log(val_wandb, step=epoch)
 
             if mean_acc > best_val_acc:
@@ -1393,7 +1485,7 @@ def main():
     # Model
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--k_pred", type=int, default=20)
-    parser.add_argument("--num_eigenvectors", type=int, default=30,
+    parser.add_argument("--num_eigenvectors", type=int, default=80,
                         help="Number of eigenvectors for evaluation")
     parser.add_argument("--freeze_input_projection", action="store_true")
 
@@ -1422,6 +1514,8 @@ def main():
                         help="Vertices to subsample for contrastive loss (V-way ranking)")
     parser.add_argument("--w_prox", type=float, default=10.0,
                         help="Weight for parameter-space proximity ||θ-θ_ref||²/||θ_ref||²")
+    parser.add_argument("--sparsify_laplacian", action="store_true",
+                        help="Mask L=G^T M G to 1-hop kNN sparsity (drop 2-hop entries)")
 
     # Curriculum: same-family → cross-family
     parser.add_argument("--cross_ratio_start", type=float, default=0.0,
