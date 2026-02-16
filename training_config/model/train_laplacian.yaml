@@ -12,6 +12,9 @@ module:
   scale_areas_by_patch_size: True
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
+  patch_mcv_mode: 'isotropic'
+  operator_mode: 'gradient'
+  val_laplacian_mode: 'sparse_anisotropic'
   loss_configs:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:

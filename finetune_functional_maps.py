@@ -1485,7 +1485,7 @@ def main():
     # Model
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--k_pred", type=int, default=20)
-    parser.add_argument("--num_eigenvectors", type=int, default=80,
+    parser.add_argument("--num_eigenvectors", type=int, default=30,
                         help="Number of eigenvectors for evaluation")
     parser.add_argument("--freeze_input_projection", action="store_true")
 
