@@ -142,6 +142,93 @@ def _sparsify_L_to_knn(L: torch.Tensor, knn: torch.Tensor) -> torch.Tensor:
     return L_sp
 
 
+def _assemble_anisotropic_laplacian_sparse(
+    grad_coeffs: torch.Tensor,
+    areas: torch.Tensor,
+    knn: torch.Tensor,
+) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix]:
+    """
+    Assemble sparse anisotropic L = G^T M_3 G, keeping only 1-hop entries.
+
+    Directly computes 1-hop entries without building a dense N×N intermediate.
+    For center vertex i, the local Gram contribution is:
+        L_local(p,q) = a_i * (ext_coeffs[p] · ext_coeffs[q])
+    where ext_coeffs = [-Σ_m g_im, g_i1, ..., g_ik].
+
+    Returns scipy sparse matrices ready for eigsh.
+
+    Args:
+        grad_coeffs: (N, k, 3) gradient coefficients per edge
+        areas: (N,) vertex areas
+        knn: (N, k) neighbor indices
+
+    Returns:
+        L: (N, N) scipy CSR sparse Laplacian
+        M: (N, N) scipy sparse diagonal mass matrix
+    """
+    N, k, _ = grad_coeffs.shape
+
+    # Move to CPU numpy
+    gc = grad_coeffs.detach().cpu().numpy()   # (N, k, 3)
+    a = areas.detach().cpu().numpy()           # (N,)
+    knn_np = knn.cpu().numpy()                 # (N, k)
+
+    # Extended coefficients: prepend center = -Σ g_im
+    center_coeffs = -gc.sum(axis=1, keepdims=True)  # (N, 1, 3)
+    ext_coeffs = np.concatenate([center_coeffs, gc], axis=1)  # (N, k+1, 3)
+
+    # Local Gram matrices: a_i * ext @ ext^T  -> (N, k+1, k+1)
+    sqrt_a = np.sqrt(a)[:, None, None]  # (N, 1, 1)
+    scaled = sqrt_a * ext_coeffs  # (N, k+1, 3)
+    gram = np.einsum('npd,nqd->npq', scaled, scaled)  # (N, k+1, k+1)
+
+    # Extended indices: [i, knn[i,0], ..., knn[i,k-1]]
+    center_idx = np.arange(N)[:, None]  # (N, 1)
+    ext_idx = np.concatenate([center_idx, knn_np], axis=1)  # (N, k+1)
+
+    # Build COO arrays (vectorized)
+    kp1 = k + 1
+    # Row indices: ext_idx[:, p] repeated for each q
+    row_idx = np.repeat(ext_idx[:, :, None], kp1, axis=2)  # (N, k+1, k+1)
+    col_idx = np.repeat(ext_idx[:, None, :], kp1, axis=1)  # (N, k+1, k+1)
+
+    # Flatten
+    rows = row_idx.ravel()
+    cols = col_idx.ravel()
+    vals = gram.ravel()
+
+    # Build sparse matrix (duplicates summed automatically)
+    L = scipy.sparse.coo_matrix((vals, (rows, cols)), shape=(N, N)).tocsr()
+    L = 0.5 * (L + L.T)
+
+    # Mask to 1-hop kNN sparsity pattern (remove 2-hop fill between
+    # neighbors of the same center that aren't direct neighbors of each other)
+    knn_row = np.repeat(np.arange(N), k)
+    knn_col = knn_np.ravel()
+    ones = np.ones(N * k)
+    # Symmetric adjacency: edge exists if i∈kNN(j) or j∈kNN(i)
+    adj = scipy.sparse.coo_matrix((ones, (knn_row, knn_col)), shape=(N, N)).tocsr()
+    adj = adj + adj.T
+    adj = (adj > 0).astype(L.dtype)
+    # Add diagonal
+    adj = adj + scipy.sparse.eye(N, dtype=L.dtype)
+
+    # Element-wise multiply to keep only 1-hop + diagonal entries
+    L = L.multiply(adj).tocsr()
+
+    # Fix diagonal: ensure row sums are zero
+    offdiag = L.copy()
+    offdiag.setdiag(0)
+    offdiag.eliminate_zeros()
+    diag_vals = -np.array(offdiag.sum(axis=1)).ravel()
+    L = offdiag + scipy.sparse.diags(diag_vals)
+
+    # Mass matrix
+    M = scipy.sparse.diags(a)
+
+    return L, M
+
+
 def _eigh_anisotropic(L: torch.Tensor, M_diag: torch.Tensor,
                       num_eigenvectors: int) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -1015,26 +1102,34 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             else:
                 device = grad_coeffs.device
                 batch_sizes = forward_result['batch_sizes']
-                N = int(batch_sizes.sum().item())
-                k = batch_sizes[0].item()
+                N = len(batch_sizes)           # number of vertices
+                k = batch_sizes[0].item()      # neighbors per patch
 
                 # Reshape vertex_indices to (N, k) for knn
                 knn = mesh_batch.vertex_indices.reshape(N, k).to(device)
                 areas = forward_result['areas'].detach()
 
                 with torch.no_grad():
-                    L, M_diag = _assemble_anisotropic_laplacian_dense(
-                        grad_coeffs=grad_coeffs,
-                        areas=areas,
-                        knn=knn,
-                    )
-
                     if self._val_laplacian_mode == "sparse_anisotropic":
-                        L = _sparsify_L_to_knn(L, knn)
-
-                    pred_eigenvalues, pred_eigenvectors = _eigh_anisotropic(
-                        L, M_diag, self._num_eigenvalues
-                    )
+                        # Direct sparse assembly — no dense N×N intermediate
+                        L_scipy, M_scipy = _assemble_anisotropic_laplacian_sparse(
+                            grad_coeffs=grad_coeffs,
+                            areas=areas,
+                            knn=knn,
+                        )
+                        pred_eigenvalues, pred_eigenvectors = compute_laplacian_eigendecomposition(
+                            L_scipy, self._num_eigenvalues, mass_matrix=M_scipy
+                        )
+                    else:
+                        # dense_anisotropic: full dense L then dense eigh
+                        L, M_diag = _assemble_anisotropic_laplacian_dense(
+                            grad_coeffs=grad_coeffs,
+                            areas=areas,
+                            knn=knn,
+                        )
+                        pred_eigenvalues, pred_eigenvectors = _eigh_anisotropic(
+                            L, M_diag, self._num_eigenvalues
+                        )
 
         # Get ground-truth eigendecomposition (stored as tuple to avoid PyG batching issues)
         gt_eigenvalues, gt_eigenvectors = mesh_data.gt_eigen
