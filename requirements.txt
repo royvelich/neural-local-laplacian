@@ -33,3 +33,4 @@ meshio
 trimesh
 kornia
 pcdiff
+peft
