@@ -34,6 +34,7 @@ Usage:
 
 import argparse
 import copy
+import math
 import sys
 import types
 import pickle
@@ -1582,9 +1583,14 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.lr_T_max, eta_min=args.lr * 0.01
-    )
+    # Cosine decay to eta_min over lr_T_max epochs, then stay flat (no restart).
+    eta_min_ratio = 0.01  # eta_min = lr * 0.01
+    def _cosine_no_restart(epoch):
+        if epoch >= args.lr_T_max:
+            return eta_min_ratio
+        return eta_min_ratio + (1.0 - eta_min_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * epoch / args.lr_T_max))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_no_restart)
 
     # Logging
     log_file = open(output_dir / "train_log.csv", "w")
@@ -2028,7 +2034,7 @@ def main():
     parser.add_argument("--keep_areas_head", action="store_true",
                         help="[with --random_init] Preserve pretrained areas head weights during reset")
     parser.add_argument("--k_pred", type=int, default=20)
-    parser.add_argument("--num_eigenvectors", type=int, default=80)
+    parser.add_argument("--num_eigenvectors", type=int, default=100)
     parser.add_argument("--freeze_input_projection", action="store_true")
     parser.add_argument("--freeze_areas_head", action="store_true",
                         help="Freeze the areas head (keep pretrained weights, no gradient updates)")
@@ -2058,8 +2064,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_T_max", type=int, default=200,
                         help="T_max for CosineAnnealingLR (default: 200)")
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=10.0)
+    parser.add_argument("--weight_decay", type=float, default=1e-2)
+    parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--max_vertices", type=int, default=0,
                         help="Subsample shapes to this many vertices during training "
                              "(0 = no subsampling). Useful for large meshes (e.g. DT4D ~8000).")
@@ -2071,7 +2077,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     # InfoNCE loss
-    parser.add_argument("--num_landmarks", type=int, default=512)
+    parser.add_argument("--num_landmarks", type=int, default=128)
     parser.add_argument("--alphas", type=str, default="1.0,10.0,100.0")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--num_sample_vertices", type=int, default=1024)
@@ -2080,12 +2086,12 @@ def main():
                         help="Contrastive loss: infonce, dcl (decoupled), dclw (weighted decoupled)")
     parser.add_argument("--dclw_sigma", type=float, default=0.5,
                         help="[DCLW] Sigma for positive reweighting")
-    parser.add_argument("--w_prox", type=float, default=10.0)
+    parser.add_argument("--w_prox", type=float, default=20.0)
     parser.add_argument("--sparsify_laplacian", action="store_true")
 
     # Curriculum
     parser.add_argument("--cross_ratio_start", type=float, default=0.0)
-    parser.add_argument("--cross_ratio_end", type=float, default=0.5)
+    parser.add_argument("--cross_ratio_end", type=float, default=0.3)
     parser.add_argument("--curriculum_epochs", type=int, default=50)
 
     # Evaluation & checkpointing
