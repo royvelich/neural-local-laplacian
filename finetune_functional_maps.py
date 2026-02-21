@@ -104,6 +104,7 @@ class PairGenerator(ABC):
     @abstractmethod
     def get_val_pairs(
         self, rng: np.random.RandomState,
+        poses_per_pair: int = 1,
     ) -> List[PairSample]:
         ...
 
@@ -361,16 +362,18 @@ class SMALPairGenerator(PairGenerator):
         return PairSample(verts_a, verts_b, corr_a, corr_b,
                           f"{pair_type}_{fam_a}_vs_{fam_b}")
 
-    def get_val_pairs(self, rng: np.random.RandomState) -> List[PairSample]:
+    def get_val_pairs(self, rng: np.random.RandomState,
+                      poses_per_pair: int = 1) -> List[PairSample]:
         pairs = []
         for fam_a, fam_b in self.val_pairs:
-            pair_rng = np.random.RandomState(fam_a * 100 + fam_b)
-            verts_a = self.smal.generate(fam_a, self.pose_scale, pair_rng)
-            verts_b = self.smal.generate(fam_b, self.pose_scale, pair_rng)
-            n = len(verts_a)
-            corr_a, corr_b = identity_correspondence(n)
-            pairs.append(PairSample(verts_a, verts_b, corr_a, corr_b,
-                                    f"val_{fam_a}_vs_{fam_b}"))
+            for pose_idx in range(poses_per_pair):
+                pair_rng = np.random.RandomState(fam_a * 100 + fam_b + pose_idx * 10000)
+                verts_a = self.smal.generate(fam_a, self.pose_scale, pair_rng)
+                verts_b = self.smal.generate(fam_b, self.pose_scale, pair_rng)
+                n = len(verts_a)
+                corr_a, corr_b = identity_correspondence(n)
+                pairs.append(PairSample(verts_a, verts_b, corr_a, corr_b,
+                                        f"val_{fam_a}_vs_{fam_b}_p{pose_idx}"))
         return pairs
 
 
@@ -607,27 +610,39 @@ class DT4DPairGenerator(PairGenerator):
             name=f"{pair_type}_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
         )
 
-    def get_val_pairs(self, rng: np.random.RandomState) -> List[PairSample]:
+    def get_val_pairs(self, rng: np.random.RandomState,
+                      poses_per_pair: int = 1) -> List[PairSample]:
         pairs = []
         for cat_a, cat_b in self.val_pairs:
             # Deterministic poses per pair
             pair_rng = np.random.RandomState(_stable_hash((cat_a, cat_b)))
             c_a = self.categories[cat_a]
             c_b = self.categories[cat_b]
-            pose_a = pair_rng.randint(c_a.num_poses)
-            pose_b = pair_rng.randint(c_b.num_poses)
-            if cat_a == cat_b and c_a.num_poses > 1:
-                while pose_b == pose_a:
-                    pose_b = pair_rng.randint(c_b.num_poses)
 
-            corr_a, corr_b = self._build_correspondence(cat_a, pose_a, cat_b, pose_b)
-            pairs.append(PairSample(
-                verts_a=c_a.vertices[pose_a],
-                verts_b=c_b.vertices[pose_b],
-                corr_a=corr_a,
-                corr_b=corr_b,
-                name=f"val_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
-            ))
+            # Collect distinct pose combinations
+            seen = set()
+            for _ in range(poses_per_pair):
+                # Draw candidates until we get an unseen combo
+                # (cap attempts to avoid infinite loops if pose space is small)
+                for _attempt in range(200):
+                    pa = pair_rng.randint(c_a.num_poses)
+                    pb = pair_rng.randint(c_b.num_poses)
+                    if cat_a == cat_b and pa == pb and c_a.num_poses > 1:
+                        continue
+                    if (pa, pb) not in seen:
+                        break
+                else:
+                    break  # exhausted attempts, skip remaining combos
+                seen.add((pa, pb))
+
+                corr_a, corr_b = self._build_correspondence(cat_a, pa, cat_b, pb)
+                pairs.append(PairSample(
+                    verts_a=c_a.vertices[pa],
+                    verts_b=c_b.vertices[pb],
+                    corr_a=corr_a,
+                    corr_b=corr_b,
+                    name=f"val_{cat_a}:{c_a.poses[pa]}_vs_{cat_b}:{c_b.poses[pb]}",
+                ))
         return pairs
 
 
@@ -1605,8 +1620,10 @@ def train(args):
     global_step = 0
 
     # Compute robust Laplacian baseline (once)
-    print("\n  Computing robust Laplacian baseline...")
-    val_pairs_baseline = pair_gen.get_val_pairs(rng)
+    print(f"\n  Computing robust Laplacian baseline "
+          f"({len(pair_gen.val_pairs)} category pairs × {args.val_poses_per_pair} poses "
+          f"= {len(pair_gen.val_pairs) * args.val_poses_per_pair} evaluations)...")
+    val_pairs_baseline = pair_gen.get_val_pairs(rng, args.val_poses_per_pair)
     robust_metrics_list = []
     for pair in val_pairs_baseline:
         eval_pair = pair
@@ -1634,7 +1651,7 @@ def train(args):
     init_label = "random init" if from_scratch else "pretrained model"
     print(f"\n  Computing {init_label} baseline (epoch 0)...")
     model.eval()
-    val_pairs_ep0 = pair_gen.get_val_pairs(rng)
+    val_pairs_ep0 = pair_gen.get_val_pairs(rng, args.val_poses_per_pair)
     ep0_metrics_list = []
     for pair in val_pairs_ep0:
         eval_pair = pair
@@ -1719,6 +1736,10 @@ def train(args):
         print(f"  Vertex subsampling: {args.max_vertices} (per shape, per step)")
     if args.vertex_noise > 0:
         print(f"  Vertex noise: {args.vertex_noise:.4f} (relative to mean radius)")
+    if args.grad_accum_steps > 1:
+        eff_batch = args.pairs_per_step * args.grad_accum_steps
+        print(f"  Gradient accumulation: {args.grad_accum_steps} steps "
+              f"(effective batch = {args.pairs_per_step} × {args.grad_accum_steps} = {eff_batch} pairs)")
     print("=" * 80)
 
     for epoch in range(1, args.epochs + 1):
@@ -1728,9 +1749,15 @@ def train(args):
         progress = min(1.0, (epoch - 1) / max(1, args.curriculum_epochs))
         cross_ratio = args.cross_ratio_start + progress * (args.cross_ratio_end - args.cross_ratio_start)
 
+        accum = args.grad_accum_steps
+        loss_scale = args.pairs_per_step * accum
+
         for step in range(args.steps_per_epoch):
             global_step += 1
-            optimizer.zero_grad()
+
+            # Zero gradients at the start of each accumulation window
+            if step % accum == 0:
+                optimizer.zero_grad()
 
             step_metrics_list = []
             valid_pairs = 0
@@ -1782,22 +1809,27 @@ def train(args):
                     S_A.retain_grad()
                     S_B.retain_grad()
 
-                (loss / args.pairs_per_step).backward()
+                (loss / loss_scale).backward()
 
                 step_metrics_list.append(metrics)
                 valid_pairs += 1
 
             if valid_pairs == 0:
                 print(f"  [Step {global_step}] All pairs failed! Skipping.")
-                optimizer.zero_grad()
+                # If at accumulation boundary, clear stale grads
+                if (step + 1) % accum == 0 or step == args.steps_per_epoch - 1:
+                    optimizer.zero_grad()
                 continue
 
-            # Always compute grad norm for monitoring
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                args.grad_clip if args.grad_clip > 0 else float('inf'))
-
-            optimizer.step()
+            # Clip and step at end of accumulation window (or end of epoch)
+            is_accum_boundary = ((step + 1) % accum == 0) or (step == args.steps_per_epoch - 1)
+            if is_accum_boundary:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.grad_clip if args.grad_clip > 0 else float('inf'))
+                optimizer.step()
+            else:
+                grad_norm = torch.tensor(0.0)  # not stepping yet
 
             avg_step = {k: np.mean([m[k] for m in step_metrics_list])
                         for k in step_metrics_list[0]}
@@ -1851,7 +1883,7 @@ def train(args):
         # Validation
         if epoch % args.eval_every == 0:
             model.eval()
-            val_pairs = pair_gen.get_val_pairs(rng)
+            val_pairs = pair_gen.get_val_pairs(rng, args.val_poses_per_pair)
             val_metrics_list = []
 
             print(f"  --- Validation (epoch {epoch}) ---")
@@ -2025,6 +2057,9 @@ def main():
                         help="Path to DeformingThings4DMatching root (required for --dataset dt4d)")
     parser.add_argument("--val_categories", type=str, default=None,
                         help="[DT4D] Comma-separated category names for validation")
+    parser.add_argument("--val_poses_per_pair", type=int, default=2,
+                        help="Number of pose combinations to evaluate per val category pair "
+                             "(default: 1). E.g. 5 → 13 pairs × 5 = 65 val evaluations.")
 
     # Model
     parser.add_argument("--checkpoint", type=str, required=True,
@@ -2061,15 +2096,18 @@ def main():
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--steps_per_epoch", type=int, default=10)
     parser.add_argument("--pairs_per_step", type=int, default=1)
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                        help="Accumulate gradients over this many steps before optimizer.step(). "
+                             "Effective batch = pairs_per_step * grad_accum_steps.")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_T_max", type=int, default=200,
                         help="T_max for CosineAnnealingLR (default: 200)")
-    parser.add_argument("--weight_decay", type=float, default=1e-2)
-    parser.add_argument("--grad_clip", type=float, default=0.0)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--grad_clip", type=float, default=10.0)
     parser.add_argument("--max_vertices", type=int, default=0,
                         help="Subsample shapes to this many vertices during training "
                              "(0 = no subsampling). Useful for large meshes (e.g. DT4D ~8000).")
-    parser.add_argument("--vertex_noise", type=float, default=0.01,
+    parser.add_argument("--vertex_noise", type=float, default=0.05,
                         help="Gaussian noise scale relative to mean vertex radius "
                              "(e.g. 0.005 = 0.5%%). Augments training poses for diversity.")
     parser.add_argument("--pose_scale", type=float, default=0.3,
@@ -2077,7 +2115,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     # InfoNCE loss
-    parser.add_argument("--num_landmarks", type=int, default=128)
+    parser.add_argument("--num_landmarks", type=int, default=512)
     parser.add_argument("--alphas", type=str, default="1.0,10.0,100.0")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--num_sample_vertices", type=int, default=1024)
@@ -2091,7 +2129,7 @@ def main():
 
     # Curriculum
     parser.add_argument("--cross_ratio_start", type=float, default=0.0)
-    parser.add_argument("--cross_ratio_end", type=float, default=0.3)
+    parser.add_argument("--cross_ratio_end", type=float, default=0.5)
     parser.add_argument("--curriculum_epochs", type=int, default=50)
 
     # Evaluation & checkpointing
