@@ -17,8 +17,8 @@ module:
       feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
       conv_k_nearest: null
-      pose_transformers:
-        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      pose_transformers: null
+#        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
       coeff_generation_method:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
         _args_: ['uniform']
@@ -29,15 +29,21 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_area: False
-    batch_size: 200
-    num_workers: 5
+    batch_size: 1000
+    num_workers: 0
     shuffle: True
   val_dataset_specifications:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        mesh_folder_path: './assets/meshes5'
-        k: 20
+        max_meshes: 60
+        file_size_range_mb: [0.5, 5]
+        shuffle: True
+        mesh_folder_paths:
+          - '/workspace/datasets/mpz14'
+          - '/workspace/datasets/deftransfer'
+          - '/workspace/datasets/shrec15'
+        k: 6
         feature_extractor:
           _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
         pose_transformers:

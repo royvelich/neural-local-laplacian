@@ -9,7 +9,7 @@
   "checkpoint": "C:\\Users\\Roy\\Downloads\\model.ckpt",
   "random_init": false,
   "keep_areas_head": false,
-  "k_pred": 20,
+  "k_pred": 15,
   "num_eigenvectors": 100,
   "freeze_input_projection": false,
   "freeze_areas_head": false,

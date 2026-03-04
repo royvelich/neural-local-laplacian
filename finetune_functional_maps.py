@@ -2068,7 +2068,7 @@ def main():
                         help="Reset all weights to random initialization after loading checkpoint architecture")
     parser.add_argument("--keep_areas_head", action="store_true",
                         help="[with --random_init] Preserve pretrained areas head weights during reset")
-    parser.add_argument("--k_pred", type=int, default=20)
+    parser.add_argument("--k_pred", type=int, default=15)
     parser.add_argument("--num_eigenvectors", type=int, default=100)
     parser.add_argument("--freeze_input_projection", action="store_true")
     parser.add_argument("--freeze_areas_head", action="store_true",
