@@ -9,8 +9,6 @@ val_dataset_specifications:
       file_size_range_mb: [0.5, 2]
       shuffle: True
       k: 30
-      feature_extractor:
-        _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
       pose_transformers:
         - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
     batch_size: 1

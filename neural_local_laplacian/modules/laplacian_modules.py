@@ -43,6 +43,7 @@ from pyFM.mesh import TriMesh
 # neural laplacian
 from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, assemble_gradient_operator, compute_laplacian_eigendecomposition
 from neural_local_laplacian.modules.losses import LossConfig, LossContext
+from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_pointcloud,
     compute_heat_geodesic_learned,
@@ -322,8 +323,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
     """Surface transformer module with support for variable-sized patches."""
 
     def __init__(self,
-                 input_dim: int,
+                 input_dim: Optional[int] = None,
                  loss_configs: Optional[List[LossConfig]] = None,
+                 feature_extractor: Optional[FeatureExtractor] = None,
                  d_model: int = 512,
                  nhead: int = 8,
                  num_encoder_layers: int = 6,
@@ -342,8 +344,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         super().__init__(**kwargs)
 
         # This saves all the __init__ arguments automatically
-        # Exclude loss_configs from hyperparameters since they contain non-serializable PyTorch modules
-        self.save_hyperparameters(ignore=['loss_configs'])
+        # Exclude loss_configs and feature_extractor: they contain non-serializable PyTorch modules
+        self.save_hyperparameters(ignore=['loss_configs', 'feature_extractor'])
 
         # Manually save loss configuration info for logging (serializable version)
         if loss_configs is not None:
@@ -358,9 +360,25 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                     config.weight for config in self._normalize_loss_weights(loss_configs)
                 ]
 
-        # Validate input_dim
-        if input_dim is None or input_dim <= 0:
-            raise ValueError(f"input_dim must be a positive integer, got: {input_dim}")
+        # Validate input_dim / feature_extractor
+        if feature_extractor is not None:
+            # Register as a proper submodule so it moves with .to(device) and is saved in state_dict
+            if isinstance(feature_extractor, nn.Module):
+                self.feature_extractor = feature_extractor
+            else:
+                self.feature_extractor = None
+                self._feature_extractor_fn = feature_extractor
+            resolved_input_dim = feature_extractor.output_dim
+            if input_dim is not None and input_dim != resolved_input_dim:
+                raise ValueError(
+                    f"input_dim={input_dim} conflicts with feature_extractor.output_dim={resolved_input_dim}. "
+                    f"When a feature_extractor is provided, input_dim is inferred automatically."
+                )
+        else:
+            self.feature_extractor = None
+            if input_dim is None or input_dim <= 0:
+                raise ValueError("input_dim must be a positive integer when no feature_extractor is provided.")
+            resolved_input_dim = input_dim
 
         # Validate operator_mode
         if operator_mode not in ("stiffness", "gradient"):
@@ -380,7 +398,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             raise ValueError(f"val_laplacian_mode='{val_laplacian_mode}' requires operator_mode='gradient'")
 
         self._d_model = d_model
-        self._input_dim = input_dim
+        self._input_dim = resolved_input_dim
         self._num_eigenvalues = num_eigenvalues
         self._normalize_patch_features = normalize_patch_features
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
@@ -395,7 +413,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             self._loss_configs = loss_configs
 
         # Input and output projections
-        self.input_projection = self._build_projection(input_dim, d_model, input_projection_hidden_dims)
+        self.input_projection = self._build_projection(resolved_input_dim, d_model, input_projection_hidden_dims)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -722,7 +740,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             - batch_sizes: (batch_size,) - all equal to k
             - scale_factors: (batch_size,) - max_dist per patch (only if normalizing)
         """
-        features = batch.x  # Shape: (total_points, feature_dim)
+        features = batch.x  # Shape: (total_points, 3) — raw positions
         positions = batch.pos  # Shape: (total_points, 3)
 
         # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
@@ -748,10 +766,17 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
             # Normalize features by scale factors (broadcast per-patch scale to per-point)
             per_point_scales = scale_factors[batch_indices]  # (total_points,)
-            features = features / per_point_scales.unsqueeze(-1)  # (total_points, feature_dim)
+            features = features / per_point_scales.unsqueeze(-1)  # (total_points, 3)
         else:
             # No normalization - scale factors are all 1.0
             scale_factors = torch.ones(batch_size, device=features.device, dtype=features.dtype)
+
+        # Apply feature extractor if provided (operates on normalized positions)
+        if self.feature_extractor is not None:
+            # Reshape to (batch_size, k, 3), extract, reshape back to (total_points, feature_dim)
+            features = features.view(batch_size, k, 3)
+            features = self.feature_extractor.extract_features(features)  # (batch_size, k, feature_dim)
+            features = features.view(batch_size * k, -1)  # (total_points, feature_dim)
 
         # Project to model dimension
         features = self.input_projection(features)  # (total_points, d_model)
@@ -823,7 +848,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             - batch_sizes: (batch_size,) - actual number of points per patch
             - scale_factors: (batch_size,) - max_dist per patch (only if normalizing)
         """
-        features = batch.x  # Shape: (total_points, feature_dim)
+        features = batch.x  # Shape: (total_points, 3) — raw positions
         positions = batch.pos  # Shape: (total_points, 3)
 
         # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
@@ -849,10 +874,22 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
             # Normalize features by scale factors (broadcast per-patch scale to per-point)
             per_point_scales = scale_factors[batch_indices]  # (total_points,)
-            features = features / per_point_scales.unsqueeze(-1)  # (total_points, feature_dim)
+            features = features / per_point_scales.unsqueeze(-1)  # (total_points, 3)
         else:
             # No normalization - scale factors are all 1.0
             scale_factors = torch.ones(batch_size, device=features.device, dtype=features.dtype)
+
+        # Apply feature extractor if provided (operates on normalized positions)
+        # Variable-k: extract per-patch using the base class dispatch (handles ragged via loop)
+        if self.feature_extractor is not None:
+            extracted = []
+            start = 0
+            for sz in batch_sizes:
+                sz = sz.item()
+                patch = features[start:start + sz]  # (sz, 3)
+                extracted.append(self.feature_extractor.extract_features(patch))  # (sz, feature_dim)
+                start += sz
+            features = torch.cat(extracted, dim=0)  # (total_points, feature_dim)
 
         # Project to model dimension
         features = self.input_projection(features)  # (total_points, d_model)

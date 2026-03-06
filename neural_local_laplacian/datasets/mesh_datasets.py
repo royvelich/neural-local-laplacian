@@ -16,7 +16,6 @@ import trimesh
 
 # Local imports
 from neural_local_laplacian.datasets.base_datasets import PoseType
-from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 from neural_local_laplacian.utils import utils
 from neural_local_laplacian.utils.geodesic_utils import (
@@ -65,7 +64,6 @@ class MeshDataset(Dataset):
             mesh_folder_paths: Union[str, Path, List[Union[str, Path]]] = None,
             k: int = 20,
             num_eigenvalues: int = 20,
-            feature_extractor: Optional[FeatureExtractor] = None,
             pose_transformers: Optional[List[PoseTransformer]] = None,
             num_geodesic_sources: int = 5,
             geodesic_source_method: str = "farthest_point_sampling",
@@ -83,7 +81,6 @@ class MeshDataset(Dataset):
                 Also accepts 'mesh_folder_path' (singular) for backward compatibility.
             k: Number of nearest neighbors to extract (excluding center point)
             num_eigenvalues: Number of eigenvalues/eigenvectors to compute for ground truth
-            feature_extractor: Feature extractor to apply to patch points
             pose_transformers: Optional list of pose transformations to apply sequentially
             num_geodesic_sources: Number of source vertices for geodesic validation (default: 5)
             geodesic_source_method: Method for selecting sources:
@@ -112,7 +109,6 @@ class MeshDataset(Dataset):
 
         self._k = k
         self._num_eigenvalues = num_eigenvalues
-        self._feature_extractor = feature_extractor
         self._pose_transformers = pose_transformers if pose_transformers is not None else []
         self._num_geodesic_sources = num_geodesic_sources
         self._geodesic_source_method = geodesic_source_method
@@ -510,36 +506,8 @@ class MeshDataset(Dataset):
         return pos_tensor.numpy(), normal_tensor.numpy()
 
     def _extract_patch_features(self, patch_positions: np.ndarray, vertex_normals: np.ndarray) -> np.ndarray:
-        """
-        Extract features for ALL patches using vectorized operations.
-
-        Args:
-            patch_positions: Patch positions of shape (N, k, 3)
-            vertex_normals: Normal vectors at center vertices, shape (N, 3)
-
-        Returns:
-            Feature array of shape (N, k, feature_dim)
-        """
-        if self._feature_extractor is not None:
-            # Use the center vertex normals for feature extraction
-            # Expand normals to match patch structure: (N, 3) -> (N, 1, 3)
-            center_normals_expanded = vertex_normals[:, np.newaxis, :]  # Shape: (N, 1, 3)
-
-            try:
-                # The feature extractor should handle batch processing
-                features = self._feature_extractor.extract_features(
-                    points=patch_positions,
-                    normals=center_normals_expanded
-                )
-                return features
-            except Exception as e:
-                import traceback
-                print(f"Warning: Feature extraction failed, using positions as features: {e}")
-                traceback.print_exc()
-                return patch_positions
-        else:
-            # Fallback: use positions as features
-            return patch_positions
+        """Return raw patch positions as features — feature extraction is handled by the model."""
+        return patch_positions
 
     @property
     def mesh_file_paths(self) -> List[Path]:

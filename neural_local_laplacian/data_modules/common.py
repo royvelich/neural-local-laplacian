@@ -1,87 +1,130 @@
 # Standard library imports
-from typing import Optional, List
-from dataclasses import dataclass
+from typing import Optional, List, Callable
 
 # Third-party library imports
 import lightning
-from torch_geometric.loader import DataLoader
-from torch_geometric.data import Dataset, Data
+import torch.utils.data
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch_geometric.data import Dataset as PyGDataset
 
 # neural signatures
 from neural_local_laplacian.utils import utils
 
 
-@dataclass
+# ---------------------------------------------------------------------------
+# Dataset specification
+# ---------------------------------------------------------------------------
+
 class DatasetSpecification:
-    dataset: Dataset
-    batch_size: int
-    num_workers: int
-    shuffle: bool
+    """Bundles a dataset with its DataLoader settings.
 
-
-class GenericDataModule(lightning.pytorch.LightningDataModule):
-    """
-    PyTorch Lightning DataModule for handling Polynomial Surface datasets.
-
-    This module manages the creation of train and validation dataloaders
-    for synthetic polynomial surface data.
-
-    Attributes:
-        _train_dataset (SyntheticSurfaceDataset): Dataset for training.
-        _val_dataset (SyntheticSurfaceDataset): Dataset for validation.
-        _batch_size (int): Number of samples per batch.
-        _num_workers (int): Number of subprocesses to use for data loading.
-        _shuffle (bool): Whether to shuffle the data during training.
+    Args:
+        dataset:     The dataset instance (PyG or plain torch).
+        batch_size:  Items per batch.
+        num_workers: DataLoader worker processes (0 = main process).
+        shuffle:     Whether to shuffle each epoch.
+        collate_fn:  Optional collate function (plain DataLoader only;
+                     ignored by GenericPygDataModule which uses PyG's DataLoader).
     """
 
     def __init__(
-            self,
-            train_dataset_specification: DatasetSpecification,
-            val_dataset_specifications: List[DatasetSpecification],
-    ) -> None:
-        """
-        Initialize the PolynomialSurfaceDataModule.
+        self,
+        dataset,
+        batch_size: int,
+        num_workers: int,
+        shuffle: bool,
+        collate_fn: Optional[Callable] = None,
+    ):
+        self.dataset     = dataset
+        self.batch_size  = batch_size
+        self.num_workers = num_workers
+        self.shuffle     = shuffle
+        self.collate_fn  = collate_fn
 
-        Args:
-            train_synthetic_dataset (SyntheticSurfaceDataset): Dataset for training.
-            val_dataset (SyntheticSurfaceDataset): Dataset for validation.
-            batch_size (int): Number of samples per batch.
-            num_workers (int): Number of subprocesses to use for data loading.
-            shuffle (bool, optional): Whether to shuffle the data during training. Defaults to True.
-        """
+
+# ---------------------------------------------------------------------------
+# Base: shared __init__ and structure, no DataLoader imports
+# ---------------------------------------------------------------------------
+
+class _GenericDataModuleBase(lightning.pytorch.LightningDataModule):
+    """Internal base: stores specifications, leaves DataLoader construction
+    to subclasses that know which loader to use."""
+
+    def __init__(
+        self,
+        train_dataset_specification: DatasetSpecification,
+        val_dataset_specifications: List[DatasetSpecification],
+    ) -> None:
         super().__init__()
         self._train_dataset_specification = train_dataset_specification
-        self._val_dataset_specifications = val_dataset_specifications
+        self._val_dataset_specifications  = val_dataset_specifications
 
-    def train_dataloader(self) -> DataLoader:
-        """
-        Create and return the train dataloader.
+    def _make_train_loader(self, spec: DatasetSpecification):
+        raise NotImplementedError
 
-        Returns:
-            DataLoader: The dataloader for training data.
-        """
-        return DataLoader(
-            dataset=self._train_dataset_specification.dataset,
-            batch_size=self._train_dataset_specification.batch_size,
-            shuffle=self._train_dataset_specification.shuffle,
-            num_workers=self._train_dataset_specification.num_workers,
-            persistent_workers=self._train_dataset_specification.num_workers > 0
+    def _make_val_loader(self, spec: DatasetSpecification):
+        raise NotImplementedError
+
+    def train_dataloader(self):
+        return self._make_train_loader(self._train_dataset_specification)
+
+    def val_dataloader(self) -> List:
+        return [self._make_val_loader(s) for s in self._val_dataset_specifications]
+
+
+# ---------------------------------------------------------------------------
+# PyG DataLoader subclass  (existing behaviour, unchanged)
+# ---------------------------------------------------------------------------
+
+class GenericPygDataModule(_GenericDataModuleBase):
+    """DataModule backed by PyTorch Geometric's DataLoader.
+
+    Use this when datasets yield ``torch_geometric.data.Data`` objects that
+    need PyG's automatic batching (stacking node/edge features into a single
+    large disconnected graph).
+    """
+
+    def _make_loader(self, spec: DatasetSpecification) -> PyGDataLoader:
+        return PyGDataLoader(
+            dataset=spec.dataset,
+            batch_size=spec.batch_size,
+            shuffle=spec.shuffle,
+            num_workers=spec.num_workers,
+            persistent_workers=spec.num_workers > 0,
         )
 
-    def val_dataloader(self) -> List[DataLoader]:
-        """
-        Create and return the validation dataloader.
+    def _make_train_loader(self, spec: DatasetSpecification) -> PyGDataLoader:
+        return self._make_loader(spec)
 
-        Returns:
-            DataLoader: The dataloader for validation data.
-        """
-        return [
-            DataLoader(
-                dataset=val_dataset_specification.dataset,
-                batch_size=val_dataset_specification.batch_size,
-                shuffle=val_dataset_specification.shuffle,
-                num_workers=val_dataset_specification.num_workers,
-                persistent_workers=val_dataset_specification.num_workers > 0
-            ) for val_dataset_specification in self._val_dataset_specifications
-        ]
+    def _make_val_loader(self, spec: DatasetSpecification) -> PyGDataLoader:
+        return self._make_loader(spec)
 
+
+# ---------------------------------------------------------------------------
+# Plain torch DataLoader subclass  (new, for non-PyG datasets)
+# ---------------------------------------------------------------------------
+
+class GenericPlainDataModule(_GenericDataModuleBase):
+    """DataModule backed by standard ``torch.utils.data.DataLoader``.
+
+    Use this when datasets yield arbitrary Python objects (e.g. plain
+    dataclasses, numpy arrays, variable-size meshes) that cannot be
+    batched by PyG's collator.  Pass a ``collate_fn`` in the
+    ``DatasetSpecification`` to control how items are batched.
+    """
+
+    def _make_loader(self, spec: DatasetSpecification) -> torch.utils.data.DataLoader:
+        return torch.utils.data.DataLoader(
+            dataset=spec.dataset,
+            batch_size=spec.batch_size,
+            shuffle=spec.shuffle,
+            num_workers=spec.num_workers,
+            persistent_workers=spec.num_workers > 0,
+            collate_fn=spec.collate_fn,
+        )
+
+    def _make_train_loader(self, spec: DatasetSpecification) -> torch.utils.data.DataLoader:
+        return self._make_loader(spec)
+
+    def _make_val_loader(self, spec: DatasetSpecification) -> torch.utils.data.DataLoader:
+        return self._make_loader(spec)

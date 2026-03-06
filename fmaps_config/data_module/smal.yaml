@@ -1,0 +1,51 @@
+# fmaps_config/data_module/smal.yaml
+# SMAL parametric animal model — on-the-fly shape generation.
+#
+# Required CLI overrides:
+#   data_module.module.train_dataset_specification.dataset.pair_generator.smal.model_path=<path>
+#   data_module.module.train_dataset_specification.dataset.pair_generator.smal.data_path=<path>
+
+module:
+  _target_: common.GenericPlainDataModule
+
+  train_dataset_specification:
+    _target_: common.DatasetSpecification
+    dataset:
+      _target_: functional_map_dataset.ShapePairDataset
+      pair_generator:
+        _target_: functional_map_dataset.SMALPairGenerator
+        smal:
+          _target_: functional_map_dataset.SMALModel
+          model_path: ???          # path to smal_CVPR2017.pkl
+          data_path: ???           # path to smal_CVPR2017_data.pkl
+        train_families: null       # null → auto: all families except last 2
+        val_families: null         # null → auto: last 2 families
+        pose_scale: 0.3
+      num_samples: 100             # epoch length (total pairs across all GPUs)
+      cross_ratio: 0.0             # updated each epoch by FunctionalMapModule
+    batch_size: 1
+    num_workers: 0
+    shuffle: true
+    collate_fn:
+      _target_: functional_map_dataset.pair_collate_fn
+
+  val_dataset_specifications:
+    - _target_: common.DatasetSpecification
+      dataset:
+        _target_: functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: functional_map_dataset.SMALPairGenerator
+          smal:
+            _target_: functional_map_dataset.SMALModel
+            model_path: ???
+            data_path: ???
+          train_families: null
+          val_families: null
+          pose_scale: 0.3
+        val_poses_per_pair: 2
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: functional_map_dataset.pair_collate_fn

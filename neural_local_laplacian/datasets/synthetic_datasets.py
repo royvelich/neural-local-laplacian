@@ -16,7 +16,6 @@ from scipy.spatial import Delaunay
 
 # neural signatures
 from neural_local_laplacian.datasets.base_datasets import CoeffGenerationMethod
-from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 
 
@@ -202,7 +201,6 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             epoch_size: int,
             pose_transformers: Optional[List[PoseTransformer]] = None,
             seed: int = 0,
-            feature_extractor: Optional[FeatureExtractor] = None,
             conv_k_nearest: Optional[int] = None,
     ):
         super().__init__()
@@ -210,7 +208,6 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         self._rng = np.random.default_rng(seed)
         self._epoch_size = epoch_size
         self._pose_transformers = pose_transformers if pose_transformers is not None else []
-        self._feature_extractor = feature_extractor
         self._conv_k_nearest = conv_k_nearest
 
     def reset_rng(self) -> None:
@@ -305,25 +302,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         return data
 
     def _add_surface_features(self, data: Data) -> None:
-        """
-        Add appropriate features to the surface data object using the feature extractor.
-
-        Args:
-            data: Surface data object to add features to (modified in place)
-        """
-        if self._feature_extractor is not None:
-            # Extract points and normals as numpy arrays
-            points = data.pos.detach().cpu().numpy()
-            normals = data.normal.detach().cpu().numpy()
-
-            # Use the feature extractor to compute features
-            features = self._feature_extractor.extract_features(points=points, normals=normals)
-
-            # Convert back to tensor and store
-            data['x'] = torch.from_numpy(features).float()
-        else:
-            # Fallback to using positions as features if no extractor provided
-            data['x'] = data.pos
+        """Store raw positions as features — feature extraction is handled by the model."""
+        data['x'] = data.pos
 
     def get(self, idx: int) -> List[Data]:
         """Generate multiple samplings of the same surface."""
