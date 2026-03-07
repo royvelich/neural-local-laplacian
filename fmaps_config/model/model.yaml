@@ -28,14 +28,14 @@ module:
   freeze_areas_head: false
 
   # ── Laplacian assembly ──────────────────────────────────────────────────
-  sparsify_laplacian: false        # zero out off-kNN entries in the dense G^TMG
+  sparsify_laplacian: true        # zero out off-kNN entries in the dense G^TMG
 
   # ── Training augmentation ───────────────────────────────────────────────
   max_vertices: 2000               # 0 = no subsampling; lower → faster O(N³) solve
-  vertex_noise: 0.05               # Gaussian noise scale relative to mean vertex radius
+  vertex_noise: 0.01               # Gaussian noise scale relative to mean vertex radius
 
   # ── Proximity regularisation ────────────────────────────────────────────
-  w_prox: 20.0                     # 0.0 to disable; ignored with random_init or use_lora
+  w_prox: 5.0                     # 0.0 to disable; ignored with random_init or use_lora
 
   # ── Cross-pair curriculum ───────────────────────────────────────────────
   # Linearly ramps the fraction of cross-category pairs from start → end

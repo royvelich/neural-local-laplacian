@@ -800,7 +800,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         dm = self.trainer.datamodule
         if dm is not None:
             dm._train_dataset_specification.dataset.cross_ratio = cross_ratio
-        self.log("train/cross_ratio", cross_ratio, rank_zero_only=True)
+        self.log("train/cross_ratio", cross_ratio, sync_dist=True)
 
     # ------------------------------------------------------------------
     # Training step
@@ -908,28 +908,28 @@ class FunctionalMapModule(LaplacianModuleBase):
         mean_acc = float(np.mean([m["accuracy"] for m in all_metrics]))
         med_acc  = float(np.median([m["accuracy"] for m in all_metrics]))
         mean_err = float(np.mean([m["mean_error"] for m in all_metrics]))
-        self.log("val/top1",        mean_acc, prog_bar=True)
-        self.log("val/median_top1", med_acc)
-        self.log("val/mean_error",  mean_err)
+        self.log("val/top1",        mean_acc, prog_bar=True, sync_dist=True)
+        self.log("val/median_top1", med_acc, sync_dist=True)
+        self.log("val/mean_error",  mean_err, sync_dist=True)
         for k in (3, 5, 10):
             vals = [m[f"top{k}_acc"] for m in all_metrics if f"top{k}_acc" in m]
             if vals:
-                self.log(f"val/top{k}", float(np.mean(vals)))
+                self.log(f"val/top{k}", float(np.mean(vals)), sync_dist=True)
 
         sp_accs = [m["sp_accuracy"] for m in all_metrics if "sp_accuracy" in m]
         if sp_accs:
             mean_sp = float(np.mean(sp_accs))
             mean_sp_err = float(np.mean([m["sp_mean_error"] for m in all_metrics
                                          if "sp_mean_error" in m]))
-            self.log("val/sp_top1",       mean_sp,     prog_bar=True)
-            self.log("val/sp_mean_error",  mean_sp_err)
+            self.log("val/sp_top1",       mean_sp,     prog_bar=True, sync_dist=True)
+            self.log("val/sp_mean_error",  mean_sp_err, sync_dist=True)
             for k in (3, 5, 10):
                 vals = [m[f"sp_top{k}_acc"] for m in all_metrics if f"sp_top{k}_acc" in m]
                 if vals:
-                    self.log(f"val/sp_top{k}", float(np.mean(vals)))
+                    self.log(f"val/sp_top{k}", float(np.mean(vals)), sync_dist=True)
 
         primary = float(np.mean(sp_accs)) if sp_accs else mean_acc
-        self.log("val/best_acc", primary, prog_bar=True)
+        self.log("val/best_acc", primary, prog_bar=True, sync_dist=True)
         if self.trainer.is_global_zero:
             print(f"  [Val epoch {self.current_epoch}] "
                   f"top1={mean_acc*100:5.1f}%  med={med_acc*100:5.1f}%  Err={mean_err:.4f}"

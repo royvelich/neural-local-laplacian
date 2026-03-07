@@ -17,9 +17,9 @@ module:
         root: '/workspace/datasets/DeformingThings4DMatching'                  # path to DeformingThings4DMatching root
         train_categories: null     # null → auto: all categories except last 2
         val_categories: null       # null → auto: last 2 categories alphabetically
-      num_samples: 800
+      num_samples: 8000
       cross_ratio: 0.0
-    batch_size: 2
+    batch_size: 20
     num_workers: 0
     shuffle: true
     collate_fn:
