@@ -5,6 +5,8 @@ All Laplacian assembly, loss, and evaluation utilities live here alongside
 FunctionalMapModule so this file is self-contained on the model side.
 """
 from __future__ import annotations
+import contextlib
+import time
 
 import scipy.sparse
 import scipy.sparse.linalg
@@ -35,6 +37,68 @@ from fmaps_finetune.datasets.functional_map_dataset import (
     subsample_pair,
     _stable_hash,
 )
+
+
+
+# =============================================================================
+# Step profiler (optional, activated by profile_steps > 0)
+# =============================================================================
+
+class _StepProfiler:
+    """Lightweight per-phase CUDA wall-time profiler.
+
+    Wraps major training_step phases with CUDA-synchronized wall timings.
+    Activated when hparams.profile_steps > 0; prints a summary every
+    profile_steps steps then resets accumulators.
+
+    Usage::
+        with prof.phase("knn"):        ...
+        with prof.phase("transformer"): ...
+        with prof.phase("assembly"):   ...
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._times:  Dict[str, float] = {}
+        self._counts: Dict[str, int]   = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        yield
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        self._times[name]  = self._times.get(name, 0.0)  + dt
+        self._counts[name] = self._counts.get(name, 0)    + 1
+
+    def summary_str(self, step: int) -> str:
+        if not self._times:
+            return ""
+        total = sum(self._times.values())
+        lines = [f"  [Profiler step={step}]  total={total*1e3:.1f}ms"]
+        for name, t in self._times.items():
+            n   = self._counts[name]
+            pct = 100.0 * t / total if total > 0 else 0.0
+            lines.append(
+                f"    {name:<28s}  {t/n*1e3:7.2f}ms/call  "
+                f"{t*1e3:8.2f}ms total  {pct:5.1f}%  (n={n})")
+        return "\n".join(lines)
+
+    def reset(self):
+        self._times.clear()
+        self._counts.clear()
 
 
 # =============================================================================
@@ -612,6 +676,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         lora_target_modules: str = "all-linear",
         lora_dora: bool = False,
         lora_rslora: bool = False,
+        profile_steps: int = 0,   # print profiler summary every N steps (0 = off)
         **kwargs,
     ):
         super().__init__(optimizer_cfg=optimizer_cfg,
@@ -811,31 +876,64 @@ class FunctionalMapModule(LaplacianModuleBase):
         total_loss = torch.tensor(0.0, device=device)
         metrics_list: List[Dict] = []
 
+        prof = _StepProfiler(enabled=(hp.profile_steps > 0 and self.global_rank == 0))
+
         for pair in batch:
-            if hp.max_vertices > 0:
-                pair = subsample_pair(pair, hp.max_vertices, self._train_rng)
-            if hp.vertex_noise > 0:
-                for attr in ("verts_a", "verts_b"):
-                    v     = getattr(pair, attr)
-                    scale = hp.vertex_noise * float(np.linalg.norm(v, axis=1).mean())
-                    noise = self._train_rng.randn(*v.shape).astype(np.float32) * scale
-                    setattr(pair, attr, v + noise)
+            with prof.phase("subsample + noise"):
+                if hp.max_vertices > 0:
+                    pair = subsample_pair(pair, hp.max_vertices, self._train_rng)
+                if hp.vertex_noise > 0:
+                    for attr in ("verts_a", "verts_b"):
+                        v     = getattr(pair, attr)
+                        scale = hp.vertex_noise * float(np.linalg.norm(v, axis=1).mean())
+                        noise = self._train_rng.randn(*v.shape).astype(np.float32) * scale
+                        setattr(pair, attr, v + noise)
 
-            S_A, M_A = compute_laplacian_differentiable(
-                self.model, pair.verts_a, hp.k, device, sparsify=hp.sparsify_laplacian)
-            S_B, M_B = compute_laplacian_differentiable(
-                self.model, pair.verts_b, hp.k, device, sparsify=hp.sparsify_laplacian)
+            with prof.phase("knn (cpu)"):
+                knn_a = compute_knn(pair.verts_a, hp.k)
+                knn_b = compute_knn(pair.verts_b, hp.k)
 
-            loss_nce, m = self.loss_fn(S_A, S_B, M_A, M_B, self._train_rng,
-                                       corr_a=pair.corr_a, corr_b=pair.corr_b)
+            with prof.phase("patch build + transfer"):
+                va_t = torch.from_numpy(pair.verts_a).float().to(device)
+                vb_t = torch.from_numpy(pair.verts_b).float().to(device)
+                knn_a_t = torch.from_numpy(knn_a).long().to(device)
+                knn_b_t = torch.from_numpy(knn_b).long().to(device)
+                bd_a = Batch.from_data_list([build_patch_data(va_t, knn_a, device)]).to(device)
+                bd_b = Batch.from_data_list([build_patch_data(vb_t, knn_b, device)]).to(device)
 
-            if hp.w_prox > 0 and hasattr(self, "ref_params"):
-                cur = torch.cat([p.flatten() for p in self.model.parameters()])
-                loss_prox = ((cur - self.ref_params) ** 2).sum() / self.ref_norm_sq
-                loss = loss_nce + hp.w_prox * loss_prox
-            else:
-                loss_prox = torch.tensor(0.0, device=device)
-                loss = loss_nce
+            with prof.phase("transformer forward"):
+                fwd_a = self.model._forward_pass(bd_a)
+                fwd_b = self.model._forward_pass(bd_b)
+
+            with prof.phase("laplacian assembly"):
+                S_A, M_A = (assemble_anisotropic_laplacian(fwd_a['grad_coeffs'], fwd_a['areas'], knn_a_t)
+                            if fwd_a.get('grad_coeffs') is not None
+                            else assemble_dense_stiffness_and_mass(
+                                fwd_a['stiffness_weights'], fwd_a['areas'],
+                                fwd_a['attention_mask'], bd_a.vertex_indices,
+                                bd_a.center_indices, getattr(bd_a, 'patch_idx', bd_a.batch)))
+                S_B, M_B = (assemble_anisotropic_laplacian(fwd_b['grad_coeffs'], fwd_b['areas'], knn_b_t)
+                            if fwd_b.get('grad_coeffs') is not None
+                            else assemble_dense_stiffness_and_mass(
+                                fwd_b['stiffness_weights'], fwd_b['areas'],
+                                fwd_b['attention_mask'], bd_b.vertex_indices,
+                                bd_b.center_indices, getattr(bd_b, 'patch_idx', bd_b.batch)))
+                if hp.sparsify_laplacian:
+                    S_A = _sparsify_L_to_knn(S_A, knn_a_t)
+                    S_B = _sparsify_L_to_knn(S_B, knn_b_t)
+
+            with prof.phase("loss (linear solves + InfoNCE)"):
+                loss_nce, m = self.loss_fn(S_A, S_B, M_A, M_B, self._train_rng,
+                                           corr_a=pair.corr_a, corr_b=pair.corr_b)
+
+            with prof.phase("prox regularization"):
+                if hp.w_prox > 0 and hasattr(self, "ref_params"):
+                    cur = torch.cat([p.flatten() for p in self.model.parameters()])
+                    loss_prox = ((cur - self.ref_params) ** 2).sum() / self.ref_norm_sq
+                    loss = loss_nce + hp.w_prox * loss_prox
+                else:
+                    loss_prox = torch.tensor(0.0, device=device)
+                    loss = loss_nce
 
             if torch.isnan(loss):
                 continue
@@ -844,6 +942,12 @@ class FunctionalMapModule(LaplacianModuleBase):
             m["loss_prox"]  = loss_prox.item()
             m["loss_total"] = loss.item()
             metrics_list.append(m)
+
+        if hp.profile_steps > 0 and self.global_rank == 0:
+            step = self.global_step
+            if step % hp.profile_steps == 0:
+                print(prof.summary_str(step=step))
+            prof.reset()
 
         if not metrics_list:
             return None

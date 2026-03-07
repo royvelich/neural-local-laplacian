@@ -31,7 +31,7 @@ module:
   sparsify_laplacian: false        # zero out off-kNN entries in the dense G^TMG
 
   # ── Training augmentation ───────────────────────────────────────────────
-  max_vertices: 1500               # 0 = no subsampling; lower → faster O(N³) solve
+  max_vertices: 1000               # 0 = no subsampling; lower → faster O(N³) solve
   vertex_noise: 0.02               # Gaussian noise scale relative to mean vertex radius
 
   # ── Proximity regularisation ────────────────────────────────────────────
