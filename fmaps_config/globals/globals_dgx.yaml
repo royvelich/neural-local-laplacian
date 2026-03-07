@@ -11,7 +11,7 @@ ckpt_path: null
 checkpoint_path: '/workspace/datasets/model.ckpt'
 
 # kNN neighbourhood size for the differentiable Laplacian.
-k: 30
+k: 25
 
 # Number of LBO eigenvectors used during evaluation.
 num_eigenvectors: 100
