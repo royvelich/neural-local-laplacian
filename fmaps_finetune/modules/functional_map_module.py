@@ -553,6 +553,35 @@ def evaluate_pair_robust(
 # LightningModule
 # =============================================================================
 
+def cosine_flat_scheduler(
+    optimizer: torch.optim.Optimizer,
+    T_max: int,
+    eta_min: float = 1e-6,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Cosine decay from base_lr to eta_min over T_max epochs, then flat.
+
+    Unlike CosineAnnealingLR this does not cycle back up after T_max.
+    The multiplier is clamped so progress never exceeds 1.0.
+    """
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+
+    def _lambda(epoch: int, base_lr: float) -> float:
+        if base_lr < 1e-12:
+            return 1.0
+        t       = min(epoch, T_max)
+        cosine  = 0.5 * (1.0 + math.cos(math.pi * t / T_max))
+        lr      = eta_min + (base_lr - eta_min) * cosine
+        return lr / base_lr
+
+    lambdas = [lambda epoch, blr=blr: _lambda(epoch, blr) for blr in base_lrs]
+    # LambdaLR accepts a list of lambdas (one per param group) or a single one
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambdas if len(lambdas) > 1 else lambdas[0],
+    )
+
+
+
 class FunctionalMapModule(LaplacianModuleBase):
     """Fine-tune a pretrained LaplacianTransformerModule for shape correspondence."""
 
@@ -660,6 +689,10 @@ class FunctionalMapModule(LaplacianModuleBase):
         n_total = sum(p.numel() for p in self.parameters())
         print(f"  [FMModule rank={self.global_rank}] "
               f"Trainable: {n_train:,} / {n_total:,}")
+        if self.global_rank == 0 and self._scheduler_cfg is not None:
+            # Surface the effective T_max so it appears in logs / W&B config
+            t_max = getattr(self._scheduler_cfg, 'keywords', {}).get('T_max', '?')
+            print(f"  [FMModule] Scheduler T_max={t_max} epochs")
 
     # ------------------------------------------------------------------
     # Optimiser
@@ -866,37 +899,38 @@ class FunctionalMapModule(LaplacianModuleBase):
         true_val_size = len(self.trainer.datamodule._val_dataset_specifications[0].dataset)
         all_flat = all_flat[:true_val_size]
 
-        if not self.trainer.is_global_zero:
-            return
-
+        # All ranks compute identical metrics from the same gathered tensor.
+        # This is required so ModelCheckpoint (which runs on every rank) can
+        # find val/best_acc in its local metric dict.
         all_metrics = [{k: all_flat[i, j].item() for j, k in enumerate(float_keys)}
                        for i in range(all_flat.shape[0])]
 
         mean_acc = float(np.mean([m["accuracy"] for m in all_metrics]))
         med_acc  = float(np.median([m["accuracy"] for m in all_metrics]))
         mean_err = float(np.mean([m["mean_error"] for m in all_metrics]))
-        self.log("val/top1",        mean_acc, rank_zero_only=True, prog_bar=True)
-        self.log("val/median_top1", med_acc,  rank_zero_only=True)
-        self.log("val/mean_error",  mean_err, rank_zero_only=True)
+        self.log("val/top1",        mean_acc, prog_bar=True)
+        self.log("val/median_top1", med_acc)
+        self.log("val/mean_error",  mean_err)
         for k in (3, 5, 10):
             vals = [m[f"top{k}_acc"] for m in all_metrics if f"top{k}_acc" in m]
             if vals:
-                self.log(f"val/top{k}", float(np.mean(vals)), rank_zero_only=True)
+                self.log(f"val/top{k}", float(np.mean(vals)))
 
         sp_accs = [m["sp_accuracy"] for m in all_metrics if "sp_accuracy" in m]
         if sp_accs:
             mean_sp = float(np.mean(sp_accs))
             mean_sp_err = float(np.mean([m["sp_mean_error"] for m in all_metrics
                                          if "sp_mean_error" in m]))
-            self.log("val/sp_top1",      mean_sp,     rank_zero_only=True, prog_bar=True)
-            self.log("val/sp_mean_error", mean_sp_err, rank_zero_only=True)
+            self.log("val/sp_top1",       mean_sp,     prog_bar=True)
+            self.log("val/sp_mean_error",  mean_sp_err)
             for k in (3, 5, 10):
                 vals = [m[f"sp_top{k}_acc"] for m in all_metrics if f"sp_top{k}_acc" in m]
                 if vals:
-                    self.log(f"val/sp_top{k}", float(np.mean(vals)), rank_zero_only=True)
+                    self.log(f"val/sp_top{k}", float(np.mean(vals)))
 
         primary = float(np.mean(sp_accs)) if sp_accs else mean_acc
-        self.log("val/best_acc", primary, rank_zero_only=True, prog_bar=True)
-        print(f"  [Val epoch {self.current_epoch}] "
-              f"top1={mean_acc*100:5.1f}%  med={med_acc*100:5.1f}%  Err={mean_err:.4f}"
-              + (f"  │ sp_top1={float(np.mean(sp_accs))*100:5.1f}%" if sp_accs else ""))
+        self.log("val/best_acc", primary, prog_bar=True)
+        if self.trainer.is_global_zero:
+            print(f"  [Val epoch {self.current_epoch}] "
+                  f"top1={mean_acc*100:5.1f}%  med={med_acc*100:5.1f}%  Err={mean_err:.4f}"
+                  + (f"  │ sp_top1={float(np.mean(sp_accs))*100:5.1f}%" if sp_accs else ""))
