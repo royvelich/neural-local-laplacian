@@ -14,10 +14,10 @@ module:
   # Hydra recursively instantiates this before passing to __init__.
   loss_fn:
     _target_: fmaps_finetune.modules.functional_map_module.SoftCorrespondenceLoss
-    num_landmarks: 512
+    num_landmarks: 128
     alphas: [1.0, 10.0, 100.0]    # diffusion scales α for fingerprint descriptors
     temperature: 0.07
-    num_sample_vertices: 1024      # vertices subsampled for contrastive ranking per step
+    num_sample_vertices: 512      # vertices subsampled for contrastive ranking per step
     loss_type: infonce             # infonce | dcl | dclw
     dclw_sigma: 0.5                # only used when loss_type=dclw
 
@@ -31,7 +31,7 @@ module:
   sparsify_laplacian: false        # zero out off-kNN entries in the dense G^TMG
 
   # ── Training augmentation ───────────────────────────────────────────────
-  max_vertices: 2000               # 0 = no subsampling; lower → faster O(N³) solve
+  max_vertices: 1500               # 0 = no subsampling; lower → faster O(N³) solve
   vertex_noise: 0.02               # Gaussian noise scale relative to mean vertex radius
 
   # ── Proximity regularisation ────────────────────────────────────────────
