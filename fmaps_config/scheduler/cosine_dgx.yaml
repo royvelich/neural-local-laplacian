@@ -1,0 +1,8 @@
+# fmaps_config/scheduler/cosine.yaml
+# Hydra partial — called as: scheduler_cfg(optimizer=optimizer)
+# Cosine decay from lr → eta_min over T_max epochs, then stays flat.
+
+_target_: torch.optim.lr_scheduler.CosineAnnealingLR
+_partial_: true
+T_max: 200      # epochs until eta_min is reached; set equal to trainer.max_epochs for full decay
+eta_min: 1.0e-6

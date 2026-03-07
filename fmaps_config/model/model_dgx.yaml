@@ -1,0 +1,54 @@
+# fmaps_config/model/default.yaml
+# FunctionalMapModule hyperparameters.
+# optimizer_cfg and scheduler_cfg are injected by train_fmaps.py at instantiation
+# time (same pattern as train.py / LaplacianModuleBase).
+
+module:
+  _target_:  fmaps_finetune.modules.functional_map_module.FunctionalMapModule
+  checkpoint_path: ${globals.checkpoint_path}
+  k: ${globals.k}
+  num_eigenvectors: ${globals.num_eigenvectors}
+  seed: ${globals.training_seed}
+
+  # ── Contrastive loss ────────────────────────────────────────────────────
+  # Hydra recursively instantiates this before passing to __init__.
+  loss_fn:
+    _target_: fmaps_finetune.modules.functional_map_module.SoftCorrespondenceLoss
+    num_landmarks: 512
+    alphas: [1.0, 10.0, 100.0]    # diffusion scales α for fingerprint descriptors
+    temperature: 0.07
+    num_sample_vertices: 1024      # vertices subsampled for contrastive ranking per step
+    loss_type: infonce             # infonce | dcl | dclw
+    dclw_sigma: 0.5                # only used when loss_type=dclw
+
+  # ── Model initialisation ────────────────────────────────────────────────
+  random_init: false               # reset all weights after loading architecture
+  keep_areas_head: false           # with random_init=true: preserve pretrained area head
+  freeze_input_projection: false
+  freeze_areas_head: false
+
+  # ── Laplacian assembly ──────────────────────────────────────────────────
+  sparsify_laplacian: false        # zero out off-kNN entries in the dense G^TMG
+
+  # ── Training augmentation ───────────────────────────────────────────────
+  max_vertices: 2000               # 0 = no subsampling; lower → faster O(N³) solve
+  vertex_noise: 0.05               # Gaussian noise scale relative to mean vertex radius
+
+  # ── Proximity regularisation ────────────────────────────────────────────
+  w_prox: 20.0                     # 0.0 to disable; ignored with random_init or use_lora
+
+  # ── Cross-pair curriculum ───────────────────────────────────────────────
+  # Linearly ramps the fraction of cross-category pairs from start → end
+  # over the first curriculum_epochs epochs, then stays at cross_ratio_end.
+  cross_ratio_start: 0.0
+  cross_ratio_end: 0.5
+  curriculum_epochs: 50
+
+  # ── LoRA (Low-Rank Adaptation) ──────────────────────────────────────────
+  use_lora: false
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_target_modules: "all-linear"   # comma-separated names or "all-linear"
+  lora_dora: false                    # Weight-Decomposed LoRA (DoRA)
+  lora_rslora: false                  # Rank-Stabilized LoRA (rsLoRA)

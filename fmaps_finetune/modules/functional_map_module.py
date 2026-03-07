@@ -675,6 +675,85 @@ class FunctionalMapModule(LaplacianModuleBase):
                 "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
     # ------------------------------------------------------------------
+    # Baseline evaluation (runs once before first training epoch)
+    # ------------------------------------------------------------------
+
+    def on_fit_start(self) -> None:
+        """Log robust-Laplacian and epoch-0 model baselines to W&B at step 0.
+
+        Only runs on rank 0 to avoid duplicated evaluation in DDP.
+        Uses the first val dataset specification.
+        """
+        if not self.trainer.is_global_zero:
+            return
+
+        hp     = self.hparams
+        device = self.device
+        dm     = self.trainer.datamodule
+        if dm is None or not dm._val_dataset_specifications:
+            return
+
+        val_dataset = dm._val_dataset_specifications[0].dataset
+        val_pairs   = [val_dataset[i] for i in range(len(val_dataset))]
+        if not val_pairs:
+            return
+
+        def _subsample(pair):
+            if hp.max_vertices > 0:
+                return subsample_pair(pair, hp.max_vertices,
+                                      np.random.RandomState(_stable_hash(pair.name)))
+            return pair
+
+        def _summarise(metrics_list: List[Dict], prefix: str) -> Dict[str, float]:
+            out = {
+                f"{prefix}/top1":       float(np.mean([m["accuracy"]   for m in metrics_list])),
+                f"{prefix}/median_top1": float(np.median([m["accuracy"] for m in metrics_list])),
+                f"{prefix}/mean_error": float(np.mean([m["mean_error"] for m in metrics_list])),
+            }
+            for k in (3, 5, 10):
+                vals = [m[f"top{k}_acc"] for m in metrics_list if f"top{k}_acc" in m]
+                if vals:
+                    out[f"{prefix}/top{k}"] = float(np.mean(vals))
+            sp = [m for m in metrics_list if "sp_accuracy" in m]
+            if sp:
+                out[f"{prefix}/sp_top1"]      = float(np.mean([m["sp_accuracy"]   for m in sp]))
+                out[f"{prefix}/sp_mean_error"] = float(np.mean([m["sp_mean_error"] for m in sp]))
+            return out
+
+        # ── Robust Laplacian baseline ──────────────────────────────────────────
+        try:
+            import robust_laplacian  # noqa: F401
+            print("\n  Computing robust Laplacian baseline...")
+            robust_metrics = [evaluate_pair_robust(_subsample(p), hp.num_eigenvectors)
+                              for p in val_pairs]
+            rb_summary = _summarise(robust_metrics, "baseline/robust")
+            top1 = rb_summary["baseline/robust/top1"]
+            err  = rb_summary["baseline/robust/mean_error"]
+            print(f"  Robust baseline: top1={top1*100:5.1f}%  Err={err:.4f}")
+            self.logger.log_metrics(rb_summary, step=0)
+        except ImportError:
+            print("  (robust_laplacian not installed — skipping robust baseline)")
+
+        # ── Epoch-0 model baseline ────────────────────────────────────────────
+        init_label = "random init" if hp.random_init else "pretrained"
+        print(f"\n  Computing {init_label} model baseline (epoch 0)...")
+        self.model.eval()
+        with torch.no_grad():
+            ep0_metrics = [evaluate_pair(self.model, _subsample(p),
+                                         hp.k, hp.num_eigenvectors, device)
+                           for p in val_pairs]
+        self.model.train()
+
+        ep0_summary = _summarise(ep0_metrics, "baseline/model")
+        top1 = ep0_summary["baseline/model/top1"]
+        err  = ep0_summary["baseline/model/mean_error"]
+        sp_str = ""
+        if "baseline/model/sp_top1" in ep0_summary:
+            sp_str = f"  │ sp_top1={ep0_summary['baseline/model/sp_top1']*100:5.1f}%"
+        print(f"  Model baseline ({init_label}): top1={top1*100:5.1f}%  Err={err:.4f}{sp_str}")
+        self.logger.log_metrics(ep0_summary, step=0)
+
+    # ------------------------------------------------------------------
     # Curriculum
     # ------------------------------------------------------------------
 

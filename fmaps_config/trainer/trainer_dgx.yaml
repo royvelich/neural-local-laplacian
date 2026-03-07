@@ -1,0 +1,45 @@
+# fmaps_config/trainer/default.yaml
+# lightning.pytorch.Trainer — override any field from the CLI, e.g.:
+#   trainer.devices=4 trainer.strategy=ddp trainer.max_epochs=500
+
+_target_: lightning.pytorch.Trainer
+
+# ── Hardware ──────────────────────────────────────────────────────────────────
+accelerator: auto          # auto-selects gpu/cpu/mps
+devices: auto              # use all available GPUs; set to e.g. 4 for explicit count
+strategy: auto             # auto → DDP when devices > 1; override with "ddp" to force
+
+# ── Training schedule ─────────────────────────────────────────────────────────
+max_epochs: 2000
+accumulate_grad_batches: 1  # effective pairs/step = pairs_per_step × accum × num_gpus
+gradient_clip_val: 10.0
+gradient_clip_algorithm: norm
+precision: 32               # 32 | 16-mixed | bf16-mixed
+
+# ── Validation / logging ──────────────────────────────────────────────────────
+check_val_every_n_epoch: 10
+log_every_n_steps: 1
+enable_progress_bar: true
+
+# Output root for checkpoints and logs (Hydra also sets a run-specific cwd)
+default_root_dir: fmap_finetune_runs
+
+# ── Logger ────────────────────────────────────────────────────────────────────
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: neural-local-laplacian-fmaps   # W&B project name — override with trainer.logger.project=<name>
+  save_dir: fmap_finetune_runs
+  log_model: false                         # set to "all" to upload checkpoints as artifacts
+
+# ── Callbacks ─────────────────────────────────────────────────────────────────
+callbacks:
+  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: val/best_acc    # val/best_acc = sp_top1 when sparsify_laplacian=true, else top1
+    mode: max
+    save_top_k: 1
+    save_last: true
+    filename: "best-epoch={epoch:04d}-acc={val/best_acc:.4f}"
+    auto_insert_metric_name: false
+
+  - _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: epoch

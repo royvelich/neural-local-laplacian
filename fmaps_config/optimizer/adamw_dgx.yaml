@@ -1,0 +1,8 @@
+# fmaps_config/optimizer/adam.yaml
+# Hydra partial — instantiated as functools.partial(torch.optim.Adam, lr=..., ...)
+# and called inside configure_optimizers() as: optimizer_cfg(params=trainable_params)
+
+_target_: torch.optim.AdamW
+_partial_: true
+lr: 1.0e-4
+weight_decay: 1.0e-4
