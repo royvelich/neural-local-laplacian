@@ -19,7 +19,7 @@ module:
         val_categories: null       # null → auto: last 2 categories alphabetically
       num_samples: 8000
       cross_ratio: 0.0
-    batch_size: 10
+    batch_size: 5
     num_workers: 0
     shuffle: true
     collate_fn:
