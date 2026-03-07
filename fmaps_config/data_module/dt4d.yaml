@@ -17,7 +17,7 @@ module:
         root: 'F:\3DV22_DeformingThings4DMatching_dataset-main\DeformingThings4DMatching'                  # path to DeformingThings4DMatching root
         train_categories: null     # null → auto: all categories except last 2
         val_categories: null       # null → auto: last 2 categories alphabetically
-      num_samples: 50
+      num_samples: 200
       cross_ratio: 0.0
     batch_size: 5
     num_workers: 0
