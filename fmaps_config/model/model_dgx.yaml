@@ -35,7 +35,7 @@ module:
   vertex_noise: 0.02               # Gaussian noise scale relative to mean vertex radius
 
   # ── Proximity regularisation ────────────────────────────────────────────
-  w_prox: 10.0                     # 0.0 to disable; ignored with random_init or use_lora
+  w_prox: 100.0                     # 0.0 to disable; ignored with random_init or use_lora
 
   # ── Cross-pair curriculum ───────────────────────────────────────────────
   # Linearly ramps the fraction of cross-category pairs from start → end

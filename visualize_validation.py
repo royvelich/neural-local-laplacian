@@ -23,6 +23,7 @@ import time
 
 import numpy as np
 import torch
+import torch_geometric
 import polyscope as ps
 import open3d as o3d
 import trimesh
@@ -85,6 +86,71 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_multisource_geodesic_metrics,
 )
 from torch_geometric.data import Data, Batch
+
+
+# =============================================================================
+# NELO — imports from nelo.src (NeLo SIGGRAPH Asia 2024).
+# Assumes the NeLo repo's src folder is importable as nelo.src.*
+# =============================================================================
+
+# Add NeLo's root folder to sys.path so its internal `from src.xxx` imports resolve.
+# (NeLo's own modules use bare `src.*` / `config.*` imports internally.)
+_nelo_root = str(Path(__file__).parent / 'nelo')
+if _nelo_root not in sys.path:
+    sys.path.insert(0, _nelo_root)
+
+from nelo.src.pipeline import MyPipeline as _NeLo_MyPipeline
+from nelo.src.graphtree.graph_tree import construct_graph_tree_from_point_cloud as _nelo_construct_graph_tree_orig
+# Import via the bare path that NeLo's own modules use (sys.path includes nelo/),
+# so this is the same singleton instance graph_tree.py holds.
+from config.global_config import global_config as _nelo_global_config
+
+
+def _nelo_construct_graph_tree(vertices, k: int = 8):
+    """Thin wrapper: configures global_config for point-cloud mode then calls NeLo's function."""
+    _nelo_global_config.point_cloud_knn_k = k
+    _nelo_global_config.use_ref_mesh = False   # ensure point-cloud branch, not mesh branch
+    return _nelo_construct_graph_tree_orig(vertices, ref_mesh=None)
+
+
+class _NeLo_Pipeline(_NeLo_MyPipeline):
+    """
+    Thin subclass of NeLo's MyPipeline that adds forward_inference() for clean inference.
+    All weights / architecture come from the parent; only the inference helper is ours.
+    """
+
+    def forward_inference(self, graph_tree):
+        """
+        Run inference. Returns (edge_weight [E,1], vert_mass [N,1], edge_index [2,E]).
+        Graph tree must already be on the correct device.
+        """
+        graph = graph_tree.treedict[0]
+
+        feat = torch.ones(graph.x.shape[0], 3, device=graph.x.device)
+        degrees = torch_geometric.utils.degree(
+            graph.edge_index[0],
+            num_nodes=graph.x.shape[0],
+            dtype=torch.float32
+        )
+        feat = torch.cat([feat, degrees.view(-1, 1)], dim=1)  # [N, 4]
+
+        vert_feat = self.eigen_network(feat, graph_tree, graph_tree.depth)
+        if graph.x.is_cuda:
+            torch.cuda.synchronize()
+
+        va_idx = graph.edge_index[0]
+        vb_idx = graph.edge_index[1]
+        edge_w = self.edge_decoder((vert_feat[va_idx] - vert_feat[vb_idx]).pow(2))
+        edge_w = -torch.nn.functional.relu(-edge_w)   # clamp negatives (test mode)
+        mass   = self.mass_decoder(vert_feat)
+        if graph.x.is_cuda:
+            torch.cuda.synchronize()
+
+        return edge_w, mass, graph.edge_index
+
+# =============================================================================
+# END OF NELO IMPORTS
+# =============================================================================
 
 
 @dataclass
@@ -169,6 +235,13 @@ class LaplacianTimingResults:
     pred_model_inference_time: float = 0.0  # Neural network forward pass
     pred_matrix_assembly_time: float = 0.0  # Sparse matrix construction from weights
     pred_total_time: float = 0.0  # Sum of above
+
+    # NeLo timings - mirrors PRED breakdown exactly
+    nelo_graph_tree_time: float = 0.0         # construct_graph_tree_from_point_cloud (KNN build)
+    nelo_model_inference_time: float = 0.0    # pipeline.make_prediction forward pass
+    nelo_matrix_assembly_time: float = 0.0    # sparse L, M assembly from edge_weight_predicted
+    nelo_total_time: float = 0.0              # Sum of above
+    nelo_k: int = 8                           # NeLo's independent k value
 
     # GT (mesh-based cotangent) timing
     gt_matrix_assembly_time: float = 0.0  # igl.cotmatrix + massmatrix
@@ -346,6 +419,7 @@ class RealTimeEigenanalysisVisualizer:
         # Store per-eigenvector cosine similarities for UI comparison table
         self.current_cosine_similarities_pred = None  # Array of |cos| per eigenvector (GT vs PRED)
         self.current_cosine_similarities_robust = None  # Array of |cos| per eigenvector (GT vs Robust)
+        self.current_cosine_similarities_nelo = None  # Array of |cos| per eigenvector (GT vs NeLo)
 
         # NEW: Timing results for Laplacian assembly comparison
         self.timing_results = LaplacianTimingResults()
@@ -363,6 +437,15 @@ class RealTimeEigenanalysisVisualizer:
         self._diagnostic_mode = False
         self._skip_robust = False
         self._skip_visualization = False
+
+        # NeLo state
+        self.nelo_pipeline = None          # loaded once at startup via load_nelo_pipeline(); None = disabled
+        self.nelo_k = 30                    # independent k slider (default = 30, matching PRED/Robust)
+
+        self.current_nelo_L = None
+        self.current_nelo_M = None
+        self.current_nelo_eigenvectors = None
+        self.current_nelo_eigenvalues = None
 
     def setup_polyscope(self):
         """Initialize and configure polyscope with UI callback."""
@@ -427,6 +510,21 @@ class RealTimeEigenanalysisVisualizer:
                 print(f"[*] Robust k changed: {new_robust_k}")
                 if self._has_current_batch_data():
                     self._update_robust_with_new_k(new_robust_k)
+
+            # NeLo k input (independent — NeLo was trained at k=8)
+            if self.nelo_pipeline is not None:
+                nelo_k_changed, new_nelo_k = psim.InputInt(
+                    "NeLo k-NN neighbors (trained=8)",
+                    self.nelo_k,
+                    flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+                )
+                new_nelo_k = max(4, min(30, new_nelo_k))
+
+                if nelo_k_changed and new_nelo_k != self.nelo_k:
+                    self.nelo_k = new_nelo_k
+                    print(f"[*] NeLo k changed: {new_nelo_k}")
+                    if self.current_original_vertices is not None:
+                        self._update_nelo_with_new_k(new_nelo_k)
         else:
             psim.Text("k-NN input: (no data loaded)")
 
@@ -491,6 +589,19 @@ class RealTimeEigenanalysisVisualizer:
 
             psim.Text("")
 
+            # NeLo breakdown
+            if t.nelo_total_time > 0:
+                psim.TextColored((0.7, 0.3, 1.0, 1.0), f"NeLo (GNN, k={t.nelo_k})")
+                psim.Text(f"  Graph tree:        {t.nelo_graph_tree_time * 1000:>10.1f} ms")
+                psim.Text(f"  Model inference:   {t.nelo_model_inference_time * 1000:>10.1f} ms")
+                psim.Text(f"  Matrix assembly:   {t.nelo_matrix_assembly_time * 1000:>10.1f} ms")
+                nelo_total_ms = t.nelo_total_time * 1000
+                psim.TextColored((0.7, 0.3, 1.0, 1.0), f"  TOTAL:             {nelo_total_ms:>10.1f} ms")
+            else:
+                psim.TextColored((0.5, 0.5, 0.5, 1.0), "NeLo: (not available)")
+
+            psim.Text("")
+
             # Robust
             robust_ms = t.robust_matrix_assembly_time * 1000
             psim.TextColored((0.0, 0.7, 1.0, 1.0), f"Robust (Point Cloud):{robust_ms:>10.1f} ms")
@@ -508,10 +619,19 @@ class RealTimeEigenanalysisVisualizer:
                 psim.Text(f"Relative to GT:")
                 psim.Text(f"  PRED:   {pred_vs_gt:>6.2f}x")
                 psim.Text(f"  Robust: {robust_vs_gt:>6.2f}x")
+                if t.nelo_total_time > 0:
+                    nelo_vs_gt = t.nelo_total_time / t.gt_matrix_assembly_time
+                    psim.Text(f"  NeLo:   {nelo_vs_gt:>6.2f}x")
 
             if t.robust_matrix_assembly_time > 0 and t.pred_total_time > 0:
                 pred_vs_robust = t.pred_total_time / t.robust_matrix_assembly_time
                 psim.Text(f"PRED vs Robust: {pred_vs_robust:.2f}x")
+            if t.nelo_total_time > 0 and t.robust_matrix_assembly_time > 0:
+                nelo_vs_robust = t.nelo_total_time / t.robust_matrix_assembly_time
+                psim.Text(f"NeLo vs Robust: {nelo_vs_robust:.2f}x")
+            if t.nelo_total_time > 0 and t.pred_total_time > 0:
+                pred_vs_nelo = t.pred_total_time / t.nelo_total_time
+                psim.Text(f"PRED vs NeLo:   {pred_vs_nelo:.2f}x")
         else:
             psim.Text("(No timing data yet)")
 
@@ -569,16 +689,19 @@ class RealTimeEigenanalysisVisualizer:
 
         pred_sims = self.current_cosine_similarities_pred
         robust_sims = self.current_cosine_similarities_robust
+        nelo_sims = self.current_cosine_similarities_nelo
 
-        if pred_sims is not None or robust_sims is not None:
+        if pred_sims is not None or robust_sims is not None or nelo_sims is not None:
             max_available = 0
             if pred_sims is not None:
                 max_available = max(max_available, len(pred_sims))
             if robust_sims is not None:
                 max_available = max(max_available, len(robust_sims))
+            if nelo_sims is not None:
+                max_available = max(max_available, len(nelo_sims))
 
             # Header
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'#Eigvec':>8}  {'PRED':>8}  {'Robust':>8}  {'Delta':>8}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'#Eigvec':>8}  {'PRED':>8}  {'NeLo':>8}  {'Robust':>8}  {'PRED-Rob':>8}")
             psim.Separator()
 
             # Select which counts to display: show a reasonable subset
@@ -592,11 +715,13 @@ class RealTimeEigenanalysisVisualizer:
             display_counts = [c for c in display_counts if c <= max_available]
 
             for count in display_counts:
-                pred_mean = float(pred_sims[:count].mean()) if pred_sims is not None and count <= len(pred_sims) else None
+                pred_mean   = float(pred_sims[:count].mean())   if pred_sims   is not None and count <= len(pred_sims)   else None
                 robust_mean = float(robust_sims[:count].mean()) if robust_sims is not None and count <= len(robust_sims) else None
+                nelo_mean   = float(nelo_sims[:count].mean())   if nelo_sims   is not None and count <= len(nelo_sims)   else None
 
-                pred_str = f"{pred_mean:>8.4f}" if pred_mean is not None else f"{'N/A':>8}"
+                pred_str   = f"{pred_mean:>8.4f}"   if pred_mean   is not None else f"{'N/A':>8}"
                 robust_str = f"{robust_mean:>8.4f}" if robust_mean is not None else f"{'N/A':>8}"
+                nelo_str   = f"{nelo_mean:>8.4f}"   if nelo_mean   is not None else f"{'N/A':>8}"
 
                 # Delta: PRED - Robust (positive = PRED is better)
                 if pred_mean is not None and robust_mean is not None:
@@ -612,7 +737,7 @@ class RealTimeEigenanalysisVisualizer:
                     delta_str = f"{'N/A':>8}"
                     color = (0.8, 0.8, 0.8, 1.0)
 
-                psim.TextColored(color, f"  {count:>8}  {pred_str}  {robust_str}  {delta_str}")
+                psim.TextColored(color, f"  {count:>8}  {pred_str}  {nelo_str}  {robust_str}  {delta_str}")
         else:
             psim.Text("(Not computed yet)")
 
@@ -833,11 +958,12 @@ class RealTimeEigenanalysisVisualizer:
             print(f"[!] No predicted areas available, falling back to standard reconstruction")
             return None
 
-    def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
-        """Compute GT, predicted, and robust-laplacian reconstructions."""
+    def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        """Compute GT, predicted, robust-laplacian, and NeLo reconstructions."""
         gt_reconstructions = []
         pred_reconstructions = []
         robust_reconstructions = []
+        nelo_reconstructions = []
 
         # Compute GT reconstructions (always use area weighting with PyFM areas)
         if gt_data.get('gt_eigenvectors') is not None:
@@ -870,19 +996,30 @@ class RealTimeEigenanalysisVisualizer:
                 vertex_areas=gt_data.get('robust_vertex_areas')  # Use robust-laplacian areas
             )
 
-        return gt_reconstructions, pred_reconstructions, robust_reconstructions
+        # Compute NeLo reconstructions
+        if self.current_nelo_eigenvectors is not None:
+            nelo_vertex_areas = self.current_nelo_M.diagonal() if self.current_nelo_M is not None else None
+            nelo_reconstructions = self.compute_mesh_reconstruction(
+                gt_data['vertices'],
+                self.current_nelo_eigenvectors,
+                self.current_nelo_eigenvalues,
+                self.config.num_eigenvectors_to_show,
+                vertex_areas=nelo_vertex_areas
+            )
+
+        return gt_reconstructions, pred_reconstructions, robust_reconstructions, nelo_reconstructions
 
     def _update_mesh_reconstructions(self, gt_data: Dict, inference_result: Dict):
         """Complete pipeline for computing and visualizing mesh reconstructions."""
         print(f"Computing and visualizing mesh reconstructions...")
 
         # Compute reconstructions
-        gt_reconstructions, pred_reconstructions, robust_reconstructions = self._compute_all_reconstructions(
+        gt_reconstructions, pred_reconstructions, robust_reconstructions, nelo_reconstructions = self._compute_all_reconstructions(
             gt_data, inference_result
         )
 
         # Visualize reconstructions
-        if gt_reconstructions or pred_reconstructions or robust_reconstructions:
+        if gt_reconstructions or pred_reconstructions or robust_reconstructions or nelo_reconstructions:
             self.visualize_mesh_reconstructions(
                 gt_data['faces'],
                 gt_reconstructions,
@@ -890,7 +1027,9 @@ class RealTimeEigenanalysisVisualizer:
                 robust_reconstructions,
                 gt_data.get('gt_eigenvalues'),
                 inference_result['predicted_eigenvalues'],
-                gt_data.get('robust_eigenvalues')
+                gt_data.get('robust_eigenvalues'),
+                nelo_reconstructions=nelo_reconstructions,
+                nelo_eigenvalues=self.current_nelo_eigenvalues
             )
             print("[OK] Mesh reconstructions completed")
         else:
@@ -1159,6 +1298,141 @@ class RealTimeEigenanalysisVisualizer:
             print(f"  Warning: Failed to compute GT matrices with igl: {e}")
             return 0.0, None, None
 
+    def load_nelo_pipeline(self, ckpt_path: str, device: str = "cuda"):
+        """
+        Load NeLo from checkpoint using the inlined architecture.
+        No external NeLo repo required — everything is self-contained above.
+        """
+        print(f"  Loading NeLo checkpoint: {ckpt_path}")
+        pipeline = _NeLo_Pipeline.load_from_checkpoint(ckpt_path, map_location=device)
+        pipeline.eval()
+        pipeline.to(device)
+        self.nelo_pipeline = pipeline
+        self.nelo_k = 30
+        print(f"  NeLo pipeline loaded (default k={self.nelo_k})")
+
+    def perform_nelo_inference(self,
+                               vertices: np.ndarray,
+                               num_eigenvectors: int,
+                               device) -> Optional[Dict[str, Any]]:
+        """
+        Run NeLo inference on an (N,3) vertex array using the inlined architecture.
+
+        Timing breakdown mirrors PRED exactly:
+          nelo_graph_tree_time      ↔  pred_patch_extraction_time   (KNN graph build)
+          nelo_model_inference_time ↔  pred_model_inference_time    (forward pass)
+          nelo_matrix_assembly_time ↔  pred_matrix_assembly_time    (sparse L, M)
+
+        Returns dict with keys: L, M, eigenvalues, eigenvectors, timing — or None on failure.
+        """
+        if self.nelo_pipeline is None:
+            return None
+
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as sla
+
+        device_str = str(device)
+        N = vertices.shape[0]
+        timing = {}
+
+        # ---- sub-step 1: GraphTree construction (KNN build) ----
+        t0 = time.perf_counter()
+        graph_tree = _nelo_construct_graph_tree(vertices, k=self.nelo_k)
+        graph_tree = graph_tree.to(device_str)
+        if 'cuda' in device_str:
+            torch.cuda.synchronize()
+        timing['graph_tree'] = time.perf_counter() - t0
+        print(f"  [NeLo] [TIMING] GraphTree (k={self.nelo_k}): {timing['graph_tree'] * 1000:.2f} ms")
+
+        # ---- sub-step 2: Network forward pass ----
+        t1 = time.perf_counter()
+        with torch.no_grad():
+            edge_w, mass, edge_index = self.nelo_pipeline.forward_inference(graph_tree)
+        if 'cuda' in device_str:
+            torch.cuda.synchronize()
+        timing['forward'] = time.perf_counter() - t1
+        print(f"  [NeLo] [TIMING] Forward pass: {timing['forward'] * 1000:.2f} ms")
+
+        # ---- sub-step 3: Sparse (L, M) assembly ----
+        t2 = time.perf_counter()
+        rows = edge_index[0].cpu().numpy()
+        cols = edge_index[1].cpu().numpy()
+        # NeLo outputs non-positive weights (clamped with -relu(-x)).
+        # Negate so w > 0, giving the standard positive semi-definite L = D - W.
+        w    = -edge_w.squeeze().detach().cpu().numpy()
+        mass_np = mass.squeeze().detach().cpu().numpy()
+
+        diag_vals = np.zeros(N)
+        np.add.at(diag_vals, rows, w)
+        L = (sp.coo_matrix((-w, (rows, cols)), shape=(N, N)) + sp.diags(diag_vals)).tocsr()
+
+        mass_mean = mass_np.mean()
+        mass_rel = np.maximum(mass_np / mass_mean, 0.01) if mass_mean > 0 else np.ones(N)
+        M = sp.diags(mass_rel).tocsr()
+
+        timing['assembly'] = time.perf_counter() - t2
+        timing['total']    = timing['graph_tree'] + timing['forward'] + timing['assembly']
+        print(f"  [NeLo] [TIMING] Sparse assembly: {timing['assembly'] * 1000:.2f} ms")
+        print(f"  [NeLo] [TIMING] Total (L,M):     {timing['total'] * 1000:.2f} ms")
+
+        # ---- Eigendecomposition (not timed — consistent with PRED/Robust) ----
+        eigenvalues, eigenvectors = None, None
+        try:
+            k_eig = min(num_eigenvectors + 1, N - 2)
+            eigenvalues, eigenvectors = sla.eigsh(L, k=k_eig, M=M, sigma=1e-6)
+            eigenvalues  = eigenvalues[1:]
+            eigenvectors = eigenvectors[:, 1:]
+            print(f"  [NeLo] Eigenvalue range: [{eigenvalues[0]:.2e}, {eigenvalues[-1]:.6f}]")
+        except Exception as e:
+            print(f"  [NeLo] eigsh failed: {e}")
+
+        return {
+            'L': L,
+            'M': M,
+            'eigenvalues': eigenvalues,
+            'eigenvectors': eigenvectors,
+            'timing': timing,
+        }
+
+    def _update_nelo_with_new_k(self, new_k: int):
+        """Re-run NeLo inference with new k and update all stored state."""
+        print(f"\n{'=' * 60}")
+        print(f"UPDATING NeLo WITH NEW k={new_k}")
+        print('=' * 60)
+
+        if self.current_original_vertices is None or self.nelo_pipeline is None:
+            print("[!] NeLo pipeline or vertices not available")
+            return
+
+        self.nelo_k = new_k
+        nelo_result = self.perform_nelo_inference(
+            self.current_original_vertices,
+            self.config.num_eigenvectors_to_show,
+            self.current_device,
+        )
+        if nelo_result is None:
+            return
+
+        self.current_nelo_L = nelo_result['L']
+        self.current_nelo_M = nelo_result['M']
+        self.current_nelo_eigenvectors = nelo_result['eigenvectors']
+        self.current_nelo_eigenvalues  = nelo_result['eigenvalues']
+        t = nelo_result['timing']
+        self.timing_results.nelo_graph_tree_time      = t['graph_tree']
+        self.timing_results.nelo_model_inference_time = t['forward']
+        self.timing_results.nelo_matrix_assembly_time = t['assembly']
+        self.timing_results.nelo_total_time           = t['total']
+        self.timing_results.nelo_k                    = self.nelo_k
+
+        # Update cosine similarities
+        if self.current_gt_data is not None and nelo_result['eigenvectors'] is not None:
+            self.current_cosine_similarities_nelo = self._compute_eigenvector_cosine_similarities(
+                self.current_gt_data.get('gt_eigenvectors'),
+                nelo_result['eigenvectors']
+            )
+
+        self._print_timing_summary()
+
     def _print_timing_summary(self):
         """Print a summary table comparing matrix assembly times for all methods."""
         t = self.timing_results
@@ -1180,6 +1454,18 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"{'-' * 70}")
 
+        # NeLo breakdown
+        if t.nelo_total_time > 0:
+            print(f"{'NeLo (GNN)':<25}  (k={t.nelo_k})")
+            print(f"  {'Graph tree (KNN)':<23} {t.nelo_graph_tree_time * 1000:>10.2f} ms")
+            print(f"  {'Model inference':<23} {t.nelo_model_inference_time * 1000:>10.2f} ms")
+            print(f"  {'Matrix assembly':<23} {t.nelo_matrix_assembly_time * 1000:>10.2f} ms")
+            print(f"  {'TOTAL':<23} {t.nelo_total_time * 1000:>10.2f} ms")
+        else:
+            print(f"{'NeLo (GNN)':<25} N/A (not loaded)")
+
+        print(f"{'-' * 70}")
+
         # Robust
         print(f"{'Robust (Point Cloud)':<25} {t.robust_matrix_assembly_time * 1000:>10.2f} ms   k-NN + weights + assembly")
 
@@ -1194,11 +1480,21 @@ class RealTimeEigenanalysisVisualizer:
         if t.gt_matrix_assembly_time > 0:
             pred_vs_gt = t.pred_total_time / t.gt_matrix_assembly_time
             robust_vs_gt = t.robust_matrix_assembly_time / t.gt_matrix_assembly_time if t.robust_matrix_assembly_time > 0 else 0
-            print(f"Relative to GT:  PRED = {pred_vs_gt:.2f}x,  Robust = {robust_vs_gt:.2f}x")
+            print(f"Relative to GT:  PRED = {pred_vs_gt:.2f}x,  Robust = {robust_vs_gt:.2f}x", end="")
+            if t.nelo_total_time > 0:
+                nelo_vs_gt = t.nelo_total_time / t.gt_matrix_assembly_time
+                print(f",  NeLo = {nelo_vs_gt:.2f}x", end="")
+            print()
 
         if t.robust_matrix_assembly_time > 0 and t.pred_total_time > 0:
             pred_vs_robust = t.pred_total_time / t.robust_matrix_assembly_time
             print(f"PRED vs Robust:  {pred_vs_robust:.2f}x")
+        if t.nelo_total_time > 0 and t.robust_matrix_assembly_time > 0:
+            nelo_vs_robust = t.nelo_total_time / t.robust_matrix_assembly_time
+            print(f"NeLo vs Robust:  {nelo_vs_robust:.2f}x")
+        if t.nelo_total_time > 0 and t.pred_total_time > 0:
+            pred_vs_nelo = t.pred_total_time / t.nelo_total_time
+            print(f"PRED vs NeLo:    {pred_vs_nelo:.2f}x")
 
         print(f"{'=' * 70}\n")
 
@@ -2221,26 +2517,21 @@ class RealTimeEigenanalysisVisualizer:
                                        pred_reconstructions: List[np.ndarray], robust_reconstructions: List[np.ndarray],
                                        gt_eigenvalues: Optional[np.ndarray],
                                        pred_eigenvalues: Optional[np.ndarray],
-                                       robust_eigenvalues: Optional[np.ndarray]):
+                                       robust_eigenvalues: Optional[np.ndarray],
+                                       nelo_reconstructions: Optional[List[np.ndarray]] = None,
+                                       nelo_eigenvalues: Optional[np.ndarray] = None):
         """
         Visualize progressive mesh reconstructions using eigenvectors.
-        GT (PyFM) on the right, PRED in the center-left, Robust on the far left.
-
-        Args:
-            original_faces: Mesh faces for topology
-            gt_reconstructions: List of GT (PyFM) reconstructed vertices
-            pred_reconstructions: List of predicted reconstructed vertices
-            robust_reconstructions: List of robust-laplacian reconstructed vertices
-            gt_eigenvalues: GT eigenvalues for labeling
-            pred_eigenvalues: Predicted eigenvalues for labeling
-            robust_eigenvalues: Robust-laplacian eigenvalues for labeling
+        GT (PyFM) on the right, PRED in front, Robust on the left, NeLo behind.
         """
         print("Adding mesh reconstruction visualizations...")
+        nelo_reconstructions = nelo_reconstructions or []
 
         # Fixed positions for overlaid reconstructions
-        gt_offset = np.array([3.0, 0.0, 0.0])  # GT (PyFM) reconstructions on the right
-        pred_offset = np.array([0.0, 0.0, -3.0])  # PRED reconstructions in front
-        robust_offset = np.array([-3.0, 0.0, 0.0])  # Robust reconstructions on the left
+        gt_offset     = np.array([ 3.0, 0.0,  0.0])   # GT on the right
+        pred_offset   = np.array([ 0.0, 0.0, -3.0])   # PRED in front
+        robust_offset = np.array([-3.0, 0.0,  0.0])   # Robust on the left
+        nelo_offset   = np.array([ 0.0, 0.0,  3.0])   # NeLo behind
 
         # Visualize GT (PyFM) reconstructions (all overlaid on the right)
         for i, gt_vertices in enumerate(gt_reconstructions):
@@ -2346,7 +2637,33 @@ class RealTimeEigenanalysisVisualizer:
             except Exception as e:
                 print(f"Warning: Failed to visualize robust reconstruction {num_eigenvecs}: {e}")
 
-        print(f"Added {len(gt_reconstructions)} GT-PyFM, {len(pred_reconstructions)} PRED, and {len(robust_reconstructions)} Robust mesh reconstructions")
+        # Visualize NeLo reconstructions (behind)
+        for i, nelo_vertices in enumerate(nelo_reconstructions):
+            num_eigenvecs = i + 1
+            nelo_eigenval = nelo_eigenvalues[i] if nelo_eigenvalues is not None and i < len(nelo_eigenvalues) else 0.0
+
+            offset_vertices = nelo_vertices + nelo_offset
+            mesh_name = f"NeLo Recon {num_eigenvecs:02d} eigenvec (lambda={nelo_eigenval:.3f})"
+
+            try:
+                nelo_mesh = ps.register_surface_mesh(
+                    name=mesh_name,
+                    vertices=offset_vertices,
+                    faces=original_faces,
+                    enabled=(i == 0)
+                )
+                self.reconstruction_structure_names.append(mesh_name)
+
+                # Purple tones for NeLo
+                purple_intensity = 0.5 + 0.5 * (i / max(1, len(nelo_reconstructions) - 1))
+                mesh_color = np.array([purple_intensity, 0.2, purple_intensity])
+                vertex_colors = np.tile(mesh_color, (len(offset_vertices), 1))
+                nelo_mesh.add_color_quantity(name="nelo_color", values=vertex_colors, enabled=True)
+
+            except Exception as e:
+                print(f"Warning: Failed to visualize NeLo reconstruction {num_eigenvecs}: {e}")
+
+        print(f"Added {len(gt_reconstructions)} GT-PyFM, {len(pred_reconstructions)} PRED, {len(robust_reconstructions)} Robust, and {len(nelo_reconstructions)} NeLo mesh reconstructions")
         print("Toggle visibility to compare different numbers of eigenvectors")
 
     def print_eigenvalue_analysis(self, gt_eigenvalues: Optional[np.ndarray],
@@ -2771,22 +3088,24 @@ class RealTimeEigenanalysisVisualizer:
     def visualize_comprehensive_eigenvectors(self, mesh_structure,
                                              gt_eigenvalues: Optional[np.ndarray], gt_eigenvectors: Optional[np.ndarray],
                                              pred_eigenvalues: Optional[np.ndarray], pred_eigenvectors: Optional[np.ndarray],
-                                             robust_eigenvalues: Optional[np.ndarray] = None, robust_eigenvectors: Optional[np.ndarray] = None):
-        """Add GT (PyFM), predicted, and robust-laplacian eigenvector scalar fields to the mesh."""
+                                             robust_eigenvalues: Optional[np.ndarray] = None, robust_eigenvectors: Optional[np.ndarray] = None,
+                                             nelo_eigenvalues: Optional[np.ndarray] = None, nelo_eigenvectors: Optional[np.ndarray] = None):
+        """Add GT (PyFM), predicted, robust-laplacian, and NeLo eigenvector scalar fields to the mesh."""
         num_to_show = self.config.num_eigenvectors_to_show
 
-        # Determine how many eigenvectors we can show for each type
-        gt_available = gt_eigenvectors.shape[1] if gt_eigenvectors is not None else 0
-        pred_available = pred_eigenvectors.shape[1] if pred_eigenvectors is not None else 0
+        gt_available     = gt_eigenvectors.shape[1]     if gt_eigenvectors     is not None else 0
+        pred_available   = pred_eigenvectors.shape[1]   if pred_eigenvectors   is not None else 0
         robust_available = robust_eigenvectors.shape[1] if robust_eigenvectors is not None else 0
+        nelo_available   = nelo_eigenvectors.shape[1]   if nelo_eigenvectors   is not None else 0
 
-        max_available = max(gt_available, pred_available, robust_available)
+        max_available = max(gt_available, pred_available, robust_available, nelo_available)
         num_to_show = min(num_to_show, max_available)
 
         print(f"Adding eigenvector visualization:")
         print(f"  GT (PyFM) eigenvectors available: {gt_available}")
         print(f"  Predicted eigenvectors available: {pred_available}")
         print(f"  Robust-laplacian eigenvectors available: {robust_available}")
+        print(f"  NeLo eigenvectors available: {nelo_available}")
         print(f"  Showing: {num_to_show} eigenvectors per type")
 
         # Compute cosine similarities between GT and predicted eigenvectors
@@ -2799,13 +3118,18 @@ class RealTimeEigenanalysisVisualizer:
             gt_eigenvectors, robust_eigenvectors
         )
 
+        # Compute cosine similarities between GT and NeLo eigenvectors
+        cosine_similarities_nelo = self._compute_eigenvector_cosine_similarities(
+            gt_eigenvectors, nelo_eigenvectors if nelo_eigenvectors is not None else self.current_nelo_eigenvectors
+        )
+
         # Print cosine similarities to console
-        if cosine_similarities_pred is not None or cosine_similarities_robust is not None:
-            print(f"\n" + "-" * 85)
+        if cosine_similarities_pred is not None or cosine_similarities_robust is not None or cosine_similarities_nelo is not None:
+            print(f"\n" + "-" * 99)
             print("EIGENVECTOR COSINE SIMILARITIES")
-            print("-" * 85)
-            print(f"{'Index':<8} {'GT vs PRED':<14} {'GT vs Robust':<14} {'Description'}")
-            print("-" * 85)
+            print("-" * 99)
+            print(f"{'Index':<8} {'GT vs PRED':<14} {'GT vs NeLo':<14} {'GT vs Robust':<14} {'Description'}")
+            print("-" * 99)
             for i in range(num_to_show):
                 if i == 0:
                     desc = "constant"
@@ -2814,32 +3138,37 @@ class RealTimeEigenanalysisVisualizer:
                 else:
                     desc = ""
 
-                pred_sim = cosine_similarities_pred[i] if cosine_similarities_pred is not None and i < len(cosine_similarities_pred) else float('nan')
+                pred_sim   = cosine_similarities_pred[i]   if cosine_similarities_pred   is not None and i < len(cosine_similarities_pred)   else float('nan')
                 robust_sim = cosine_similarities_robust[i] if cosine_similarities_robust is not None and i < len(cosine_similarities_robust) else float('nan')
+                nelo_sim   = cosine_similarities_nelo[i]   if cosine_similarities_nelo   is not None and i < len(cosine_similarities_nelo)   else float('nan')
 
-                print(f"{i:<8} {pred_sim:<14.6f} {robust_sim:<14.6f} {desc}")
+                print(f"{i:<8} {pred_sim:<14.6f} {nelo_sim:<14.6f} {robust_sim:<14.6f} {desc}")
 
             # Summary statistics
-            print("-" * 85)
+            print("-" * 99)
             if cosine_similarities_pred is not None:
-                print(f"GT vs PRED - Mean: {cosine_similarities_pred[:num_to_show].mean():.6f}, Min: {cosine_similarities_pred[:num_to_show].min():.6f}, Max: {cosine_similarities_pred[:num_to_show].max():.6f}")
+                print(f"GT vs PRED   - Mean: {cosine_similarities_pred[:num_to_show].mean():.6f}, Min: {cosine_similarities_pred[:num_to_show].min():.6f}, Max: {cosine_similarities_pred[:num_to_show].max():.6f}")
+            if cosine_similarities_nelo is not None:
+                print(f"GT vs NeLo   - Mean: {cosine_similarities_nelo[:num_to_show].mean():.6f}, Min: {cosine_similarities_nelo[:num_to_show].min():.6f}, Max: {cosine_similarities_nelo[:num_to_show].max():.6f}")
             if cosine_similarities_robust is not None:
                 print(f"GT vs Robust - Mean: {cosine_similarities_robust[:num_to_show].mean():.6f}, Min: {cosine_similarities_robust[:num_to_show].min():.6f}, Max: {cosine_similarities_robust[:num_to_show].max():.6f}")
-            print("-" * 85 + "\n")
+            print("-" * 99 + "\n")
 
             # Store average cosine similarity for UI display (GT vs PRED)
             if cosine_similarities_pred is not None:
                 self.current_avg_cosine_similarity = float(cosine_similarities_pred[:num_to_show].mean())
 
             # Store per-eigenvector cosine similarities for UI comparison table
-            self.current_cosine_similarities_pred = cosine_similarities_pred
+            self.current_cosine_similarities_pred   = cosine_similarities_pred
             self.current_cosine_similarities_robust = cosine_similarities_robust
+            self.current_cosine_similarities_nelo   = cosine_similarities_nelo
 
         # Add eigenvectors in groups
         for i in range(num_to_show):
             # Get cosine similarities for this index
-            cos_sim_pred = cosine_similarities_pred[i] if cosine_similarities_pred is not None and i < len(cosine_similarities_pred) else None
+            cos_sim_pred   = cosine_similarities_pred[i]   if cosine_similarities_pred   is not None and i < len(cosine_similarities_pred)   else None
             cos_sim_robust = cosine_similarities_robust[i] if cosine_similarities_robust is not None and i < len(cosine_similarities_robust) else None
+            cos_sim_nelo   = cosine_similarities_nelo[i]   if cosine_similarities_nelo   is not None and i < len(cosine_similarities_nelo)   else None
 
             # Add GT (PyFM) eigenvector
             if gt_eigenvectors is not None and i < gt_available:
@@ -2896,6 +3225,26 @@ class RealTimeEigenanalysisVisualizer:
                 mesh_structure.add_scalar_quantity(
                     name=robust_name,
                     values=robust_eigenvector,
+                    enabled=False,
+                    cmap=self.config.colormap
+                )
+
+            # Add NeLo eigenvector
+            if nelo_eigenvectors is not None and i < nelo_available:
+                nelo_eigenvector = nelo_eigenvectors[:, i]
+                nelo_eigenvalue  = nelo_eigenvalues[i] if nelo_eigenvalues is not None else 0.0
+                cos_str = f", cos={cos_sim_nelo:.4f}" if cos_sim_nelo is not None else ""
+
+                if i == 0:
+                    nelo_name = f"Eigenvector {i:02d}d NeLo (lambda={nelo_eigenvalue:.2e}, constant{cos_str})"
+                elif i == 1:
+                    nelo_name = f"Eigenvector {i:02d}d NeLo (lambda={nelo_eigenvalue:.6f}, Fiedler{cos_str})"
+                else:
+                    nelo_name = f"Eigenvector {i:02d}d NeLo (lambda={nelo_eigenvalue:.6f}{cos_str})"
+
+                mesh_structure.add_scalar_quantity(
+                    name=nelo_name,
+                    values=nelo_eigenvector,
                     enabled=False,
                     cmap=self.config.colormap
                 )
@@ -3631,6 +3980,29 @@ class RealTimeEigenanalysisVisualizer:
             print("  [!] Robust computation skipped (skip_robust=True)")
 
         # =====================================================================
+        # 4. NeLo Green's Function
+        # =====================================================================
+        if self.current_nelo_L is not None:
+            print("\nComputing NeLo Green's function...")
+            try:
+                result = self.compute_greens_function(self.current_nelo_L, self.current_nelo_M, source_vertex_idx)
+                if result is not None:
+                    nelo_greens, nelo_residual = result
+                    results['NeLo'] = self.validate_maximum_principle(
+                        nelo_greens, source_vertex_idx, "NeLo",
+                        vertices=vertices,
+                        faces=faces,
+                        laplacian_residual_norm=nelo_residual,
+                        gt_greens_function=gt_greens
+                    )
+                    greens_functions['NeLo'] = nelo_greens
+                    print(f"  NeLo Green's function: min={nelo_greens.min():.6f}, max={nelo_greens.max():.6f}")
+            except Exception as e:
+                print(f"  [!] Failed to compute NeLo Green's function: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # =====================================================================
         # Print comparison table
         # =====================================================================
         print(f"\n" + "=" * 90)
@@ -4097,6 +4469,20 @@ class RealTimeEigenanalysisVisualizer:
             except Exception as e:
                 print(f"  [!] potpourri3d point cloud solver failed: {e}")
 
+        # NeLo Laplacian: use point-cloud Heat Method (same as PRED stiffness path)
+        if self.current_nelo_L is not None and self.current_nelo_M is not None:
+            if pc_grad_op is not None and pc_div_op is not None:
+                print(f"\nComputing Heat Method geodesic with NeLo Laplacian...")
+                distances, _t, elapsed_ms = compute_heat_geodesic_pointcloud_local(
+                    self.current_nelo_L, self.current_nelo_M, pc_grad_op, pc_div_op, "NeLo"
+                )
+                if distances is not None:
+                    geodesic_distances["NeLo"] = distances
+                    print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
+                    print(f"  Time: {elapsed_ms:.1f} ms")
+            else:
+                print(f"\n[NeLo] Point cloud gradient not available, skipping Heat Method")
+
         # Add exact geodesics to the comparison set
         geodesic_distances["Exact"] = exact_distances
 
@@ -4355,9 +4741,33 @@ class RealTimeEigenanalysisVisualizer:
 
         # STEP 5.6: Compute Laplacian sparsity comparison
         print(f"\nSTEP 5.6: Computing Laplacian sparsity comparison...")
-        self._compute_and_store_all_sparsity_stats()
 
-        # STEP 6: Visualization (skip if not needed)
+        # STEP 5.7: NeLo inference
+        self.current_nelo_L = None
+        self.current_nelo_M = None
+        self.current_nelo_eigenvectors = None
+        self.current_nelo_eigenvalues = None
+        if self.nelo_pipeline is not None:
+            print(f"\nSTEP 5.7: NeLo inference (k={self.nelo_k})...")
+            nelo_result = self.perform_nelo_inference(
+                gt_data['vertices'],
+                self.config.num_eigenvectors_to_show,
+                device,
+            )
+            if nelo_result is not None:
+                self.current_nelo_L            = nelo_result['L']
+                self.current_nelo_M            = nelo_result['M']
+                self.current_nelo_eigenvectors = nelo_result['eigenvectors']
+                self.current_nelo_eigenvalues  = nelo_result['eigenvalues']
+                t_nelo = nelo_result['timing']
+                self.timing_results.nelo_graph_tree_time      = t_nelo['graph_tree']
+                self.timing_results.nelo_model_inference_time = t_nelo['forward']
+                self.timing_results.nelo_matrix_assembly_time = t_nelo['assembly']
+                self.timing_results.nelo_total_time           = t_nelo['total']
+                self.timing_results.nelo_k                    = self.nelo_k
+        else:
+            print("\nSTEP 5.7: NeLo skipped (pipeline not loaded)")
+        self._compute_and_store_all_sparsity_stats()
         if not self._skip_visualization:
             print(f"\nSTEP 6: Creating comprehensive visualization")
             mesh_structure = self.visualize_mesh(gt_data['vertices'], gt_data['gt_vertex_normals'], gt_data['faces'])
@@ -4389,7 +4799,8 @@ class RealTimeEigenanalysisVisualizer:
                 mesh_structure,
                 gt_data.get('gt_eigenvalues'), gt_data.get('gt_eigenvectors'),
                 inference_result['predicted_eigenvalues'], inference_result['predicted_eigenvectors'],
-                gt_data.get('robust_eigenvalues'), gt_data.get('robust_eigenvectors')
+                gt_data.get('robust_eigenvalues'), gt_data.get('robust_eigenvectors'),
+                self.current_nelo_eigenvalues, self.current_nelo_eigenvectors
             )
 
             self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data, inference_result)
@@ -4516,6 +4927,18 @@ class RealTimeEigenanalysisVisualizer:
 
         # Load trained model
         model = self.load_trained_model(ckpt_path, device, cfg, diagnostic_mode=diagnostic_mode)
+
+        # Load NeLo pipeline if checkpoint path provided
+        nelo_ckpt = getattr(cfg, 'nelo_ckpt_path', None)
+        if nelo_ckpt is not None:
+            print(f"\nLoading NeLo pipeline from: {nelo_ckpt}")
+            try:
+                self.load_nelo_pipeline(str(nelo_ckpt), device=str(device))
+                print("[OK] NeLo pipeline ready")
+            except Exception as e:
+                print(f"[!] Failed to load NeLo pipeline: {e} — NeLo will be skipped")
+        else:
+            print("\n[INFO] nelo_ckpt_path not set — NeLo comparison will be skipped")
 
         # Set random seed for reproducibility
         pl.seed_everything(cfg.globals.seed)
