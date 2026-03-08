@@ -12,7 +12,7 @@ strategy: auto             # auto → DDP when devices > 1; override with "ddp" 
 # ── Training schedule ─────────────────────────────────────────────────────────
 max_epochs: 2000
 accumulate_grad_batches: 1  # effective pairs/step = pairs_per_step × accum × num_gpus
-gradient_clip_val: 10.0
+gradient_clip_val: 1.0
 gradient_clip_algorithm: norm
 precision: 32               # 32 | 16-mixed | bf16-mixed
 
