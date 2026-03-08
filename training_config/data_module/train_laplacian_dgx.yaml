@@ -34,16 +34,14 @@ module:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        max_meshes: 60
+        max_meshes: 160
         file_size_range_mb: [0.5, 5]
         shuffle: True
         mesh_folder_paths:
           - '/workspace/datasets/mpz14'
           - '/workspace/datasets/deftransfer'
           - '/workspace/datasets/shrec15'
-        k: 6
-        feature_extractor:
-          _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
+        k: 15
         pose_transformers:
           - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
         num_geodesic_sources: 1
