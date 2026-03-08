@@ -5,15 +5,17 @@ All Laplacian assembly, loss, and evaluation utilities live here alongside
 FunctionalMapModule so this file is self-contained on the model side.
 """
 from __future__ import annotations
+import os
 import contextlib
 import time
 
 import scipy.sparse
 import scipy.sparse.linalg
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import lightning
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig
@@ -643,6 +645,67 @@ def cosine_flat_scheduler(
         optimizer,
         lr_lambda=lambdas if len(lambdas) > 1 else lambdas[0],
     )
+
+
+
+# =============================================================================
+# Model export callback
+# =============================================================================
+
+class BestModelExportCallback(lightning.pytorch.callbacks.ModelCheckpoint):
+    """ModelCheckpoint subclass that saves only the inner LaplacianTransformerModule.
+
+    Because it inherits from ModelCheckpoint, WandbLogger (log_model=true) will
+    automatically upload its best checkpoint as a W&B artifact — identical in
+    structure and size to the input pretrained checkpoint.
+
+    Pass the same monitor/mode/dirpath as the main ModelCheckpoint so the two
+    checkpoints sit side by side and the best-model tracking is consistent.
+    """
+
+    def _save_checkpoint(self, trainer: "lightning.pytorch.Trainer", filepath: str) -> None:
+        if not trainer.is_global_zero:
+            return
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        pl_module: "FunctionalMapModule" = trainer.lightning_module  # type: ignore[assignment]
+        inner_model: lightning.pytorch.LightningModule = pl_module.model  # type: ignore[assignment]
+        ckpt: Dict[str, Any] = {
+            "state_dict":                    inner_model.state_dict(),
+            "hyper_parameters":              dict(inner_model.hparams),
+            "pytorch-lightning_version":     lightning.__version__,
+        }
+        torch.save(ckpt, filepath)
+        self.best_model_path = filepath
+
+        # WandbLogger only scans the *last* ModelCheckpoint in the callbacks list,
+        # so log_model='all' will never reliably upload our callback. Upload directly.
+        try:
+            import wandb
+            if wandb.run is not None:
+                artifact_name = f"model-{wandb.run.id}"
+                artifact = wandb.Artifact(
+                    name=artifact_name,
+                    type="model",
+                    metadata={
+                        "score":   float(self.current_score) if self.current_score is not None else None,
+                        "epoch":   trainer.current_epoch,
+                        "monitor": self.monitor,
+                    },
+                )
+                artifact.add_file(filepath, name="model.ckpt")
+                wandb.run.log_artifact(artifact, aliases=["latest", "best"])
+                print(f"  [Export] Uploaded to W&B artifact '{artifact_name}'")
+            else:
+                print("  [Export] W&B upload skipped: no active wandb run")
+        except Exception as e:
+            import traceback
+            print(f"  [Export] W&B upload failed: {e}")
+            traceback.print_exc()
+
+        print(f"  [Export] Saved inner model checkpoint → {filepath}")
+
+
 
 
 
