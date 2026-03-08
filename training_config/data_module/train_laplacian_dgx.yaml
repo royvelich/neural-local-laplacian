@@ -1,5 +1,5 @@
 module:
-  _target_: neural_local_laplacian.data_modules.common.GenericDataModule
+  _target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
   train_dataset_specification:
     _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
     dataset:
@@ -14,8 +14,6 @@ module:
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
           num_points_range: 20
-      feature_extractor:
-          _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
       conv_k_nearest: null
       pose_transformers: null
 #        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer

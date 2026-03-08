@@ -5005,31 +5005,9 @@ class RealTimeEigenanalysisVisualizer:
                     print("Close window to continue to next batch.")
                     ps.show()
 
-                    # === CLEANUP after polyscope visualization ===
-                    # Polyscope uses OpenGL which can interfere with CUDA
-                    # Force a full CUDA synchronization and cache clear to restore GPU state
+                    # Free GPU memory held by polyscope before next batch
                     if device.type == 'cuda':
-                        print("[DEBUG] Cleaning up GPU state after polyscope...")
-                        torch.cuda.synchronize()
                         torch.cuda.empty_cache()
-
-                        # Do a quick warmup inference to restore torch.compile state
-                        print("[DEBUG] Re-warming model after polyscope...")
-                        from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
-                        with torch.no_grad():
-                            dummy = MeshPatchData(
-                                pos=torch.randn(5000 * actual_k, 3, device=device),
-                                x=torch.randn(5000 * actual_k, 3, device=device),
-                                patch_idx=torch.arange(5000, device=device).repeat_interleave(actual_k),
-                                vertex_indices=torch.randint(0, 5000, (5000 * actual_k,), device=device),
-                                center_indices=torch.arange(5000, device=device)
-                            )
-                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                                _ = model._forward_pass(dummy)
-                            torch.cuda.synchronize()
-                        del dummy
-                        torch.cuda.empty_cache()
-                        print("[DEBUG] Re-warm complete")
                 else:
                     print(f"\n[skip_visualization=True] Skipping polyscope for batch {batch_idx + 1}")
 
