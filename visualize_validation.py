@@ -329,8 +329,8 @@ class GreensFunctionValidationResult:
     max_geodesic_dist: float = 0.0  # Maximum geodesic distance from source (for reference)
 
     def __str__(self) -> str:
-        status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ PASS" if self.satisfies_maximum_principle else "ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ FAIL"
-        max_status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“" if self.max_at_source else "ÃƒÂ¢Ã…â€œÃ¢â‚¬â€"
+        status = "[OK] PASS" if self.satisfies_maximum_principle else "[X] FAIL"
+        max_status = "[OK]" if self.max_at_source else "[X]"
         return (f"{self.method_name:<14} {self.value_at_source:>10.4f} {self.max_value:>10.4f} "
                 f"{max_status:^12} {self.num_violations:>6} {status:>10}")
 
@@ -644,9 +644,9 @@ class RealTimeEigenanalysisVisualizer:
             # Show results for each method
             for method_name, result in self.current_greens_results.items():
                 if result.satisfies_maximum_principle:
-                    psim.TextColored((0.0, 1.0, 0.0, 1.0), f"  {method_name}: ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ PASS")
+                    psim.TextColored((0.0, 1.0, 0.0, 1.0), f"  {method_name}: [OK] PASS")
                 else:
-                    psim.TextColored((1.0, 0.0, 0.0, 1.0), f"  {method_name}: ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ FAIL")
+                    psim.TextColored((1.0, 0.0, 0.0, 1.0), f"  {method_name}: [X] FAIL")
                     if result.num_violations > 0:
                         psim.Text(f"    {result.num_violations} vertices above source")
                     if not result.max_at_source:
@@ -823,6 +823,15 @@ class RealTimeEigenanalysisVisualizer:
                 stats['Robust'] = self._compute_sparsity_for_matrix(L_robust, f"Robust (k={k})")
             except Exception as e:
                 print(f"  [!] Failed to compute Robust sparsity: {e}")
+
+        # NeLo Laplacian
+        if self.current_nelo_L is not None:
+            try:
+                stats['NeLo'] = self._compute_sparsity_for_matrix(
+                    self.current_nelo_L, f"NeLo (k={self.nelo_k})"
+                )
+            except Exception as e:
+                print(f"  [!] Failed to compute NeLo sparsity: {e}")
 
         self.current_sparsity_stats = stats
         self._print_sparsity_comparison()
@@ -1307,6 +1316,9 @@ class RealTimeEigenanalysisVisualizer:
         pipeline = _NeLo_Pipeline.load_from_checkpoint(ckpt_path, map_location=device)
         pipeline.eval()
         pipeline.to(device)
+        # Verify the two assumptions forward_inference hardcodes
+        assert _nelo_global_config.gnn_input_signal == "all_one",             f"NeLo checkpoint uses gnn_input_signal={_nelo_global_config.gnn_input_signal!r}, but forward_inference hardcodes all_one"
+        assert _nelo_global_config.use_vertex_mass == True,             f"NeLo checkpoint has use_vertex_mass=False, but forward_inference always calls mass_decoder"
         self.nelo_pipeline = pipeline
         self.nelo_k = 30
         print(f"  NeLo pipeline loaded (default k={self.nelo_k})")
@@ -4023,9 +4035,9 @@ class RealTimeEigenanalysisVisualizer:
         print("-" * 62)
         for method_name, result in results.items():
             if result.num_positive_vertices == 0:
-                status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ PASS"
+                status = "[OK] PASS"
             else:
-                status = "ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ FAIL"
+                status = "[X] FAIL"
             print(f"{result.method_name:<14} {result.num_positive_vertices:>10} {result.max_positive_value:>14.6f} "
                   f"{result.positive_vertex_idx:>10} {status:>10}")
 
@@ -4088,9 +4100,9 @@ class RealTimeEigenanalysisVisualizer:
         # Overall summary
         all_pass = all(r.satisfies_maximum_principle for r in results.values())
         if all_pass:
-            print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“ All methods satisfy the discrete maximum principle")
+            print("[OK] All methods satisfy the discrete maximum principle")
         else:
-            print("ÃƒÂ¢Ã…â€œÃ¢â‚¬â€ Some methods VIOLATE the discrete maximum principle:")
+            print("[X] Some methods VIOLATE the discrete maximum principle:")
             for method_name, result in results.items():
                 if not result.satisfies_maximum_principle:
                     print(f"  - {result.method_name}: Max value {result.max_value:.4f} at vertex {result.worst_violation_vertex}, "
