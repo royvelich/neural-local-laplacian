@@ -69,7 +69,11 @@ class MeshDataset(Dataset):
             geodesic_source_method: str = "farthest_point_sampling",
             max_meshes: Optional[int] = None,
             file_size_range_mb: Optional[Tuple[float, float]] = None,
+            vertices_count_range: Optional[Tuple[int, int]] = None,
+            faces_count_range: Optional[Tuple[int, int]] = None,
+            num_components_range: Optional[Tuple[int, int]] = None,
             shuffle: bool = False,
+            verbose_diagnostics: bool = False,
             # Backward compatibility: singular form still accepted
             mesh_folder_path: Union[str, Path] = None
     ):
@@ -91,8 +95,20 @@ class MeshDataset(Dataset):
                 optional shuffling.
             file_size_range_mb: Optional (min_mb, max_mb) tuple. Mesh files outside this
                 size range on disk are skipped. Use None for no filtering.
+            vertices_count_range: Optional (min_verts, max_verts) tuple. Meshes with vertex
+                count outside this range are skipped. Requires loading each mesh. Use None
+                for no filtering.
+            faces_count_range: Optional (min_faces, max_faces) tuple. Meshes with face count
+                outside this range are skipped. Requires loading each mesh. Use None for no
+                filtering.
+            num_components_range: Optional (min_components, max_components) tuple. Meshes
+                whose number of connected components falls outside this range are skipped.
+                E.g., (1, 1) keeps only single-component meshes. Requires loading each mesh.
+                Use None for no filtering.
             shuffle: If True, shuffle the mesh file list before applying max_meshes cap.
                 Useful for random subsampling from a large collection.
+            verbose_diagnostics: If True, print detailed diagnostic messages before each
+                native call during mesh loading (useful for debugging segfaults).
         """
         super().__init__()
 
@@ -114,7 +130,11 @@ class MeshDataset(Dataset):
         self._geodesic_source_method = geodesic_source_method
         self._max_meshes = max_meshes
         self._file_size_range_mb = file_size_range_mb
+        self._vertices_count_range = vertices_count_range
+        self._faces_count_range = faces_count_range
+        self._num_components_range = num_components_range
         self._shuffle = shuffle
+        self._verbose = verbose_diagnostics
 
         # Validate inputs
         self._validate_inputs()
@@ -153,10 +173,35 @@ class MeshDataset(Dataset):
             if max_mb <= min_mb:
                 raise ValueError(f"file_size_range_mb max ({max_mb}) must be > min ({min_mb})")
 
+        if self._vertices_count_range is not None:
+            min_v, max_v = self._vertices_count_range
+            if min_v < 0:
+                raise ValueError(f"vertices_count_range min must be >= 0, got {min_v}")
+            if max_v <= min_v:
+                raise ValueError(f"vertices_count_range max ({max_v}) must be > min ({min_v})")
+
+        if self._faces_count_range is not None:
+            min_f, max_f = self._faces_count_range
+            if min_f < 0:
+                raise ValueError(f"faces_count_range min must be >= 0, got {min_f}")
+            if max_f <= min_f:
+                raise ValueError(f"faces_count_range max ({max_f}) must be > min ({min_f})")
+
+        if self._num_components_range is not None:
+            min_c, max_c = self._num_components_range
+            if min_c < 1:
+                raise ValueError(f"num_components_range min must be >= 1, got {min_c}")
+            if max_c < min_c:
+                raise ValueError(f"num_components_range max ({max_c}) must be >= min ({min_c})")
+
     def _scan_mesh_folders(self) -> List[Path]:
         """
         Scan all mesh folders for supported mesh files, applying size filtering,
-        optional shuffling, and max mesh cap.
+        geometry filtering (vertices/faces/components), optional shuffling, and
+        max mesh cap.
+
+        Filter order: file size (cheap, no I/O) → geometry (requires mesh loading) →
+        shuffle → cap.
 
         Returns:
             List of Path objects for found mesh files
@@ -164,14 +209,14 @@ class MeshDataset(Dataset):
         mesh_files = []
 
         for folder_path in self._mesh_folder_paths:
-            for file_path in folder_path.iterdir():
+            for file_path in folder_path.rglob('*'):
                 if file_path.is_file() and file_path.suffix.lower() in self.SUPPORTED_FORMATS:
                     mesh_files.append(file_path)
 
         # Sort for consistent base ordering (before optional shuffle)
         mesh_files.sort()
 
-        # Filter by file size if specified
+        # Filter by file size if specified (cheap — no mesh loading)
         if self._file_size_range_mb is not None:
             min_bytes = self._file_size_range_mb[0] * 1024 * 1024
             max_bytes = self._file_size_range_mb[1] * 1024 * 1024
@@ -186,6 +231,16 @@ class MeshDataset(Dataset):
                       f"{self._file_size_range_mb[1]:.2f} MB): "
                       f"kept {len(mesh_files)}, skipped {filtered_count}")
 
+        # Filter by geometry properties if any geometry filter is specified
+        # (requires loading each mesh — applied after cheap file-size filter)
+        has_geometry_filters = (
+            self._vertices_count_range is not None
+            or self._faces_count_range is not None
+            or self._num_components_range is not None
+        )
+        if has_geometry_filters and len(mesh_files) > 0:
+            mesh_files = self._apply_geometry_filters(mesh_files)
+
         # Shuffle before capping if requested
         if self._shuffle:
             random.shuffle(mesh_files)
@@ -197,6 +252,107 @@ class MeshDataset(Dataset):
             mesh_files = mesh_files[:self._max_meshes]
 
         return mesh_files
+
+    def _get_mesh_geometry_info(self, file_path: Path) -> Optional[Tuple[int, int, int]]:
+        """
+        Load a mesh and return its vertex count, face count, and number of
+        connected components.
+
+        Args:
+            file_path: Path to the mesh file
+
+        Returns:
+            Tuple of (num_vertices, num_faces, num_components), or None if the
+            mesh could not be loaded.
+        """
+        try:
+            loaded = trimesh.load(str(file_path))
+        except Exception as e:
+            print(f"  Warning: could not load {file_path.name} for filtering: {e}")
+            return None
+
+        if isinstance(loaded, trimesh.Scene):
+            # Scene: each entry in .geometry is a separate object
+            num_components = len(loaded.geometry)
+            # Aggregate vertex/face counts across all geometries
+            num_vertices = sum(
+                len(g.vertices) for g in loaded.geometry.values()
+                if hasattr(g, 'vertices')
+            )
+            num_faces = sum(
+                len(g.faces) for g in loaded.geometry.values()
+                if hasattr(g, 'faces')
+            )
+        elif isinstance(loaded, trimesh.Trimesh):
+            num_vertices = len(loaded.vertices)
+            num_faces = len(loaded.faces)
+            num_components = len(loaded.split())
+        else:
+            print(f"  Warning: unsupported mesh type {type(loaded).__name__} "
+                  f"for {file_path.name}, skipping")
+            return None
+
+        return num_vertices, num_faces, num_components
+
+    def _apply_geometry_filters(self, mesh_files: List[Path]) -> List[Path]:
+        """
+        Filter mesh files by vertex count, face count, and/or number of connected
+        components.  Each mesh is loaded once; all three filters are checked in a
+        single pass.
+
+        Args:
+            mesh_files: List of mesh file paths that passed earlier (cheap) filters
+
+        Returns:
+            Filtered list of mesh file paths
+        """
+        # Build human-readable description of active filters for logging
+        filter_parts = []
+        if self._vertices_count_range is not None:
+            lo, hi = self._vertices_count_range
+            filter_parts.append(f"vertices in [{lo}, {hi}]")
+        if self._faces_count_range is not None:
+            lo, hi = self._faces_count_range
+            filter_parts.append(f"faces in [{lo}, {hi}]")
+        if self._num_components_range is not None:
+            lo, hi = self._num_components_range
+            filter_parts.append(f"components in [{lo}, {hi}]")
+        filter_desc = ", ".join(filter_parts)
+        print(f"Geometry filter ({filter_desc}): loading {len(mesh_files)} meshes ...")
+
+        kept: List[Path] = []
+        skipped = 0
+
+        for file_path in mesh_files:
+            info = self._get_mesh_geometry_info(file_path)
+            if info is None:
+                skipped += 1
+                continue
+
+            num_vertices, num_faces, num_components = info
+
+            if self._vertices_count_range is not None:
+                lo, hi = self._vertices_count_range
+                if not (lo <= num_vertices <= hi):
+                    skipped += 1
+                    continue
+
+            if self._faces_count_range is not None:
+                lo, hi = self._faces_count_range
+                if not (lo <= num_faces <= hi):
+                    skipped += 1
+                    continue
+
+            if self._num_components_range is not None:
+                lo, hi = self._num_components_range
+                if not (lo <= num_components <= hi):
+                    skipped += 1
+                    continue
+
+            kept.append(file_path)
+
+        print(f"Geometry filter: kept {len(kept)}, skipped {skipped}")
+        return kept
 
     def len(self) -> int:
         """Return the number of mesh files in the dataset."""
@@ -216,9 +372,12 @@ class MeshDataset(Dataset):
             raise IndexError(f"Index {idx} out of range for {len(self._mesh_file_paths)} mesh files")
 
         mesh_file_path = self._mesh_file_paths[idx]
+        _v = self._verbose
+        if _v: print(f"  [MeshDataset] Loading mesh [{idx}]: {mesh_file_path.name}", flush=True)
 
         try:
             # Load mesh using trimesh
+            if _v: print(f"    [diag] trimesh.load ...", flush=True)
             mesh = trimesh.load(str(mesh_file_path))
 
             # Extract vertices as numpy array
@@ -238,11 +397,15 @@ class MeshDataset(Dataset):
                 faces = np.array([])
                 original_num_faces = 0
 
+            if _v: print(f"    [diag] Loaded: {original_num_vertices} verts, {original_num_faces} faces", flush=True)
+
             # Normalize mesh vertices: center at origin and fit in unit sphere
+            if _v: print(f"    [diag] normalize_mesh_vertices ...", flush=True)
             vertices = utils.normalize_mesh_vertices(raw_vertices)
 
             # Calculate vertex normals using trimesh with normalized vertices
             # Update the mesh with normalized vertices for normal computation
+            if _v: print(f"    [diag] vertex_normals ...", flush=True)
             mesh.vertices = vertices
             if hasattr(mesh, 'vertex_normals'):
                 vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
@@ -250,6 +413,7 @@ class MeshDataset(Dataset):
                 raise ValueError(f"Could not compute vertex normals for mesh: {mesh_file_path}")
 
             # Compute ground-truth Laplacian eigendecomposition using robust-laplacian
+            if _v: print(f"    [diag] GT eigendecomposition ...", flush=True)
             gt_eigenvalues, gt_eigenvectors = self._compute_ground_truth_eigendecomposition(
                 vertices, faces
             )
@@ -262,6 +426,7 @@ class MeshDataset(Dataset):
             raise ValueError(f"Mesh has only {len(vertices)} vertices, need at least {self._k + 1}")
 
         # Extract local patches for all vertices
+        if _v: print(f"    [diag] extract_all_patches (k={self._k}) ...", flush=True)
         patches_data = self._extract_all_patches(vertices, vertex_normals)
 
         # Add mesh metadata as individual attributes (more robust for PyTorch Geometric batching)
@@ -276,11 +441,13 @@ class MeshDataset(Dataset):
         patches_data.gt_eigen = (gt_eigenvalues, gt_eigenvectors)
 
         # Compute and store geodesic validation data
+        if _v: print(f"    [diag] geodesic_validation_data ...", flush=True)
         geodesic_data = self._compute_geodesic_validation_data(
             vertices, faces, patches_data.vertex_indices.numpy()
         )
         patches_data.geodesic_data = geodesic_data
 
+        if _v: print(f"    [diag] Done: {mesh_file_path.name}", flush=True)
         return patches_data
 
     def _compute_ground_truth_eigendecomposition(
@@ -301,9 +468,11 @@ class MeshDataset(Dataset):
             - eigenvectors: Array of shape (N, num_eigenvalues)
         """
         # Compute robust Laplacian (returns Laplacian L and mass matrix M)
+        if self._verbose: print(f"    [diag] robust_laplacian.mesh_laplacian ({len(vertices)} verts, {len(faces)} faces) ...", flush=True)
         L, M = robust_laplacian.mesh_laplacian(vertices, faces)
 
         # Use shared eigendecomposition function
+        if self._verbose: print(f"    [diag] eigsh (k={self._num_eigenvalues}) ...", flush=True)
         return utils.compute_laplacian_eigendecomposition(
             L, self._num_eigenvalues, mass_matrix=M
         )
@@ -354,6 +523,7 @@ class MeshDataset(Dataset):
         # Compute exact geodesics for each source
         exact_geodesics = {}
         for source_idx in source_indices:
+            if self._verbose: print(f"    [diag] compute_exact_geodesics (source={source_idx}) ...", flush=True)
             geodesics = compute_exact_geodesics(vertices, faces, int(source_idx))
             if geodesics is not None:
                 exact_geodesics[int(source_idx)] = geodesics
@@ -375,6 +545,7 @@ class MeshDataset(Dataset):
             edge_index = edge_index_from_knn_indices(vertex_indices, center_indices, self._k)
 
             # Build grad/div operators using the exact same connectivity
+            if self._verbose: print(f"    [diag] build_pointcloud_grad_div_operators ...", flush=True)
             pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
 
             result['pc_grad_op'] = pc_grad_op

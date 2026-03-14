@@ -513,18 +513,69 @@ def compute_heat_geodesic_learned(
         return None
 
 
+def _check_mesh_topology_safe(vertices: np.ndarray, faces: np.ndarray) -> Tuple[bool, str]:
+    """
+    Lightweight topology check to detect meshes likely to crash pygeodesic/igl.
+
+    Checks for non-manifold edges, degenerate faces, and unreferenced vertices.
+    Much cheaper than actually running geodesic algorithms.
+
+    Args:
+        vertices: Vertex positions (N, 3)
+        faces: Face indices (F, 3)
+
+    Returns:
+        Tuple of (is_safe, reason_if_unsafe)
+    """
+    n = len(vertices)
+    nf = len(faces)
+
+    if nf == 0:
+        return False, "no faces"
+
+    # Check for out-of-range face indices
+    if faces.max() >= n or faces.min() < 0:
+        return False, f"face indices out of range [0, {n})"
+
+    # Check for degenerate faces (repeated vertex indices)
+    degen = (faces[:, 0] == faces[:, 1]) | (faces[:, 1] == faces[:, 2]) | (faces[:, 0] == faces[:, 2])
+    n_degen = int(degen.sum())
+    if n_degen > 0:
+        return False, f"{n_degen} degenerate faces"
+
+    # Check for non-manifold edges (shared by >2 faces)
+    # Build edge -> face count
+    from collections import Counter
+    edge_counts = Counter()
+    for f in faces:
+        for i in range(3):
+            e = (min(f[i], f[(i + 1) % 3]), max(f[i], f[(i + 1) % 3]))
+            edge_counts[e] += 1
+
+    non_manifold = sum(1 for c in edge_counts.values() if c > 2)
+    if non_manifold > 0:
+        return False, f"{non_manifold} non-manifold edges"
+
+    return True, "ok"
+
+
 def compute_exact_geodesics(
     vertices: np.ndarray,
     faces: np.ndarray,
-    source_idx: int
+    source_idx: int,
+    verbose: bool = False
 ) -> Optional[np.ndarray]:
     """
     Compute exact geodesic distances using pygeodesic or igl.
+
+    Performs a lightweight mesh topology check before calling native code
+    to avoid segfaults on degenerate meshes.
 
     Args:
         vertices: Vertex positions (N, 3)
         faces: Face indices (F, 3)
         source_idx: Index of source vertex
+        verbose: If True, print diagnostic messages before each native call
 
     Returns:
         Exact geodesic distances (N,) or None if computation fails
@@ -533,9 +584,16 @@ def compute_exact_geodesics(
     vertices = vertices.astype(np.float64)
     faces = faces.astype(np.int32)
 
+    # Pre-flight topology check to avoid segfaults in native code
+    is_safe, reason = _check_mesh_topology_safe(vertices, faces)
+    if not is_safe:
+        print(f"      [!] Skipping exact geodesics: mesh topology unsafe ({reason})", flush=True)
+        return None
+
     # Try pygeodesic first (fastest exact algorithm)
     try:
         import pygeodesic.geodesic as geodesic
+        if verbose: print(f"      [diag] pygeodesic.geodesicDistances (N={n}, F={len(faces)}, src={source_idx}) ...", flush=True)
         geoalg = geodesic.PyGeodesicAlgorithmExact(vertices, faces)
         distances, _ = geoalg.geodesicDistances(np.array([source_idx]), None)
 
@@ -549,6 +607,7 @@ def compute_exact_geodesics(
     # Try igl.exact_geodesic
     if HAS_IGL:
         try:
+            if verbose: print(f"      [diag] igl.exact_geodesic (N={n}, F={len(faces)}, src={source_idx}) ...", flush=True)
             VS = np.array([source_idx], dtype=np.int32)
             VT = np.arange(n, dtype=np.int32)
             distances = igl.exact_geodesic(vertices, faces, VS, VT)

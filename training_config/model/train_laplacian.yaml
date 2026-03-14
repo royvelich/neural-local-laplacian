@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 256
+  d_model: 512
   nhead: 8
-  num_encoder_layers: 6
-  dim_feedforward: 256
+  num_encoder_layers: 1
+  dim_feedforward: 512
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.0
   normalize_loss_weights: False
@@ -16,11 +16,12 @@ module:
   operator_mode: 'gradient'
   val_laplacian_mode: 'sparse_anisotropic'
   feature_extractor: null
+#    _target_: neural_local_laplacian.utils.features.FourierFeatureExtractor
   loss_configs:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 20.0
+      weight: 2.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss

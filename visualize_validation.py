@@ -433,10 +433,18 @@ class RealTimeEigenanalysisVisualizer:
         # NEW: Laplacian sparsity comparison stats
         self.current_sparsity_stats: Dict[str, LaplacianSparsityStats] = {}
 
+        # Cached state for targeted per-method validation recomputation
+        self._greens_source_vertex_idx: Optional[int] = None
+        self._greens_gt_values: Optional[np.ndarray] = None  # GT Green's fn for correlation
+        self._geodesic_source_vertex_idx: Optional[int] = None
+        self._exact_geodesic_distances: Optional[np.ndarray] = None
+        self._pc_grad_op = None   # pcdiff point cloud gradient operator
+        self._pc_div_op = None    # pcdiff point cloud divergence operator
+
         # Debug flags (set from config in run_dataset_iteration)
         self._diagnostic_mode = False
         self._skip_robust = False
-        self._skip_visualization = False
+        self._quantitative_mode = False
 
         # NeLo state
         self.nelo_pipeline = None          # loaded once at startup via load_nelo_pipeline(); None = disabled
@@ -518,7 +526,7 @@ class RealTimeEigenanalysisVisualizer:
                     self.nelo_k,
                     flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
                 )
-                new_nelo_k = max(4, min(30, new_nelo_k))
+                new_nelo_k = max(4, min(100, new_nelo_k))
 
                 if nelo_k_changed and new_nelo_k != self.nelo_k:
                     self.nelo_k = new_nelo_k
@@ -540,7 +548,7 @@ class RealTimeEigenanalysisVisualizer:
             psim.Text("  (Standard L2 projection for PRED)")
 
         if self.original_k is not None:
-            psim.Text(f"Original k: {self.original_k}, PRED k: {self.reconstruction_settings.current_pred_k}, Robust k: {self.reconstruction_settings.current_robust_k}")
+            psim.Text(f"Dataset k: {self.original_k}, PRED k: {self.reconstruction_settings.current_pred_k}, Robust k: {self.reconstruction_settings.current_robust_k}, NeLo k: {self.nelo_k}")
 
         psim.Text("")
         psim.Separator()
@@ -855,73 +863,264 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"{'=' * 85}\n")
 
-    def _recompute_validations_after_k_change(self):
-        """Recompute all downstream validations after a k change.
+    def _get_method_L_M(self, method_key: str) -> Tuple[Optional[Any], Optional[Any]]:
+        """Return the (L, M) sparse matrices for a given method.
 
-        This re-runs Green's function validation (step 8), heat method geodesics (step 9),
-        sparsity stats, and updates all UI-facing results.
+        Args:
+            method_key: One of 'GT', 'PRED', 'Robust', 'NeLo'
+
+        Returns:
+            Tuple of (L, M) sparse matrices, or (None, None) if unavailable.
+        """
+        vertices = self.current_gt_data['vertices'] if self.current_gt_data else None
+
+        if method_key == 'GT':
+            if HAS_IGL and vertices is not None:
+                V = vertices.astype(np.float64)
+                F = self.current_gt_data['faces'].astype(np.int32)
+                return -igl.cotmatrix(V, F), igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+            return None, None
+
+        if method_key == 'PRED':
+            if self.current_inference_result is not None:
+                return (self.current_inference_result.get('stiffness_matrix'),
+                        self.current_inference_result.get('mass_matrix'))
+            return None, None
+
+        if method_key == 'Robust':
+            if not self._skip_robust and vertices is not None:
+                k = self.reconstruction_settings.current_robust_k
+                return robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
+            return None, None
+
+        if method_key == 'NeLo':
+            return self.current_nelo_L, self.current_nelo_M
+
+        return None, None
+
+    def _update_sparsity_for_method(self, method_key: str):
+        """Recompute sparsity stats for a single method, keeping others unchanged."""
+        L, _ = self._get_method_L_M(method_key)
+        if L is None:
+            return
+
+        label_map = {
+            'GT': "GT (Cotangent)",
+            'PRED': "PRED (Neural)",
+            'Robust': f"Robust (k={self.reconstruction_settings.current_robust_k})",
+            'NeLo': f"NeLo (k={self.nelo_k})",
+        }
+        label = label_map.get(method_key, method_key)
+
+        try:
+            self.current_sparsity_stats[method_key] = self._compute_sparsity_for_matrix(L, label)
+        except Exception as e:
+            print(f"  [!] Failed to compute {method_key} sparsity: {e}")
+
+        self._print_sparsity_comparison()
+
+    def _update_greens_for_method(self, method_key: str):
+        """Recompute Green's function validation for a single method, keeping others unchanged.
+
+        Uses the cached source vertex from the initial computation.
+        """
+        if self.current_gt_data is None:
+            return
+
+        vertices = self.current_gt_data['vertices']
+        faces = self.current_gt_data['faces']
+        source_idx = self._greens_source_vertex_idx
+        if source_idx is None:
+            source_idx = self.select_source_vertex(vertices, method="centroid")
+
+        L, M = self._get_method_L_M(method_key)
+        if L is None:
+            return
+
+        try:
+            print(f"\nRecomputing Green's function for {method_key}...")
+            result = self.compute_greens_function(L, M, source_idx)
+            if result is not None:
+                greens_values, residual = result
+                validation = self.validate_maximum_principle(
+                    greens_values, source_idx, method_key,
+                    vertices=vertices,
+                    faces=faces,
+                    laplacian_residual_norm=residual,
+                    gt_greens_function=self._greens_gt_values
+                )
+
+                # Merge into existing results
+                if self.current_greens_results is None:
+                    self.current_greens_results = {}
+                self.current_greens_results[method_key] = validation
+                print(f"  {method_key} Green's function: min={greens_values.min():.6f}, max={greens_values.max():.6f}")
+
+                # Update GT cache if we just recomputed GT
+                if method_key == 'GT':
+                    self._greens_gt_values = greens_values
+        except Exception as e:
+            print(f"  [!] Green's function recomputation for {method_key} failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _update_geodesics_for_method(self, method_key: str):
+        """Recompute heat method geodesics for a single method, keeping others unchanged.
+
+        Uses the cached source vertex and exact geodesic distances from the
+        initial computation.
+        """
+        if self.current_gt_data is None:
+            return
+
+        vertices = self.current_gt_data['vertices'].astype(np.float64)
+        n = len(vertices)
+        source_idx = self._geodesic_source_vertex_idx
+        exact_distances = self._exact_geodesic_distances
+
+        if source_idx is None or exact_distances is None:
+            print(f"  [!] Cached geodesic state not available, skipping {method_key} geodesic update")
+            return
+
+        L, M = self._get_method_L_M(method_key)
+
+        operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
+        distances = None
+
+        try:
+            if method_key == 'GT':
+                # Mesh-based gradient
+                if HAS_IGL and L is not None and M is not None:
+                    faces = self.current_gt_data['faces'].astype(np.int32)
+                    mesh_grad_op = igl.grad(vertices, faces)
+                    mesh_face_areas = igl.doublearea(vertices, faces).flatten() / 2.0
+                    print(f"\nRecomputing Heat Method geodesic for GT...")
+                    distances = compute_heat_geodesic_mesh(
+                        L=L, M=M, grad_op=mesh_grad_op, face_areas=mesh_face_areas,
+                        source_idx=source_idx, n_vertices=n
+                    )
+
+            elif method_key == 'PRED':
+                if L is not None and M is not None:
+                    if operator_mode == "gradient":
+                        # Use learned gradient operator
+                        if self.current_learned_gradient_op is not None:
+                            print(f"\nRecomputing Heat Method geodesic for PRED (learned G)...")
+                            distances = compute_heat_geodesic_learned(
+                                S=L, M=M, G=self.current_learned_gradient_op,
+                                source_idx=source_idx, n_vertices=n
+                            )
+                    else:
+                        # Stiffness mode: use pcdiff operators
+                        if self._pc_grad_op is not None and self._pc_div_op is not None:
+                            print(f"\nRecomputing Heat Method geodesic for PRED (pcdiff)...")
+                            distances = compute_heat_geodesic_pointcloud(
+                                L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
+                                source_idx=source_idx, n_vertices=n
+                            )
+
+            elif method_key == 'Robust':
+                # Robust uses potpourri3d point cloud solver
+                print(f"\nRecomputing geodesic for Robust (pp3d)...")
+                try:
+                    import potpourri3d as pp3d
+                    pc_solver = pp3d.PointCloudHeatSolver(vertices)
+                    distances = pc_solver.compute_distance(source_idx)
+                except Exception as e:
+                    print(f"  [!] potpourri3d solver failed: {e}")
+
+            elif method_key == 'NeLo':
+                if L is not None and M is not None:
+                    if self._pc_grad_op is not None and self._pc_div_op is not None:
+                        print(f"\nRecomputing Heat Method geodesic for NeLo (pcdiff)...")
+                        distances = compute_heat_geodesic_pointcloud(
+                            L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
+                            source_idx=source_idx, n_vertices=n
+                        )
+
+            if distances is not None:
+                # The Robust result key in the geodesic results dict uses "Robust (pp3d)"
+                result_key = "Robust (pp3d)" if method_key == "Robust" else method_key
+
+                metrics = compute_geodesic_metrics(distances, exact_distances)
+                result = HeatMethodGeodesicResult(
+                    method_name=result_key,
+                    source_vertex_idx=source_idx,
+                    num_vertices=n,
+                    min_distance=float(distances.min()),
+                    max_distance=float(distances.max()),
+                    mean_distance=float(distances.mean()),
+                    distance_at_source=float(distances[source_idx]),
+                    correlation_with_reference=float(metrics.correlation),
+                    mean_absolute_error=float(metrics.mae_normalized),
+                    max_absolute_error=float(metrics.max_error_normalized),
+                    relative_error_percent=float(metrics.mae_normalized * 100),
+                    monotonicity_score=float(metrics.monotonicity),
+                )
+
+                if self.current_heat_geodesic_results is None:
+                    self.current_heat_geodesic_results = {}
+                self.current_heat_geodesic_results[result_key] = result
+
+                print(f"  {result_key}: corr={metrics.correlation:.4f}, MAE={metrics.mae_normalized:.4f}")
+
+                # Update visualization if available
+                mesh_structure = self.current_mesh_structure
+                if mesh_structure is not None and not self._quantitative_mode:
+                    d_norm = normalize_distances(distances)
+                    mesh_structure.add_scalar_quantity(
+                        name=f"K1 Geodesic (norm) - {result_key}",
+                        values=d_norm,
+                        enabled=False,
+                        cmap='viridis'
+                    )
+                    exact_norm = normalize_distances(exact_distances)
+                    error = np.abs(d_norm - exact_norm)
+                    mesh_structure.add_scalar_quantity(
+                        name=f"K2 Geodesic Error - {result_key}",
+                        values=error,
+                        enabled=False,
+                        cmap='reds'
+                    )
+            else:
+                print(f"  [!] No geodesic distances computed for {method_key}")
+
+        except Exception as e:
+            print(f"  [!] Geodesic recomputation for {method_key} failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _recompute_validations_after_k_change(self, changed_method: str):
+        """Recompute downstream validations ONLY for the method whose k changed.
+
+        This replaces the previous approach of recomputing everything for all
+        methods, which was wasteful when only one method's k changed.
+
+        Args:
+            changed_method: The method whose k changed ('PRED', 'Robust', or 'NeLo').
         """
         if self.current_gt_data is None or self.current_inference_result is None:
             print("[!] No current data available for validation recomputation")
             return
 
-        vertices = self.current_gt_data['vertices']
-        faces = self.current_gt_data['faces']
-        mesh_structure = self.current_mesh_structure
+        print(f"\n--- Recomputing validations for {changed_method} only ---")
 
-        # --- Recompute sparsity stats ---
-        print("\nRecomputing sparsity stats...")
-        self._compute_and_store_all_sparsity_stats()
+        # Rebuild pcdiff operators if PRED's kNN changed (they depend on PRED connectivity)
+        if changed_method == 'PRED' and HAS_PCDIFF and self.current_vertex_indices is not None:
+            try:
+                vertices = self.current_gt_data['vertices'].astype(np.float64)
+                vertex_indices_np = self.current_vertex_indices.cpu().numpy()
+                center_indices_np = self.current_center_indices.cpu().numpy()
+                k = len(vertex_indices_np) // len(center_indices_np)
+                edge_index = edge_index_from_knn_indices(vertex_indices_np, center_indices_np, k)
+                self._pc_grad_op, self._pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
+                print(f"  Rebuilt pcdiff operators for new PRED k={k}")
+            except Exception as e:
+                print(f"  [!] Failed to rebuild pcdiff operators: {e}")
 
-        # --- Recompute Green's function validation (Step 8) ---
-        print("\nRecomputing Green's function validation...")
-        try:
-            greens_results = self.compute_and_visualize_greens_functions(
-                mesh_structure, self.current_gt_data, self.current_inference_result
-            )
-            self.current_greens_results = greens_results
-        except Exception as e:
-            print(f"  [!] Green's function recomputation failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # --- Recompute Heat Method geodesics (Step 9) ---
-        print("\nRecomputing Heat Method geodesics...")
-        try:
-            # Build Laplacians
-            L_gt, M_gt = None, None
-            L_pred, M_pred = None, None
-            L_robust, M_robust = None, None
-
-            if HAS_IGL:
-                V = vertices.astype(np.float64)
-                F = faces.astype(np.int32)
-                L_gt = -igl.cotmatrix(V, F)
-                M_gt = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
-
-            if self.current_inference_result.get('stiffness_matrix') is not None:
-                L_pred = self.current_inference_result['stiffness_matrix']
-                M_pred = self.current_inference_result.get('mass_matrix')
-
-            if not self._skip_robust:
-                k = self.reconstruction_settings.current_robust_k
-                L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
-
-            heat_geodesic_results = self.validate_heat_method_geodesics_step9(
-                vertices=vertices,
-                faces=faces,
-                L_gt=L_gt, M_gt=M_gt,
-                L_pred=L_pred, M_pred=M_pred,
-                L_robust=L_robust, M_robust=M_robust,
-                source_vertex_idx=None,
-                mesh_structure=mesh_structure,
-                k_neighbors=self.original_k if self.original_k else 20
-            )
-            self.current_heat_geodesic_results = heat_geodesic_results
-        except Exception as e:
-            print(f"  [!] Heat Method geodesic recomputation failed: {e}")
-            import traceback
-            traceback.print_exc()
+        self._update_sparsity_for_method(changed_method)
+        self._update_greens_for_method(changed_method)
+        self._update_geodesics_for_method(changed_method)
 
     def _clear_stored_references(self):
         """Clear stored references from previous batch to free memory.
@@ -942,6 +1141,14 @@ class RealTimeEigenanalysisVisualizer:
         self.current_predicted_data = None
         self.current_original_vertices = None
         self.current_sparsity_stats = {}
+
+        # Clear cached validation state
+        self._greens_source_vertex_idx = None
+        self._greens_gt_values = None
+        self._geodesic_source_vertex_idx = None
+        self._exact_geodesic_distances = None
+        self._pc_grad_op = None
+        self._pc_div_op = None
 
         # Force garbage collection
         import gc
@@ -1320,8 +1527,7 @@ class RealTimeEigenanalysisVisualizer:
         assert _nelo_global_config.gnn_input_signal == "all_one",             f"NeLo checkpoint uses gnn_input_signal={_nelo_global_config.gnn_input_signal!r}, but forward_inference hardcodes all_one"
         assert _nelo_global_config.use_vertex_mass == True,             f"NeLo checkpoint has use_vertex_mass=False, but forward_inference always calls mass_decoder"
         self.nelo_pipeline = pipeline
-        self.nelo_k = 30
-        print(f"  NeLo pipeline loaded (default k={self.nelo_k})")
+        print(f"  NeLo pipeline loaded (k will be set from config)")
 
     def perform_nelo_inference(self,
                                vertices: np.ndarray,
@@ -1388,6 +1594,10 @@ class RealTimeEigenanalysisVisualizer:
         print(f"  [NeLo] [TIMING] Total (L,M):     {timing['total'] * 1000:.2f} ms")
 
         # ---- Eigendecomposition (not timed — consistent with PRED/Robust) ----
+        # Ensure matching dtypes for ARPACK (eigsh)
+        L = L.astype(np.float64)
+        M = M.astype(np.float64)
+
         eigenvalues, eigenvectors = None, None
         try:
             k_eig = min(num_eigenvectors + 1, N - 2)
@@ -1442,6 +1652,15 @@ class RealTimeEigenanalysisVisualizer:
                 self.current_gt_data.get('gt_eigenvectors'),
                 nelo_result['eigenvectors']
             )
+
+        # Update visualizations (reconstructions include NeLo)
+        if self._has_current_batch_data():
+            self._remove_existing_reconstructions()
+            self._update_mesh_reconstructions(self.current_gt_data, self.current_inference_result)
+
+        # Recompute downstream validations for NeLo only
+        print(f"Recomputing downstream validations for NeLo...")
+        self._recompute_validations_after_k_change("NeLo")
 
         self._print_timing_summary()
 
@@ -1613,8 +1832,8 @@ class RealTimeEigenanalysisVisualizer:
         self._update_eigenvector_visualizations()
 
         # STEP 5: Recompute all downstream validations (Green's fn, geodesics, sparsity)
-        print(f"STEP 5: Recomputing downstream validations...")
-        self._recompute_validations_after_k_change()
+        print(f"STEP 5: Recomputing downstream validations for PRED...")
+        self._recompute_validations_after_k_change("PRED")
 
         # Print timing summary
         self._print_timing_summary()
@@ -1656,9 +1875,9 @@ class RealTimeEigenanalysisVisualizer:
         # Update eigenvector visualizations on the mesh
         self._update_eigenvector_visualizations()
 
-        # Recompute all downstream validations (Green's fn, geodesics, sparsity)
-        print(f"Recomputing downstream validations...")
-        self._recompute_validations_after_k_change()
+        # Recompute downstream validations for Robust only
+        print(f"Recomputing downstream validations for Robust...")
+        self._recompute_validations_after_k_change("Robust")
 
         print(f"\n[OK] Updated Robust with k={new_k}")
         print('=' * 60)
@@ -1686,6 +1905,9 @@ class RealTimeEigenanalysisVisualizer:
         cosine_similarities_robust = self._compute_eigenvector_cosine_similarities(
             gt_eigenvectors, robust_eigenvectors
         )
+        cosine_similarities_nelo = self._compute_eigenvector_cosine_similarities(
+            gt_eigenvectors, self.current_nelo_eigenvectors
+        )
 
         # Update stored average for UI
         if cosine_similarities_pred is not None:
@@ -1695,6 +1917,7 @@ class RealTimeEigenanalysisVisualizer:
         # Update per-eigenvector cosine similarities for UI comparison table
         self.current_cosine_similarities_pred = cosine_similarities_pred
         self.current_cosine_similarities_robust = cosine_similarities_robust
+        self.current_cosine_similarities_nelo = cosine_similarities_nelo
 
         # Print updated comparison
         print(f"\nUpdated eigenvector cosine similarities:")
@@ -1702,6 +1925,8 @@ class RealTimeEigenanalysisVisualizer:
             print(f"  GT vs PRED mean: {cosine_similarities_pred.mean():.4f}")
         if cosine_similarities_robust is not None:
             print(f"  GT vs Robust mean: {cosine_similarities_robust.mean():.4f}")
+        if cosine_similarities_nelo is not None:
+            print(f"  GT vs NeLo mean: {cosine_similarities_nelo.mean():.4f}")
 
     def _recompute_and_update_reconstructions(self):
         """Re-compute and update mesh reconstructions with new settings."""
@@ -1984,40 +2209,47 @@ class RealTimeEigenanalysisVisualizer:
         gt_mesh_grad_op = None
         gt_face_areas = None
         if HAS_IGL:
+            vertices_igl = vertices.astype(np.float64)
+            faces_igl = faces.astype(np.int32)
+
+            # Curvature computation — only needed for visualization, skip in quantitative mode
+            if not self._quantitative_mode:
+                try:
+                    print("Computing GT mean curvature using libigl...")
+
+                    # Compute principal curvatures using libigl
+                    _, _, principal_curvature1, principal_curvature2, _ = igl.principal_curvature(
+                        vertices_igl, faces_igl
+                    )
+
+                    # Mean curvature is the average of principal curvatures: H = (k1 + k2) / 2
+                    gt_mean_curvature = (principal_curvature1 + principal_curvature2) / 2.0
+                    gt_mean_curvature = gt_mean_curvature.astype(np.float32)
+
+                    # Gaussian curvature: K = k1 * k2
+                    gt_gaussian_curvature = (principal_curvature1 * principal_curvature2).astype(np.float32)
+
+                    # GT mean curvature vector = GT normal * GT mean curvature
+                    gt_mean_curvature_vector = gt_vertex_normals * gt_mean_curvature[:, np.newaxis]
+
+                    print(f"GT mean curvature range: [{gt_mean_curvature.min():.6f}, {gt_mean_curvature.max():.6f}]")
+                    print(f"GT Gaussian curvature range: [{gt_gaussian_curvature.min():.6f}, {gt_gaussian_curvature.max():.6f}]")
+
+                except Exception as e:
+                    print(f"Warning: Failed to compute GT curvatures with libigl: {e}")
+                    gt_mean_curvature = None
+                    gt_mean_curvature_vector = None
+                    gt_gaussian_curvature = None
+            else:
+                print("Skipping GT curvature computation (quantitative_mode)")
+
+            # Gradient operator — always needed (used for GT heat method geodesics)
             try:
-                print("Computing GT mean curvature using libigl...")
-                # Convert to float64 for libigl (more stable)
-                vertices_igl = vertices.astype(np.float64)
-                faces_igl = faces.astype(np.int32)
-
-                # Compute principal curvatures using libigl
-                _, _, principal_curvature1, principal_curvature2, _ = igl.principal_curvature(
-                    vertices_igl, faces_igl
-                )
-
-                # Mean curvature is the average of principal curvatures: H = (k1 + k2) / 2
-                gt_mean_curvature = (principal_curvature1 + principal_curvature2) / 2.0
-                gt_mean_curvature = gt_mean_curvature.astype(np.float32)
-
-                # Gaussian curvature: K = k1 * k2
-                gt_gaussian_curvature = (principal_curvature1 * principal_curvature2).astype(np.float32)
-
-                # GT mean curvature vector = GT normal * GT mean curvature
-                gt_mean_curvature_vector = gt_vertex_normals * gt_mean_curvature[:, np.newaxis]
-
-                print(f"GT mean curvature range: [{gt_mean_curvature.min():.6f}, {gt_mean_curvature.max():.6f}]")
-                print(f"GT Gaussian curvature range: [{gt_gaussian_curvature.min():.6f}, {gt_gaussian_curvature.max():.6f}]")
-
-                # Build GT mesh gradient operator (face-based, 3*nF x N)
                 gt_mesh_grad_op = igl.grad(vertices_igl, faces_igl)
                 gt_face_areas = (igl.doublearea(vertices_igl, faces_igl).flatten() / 2.0).astype(np.float64)
                 print(f"GT mesh gradient operator: {gt_mesh_grad_op.shape}")
-
             except Exception as e:
-                print(f"Warning: Failed to compute GT curvatures with libigl: {e}")
-                gt_mean_curvature = None
-                gt_mean_curvature_vector = None
-                gt_gaussian_curvature = None
+                print(f"Warning: Failed to compute GT gradient operator: {e}")
                 gt_mesh_grad_op = None
                 gt_face_areas = None
 
@@ -2025,6 +2257,8 @@ class RealTimeEigenanalysisVisualizer:
         print("Computing GT Laplacian eigendecomposition using PyFM...")
         gt_laplacian_time = 0.0
         try:
+            import warnings
+
             # Create PyFM TriMesh object
             pyfm_mesh = TriMesh(vertices, faces)
 
@@ -2034,7 +2268,10 @@ class RealTimeEigenanalysisVisualizer:
             t_gt_start = time.perf_counter()
 
             # Process the mesh and compute the Laplacian spectrum
-            pyfm_mesh.process(k=self.config.num_eigenvectors_to_show, intrinsic=False, verbose=False)
+            # Suppress PyFM warnings from degenerate triangles (divide by zero, invalid sqrt)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                pyfm_mesh.process(k=self.config.num_eigenvectors_to_show, intrinsic=False, verbose=False)
 
             t_gt_end = time.perf_counter()
             gt_laplacian_time = t_gt_end - t_gt_start
@@ -2052,12 +2289,6 @@ class RealTimeEigenanalysisVisualizer:
 
             print(f"Computed {len(gt_eigenvalues)} GT eigenvalues")
             print(f"GT eigenvalue range: [{gt_eigenvalues[0]:.2e}, {gt_eigenvalues[-1]:.6f}]")
-
-        except Exception as e:
-            print(f"Warning: Failed to compute GT eigendecomposition: {e}")
-            gt_eigenvalues = None
-            gt_eigenvectors = None
-            vertex_areas = None
 
         except Exception as e:
             print(f"Warning: Failed to compute GT eigendecomposition: {e}")
@@ -3418,7 +3649,7 @@ class RealTimeEigenanalysisVisualizer:
 
         Tests performed:
         1. PRIMARY: Is the maximum at the source vertex? (argmax invariant to normalization)
-        2. SECONDARY: Does value decrease with GEODESIC distance? (uses igl.exact_geodesic)
+        2. SECONDARY: Does value decrease with GEODESIC distance? (uses compute_exact_geodesics with safety check)
         3. TERTIARY: Laplacian residual (computed before normalization, passed in)
         4. COMPARISON: Correlation with GT (invariant to normalization)
 
@@ -3495,83 +3726,13 @@ class RealTimeEigenanalysisVisualizer:
         monotonicity_score = 1.0
         distances = None  # Will store geodesic distances for later use
 
-        # Try to compute geodesic distances using various methods
-        # Priority: 1) pygeodesic (fast, robust), 2) igl.heat_geodesic, 3) igl.exact_geodesic, 4) Euclidean
+        # Try to compute geodesic distances using the shared protected function
+        # (includes topology safety check to avoid segfaults on degenerate meshes)
+        distances = compute_exact_geodesics(vertices, faces, source_vertex_idx)
 
-        geodesic_computed = False
-
-        # Method 1: Try pygeodesic (fastest and most robust)
-        try:
-            import pygeodesic.geodesic as geodesic
-
-            V = vertices.astype(np.float64)
-            F = faces.astype(np.int32)
-
-            # Create geodesic algorithm object
-            geoalg = geodesic.PyGeodesicAlgorithmExact(V, F)
-
-            # Compute distances from source to all vertices
-            distances, _ = geoalg.geodesicDistances(np.array([source_vertex_idx]), None)
-
-            if distances is not None and len(distances) == n:
-                geodesic_computed = True
-            else:
-                raise ValueError(f"pygeodesic returned invalid result")
-
-        except ImportError:
-            pass  # pygeodesic not installed, try next method
-        except Exception as e:
-            print(f"    [!] pygeodesic failed: {e}")
-
-        # Method 2: Try igl heat geodesic
-        if not geodesic_computed and HAS_IGL:
-            try:
-                V = vertices.astype(np.float64)
-                F = faces.astype(np.int32)
-
-                # Compute mean edge length for time parameter
-                edges = np.vstack([
-                    F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]
-                ])
-                edge_lengths = np.linalg.norm(V[edges[:, 0]] - V[edges[:, 1]], axis=1)
-                mean_edge = edge_lengths.mean()
-                t = mean_edge ** 2  # Default time parameter
-
-                # Source vertex
-                gamma = np.array([source_vertex_idx], dtype=np.int32)
-
-                # Compute heat geodesic distances
-                distances = igl.heat_geodesic(V, F, t, gamma)
-
-                if distances is not None and len(distances) == n:
-                    geodesic_computed = True
-                else:
-                    raise ValueError("heat_geodesic returned invalid result")
-
-            except Exception as e:
-                print(f"    [!] igl.heat_geodesic failed: {e}")
-
-        # Method 3: Try igl exact geodesic
-        if not geodesic_computed and HAS_IGL:
-            try:
-                V = vertices.astype(np.float64)
-                F = faces.astype(np.int32)
-
-                VS = np.array([source_vertex_idx], dtype=np.int32)
-                VT = np.arange(n, dtype=np.int32)
-                distances = igl.exact_geodesic(V, F, VS, VT)
-
-                if distances is not None and len(distances) == n:
-                    geodesic_computed = True
-                else:
-                    raise ValueError("exact_geodesic returned invalid result")
-
-            except Exception as e:
-                print(f"    [!] igl.exact_geodesic failed: {e}")
-
-        # Method 4: Fall back to Euclidean distances
-        if not geodesic_computed:
-            print(f"    [!] All geodesic methods failed, using Euclidean distances")
+        # Fallback to Euclidean distances if geodesic computation failed
+        if distances is None or len(distances) != n:
+            print(f"    [!] Exact geodesics unavailable, using Euclidean distances for monotonicity test")
             distances = np.linalg.norm(vertices - vertices[source_vertex_idx], axis=1)
 
         # Now compute correlation and monotonicity using the distances
@@ -3855,6 +4016,9 @@ class RealTimeEigenanalysisVisualizer:
         if source_vertex_idx is None:
             source_vertex_idx = self.select_source_vertex(vertices, method="centroid")
 
+        # Cache source vertex for targeted recomputation
+        self._greens_source_vertex_idx = source_vertex_idx
+
         source_pos = vertices[source_vertex_idx]
         print(f"Source vertex: {source_vertex_idx} at position ({source_pos[0]:.4f}, {source_pos[1]:.4f}, {source_pos[2]:.4f})")
         print(f"Number of vertices: {n}")
@@ -3900,6 +4064,7 @@ class RealTimeEigenanalysisVisualizer:
                         gt_greens_function=None  # This IS the GT
                     )
                     greens_functions['GT'] = gt_greens
+                    self._greens_gt_values = gt_greens  # Cache for per-method recomputation
                     print(f"  GT Green's function: min={gt_greens.min():.6f}, max={gt_greens.max():.6f}")
 
             except Exception as e:
@@ -3961,8 +4126,8 @@ class RealTimeEigenanalysisVisualizer:
 
         if not self._skip_robust:
             try:
-                # Use the same k as PRED for fair comparison
-                k = self.original_k if self.original_k is not None else 30
+                # Use the current robust k from settings
+                k = self.reconstruction_settings.current_robust_k
 
                 L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
 
@@ -4113,7 +4278,7 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         # Add visualizations to mesh structure
         # =====================================================================
-        if mesh_structure is not None and not self._skip_visualization:
+        if mesh_structure is not None and not self._quantitative_mode:
             print("\nAdding Green's function visualizations...")
 
             # Add source vertex indicator
@@ -4271,6 +4436,9 @@ class RealTimeEigenanalysisVisualizer:
         if source_vertex_idx is None:
             source_vertex_idx = select_geodesic_source_vertex(vertices, method="centroid")
 
+        # Cache source vertex for targeted recomputation
+        self._geodesic_source_vertex_idx = source_vertex_idx
+
         source_pos = vertices[source_vertex_idx]
         print(f"Source vertex: {source_vertex_idx} at ({source_pos[0]:.4f}, {source_pos[1]:.4f}, {source_pos[2]:.4f})")
 
@@ -4330,6 +4498,10 @@ class RealTimeEigenanalysisVisualizer:
             except Exception as e:
                 print(f"  [!] pcdiff operators failed: {e}")
 
+        # Cache pcdiff operators for targeted per-method recomputation
+        self._pc_grad_op = pc_grad_op
+        self._pc_div_op = pc_div_op
+
         # =====================================================================
         # Compute EXACT geodesic distances (TRUE ground truth)
         # =====================================================================
@@ -4361,6 +4533,9 @@ class RealTimeEigenanalysisVisualizer:
         # Store for comparison
         reference_distances = exact_distances
         reference_method = exact_method
+
+        # Cache exact distances for targeted recomputation
+        self._exact_geodesic_distances = exact_distances
 
         # =====================================================================
         # NOTE: normalize_distances and compute_geodesic_metrics are imported
@@ -4551,7 +4726,7 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         # Add visualizations
         # =====================================================================
-        if mesh_structure is not None and not self._skip_visualization:
+        if mesh_structure is not None and not self._quantitative_mode:
             print("\nAdding geodesic visualizations...")
 
             # Add source vertex indicator
@@ -4595,14 +4770,18 @@ class RealTimeEigenanalysisVisualizer:
 
         return results
 
-    def process_batch(self, model: LaplacianTransformerModule, batch_data, batch_idx: int, device: torch.device):
-        """Process a single batch through the complete pipeline."""
+    def process_batch(self, model: LaplacianTransformerModule, batch_data, batch_idx: int, device: torch.device) -> bool:
+        """Process a single batch through the complete pipeline.
+
+        Returns:
+            True if processing succeeded, False if the mesh was skipped.
+        """
         print(f"\n{'=' * 80}")
         print(f"PROCESSING BATCH {batch_idx + 1}")
         print('=' * 80)
 
         # Clear previous visualization and tracking (only if polyscope is active)
-        if not self._skip_visualization:
+        if not self._quantitative_mode:
             ps.remove_all_structures()
         self.reconstruction_structure_names.clear()  # Clear reconstruction tracking
 
@@ -4653,13 +4832,20 @@ class RealTimeEigenanalysisVisualizer:
         print(f"\nSTEP 2: Loading original mesh for GT computation")
         gt_data = self.load_original_mesh_for_gt(mesh_file_path)
 
-        # STEP 2.5: Re-extract patches with timing for fair comparison
+        # Check if GT eigendecomposition succeeded (PyFM can fail on degenerate meshes)
+        if gt_data.get('gt_eigenvalues') is None:
+            print(f"[X] GT eigendecomposition failed for {Path(mesh_file_path).name} "
+                  f"(likely degenerate triangles), skipping this mesh")
+            return False
+
+        # STEP 2.5: Re-extract patches with PRED k for timing comparison
         # (MeshDataset does k-NN during data loading, but we need to time it for comparison
         # since robust_laplacian includes k-NN search in its timing)
-        print(f"\nSTEP 2.5: Extracting patches with k={original_k} (for timing comparison)...")
+        pred_k = self._initial_k_pred
+        print(f"\nSTEP 2.5: Extracting patches with k={pred_k} (for timing comparison)...")
         t_extraction_start = time.perf_counter()
 
-        patch_data = self._extract_patches_for_mesh_with_k(gt_data['vertices'], original_k)
+        patch_data = self._extract_patches_for_mesh_with_k(gt_data['vertices'], pred_k)
 
         t_extraction_end = time.perf_counter()
         pred_extraction_time = t_extraction_end - t_extraction_start
@@ -4672,7 +4858,7 @@ class RealTimeEigenanalysisVisualizer:
 
         if inference_result['predicted_eigenvalues'] is None:
             print("[X] Failed to compute eigendecomposition, skipping this batch")
-            return
+            return False
 
         # Compute PRED total time
         self.timing_results.pred_total_time = (
@@ -4732,20 +4918,21 @@ class RealTimeEigenanalysisVisualizer:
                 print(f"  [!] Failed to assemble learned gradient operator: {e}")
                 self.current_learned_gradient_op = None
 
-        # Initialize PRED and Robust k sliders with original k
-        self.reconstruction_settings.current_pred_k = self.original_k
-        self.reconstruction_settings.current_robust_k = self.original_k
-        print(f"Initialized PRED k={self.original_k}, Robust k={self.original_k}")
+        # Initialize PRED and Robust k sliders with per-method k from config
+        self.reconstruction_settings.current_pred_k = self._initial_k_pred
+        self.reconstruction_settings.current_robust_k = self._initial_k_robust
+        print(f"Initialized PRED k={self._initial_k_pred}, Robust k={self._initial_k_robust}, NeLo k={self.nelo_k}")
 
         # Update timing results with mesh info (needed for UI display)
         self.timing_results.num_vertices = len(gt_data['vertices'])
         self.timing_results.num_faces = len(gt_data['faces'])
-        self.timing_results.current_k = self.original_k
+        self.timing_results.current_k = self._initial_k_pred
 
-        # STEP 5.5: Compute robust-laplacian with point_cloud_laplacian using same k as PRED
-        print(f"\nSTEP 5.5: Computing robust-laplacian with k={self.original_k}...")
+        # STEP 5.5: Compute robust-laplacian with point_cloud_laplacian using robust k
+        robust_k = self._initial_k_robust
+        print(f"\nSTEP 5.5: Computing robust-laplacian with k={robust_k}...")
         robust_eigenvalues, robust_eigenvectors, robust_vertex_areas = self._compute_robust_laplacian_with_k(
-            gt_data['vertices'], self.original_k
+            gt_data['vertices'], robust_k
         )
         gt_data['robust_eigenvalues'] = robust_eigenvalues
         gt_data['robust_eigenvectors'] = robust_eigenvectors
@@ -4780,12 +4967,12 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print("\nSTEP 5.7: NeLo skipped (pipeline not loaded)")
         self._compute_and_store_all_sparsity_stats()
-        if not self._skip_visualization:
+        if not self._quantitative_mode:
             print(f"\nSTEP 6: Creating comprehensive visualization")
             mesh_structure = self.visualize_mesh(gt_data['vertices'], gt_data['gt_vertex_normals'], gt_data['faces'])
             self.current_mesh_structure = mesh_structure
         else:
-            print(f"\nSTEP 6: Skipping visualization (skip_visualization=True)")
+            print(f"\nSTEP 6: Skipping visualization (quantitative_mode=True)")
             mesh_structure = None
 
         # Print analysis (always do this - it's console output)
@@ -4805,14 +4992,34 @@ class RealTimeEigenanalysisVisualizer:
                 )
                 self.print_eigenvector_correlation_analysis(correlation_matrix, "Predicted vs GT")
 
-        # Add visualizations (skip if not needed)
-        if not self._skip_visualization and mesh_structure is not None:
+        # Compute eigenvector cosine similarities (always — needed for quantitative metrics)
+        gt_eigvecs = gt_data.get('gt_eigenvectors')
+        pred_eigvecs = inference_result.get('predicted_eigenvectors')
+        robust_eigvecs = gt_data.get('robust_eigenvectors')
+        nelo_eigvecs = self.current_nelo_eigenvectors
+
+        self.current_cosine_similarities_pred = self._compute_eigenvector_cosine_similarities(
+            gt_eigvecs, pred_eigvecs
+        )
+        self.current_cosine_similarities_robust = self._compute_eigenvector_cosine_similarities(
+            gt_eigvecs, robust_eigvecs
+        )
+        self.current_cosine_similarities_nelo = self._compute_eigenvector_cosine_similarities(
+            gt_eigvecs, nelo_eigvecs
+        )
+
+        if self.current_cosine_similarities_pred is not None:
+            num_to_show = min(self.config.num_eigenvectors_to_show, len(self.current_cosine_similarities_pred))
+            self.current_avg_cosine_similarity = float(self.current_cosine_similarities_pred[:num_to_show].mean())
+
+        # Add visualizations (skip if in quantitative mode)
+        if not self._quantitative_mode and mesh_structure is not None:
             self.visualize_comprehensive_eigenvectors(
                 mesh_structure,
-                gt_data.get('gt_eigenvalues'), gt_data.get('gt_eigenvectors'),
-                inference_result['predicted_eigenvalues'], inference_result['predicted_eigenvectors'],
-                gt_data.get('robust_eigenvalues'), gt_data.get('robust_eigenvectors'),
-                self.current_nelo_eigenvalues, self.current_nelo_eigenvectors
+                gt_data.get('gt_eigenvalues'), gt_eigvecs,
+                inference_result['predicted_eigenvalues'], pred_eigvecs,
+                gt_data.get('robust_eigenvalues'), robust_eigvecs,
+                self.current_nelo_eigenvalues, nelo_eigvecs
             )
 
             self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data, inference_result)
@@ -4821,7 +5028,7 @@ class RealTimeEigenanalysisVisualizer:
             print(f"\nSTEP 7: Computing and visualizing mesh reconstructions")
             self._update_mesh_reconstructions(gt_data, inference_result)
         else:
-            print(f"\nSTEP 7: Skipping mesh reconstructions (skip_visualization=True)")
+            print(f"\nSTEP 7: Skipping mesh reconstructions (quantitative_mode=True)")
 
         # STEP 8: Green's function maximum principle validation
         print(f"\nSTEP 8: Green's function maximum principle validation")
@@ -4866,7 +5073,7 @@ class RealTimeEigenanalysisVisualizer:
 
             # Robust Laplacian
             if not self._skip_robust:
-                k = self.original_k if self.original_k is not None else 30
+                k = self.reconstruction_settings.current_robust_k
                 L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
 
             # Run Heat Method geodesic validation
@@ -4881,7 +5088,7 @@ class RealTimeEigenanalysisVisualizer:
                 M_robust=M_robust,
                 source_vertex_idx=None,  # Will auto-select centroid
                 mesh_structure=mesh_structure,
-                k_neighbors=self.original_k if self.original_k else 20
+                k_neighbors=self.reconstruction_settings.current_pred_k
             )
             self.current_heat_geodesic_results = heat_geodesic_results
 
@@ -4894,6 +5101,605 @@ class RealTimeEigenanalysisVisualizer:
         self._print_timing_summary()
 
         print(f"\n[OK] Comprehensive visualization completed for {Path(mesh_file_path).name}")
+        return True
+
+    def _collect_mesh_metrics(self) -> Optional[Dict[str, Any]]:
+        """
+        Collect all computed metrics for the current mesh into a flat dictionary.
+
+        Called after process_batch in quantitative mode. Extracts metrics from
+        the instance state that process_batch populated.
+
+        Returns:
+            Dictionary of metric_name -> value, or None if no data available.
+        """
+        if self.current_gt_data is None or self.current_inference_result is None:
+            return None
+
+        mesh_name = Path(self.current_mesh_file_path).name if self.current_mesh_file_path else "unknown"
+        n_verts = len(self.current_gt_data['vertices'])
+        n_faces = len(self.current_gt_data['faces'])
+
+        metrics: Dict[str, Any] = {
+            'mesh_name': mesh_name,
+            'num_vertices': n_verts,
+            'num_faces': n_faces,
+            'k': self.original_k or 0,
+        }
+
+        # --- Timing ---
+        t = self.timing_results
+        metrics['pred_patch_extraction_ms'] = t.pred_patch_extraction_time * 1000
+        metrics['pred_inference_ms'] = t.pred_model_inference_time * 1000
+        metrics['pred_assembly_ms'] = t.pred_matrix_assembly_time * 1000
+        metrics['pred_total_ms'] = t.pred_total_time * 1000
+        metrics['robust_total_ms'] = t.robust_matrix_assembly_time * 1000
+        metrics['gt_assembly_ms'] = t.gt_matrix_assembly_time * 1000
+        if t.nelo_total_time > 0:
+            metrics['nelo_graph_tree_ms'] = t.nelo_graph_tree_time * 1000
+            metrics['nelo_inference_ms'] = t.nelo_model_inference_time * 1000
+            metrics['nelo_assembly_ms'] = t.nelo_matrix_assembly_time * 1000
+            metrics['nelo_total_ms'] = t.nelo_total_time * 1000
+
+        # --- Eigenvector cosine similarity ---
+        for method_label, sims in [
+            ('pred', self.current_cosine_similarities_pred),
+            ('robust', self.current_cosine_similarities_robust),
+            ('nelo', self.current_cosine_similarities_nelo),
+        ]:
+            if sims is not None and len(sims) > 0:
+                # Cumulative means at key counts
+                for count in [5, 10, 20, 50]:
+                    if count <= len(sims):
+                        metrics[f'{method_label}_eigvec_cos_top{count}'] = float(sims[:count].mean())
+                # Overall mean
+                metrics[f'{method_label}_eigvec_cos_all'] = float(sims.mean())
+                # Per-eigenvector cosine similarities
+                for i, val in enumerate(sims):
+                    metrics[f'{method_label}_eigvec_cos_{i}'] = float(val)
+
+        # --- Eigenvalue relative error ---
+        # We use two metrics:
+        #   1. Spectrum-relative error: |pred_i - gt_i| / max(gt), normalized by spectral range
+        #   2. Per-eigenvalue relative error: |pred_i - gt_i| / gt_i (only for eigenvalues above a threshold)
+        gt_evals = self.current_gt_data.get('gt_eigenvalues')
+        if gt_evals is not None:
+            for method_label, evals in [
+                ('pred', self.current_inference_result.get('predicted_eigenvalues')),
+                ('robust', self.current_gt_data.get('robust_eigenvalues')),
+                ('nelo', self.current_nelo_eigenvalues),
+            ]:
+                if evals is not None:
+                    n_compare = min(len(gt_evals), len(evals))
+                    # Skip first eigenvalue (always ~0)
+                    if n_compare > 1:
+                        gt_slice = gt_evals[1:n_compare]
+                        pred_slice = evals[1:n_compare]
+
+                        # Spectrum-relative error: normalize by spectral range (max eigenvalue)
+                        spectral_range = np.abs(gt_slice).max()
+                        if spectral_range > 1e-10:
+                            spectrum_rel_err = np.abs(pred_slice - gt_slice) / spectral_range
+                            metrics[f'{method_label}_eval_spectrum_rel_err_mean'] = float(spectrum_rel_err.mean())
+                            metrics[f'{method_label}_eval_spectrum_rel_err_max'] = float(spectrum_rel_err.max())
+
+                        # Per-eigenvalue relative error (skip near-zero eigenvalues)
+                        # Only use eigenvalues > 1% of max to avoid division instability
+                        threshold = spectral_range * 0.01 if spectral_range > 0 else 1e-6
+                        stable_mask = np.abs(gt_slice) > threshold
+                        if stable_mask.sum() > 0:
+                            rel_err = np.abs(pred_slice[stable_mask] - gt_slice[stable_mask]) / np.abs(gt_slice[stable_mask])
+                            metrics[f'{method_label}_eval_rel_err_mean'] = float(rel_err.mean())
+                            metrics[f'{method_label}_eval_rel_err_max'] = float(rel_err.max())
+
+        # --- Green's function maximum principle ---
+        if self.current_greens_results is not None:
+            for method_key, result in self.current_greens_results.items():
+                prefix = method_key.lower().replace(' ', '_').replace('(', '').replace(')', '')
+                metrics[f'{prefix}_greens_max_principle'] = 1.0 if result.satisfies_maximum_principle else 0.0
+                metrics[f'{prefix}_greens_monotonicity'] = result.monotonicity_score
+                metrics[f'{prefix}_greens_distance_corr'] = result.distance_correlation
+                metrics[f'{prefix}_greens_residual'] = result.laplacian_residual_norm
+                if result.correlation_with_gt > 0:
+                    metrics[f'{prefix}_greens_gt_corr'] = result.correlation_with_gt
+
+        # --- Heat method geodesics ---
+        if self.current_heat_geodesic_results is not None:
+            for method_key, result in self.current_heat_geodesic_results.items():
+                prefix = method_key.lower().replace(' ', '_').replace('(', '').replace(')', '')
+                metrics[f'{prefix}_geodesic_corr'] = result.correlation_with_reference
+                metrics[f'{prefix}_geodesic_mae'] = result.mean_absolute_error
+                metrics[f'{prefix}_geodesic_max_err'] = result.max_absolute_error
+                metrics[f'{prefix}_geodesic_monotonicity'] = result.monotonicity_score
+
+        # --- Sparsity ---
+        for method_key, stats in self.current_sparsity_stats.items():
+            prefix = method_key.lower().replace(' ', '_').replace('(', '').replace(')', '')
+            metrics[f'{prefix}_nnz'] = stats.nnz
+            metrics[f'{prefix}_density_pct'] = stats.density_percent
+            metrics[f'{prefix}_avg_nnz_per_row'] = stats.avg_nnz_per_row
+
+        return metrics
+
+    def _aggregate_and_save_results(self, all_metrics: List[Dict[str, Any]], csv_path: Path):
+        """
+        Aggregate per-mesh metrics, print summary table, and write CSV.
+
+        Args:
+            all_metrics: List of per-mesh metric dictionaries from _collect_mesh_metrics.
+            csv_path: Path to write the CSV file.
+        """
+        import csv
+
+        if not all_metrics:
+            print("[!] No metrics to aggregate")
+            return
+
+        n_meshes = len(all_metrics)
+        print(f"\n{'=' * 100}")
+        print(f"QUANTITATIVE RESULTS SUMMARY ({n_meshes} meshes)")
+        print(f"{'=' * 100}")
+
+        # Collect all numeric keys (skip mesh_name)
+        numeric_keys = []
+        for key in all_metrics[0].keys():
+            if key == 'mesh_name':
+                continue
+            # Check if this key has numeric values in at least one mesh
+            values = [m.get(key) for m in all_metrics if m.get(key) is not None]
+            if len(values) > 0 and isinstance(values[0], (int, float, np.integer, np.floating)):
+                numeric_keys.append(key)
+
+        # Compute aggregated stats
+        agg_stats: Dict[str, Dict[str, float]] = {}
+        for key in numeric_keys:
+            values = np.array([m[key] for m in all_metrics if key in m and m[key] is not None])
+            if len(values) == 0:
+                continue
+            agg_stats[key] = {
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'median': float(np.median(values)),
+                'count': len(values),
+            }
+
+        # Print summary table grouped by category
+        def print_section(title: str, key_prefix: str):
+            """Print a section of the summary table for keys matching prefix."""
+            matching = [(k, v) for k, v in agg_stats.items() if k.startswith(key_prefix)]
+            if not matching:
+                return
+            print(f"\n  {title}:")
+            print(f"  {'Metric':<45} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Median':>10} {'N':>4}")
+            print(f"  {'-' * 99}")
+            for key, stats in matching:
+                print(f"  {key:<45} {stats['mean']:>10.4f} {stats['std']:>10.4f} "
+                      f"{stats['min']:>10.4f} {stats['max']:>10.4f} {stats['median']:>10.4f} {stats['count']:>4}")
+
+        # Mesh info
+        print_section("Mesh Info", "num_")
+        print_section("Mesh Info", "k")
+
+        # Timing
+        print_section("Timing (ms)", "pred_")
+        print_section("Timing (ms)", "robust_total")
+        print_section("Timing (ms)", "gt_")
+        print_section("Timing (ms)", "nelo_")
+
+        # Eigenvector alignment
+        for method in ['pred', 'robust', 'nelo']:
+            print_section(f"Eigenvector Cosine Similarity ({method.upper()})", f"{method}_eigvec")
+
+        # Eigenvalue errors
+        for method in ['pred', 'robust', 'nelo']:
+            print_section(f"Eigenvalue Relative Error ({method.upper()})", f"{method}_eval")
+
+        # Green's function
+        for method in ['gt', 'pred', 'robust', 'nelo']:
+            print_section(f"Green's Function ({method.upper()})", f"{method}_greens")
+
+        # Geodesics
+        for method in ['gt', 'pred', 'robust', 'nelo']:
+            print_section(f"Geodesics ({method.upper()})", f"{method}_geodesic")
+
+        # Sparsity
+        for method in ['gt', 'pred', 'robust', 'nelo']:
+            print_section(f"Sparsity ({method.upper()})", f"{method}_")
+
+        print(f"\n{'=' * 100}")
+
+        # --- Write per-mesh CSV ---
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Gather all possible columns across all meshes
+        all_keys = []
+        seen = set()
+        for m in all_metrics:
+            for k in m.keys():
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
+
+        # Write per-mesh rows
+        per_mesh_path = csv_path
+        with open(per_mesh_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction='ignore')
+            writer.writeheader()
+            for m in all_metrics:
+                writer.writerow(m)
+
+        print(f"\n[OK] Per-mesh CSV written to: {per_mesh_path}")
+
+        # Write aggregated summary CSV
+        summary_path = csv_path.with_name(csv_path.stem + '_summary.csv')
+        with open(summary_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['metric', 'mean', 'std', 'min', 'max', 'median', 'count'])
+            for key, stats in agg_stats.items():
+                writer.writerow([
+                    key, stats['mean'], stats['std'],
+                    stats['min'], stats['max'], stats['median'], stats['count']
+                ])
+
+        print(f"[OK] Summary CSV written to: {summary_path}")
+
+        # --- Per-eigenvector mean cosine similarity table ---
+        self._print_per_eigenvector_table(all_metrics, agg_stats)
+
+        # --- Generate comparison charts ---
+        charts_dir = csv_path.parent / 'charts'
+        charts_dir.mkdir(parents=True, exist_ok=True)
+        self._generate_comparison_charts(all_metrics, agg_stats, charts_dir)
+
+    def _print_per_eigenvector_table(self, all_metrics: List[Dict[str, Any]],
+                                      agg_stats: Dict[str, Dict[str, float]]):
+        """Print per-eigenvector mean cosine similarity table to console."""
+        methods = ['pred', 'robust', 'nelo']
+        method_labels = {'pred': 'PRED', 'robust': 'Robust', 'nelo': 'NeLo'}
+
+        # Find max eigenvector index across all methods
+        max_idx = 0
+        for m in methods:
+            for key in agg_stats:
+                if key.startswith(f'{m}_eigvec_cos_') and not any(
+                    key.endswith(s) for s in ['all', 'top5', 'top10', 'top20', 'top50']
+                ):
+                    try:
+                        idx = int(key.split('_')[-1])
+                        max_idx = max(max_idx, idx)
+                    except ValueError:
+                        pass
+
+        if max_idx == 0:
+            print("\n  No per-eigenvector data available")
+            return
+
+        print(f"\n  Per-Eigenvector Mean |cos| Similarity (averaged over {len(all_metrics)} meshes):")
+        header = f"  {'Eigvec':<8}"
+        for m in methods:
+            label = method_labels.get(m, m)
+            header += f"  {label:>10}"
+        print(header)
+        print(f"  {'-' * (8 + 12 * len(methods))}")
+
+        for i in range(max_idx + 1):
+            row = f"  {i:<8}"
+            for m in methods:
+                key = f'{m}_eigvec_cos_{i}'
+                if key in agg_stats:
+                    row += f"  {agg_stats[key]['mean']:>10.4f}"
+                else:
+                    row += f"  {'N/A':>10}"
+            print(row)
+
+        # Overall means
+        print(f"  {'-' * (8 + 12 * len(methods))}")
+        row = f"  {'MEAN':<8}"
+        for m in methods:
+            key = f'{m}_eigvec_cos_all'
+            if key in agg_stats:
+                row += f"  {agg_stats[key]['mean']:>10.4f}"
+            else:
+                row += f"  {'N/A':>10}"
+        print(row)
+
+    def _generate_comparison_charts(self, all_metrics: List[Dict[str, Any]],
+                                     agg_stats: Dict[str, Dict[str, float]],
+                                     charts_dir: Path):
+        """Generate comparison charts and save to charts_dir."""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("[!] matplotlib not available, skipping chart generation")
+            return
+
+        methods = ['pred', 'robust', 'nelo']
+        method_labels = {'pred': 'PRED', 'robust': 'Robust', 'nelo': 'NeLo'}
+        method_colors = {'pred': '#E07020', 'robust': '#2090D0', 'nelo': '#9040E0'}
+
+        n_meshes = len(all_metrics)
+
+        # =====================================================================
+        # Chart 1: Per-eigenvector mean cosine similarity (line plot)
+        # =====================================================================
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        for m in methods:
+            # Collect per-eigenvector means
+            indices = []
+            means = []
+            stds = []
+            for key, stats in sorted(agg_stats.items()):
+                if key.startswith(f'{m}_eigvec_cos_') and not any(
+                    key.endswith(s) for s in ['all', 'top5', 'top10', 'top20', 'top50']
+                ):
+                    try:
+                        idx = int(key.split('_')[-1])
+                        indices.append(idx)
+                        means.append(stats['mean'])
+                        stds.append(stats['std'])
+                    except ValueError:
+                        pass
+
+            if indices:
+                indices = np.array(indices)
+                means = np.array(means)
+                stds = np.array(stds)
+                order = np.argsort(indices)
+                indices, means, stds = indices[order], means[order], stds[order]
+
+                label = method_labels.get(m, m)
+                color = method_colors.get(m, None)
+                ax.plot(indices, means, label=label, color=color, linewidth=2)
+                ax.fill_between(indices, means - stds, np.minimum(means + stds, 1.0),
+                                alpha=0.15, color=color)
+
+        ax.set_xlabel('Eigenvector Index', fontsize=12)
+        ax.set_ylabel('Mean |cos| Similarity', fontsize=12)
+        ax.set_title(f'Per-Eigenvector Cosine Similarity (n={n_meshes} meshes)', fontsize=14)
+        ax.legend(fontsize=11)
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        chart_path = charts_dir / 'eigenvector_cosine_similarity.png'
+        fig.savefig(chart_path, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Chart saved: {chart_path}")
+
+        # =====================================================================
+        # Chart 2: Cumulative mean cosine similarity (line plot)
+        # =====================================================================
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        for m in methods:
+            # Build cumulative mean from per-eigenvector data
+            per_eig = {}
+            for key, stats in agg_stats.items():
+                if key.startswith(f'{m}_eigvec_cos_') and not any(
+                    key.endswith(s) for s in ['all', 'top5', 'top10', 'top20', 'top50']
+                ):
+                    try:
+                        idx = int(key.split('_')[-1])
+                        per_eig[idx] = stats['mean']
+                    except ValueError:
+                        pass
+
+            if per_eig:
+                max_idx = max(per_eig.keys())
+                vals = [per_eig.get(i, 0.0) for i in range(max_idx + 1)]
+                cumulative_means = np.cumsum(vals) / np.arange(1, max_idx + 2)
+
+                label = method_labels.get(m, m)
+                color = method_colors.get(m, None)
+                ax.plot(range(max_idx + 1), cumulative_means, label=label,
+                        color=color, linewidth=2)
+
+        ax.set_xlabel('Number of Eigenvectors (top-k)', fontsize=12)
+        ax.set_ylabel('Cumulative Mean |cos| Similarity', fontsize=12)
+        ax.set_title(f'Cumulative Eigenvector Alignment (n={n_meshes} meshes)', fontsize=14)
+        ax.legend(fontsize=11)
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        chart_path = charts_dir / 'cumulative_cosine_similarity.png'
+        fig.savefig(chart_path, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Chart saved: {chart_path}")
+
+        # =====================================================================
+        # Chart 3: Geodesic quality comparison (grouped bar chart)
+        # =====================================================================
+        geodesic_metrics = ['geodesic_corr', 'geodesic_mae', 'geodesic_monotonicity']
+        geodesic_labels = ['Correlation', 'MAE', 'Monotonicity']
+        # Map method labels to geodesic result keys
+        geodesic_method_map = {
+            'pred': 'pred',
+            'robust': 'robust_pp3d',
+            'nelo': 'nelo',
+            'gt': 'gt',
+        }
+        geo_methods = ['gt', 'pred', 'nelo', 'robust']
+        geo_colors = {'gt': '#30B030', 'pred': '#E07020', 'nelo': '#9040E0', 'robust': '#2090D0'}
+
+        fig, axes = plt.subplots(1, len(geodesic_metrics), figsize=(5 * len(geodesic_metrics), 6))
+        if len(geodesic_metrics) == 1:
+            axes = [axes]
+
+        for ax_idx, (metric_suffix, metric_label) in enumerate(zip(geodesic_metrics, geodesic_labels)):
+            ax = axes[ax_idx]
+            bar_vals = []
+            bar_errs = []
+            bar_labels = []
+            bar_colors_list = []
+
+            for m in geo_methods:
+                geo_key = geodesic_method_map.get(m, m)
+                key = f'{geo_key}_{metric_suffix}'
+                if key in agg_stats:
+                    bar_vals.append(agg_stats[key]['mean'])
+                    bar_errs.append(agg_stats[key]['std'])
+                    bar_labels.append(method_labels.get(m, m.upper()))
+                    bar_colors_list.append(geo_colors.get(m, '#888888'))
+
+            if bar_vals:
+                x = np.arange(len(bar_vals))
+                ax.bar(x, bar_vals, yerr=bar_errs, capsize=4,
+                       color=bar_colors_list, alpha=0.85, edgecolor='black', linewidth=0.5)
+                ax.set_xticks(x)
+                ax.set_xticklabels(bar_labels, fontsize=10)
+                ax.set_title(metric_label, fontsize=12)
+                ax.set_ylim(bottom=0)
+                ax.grid(True, axis='y', alpha=0.3)
+
+        fig.suptitle(f'Geodesic Quality Metrics (n={n_meshes} meshes)', fontsize=14)
+        fig.tight_layout()
+        chart_path = charts_dir / 'geodesic_comparison.png'
+        fig.savefig(chart_path, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Chart saved: {chart_path}")
+
+        # =====================================================================
+        # Chart 4: Eigenvalue relative error comparison (bar chart)
+        # =====================================================================
+        # Chart 4: Eigenvalue error comparison (bar chart — two metrics)
+        # =====================================================================
+        eval_metric_pairs = [
+            ('_eval_spectrum_rel_err_mean', 'Spectrum-Relative Error\n(normalized by λ_max)'),
+            ('_eval_rel_err_mean', 'Per-Eigenvalue Relative Error\n(stable eigenvalues only)'),
+        ]
+
+        fig, axes = plt.subplots(1, len(eval_metric_pairs), figsize=(6 * len(eval_metric_pairs), 6))
+        if len(eval_metric_pairs) == 1:
+            axes = [axes]
+
+        for ax_idx, (metric_suffix, metric_title) in enumerate(eval_metric_pairs):
+            ax = axes[ax_idx]
+            bar_vals = []
+            bar_errs = []
+            bar_labels = []
+            bar_colors_list = []
+
+            for m in methods:
+                key = f'{m}{metric_suffix}'
+                if key in agg_stats:
+                    mean_val = agg_stats[key]['mean']
+                    std_val = agg_stats[key]['std']
+                    bar_vals.append(mean_val)
+                    # Clamp lower error bar so bar doesn't go negative
+                    bar_errs.append(min(std_val, mean_val))
+                    bar_labels.append(method_labels.get(m, m))
+                    bar_colors_list.append(method_colors.get(m, '#888888'))
+
+            if bar_vals:
+                x = np.arange(len(bar_vals))
+                ax.bar(x, bar_vals, yerr=bar_errs, capsize=4,
+                       color=bar_colors_list, alpha=0.85, edgecolor='black', linewidth=0.5)
+                ax.set_xticks(x)
+                ax.set_xticklabels(bar_labels, fontsize=11)
+                ax.set_title(metric_title, fontsize=11)
+                ax.set_ylim(bottom=0)
+                ax.grid(True, axis='y', alpha=0.3)
+
+        fig.suptitle(f'Eigenvalue Relative Error (n={n_meshes} meshes)', fontsize=14)
+        fig.tight_layout()
+        chart_path = charts_dir / 'eigenvalue_error.png'
+        fig.savefig(chart_path, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Chart saved: {chart_path}")
+
+        # =====================================================================
+        # Chart 5: Timing comparison (bar chart)
+        # =====================================================================
+        timing_keys = {
+            'pred': 'pred_total_ms',
+            'robust': 'robust_total_ms',
+            'nelo': 'nelo_total_ms',
+            'gt': 'gt_assembly_ms',
+        }
+        fig, ax = plt.subplots(figsize=(8, 6))
+        bar_vals = []
+        bar_errs = []
+        bar_labels = []
+        bar_colors_list = []
+
+        for m, key in timing_keys.items():
+            if key in agg_stats:
+                bar_vals.append(agg_stats[key]['mean'])
+                bar_errs.append(agg_stats[key]['std'])
+                bar_labels.append(method_labels.get(m, m.upper()))
+                bar_colors_list.append(
+                    {'gt': '#30B030', 'pred': '#E07020', 'nelo': '#9040E0', 'robust': '#2090D0'}.get(m, '#888888')
+                )
+
+        if bar_vals:
+            x = np.arange(len(bar_vals))
+            ax.bar(x, bar_vals, yerr=bar_errs, capsize=4,
+                   color=bar_colors_list, alpha=0.85, edgecolor='black', linewidth=0.5)
+            ax.set_xticks(x)
+            ax.set_xticklabels(bar_labels, fontsize=11)
+            ax.set_ylabel('Time (ms)', fontsize=12)
+            ax.set_title(f'Laplacian Assembly Timing (n={n_meshes} meshes)', fontsize=14)
+            ax.set_ylim(bottom=0)
+            ax.grid(True, axis='y', alpha=0.3)
+            fig.tight_layout()
+            chart_path = charts_dir / 'timing_comparison.png'
+            fig.savefig(chart_path, dpi=150)
+            print(f"[OK] Chart saved: {chart_path}")
+        plt.close(fig)
+
+        # =====================================================================
+        # Chart 6: Green's function metrics (grouped bar chart)
+        # =====================================================================
+        greens_metrics = ['greens_monotonicity', 'greens_distance_corr']
+        greens_labels = ['Monotonicity', 'Distance Correlation']
+        greens_method_map = {
+            'gt': 'gt',
+            'pred': 'pred',
+            'robust': 'robust',
+            'nelo': 'nelo',
+        }
+
+        fig, axes = plt.subplots(1, len(greens_metrics), figsize=(5 * len(greens_metrics), 6))
+        if len(greens_metrics) == 1:
+            axes = [axes]
+
+        for ax_idx, (metric_suffix, metric_label) in enumerate(zip(greens_metrics, greens_labels)):
+            ax = axes[ax_idx]
+            bar_vals = []
+            bar_errs = []
+            bar_labels = []
+            bar_colors_list = []
+
+            for m in geo_methods:
+                g_key = greens_method_map.get(m, m)
+                key = f'{g_key}_{metric_suffix}'
+                if key in agg_stats:
+                    bar_vals.append(agg_stats[key]['mean'])
+                    bar_errs.append(agg_stats[key]['std'])
+                    bar_labels.append(method_labels.get(m, m.upper()))
+                    bar_colors_list.append(geo_colors.get(m, '#888888'))
+
+            if bar_vals:
+                x = np.arange(len(bar_vals))
+                ax.bar(x, bar_vals, yerr=bar_errs, capsize=4,
+                       color=bar_colors_list, alpha=0.85, edgecolor='black', linewidth=0.5)
+                ax.set_xticks(x)
+                ax.set_xticklabels(bar_labels, fontsize=10)
+                ax.set_title(metric_label, fontsize=12)
+                ax.set_ylim(bottom=0)
+                ax.grid(True, axis='y', alpha=0.3)
+
+        fig.suptitle(f"Green's Function Metrics (n={n_meshes} meshes)", fontsize=14)
+        fig.tight_layout()
+        chart_path = charts_dir / 'greens_function_comparison.png'
+        fig.savefig(chart_path, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Chart saved: {chart_path}")
 
     def run_dataset_iteration(self, cfg: DictConfig):
         """Run visualization on all meshes in the dataset."""
@@ -4919,7 +5725,7 @@ class RealTimeEigenanalysisVisualizer:
         # Check for diagnostic mode (disable optimizations to debug timing issues)
         diagnostic_mode = getattr(cfg, 'diagnostic_mode', False)
         skip_robust = getattr(cfg, 'skip_robust', False)  # Debug: skip robust computation
-        skip_visualization = getattr(cfg, 'skip_visualization', False)  # Debug: skip polyscope
+        quantitative_mode = getattr(cfg, 'quantitative_mode', False)  # Headless metrics-only mode
 
         if diagnostic_mode:
             print("\n" + "!" * 80)
@@ -4929,13 +5735,15 @@ class RealTimeEigenanalysisVisualizer:
         if skip_robust:
             print("[DEBUG] skip_robust=True: Robust-laplacian computation will be skipped")
 
-        if skip_visualization:
-            print("[DEBUG] skip_visualization=True: Polyscope visualization will be skipped")
+        if quantitative_mode:
+            print("\n" + "=" * 80)
+            print("QUANTITATIVE MODE — Polyscope disabled, collecting metrics for CSV output")
+            print("=" * 80 + "\n")
 
         # Store flags for use in process_batch
         self._diagnostic_mode = diagnostic_mode
         self._skip_robust = skip_robust
-        self._skip_visualization = skip_visualization
+        self._quantitative_mode = quantitative_mode
 
         # Load trained model
         model = self.load_trained_model(ckpt_path, device, cfg, diagnostic_mode=diagnostic_mode)
@@ -4951,6 +5759,14 @@ class RealTimeEigenanalysisVisualizer:
                 print(f"[!] Failed to load NeLo pipeline: {e} — NeLo will be skipped")
         else:
             print("\n[INFO] nelo_ckpt_path not set — NeLo comparison will be skipped")
+
+        # Read per-method kNN sizes from globals config (fallback to globals.k)
+        default_k = getattr(cfg.globals, 'k', 30)
+        self._initial_k_pred = getattr(cfg.globals, 'k_pred', None) or default_k
+        self._initial_k_robust = getattr(cfg.globals, 'k_robust', None) or default_k
+        self._initial_k_nelo = getattr(cfg.globals, 'k_nelo', None) or default_k
+        self.nelo_k = self._initial_k_nelo
+        print(f"Per-method kNN: PRED={self._initial_k_pred}, Robust={self._initial_k_robust}, NeLo={self._initial_k_nelo}")
 
         # Set random seed for reproducibility
         pl.seed_everything(cfg.globals.seed)
@@ -4987,38 +5803,57 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"DataLoader ready with batch size: {data_loader.batch_size}")
 
-        # Setup polyscope with UI callback (only if visualization is enabled)
-        if not skip_visualization:
+        # Setup polyscope with UI callback (only if NOT in quantitative mode)
+        if not quantitative_mode:
             self.setup_polyscope()
         else:
-            print("[skip_visualization=True] Skipping polyscope setup")
+            print("[quantitative_mode] Skipping polyscope setup")
+
+        # Collect per-mesh metrics when in quantitative mode
+        all_mesh_metrics: List[Dict[str, Any]] = []
 
         # Process all batches
         for batch_idx, batch_data in enumerate(data_loader):
             print(f"\n[>] Processing batch {batch_idx + 1}")
 
             try:
-                self.process_batch(model, batch_data, batch_idx, device)
+                success = self.process_batch(model, batch_data, batch_idx, device)
 
-                if not skip_visualization:
-                    print(f"\nVisualization ready for batch {batch_idx + 1}. Use the 'Reconstruction Settings' window to control PRED reconstruction method.")
-                    print("Close window to continue to next batch.")
-                    ps.show()
+                if not quantitative_mode:
+                    if success:
+                        print(f"\nVisualization ready for batch {batch_idx + 1}. Use the 'Reconstruction Settings' window to control PRED reconstruction method.")
+                        print("Close window to continue to next batch.")
+                        ps.show()
 
-                    # Free GPU memory held by polyscope before next batch
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
+                        # Free GPU memory held by polyscope before next batch
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
                 else:
-                    print(f"\n[skip_visualization=True] Skipping polyscope for batch {batch_idx + 1}")
+                    if success:
+                        # Collect metrics for this mesh
+                        mesh_metrics = self._collect_mesh_metrics()
+                        if mesh_metrics is not None:
+                            all_mesh_metrics.append(mesh_metrics)
+                        print(f"\n[quantitative_mode] Collected metrics for batch {batch_idx + 1}")
+                    else:
+                        print(f"\n[quantitative_mode] Skipped batch {batch_idx + 1} (processing failed)")
 
             except Exception as e:
                 print(f"[X] Error processing batch {batch_idx}: {e}")
                 import traceback
                 traceback.print_exc()
 
-                user_input = input("Continue to next batch? (y/n): ").strip().lower()
-                if user_input != 'y':
-                    break
+                if not quantitative_mode:
+                    user_input = input("Continue to next batch? (y/n): ").strip().lower()
+                    if user_input != 'y':
+                        break
+                # In quantitative mode, always continue to next batch
+
+        # Aggregate and save results in quantitative mode
+        if quantitative_mode and len(all_mesh_metrics) > 0:
+            output_dir = getattr(cfg, 'output_dir', '.')
+            csv_path = Path(output_dir) / 'quantitative_results.csv'
+            self._aggregate_and_save_results(all_mesh_metrics, csv_path)
 
         print(f"\n[OK] Completed processing all batches!")
 
