@@ -2,6 +2,7 @@
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 import random
+import json
 
 # Third-party libraries
 import numpy as np
@@ -58,6 +59,9 @@ class MeshDataset(Dataset):
 
     # Supported mesh file formats
     SUPPORTED_FORMATS = {'.obj', '.ply', '.off', '.stl'}
+
+    # Filename for the mesh properties lookup cache (stored per folder)
+    _LOOKUP_CACHE_FILENAME = '.mesh_properties_cache.json'
 
     def __init__(
             self,
@@ -253,6 +257,94 @@ class MeshDataset(Dataset):
 
         return mesh_files
 
+    def _load_lookup_table(self) -> dict:
+        """
+        Load mesh properties lookup tables from all configured folder paths and merge.
+
+        Each folder may contain a `.mesh_properties_cache.json` file with entries:
+            { "relative/path.obj": { "size_bytes": 12345, "num_vertices": 100, "num_faces": 200, "num_components": 1 } }
+
+        Returns:
+            Merged lookup dict mapping absolute file path (str) -> properties dict.
+        """
+        merged = {}
+        for folder_path in self._mesh_folder_paths:
+            cache_path = folder_path / self._LOOKUP_CACHE_FILENAME
+            if cache_path.exists():
+                try:
+                    with open(cache_path, 'r') as f:
+                        folder_cache = json.load(f)
+                    # Convert relative keys to absolute paths
+                    for rel_path, props in folder_cache.items():
+                        abs_path = str(folder_path / rel_path)
+                        merged[abs_path] = props
+                    print(f"  Loaded {len(folder_cache)} entries from {cache_path}")
+                except Exception as e:
+                    print(f"  Warning: Failed to load lookup cache {cache_path}: {e}")
+        return merged
+
+    def _save_lookup_table(self, lookup: dict):
+        """
+        Save mesh properties lookup table back to each folder's cache file.
+
+        Only entries belonging to each folder are saved to that folder's cache file.
+
+        Args:
+            lookup: Dict mapping absolute file path (str) -> properties dict.
+        """
+        for folder_path in self._mesh_folder_paths:
+            # Extract entries belonging to this folder, convert to relative paths
+            folder_entries = {}
+            for abs_path_str, props in lookup.items():
+                abs_path = Path(abs_path_str)
+                try:
+                    rel_path = str(abs_path.relative_to(folder_path))
+                    folder_entries[rel_path] = props
+                except ValueError:
+                    # abs_path is not under folder_path — skip
+                    pass
+
+            if not folder_entries:
+                continue
+
+            cache_path = folder_path / self._LOOKUP_CACHE_FILENAME
+            try:
+                with open(cache_path, 'w') as f:
+                    json.dump(folder_entries, f, indent=2)
+                print(f"  Saved {len(folder_entries)} entries to {cache_path}")
+            except Exception as e:
+                print(f"  Warning: Failed to save lookup cache {cache_path}: {e}")
+
+    def _get_cached_geometry_info(self, file_path: Path, lookup: dict) -> Optional[Tuple[int, int, int]]:
+        """
+        Get mesh geometry info from cache if available and valid (file size matches).
+
+        Args:
+            file_path: Path to the mesh file.
+            lookup: The loaded lookup table.
+
+        Returns:
+            Tuple of (num_vertices, num_faces, num_components) from cache, or None if
+            not cached or cache entry is stale (file size changed).
+        """
+        key = str(file_path)
+        if key not in lookup:
+            return None
+
+        props = lookup[key]
+        # Validate by file size — if size changed, cache is stale
+        try:
+            current_size = file_path.stat().st_size
+            if current_size != props.get('size_bytes'):
+                return None
+        except OSError:
+            return None
+
+        try:
+            return props['num_vertices'], props['num_faces'], props['num_components']
+        except KeyError:
+            return None
+
     def _get_mesh_geometry_info(self, file_path: Path) -> Optional[Tuple[int, int, int]]:
         """
         Load a mesh and return its vertex count, face count, and number of
@@ -297,8 +389,8 @@ class MeshDataset(Dataset):
     def _apply_geometry_filters(self, mesh_files: List[Path]) -> List[Path]:
         """
         Filter mesh files by vertex count, face count, and/or number of connected
-        components.  Each mesh is loaded once; all three filters are checked in a
-        single pass.
+        components.  Uses a lookup cache to avoid reloading meshes that have already
+        been inspected.
 
         Args:
             mesh_files: List of mesh file paths that passed earlier (cheap) filters
@@ -318,13 +410,41 @@ class MeshDataset(Dataset):
             lo, hi = self._num_components_range
             filter_parts.append(f"components in [{lo}, {hi}]")
         filter_desc = ", ".join(filter_parts)
-        print(f"Geometry filter ({filter_desc}): loading {len(mesh_files)} meshes ...")
+
+        # Load existing lookup cache
+        lookup = self._load_lookup_table()
+        cache_hits = 0
+        cache_misses = 0
+
+        print(f"Geometry filter ({filter_desc}): checking {len(mesh_files)} meshes "
+              f"({len(lookup)} cached entries) ...")
 
         kept: List[Path] = []
         skipped = 0
 
         for file_path in mesh_files:
-            info = self._get_mesh_geometry_info(file_path)
+            # Try cache first
+            info = self._get_cached_geometry_info(file_path, lookup)
+            if info is not None:
+                cache_hits += 1
+            else:
+                # Cache miss — load mesh and compute properties
+                cache_misses += 1
+                info = self._get_mesh_geometry_info(file_path)
+                if info is not None:
+                    # Store in lookup for saving later
+                    num_vertices, num_faces, num_components = info
+                    try:
+                        size_bytes = file_path.stat().st_size
+                    except OSError:
+                        size_bytes = 0
+                    lookup[str(file_path)] = {
+                        'size_bytes': size_bytes,
+                        'num_vertices': num_vertices,
+                        'num_faces': num_faces,
+                        'num_components': num_components,
+                    }
+
             if info is None:
                 skipped += 1
                 continue
@@ -351,7 +471,13 @@ class MeshDataset(Dataset):
 
             kept.append(file_path)
 
-        print(f"Geometry filter: kept {len(kept)}, skipped {skipped}")
+        print(f"Geometry filter: kept {len(kept)}, skipped {skipped} "
+              f"(cache: {cache_hits} hits, {cache_misses} misses)")
+
+        # Save updated lookup cache (includes any newly computed entries)
+        if cache_misses > 0:
+            self._save_lookup_table(lookup)
+
         return kept
 
     def len(self) -> int:

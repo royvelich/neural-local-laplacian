@@ -78,6 +78,7 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_mesh,
     compute_geodesic_metrics,
     compute_exact_geodesics,
+    ensure_psd,
     normalize_distances,
     build_pointcloud_grad_div_operators,
     edge_index_from_knn_indices,
@@ -248,6 +249,17 @@ class LaplacianTimingResults:
 
     # Robust (k-NN point cloud) timing
     robust_matrix_assembly_time: float = 0.0  # point_cloud_laplacian (k-NN + weights + assembly)
+
+    # Downstream solve timings (seconds) — for E2E cost measurement
+    gt_greens_solve_time: float = 0.0
+    pred_greens_solve_time: float = 0.0
+    robust_greens_solve_time: float = 0.0
+    nelo_greens_solve_time: float = 0.0
+
+    gt_geodesic_solve_time: float = 0.0
+    pred_geodesic_solve_time: float = 0.0
+    robust_geodesic_solve_time: float = 0.0
+    nelo_geodesic_solve_time: float = 0.0
 
     # Mesh info
     num_vertices: int = 0
@@ -640,6 +652,25 @@ class RealTimeEigenanalysisVisualizer:
             if t.nelo_total_time > 0 and t.pred_total_time > 0:
                 pred_vs_nelo = t.pred_total_time / t.nelo_total_time
                 psim.Text(f"PRED vs NeLo:   {pred_vs_nelo:.2f}x")
+
+            # E2E timing: assembly + downstream solve
+            has_e2e = (t.pred_geodesic_solve_time > 0 or t.pred_greens_solve_time > 0 or
+                       t.gt_geodesic_solve_time > 0 or t.gt_greens_solve_time > 0)
+            if has_e2e:
+                psim.Text("")
+                psim.Separator()
+                psim.Text("E2E: Assembly + Downstream Solve (ms):")
+                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<12} {'Geodesic':>10} {'Greens':>10}")
+
+                for label, color, total, geo_t, grn_t in [
+                    ('GT',     (0.0, 1.0, 0.0, 1.0), t.gt_matrix_assembly_time,     t.gt_geodesic_solve_time,     t.gt_greens_solve_time),
+                    ('PRED',   (1.0, 0.5, 0.0, 1.0), t.pred_total_time,             t.pred_geodesic_solve_time,   t.pred_greens_solve_time),
+                    ('NeLo',   (0.7, 0.3, 1.0, 1.0), t.nelo_total_time,             t.nelo_geodesic_solve_time,   t.nelo_greens_solve_time),
+                    ('Robust', (0.0, 0.7, 1.0, 1.0), t.robust_matrix_assembly_time, t.robust_geodesic_solve_time, t.robust_greens_solve_time),
+                ]:
+                    geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
+                    grn_str = f"{(total + grn_t) * 1000:>10.1f}" if grn_t > 0 else f"{'N/A':>10}"
+                    psim.TextColored(color, f"{label:<12} {geo_str} {grn_str}")
         else:
             psim.Text("(No timing data yet)")
 
@@ -678,15 +709,23 @@ class RealTimeEigenanalysisVisualizer:
                 max_err = result.max_absolute_error
                 mono = result.monotonicity_score
 
-                # Color code by correlation quality
-                if corr > 0.99:
-                    color = (0.0, 1.0, 0.0, 1.0)  # Green
-                elif corr > 0.95:
-                    color = (1.0, 1.0, 0.0, 1.0)  # Yellow
-                else:
-                    color = (1.0, 0.3, 0.0, 1.0)  # Orange-red
+                # Flag unreasonable results (max raw distance >> 1 for normalized meshes)
+                is_unreasonable = result.max_distance > 1e3
 
-                psim.TextColored(color, f"  {method_name:<16} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}")
+                if is_unreasonable:
+                    color = (1.0, 0.0, 0.0, 1.0)  # Red for unreasonable
+                    label = f"  {method_name + ' [!]':<16} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}"
+                else:
+                    # Color code by correlation quality
+                    if corr > 0.99:
+                        color = (0.0, 1.0, 0.0, 1.0)  # Green
+                    elif corr > 0.95:
+                        color = (1.0, 1.0, 0.0, 1.0)  # Yellow
+                    else:
+                        color = (1.0, 0.3, 0.0, 1.0)  # Orange-red
+                    label = f"  {method_name:<16} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}"
+
+                psim.TextColored(color, label)
         else:
             psim.Text("(Not computed yet)")
 
@@ -939,6 +978,7 @@ class RealTimeEigenanalysisVisualizer:
 
         try:
             print(f"\nRecomputing Green's function for {method_key}...")
+            _t_greens_start = time.perf_counter()
             result = self.compute_greens_function(L, M, source_idx)
             if result is not None:
                 greens_values, residual = result
@@ -959,6 +999,13 @@ class RealTimeEigenanalysisVisualizer:
                 # Update GT cache if we just recomputed GT
                 if method_key == 'GT':
                     self._greens_gt_values = greens_values
+
+            # Update solve timing
+            greens_elapsed = time.perf_counter() - _t_greens_start
+            timing_field = {'GT': 'gt_greens_solve_time', 'PRED': 'pred_greens_solve_time',
+                            'Robust': 'robust_greens_solve_time', 'NeLo': 'nelo_greens_solve_time'}.get(method_key)
+            if timing_field:
+                setattr(self.timing_results, timing_field, greens_elapsed)
         except Exception as e:
             print(f"  [!] Green's function recomputation for {method_key} failed: {e}")
             import traceback
@@ -986,6 +1033,7 @@ class RealTimeEigenanalysisVisualizer:
 
         operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
         distances = None
+        _t_geo_start = time.perf_counter()
 
         try:
             if method_key == 'GT':
@@ -1020,14 +1068,29 @@ class RealTimeEigenanalysisVisualizer:
                             )
 
             elif method_key == 'Robust':
-                # Robust uses potpourri3d point cloud solver
-                print(f"\nRecomputing geodesic for Robust (pp3d)...")
-                try:
-                    import potpourri3d as pp3d
-                    pc_solver = pp3d.PointCloudHeatSolver(vertices)
-                    distances = pc_solver.compute_distance(source_idx)
-                except Exception as e:
-                    print(f"  [!] potpourri3d solver failed: {e}")
+                if self._robust_geodesic_heat:
+                    # Heat method with Robust's own L, M and fresh pcdiff operators
+                    if L is not None and M is not None and HAS_PCDIFF:
+                        try:
+                            robust_k = self.reconstruction_settings.current_robust_k
+                            print(f"\nRecomputing Heat Method geodesic for Robust (k={robust_k})...")
+                            robust_edge_index = knn_graph(vertices, k=robust_k)
+                            robust_grad_op, robust_div_op = build_pointcloud_grad_div_operators(vertices, robust_edge_index)
+                            distances = compute_heat_geodesic_pointcloud(
+                                L=L, M=M, grad_op=robust_grad_op, div_op=robust_div_op,
+                                source_idx=source_idx, n_vertices=n
+                            )
+                        except Exception as e:
+                            print(f"  [!] Robust heat method failed: {e}")
+                else:
+                    # Default: potpourri3d
+                    print(f"\nRecomputing geodesic for Robust (pp3d)...")
+                    try:
+                        import potpourri3d as pp3d
+                        pc_solver = pp3d.PointCloudHeatSolver(vertices)
+                        distances = pc_solver.compute_distance(source_idx)
+                    except Exception as e:
+                        print(f"  [!] potpourri3d solver failed: {e}")
 
             elif method_key == 'NeLo':
                 if L is not None and M is not None:
@@ -1039,8 +1102,11 @@ class RealTimeEigenanalysisVisualizer:
                         )
 
             if distances is not None:
-                # The Robust result key in the geodesic results dict uses "Robust (pp3d)"
-                result_key = "Robust (pp3d)" if method_key == "Robust" else method_key
+                # Result key depends on the geodesic mode
+                if method_key == "Robust":
+                    result_key = "Robust" if self._robust_geodesic_heat else "Robust (pp3d)"
+                else:
+                    result_key = method_key
 
                 metrics = compute_geodesic_metrics(distances, exact_distances)
                 result = HeatMethodGeodesicResult(
@@ -1084,6 +1150,13 @@ class RealTimeEigenanalysisVisualizer:
                     )
             else:
                 print(f"  [!] No geodesic distances computed for {method_key}")
+
+            # Update solve timing
+            geo_elapsed = time.perf_counter() - _t_geo_start
+            timing_field = {'GT': 'gt_geodesic_solve_time', 'PRED': 'pred_geodesic_solve_time',
+                            'Robust': 'robust_geodesic_solve_time', 'NeLo': 'nelo_geodesic_solve_time'}.get(method_key)
+            if timing_field:
+                setattr(self.timing_results, timing_field, geo_elapsed)
 
         except Exception as e:
             print(f"  [!] Geodesic recomputation for {method_key} failed: {e}")
@@ -1727,6 +1800,26 @@ class RealTimeEigenanalysisVisualizer:
             pred_vs_nelo = t.pred_total_time / t.nelo_total_time
             print(f"PRED vs NeLo:    {pred_vs_nelo:.2f}x")
 
+        # E2E timing: assembly + downstream solve
+        has_e2e = (t.pred_geodesic_solve_time > 0 or t.pred_greens_solve_time > 0 or
+                   t.gt_geodesic_solve_time > 0 or t.gt_greens_solve_time > 0)
+        if has_e2e:
+            print(f"\n{'-' * 70}")
+            print(f"END-TO-END: Assembly + Downstream Solve")
+            print(f"{'-' * 70}")
+            print(f"{'Method':<25} {'Geodesic (ms)':>14} {'Greens (ms)':>14}")
+            print(f"{'-' * 70}")
+
+            for label, total, geo_t, grn_t in [
+                ('GT',     t.gt_matrix_assembly_time,     t.gt_geodesic_solve_time,     t.gt_greens_solve_time),
+                ('PRED',   t.pred_total_time,             t.pred_geodesic_solve_time,   t.pred_greens_solve_time),
+                ('NeLo',   t.nelo_total_time,             t.nelo_geodesic_solve_time,   t.nelo_greens_solve_time),
+                ('Robust', t.robust_matrix_assembly_time, t.robust_geodesic_solve_time, t.robust_greens_solve_time),
+            ]:
+                geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
+                grn_str = f"{(total + grn_t) * 1000:>10.1f}" if grn_t > 0 else f"{'N/A':>10}"
+                print(f"{label:<25} {geo_str:>14} {grn_str:>14}")
+
         print(f"{'=' * 70}\n")
 
     def _update_pred_with_new_k(self, new_k: int):
@@ -2360,33 +2453,46 @@ class RealTimeEigenanalysisVisualizer:
                 print("  Using mixed precision: FP16")
 
         with torch.no_grad():
-            # === DIAGNOSTIC: Run inference multiple times to check consistency ===
-            inference_times = []
-            num_runs = 3  # Run multiple times to check if first run is slow
+            # === Single inference for actual results ===
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_inference_start = time.perf_counter()
 
-            for run_idx in range(num_runs):
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                t_inference_start = time.perf_counter()
-
-                # Forward pass with mixed precision for faster inference
-                if use_amp:
-                    with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                        forward_result = model._forward_pass(batch_data)
-                else:
+            # Use same precision as warmup/torch.compile for consistency
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
                     forward_result = model._forward_pass(batch_data)
+            else:
+                forward_result = model._forward_pass(batch_data)
 
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                t_inference_end = time.perf_counter()
-                inference_times.append(t_inference_end - t_inference_start)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_inference_end = time.perf_counter()
+            pred_inference_time = t_inference_end - t_inference_start
 
-            # Report all inference times
-            print(f"  [DIAGNOSTIC] Inference times: {[f'{t * 1000:.1f}ms' for t in inference_times]}")
+            # === Optional: additional timing runs (results discarded) ===
+            if not self._quantitative_mode:
+                inference_times = [pred_inference_time]
+                num_extra_runs = 2
+                for run_idx in range(num_extra_runs):
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    t_start = time.perf_counter()
 
-            # Use the minimum time as the "true" inference time (excludes one-time overhead)
-            pred_inference_time = min(inference_times)
-            print(f"  [TIMING] Model inference (best of {num_runs}): {pred_inference_time * 1000:.2f} ms")
+                    if use_amp:
+                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                            _ = model._forward_pass(batch_data)
+                    else:
+                        _ = model._forward_pass(batch_data)
+
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    inference_times.append(time.perf_counter() - t_start)
+
+                print(f"  [DIAGNOSTIC] Inference times: {[f'{t * 1000:.1f}ms' for t in inference_times]}")
+                pred_inference_time = min(inference_times)
+
+            print(f"  [TIMING] Model inference: {pred_inference_time * 1000:.2f} ms")
 
             # === TIME: Result extraction and conversion ===
             t_extract_start = time.perf_counter()
@@ -3564,13 +3670,16 @@ class RealTimeEigenanalysisVisualizer:
 
             print(f"    Using regularization: {adaptive_reg:.2e} (scale={L_scale:.2e})")
 
-            # Regularized system: (L + ÃƒÅ½Ã‚ÂµM)g = ÃƒÅ½Ã‚Â´
+            # Ensure PSD convention before solving
+            L = ensure_psd(L)
             A = L + adaptive_reg * M
 
             # Solve the linear system
-            g_raw = scipy.sparse.linalg.spsolve(A, delta)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+                g_raw = scipy.sparse.linalg.spsolve(A, delta)
 
-            # Check for NaN or Inf
             if not np.isfinite(g_raw).all():
                 print(f"  [!] Solution contains NaN or Inf values")
                 return None
@@ -4052,6 +4161,7 @@ class RealTimeEigenanalysisVisualizer:
                 diag_gt = np.array(L_gt.diagonal()).flatten()
                 print(f"  GT Laplacian: diag range [{diag_gt.min():.4f}, {diag_gt.max():.4f}], row sums ~ {np.abs(L_gt.sum(axis=1)).max():.2e}")
 
+                _t_greens_start = time.perf_counter()
                 result = self.compute_greens_function(L_gt, M_gt, source_vertex_idx)
 
                 if result is not None:
@@ -4066,6 +4176,7 @@ class RealTimeEigenanalysisVisualizer:
                     greens_functions['GT'] = gt_greens
                     self._greens_gt_values = gt_greens  # Cache for per-method recomputation
                     print(f"  GT Green's function: min={gt_greens.min():.6f}, max={gt_greens.max():.6f}")
+                self.timing_results.gt_greens_solve_time = time.perf_counter() - _t_greens_start
 
             except Exception as e:
                 print(f"  [!] Failed to compute GT Green's function: {e}")
@@ -4095,6 +4206,7 @@ class RealTimeEigenanalysisVisualizer:
                 if diag_pred.min() < 0:
                     print(f"  [!] WARNING: PRED Laplacian has negative diagonal entries - may indicate sign issue")
 
+                _t_greens_start = time.perf_counter()
                 result = self.compute_greens_function(L_pred, M_pred, source_vertex_idx)
 
                 if result is not None:
@@ -4108,6 +4220,7 @@ class RealTimeEigenanalysisVisualizer:
                     )
                     greens_functions['PRED'] = pred_greens
                     print(f"  PRED Green's function: min={pred_greens.min():.6f}, max={pred_greens.max():.6f}")
+                self.timing_results.pred_greens_solve_time = time.perf_counter() - _t_greens_start
 
             except Exception as e:
                 print(f"  [!] Failed to compute PRED Green's function: {e}")
@@ -4135,6 +4248,7 @@ class RealTimeEigenanalysisVisualizer:
                 diag_robust = np.array(L_robust.diagonal()).flatten()
                 print(f"  Robust Laplacian: diag range [{diag_robust.min():.4f}, {diag_robust.max():.4f}], row sums ~ {np.abs(L_robust.sum(axis=1)).max():.2e}")
 
+                _t_greens_start = time.perf_counter()
                 result = self.compute_greens_function(L_robust, M_robust, source_vertex_idx)
 
                 if result is not None:
@@ -4148,6 +4262,7 @@ class RealTimeEigenanalysisVisualizer:
                     )
                     greens_functions['Robust'] = robust_greens
                     print(f"  Robust Green's function: min={robust_greens.min():.6f}, max={robust_greens.max():.6f}")
+                self.timing_results.robust_greens_solve_time = time.perf_counter() - _t_greens_start
 
             except Exception as e:
                 print(f"  [!] Failed to compute Robust Green's function: {e}")
@@ -4162,6 +4277,7 @@ class RealTimeEigenanalysisVisualizer:
         if self.current_nelo_L is not None:
             print("\nComputing NeLo Green's function...")
             try:
+                _t_greens_start = time.perf_counter()
                 result = self.compute_greens_function(self.current_nelo_L, self.current_nelo_M, source_vertex_idx)
                 if result is not None:
                     nelo_greens, nelo_residual = result
@@ -4174,6 +4290,7 @@ class RealTimeEigenanalysisVisualizer:
                     )
                     greens_functions['NeLo'] = nelo_greens
                     print(f"  NeLo Green's function: min={nelo_greens.min():.6f}, max={nelo_greens.max():.6f}")
+                self.timing_results.nelo_greens_solve_time = time.perf_counter() - _t_greens_start
             except Exception as e:
                 print(f"  [!] Failed to compute NeLo Green's function: {e}")
                 import traceback
@@ -4463,7 +4580,9 @@ class RealTimeEigenanalysisVisualizer:
                 print(f"  [!] igl.grad() failed: {e}")
 
         # Build POINT CLOUD gradient/divergence operators using shared function
-        # IMPORTANT: Use the SAME k-NN connectivity as PRED's Laplacian!
+        # Each method gets operators matched to its own k-NN connectivity.
+
+        # --- PRED operators (from PRED's k-NN) ---
         pc_grad_op = None
         pc_div_op = None
         if HAS_PCDIFF and self.current_vertex_indices is not None:
@@ -4483,7 +4602,7 @@ class RealTimeEigenanalysisVisualizer:
                 print(f"  Point cloud gradient operator: {pc_grad_op.shape}")
                 print(f"  Point cloud divergence operator: {pc_div_op.shape}")
             except Exception as e:
-                print(f"  [!] pcdiff operators failed: {e}")
+                print(f"  [!] pcdiff operators (PRED) failed: {e}")
                 import traceback
                 traceback.print_exc()
         elif HAS_PCDIFF:
@@ -4498,9 +4617,41 @@ class RealTimeEigenanalysisVisualizer:
             except Exception as e:
                 print(f"  [!] pcdiff operators failed: {e}")
 
-        # Cache pcdiff operators for targeted per-method recomputation
+        # Cache PRED pcdiff operators for targeted per-method recomputation
         self._pc_grad_op = pc_grad_op
         self._pc_div_op = pc_div_op
+
+        # --- NeLo operators (from NeLo's own k) ---
+        nelo_grad_op = None
+        nelo_div_op = None
+        if HAS_PCDIFF and self.current_nelo_L is not None:
+            try:
+                nelo_k = self.nelo_k
+                print(f"\nBuilding point cloud gradient/divergence operators for NeLo (k={nelo_k})...")
+                nelo_edge_index = knn_graph(vertices, k=nelo_k)
+                nelo_grad_op, nelo_div_op = build_pointcloud_grad_div_operators(vertices, nelo_edge_index)
+                print(f"  NeLo gradient operator: {nelo_grad_op.shape}")
+                print(f"  NeLo divergence operator: {nelo_div_op.shape}")
+            except Exception as e:
+                print(f"  [!] pcdiff operators (NeLo) failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # --- Robust operators (from Robust's own k, only when using heat method) ---
+        robust_grad_op = None
+        robust_div_op = None
+        if HAS_PCDIFF and self._robust_geodesic_heat and L_robust is not None:
+            try:
+                robust_k = self.reconstruction_settings.current_robust_k
+                print(f"\nBuilding point cloud gradient/divergence operators for Robust (k={robust_k})...")
+                robust_edge_index = knn_graph(vertices, k=robust_k)
+                robust_grad_op, robust_div_op = build_pointcloud_grad_div_operators(vertices, robust_edge_index)
+                print(f"  Robust gradient operator: {robust_grad_op.shape}")
+                print(f"  Robust divergence operator: {robust_div_op.shape}")
+            except Exception as e:
+                print(f"  [!] pcdiff operators (Robust) failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         # =====================================================================
         # Compute EXACT geodesic distances (TRUE ground truth)
@@ -4586,6 +4737,7 @@ class RealTimeEigenanalysisVisualizer:
             )
             if distances is not None:
                 geodesic_distances["GT"] = distances
+                self.timing_results.gt_geodesic_solve_time = elapsed_ms / 1000.0
                 print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
                 print(f"  Time: {elapsed_ms:.1f} ms")
         else:
@@ -4618,6 +4770,7 @@ class RealTimeEigenanalysisVisualizer:
 
                         if distances is not None:
                             geodesic_distances["PRED"] = distances
+                            self.timing_results.pred_geodesic_solve_time = elapsed_ms / 1000.0
                             print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
                             print(f"  Time: {elapsed_ms:.1f} ms")
                         else:
@@ -4637,34 +4790,55 @@ class RealTimeEigenanalysisVisualizer:
                     )
                     if distances is not None:
                         geodesic_distances["PRED"] = distances
+                        self.timing_results.pred_geodesic_solve_time = elapsed_ms / 1000.0
                         print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
                         print(f"  Time: {elapsed_ms:.1f} ms")
                 else:
                     print(f"\n[PRED] Point cloud gradient not available, skipping Heat Method")
 
-        # Robust Laplacian: Cannot use matched k-NN (Robust builds its own tufted cover)
-        # Use potpourri3d point cloud solver for visualization instead
+        # Robust Laplacian geodesics: pp3d solver (default) or heat method with matched operators
         if L_robust is not None and M_robust is not None:
-            print(f"\n[Robust] Heat Method skipped (uses internal tufted cover, not k-NN)")
-            print(f"         Using potpourri3d point cloud solver for visualization...")
-            try:
-                import potpourri3d as pp3d
-                pc_solver = pp3d.PointCloudHeatSolver(vertices)
-                robust_distances = pc_solver.compute_distance(source_vertex_idx)
-                geodesic_distances["Robust (pp3d)"] = robust_distances
-                print(f"  Distance range: [{robust_distances.min():.4f}, {robust_distances.max():.4f}]")
-            except Exception as e:
-                print(f"  [!] potpourri3d point cloud solver failed: {e}")
+            if self._robust_geodesic_heat:
+                # Heat method with Robust's own L, M and matched pcdiff operators
+                if robust_grad_op is not None and robust_div_op is not None:
+                    robust_k = self.reconstruction_settings.current_robust_k
+                    print(f"\nComputing Heat Method geodesic with Robust Laplacian (matched k={robust_k})...")
+                    distances, _t, elapsed_ms = compute_heat_geodesic_pointcloud_local(
+                        L_robust, M_robust, robust_grad_op, robust_div_op, "Robust"
+                    )
+                    if distances is not None:
+                        geodesic_distances["Robust"] = distances
+                        self.timing_results.robust_geodesic_solve_time = elapsed_ms / 1000.0
+                        print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
+                        print(f"  Time: {elapsed_ms:.1f} ms")
+                else:
+                    print(f"\n[Robust] Point cloud gradient not available, skipping Heat Method")
+            else:
+                # Default: potpourri3d point cloud solver
+                print(f"\n[Robust] Using potpourri3d point cloud solver...")
+                try:
+                    import potpourri3d as pp3d
+                    _t_geo_start = time.perf_counter()
+                    pc_solver = pp3d.PointCloudHeatSolver(vertices)
+                    robust_distances = pc_solver.compute_distance(source_vertex_idx)
+                    _t_geo_elapsed = time.perf_counter() - _t_geo_start
+                    self.timing_results.robust_geodesic_solve_time = _t_geo_elapsed
+                    geodesic_distances["Robust (pp3d)"] = robust_distances
+                    print(f"  Distance range: [{robust_distances.min():.4f}, {robust_distances.max():.4f}]")
+                    print(f"  Time: {_t_geo_elapsed * 1000:.1f} ms")
+                except Exception as e:
+                    print(f"  [!] potpourri3d point cloud solver failed: {e}")
 
-        # NeLo Laplacian: use point-cloud Heat Method (same as PRED stiffness path)
+        # NeLo Laplacian: use point-cloud Heat Method with NeLo's own matched k-NN operators
         if self.current_nelo_L is not None and self.current_nelo_M is not None:
-            if pc_grad_op is not None and pc_div_op is not None:
-                print(f"\nComputing Heat Method geodesic with NeLo Laplacian...")
+            if nelo_grad_op is not None and nelo_div_op is not None:
+                print(f"\nComputing Heat Method geodesic with NeLo Laplacian (matched k={self.nelo_k})...")
                 distances, _t, elapsed_ms = compute_heat_geodesic_pointcloud_local(
-                    self.current_nelo_L, self.current_nelo_M, pc_grad_op, pc_div_op, "NeLo"
+                    self.current_nelo_L, self.current_nelo_M, nelo_grad_op, nelo_div_op, "NeLo"
                 )
                 if distances is not None:
                     geodesic_distances["NeLo"] = distances
+                    self.timing_results.nelo_geodesic_solve_time = elapsed_ms / 1000.0
                     print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
                     print(f"  Time: {elapsed_ms:.1f} ms")
             else:
@@ -4684,10 +4858,15 @@ class RealTimeEigenanalysisVisualizer:
         print("=" * 70)
 
         results = {}
+        unreasonable_methods = set()  # Track methods with unreasonable distance ranges
 
         for method_name, distances in geodesic_distances.items():
             if method_name == "Exact":
                 continue  # Don't compare exact to itself
+
+            # Flag unreasonable results (normalized mesh, geodesics should be O(1))
+            if distances.max() > 1e3:
+                unreasonable_methods.add(method_name)
 
             # Use the shared metrics function (returns GeodesicMetrics dataclass)
             metrics = compute_geodesic_metrics(distances, exact_distances)
@@ -4714,14 +4893,18 @@ class RealTimeEigenanalysisVisualizer:
         print(f"\n{'Method':<20} {'Corr':>8} {'MAE':>8} {'MaxErr':>8} {'Mono':>8} {'Range':<20}")
         print("-" * 76)
         for method_name, distances in geodesic_distances.items():
+            warn = " [!]" if method_name in unreasonable_methods else ""
             if method_name == "Exact":
                 d_range = f"[{distances.min():.3f}, {distances.max():.3f}]"
                 print(f"{method_name:<20} {'1.0000':>8} {'0.0000':>8} {'0.0000':>8} {'1.0000':>8} {d_range:<20}")
             else:
                 r = results[method_name]
                 d_range = f"[{distances.min():.3f}, {distances.max():.3f}]"
-                print(f"{method_name:<20} {r.correlation_with_reference:>8.4f} {r.mean_absolute_error:>8.4f} "
+                print(f"{method_name + warn:<20} {r.correlation_with_reference:>8.4f} {r.mean_absolute_error:>8.4f} "
                       f"{r.max_absolute_error:>8.4f} {r.monotonicity_score:>8.4f} {d_range:<20}")
+
+        if unreasonable_methods:
+            print(f"\n  [!] = unreasonable distance range (max >> 1), metrics may be meaningless")
 
         # =====================================================================
         # Add visualizations
@@ -4744,11 +4927,16 @@ class RealTimeEigenanalysisVisualizer:
                 # Normalized distances (0 to 1) for fair visual comparison
                 d_norm = normalize_distances(distances)
 
+                # Use different colormap for unreasonable results
+                is_bad = method_name in unreasonable_methods
+                label_suffix = " [!]" if is_bad else ""
+                cmap = 'hot' if is_bad else 'viridis'
+
                 mesh_structure.add_scalar_quantity(
-                    name=f"K1 Geodesic (norm) - {method_name}",
+                    name=f"K1 Geodesic (norm) - {method_name}{label_suffix}",
                     values=d_norm,
                     enabled=(method_name == "Exact"),
-                    cmap='viridis'
+                    cmap=cmap
                 )
 
             # Add error visualizations (normalized error vs exact)
@@ -4851,6 +5039,11 @@ class RealTimeEigenanalysisVisualizer:
         pred_extraction_time = t_extraction_end - t_extraction_start
         self.timing_results.pred_patch_extraction_time = pred_extraction_time
         print(f"  [TIMING] PRED patch extraction (k-NN): {pred_extraction_time * 1000:.2f} ms")
+
+        # Store patch connectivity for pcdiff gradient/divergence operators (needed for geodesics)
+        self.current_vertex_indices = patch_data.vertex_indices.to(device)
+        self.current_center_indices = patch_data.center_indices.to(device)
+        self.current_batch_indices = patch_data.patch_idx.to(device)
 
         # STEP 3: Model inference (use our extracted patches for consistent timing)
         print(f"\nSTEP 3: Model inference")
@@ -5140,6 +5333,46 @@ class RealTimeEigenanalysisVisualizer:
             metrics['nelo_inference_ms'] = t.nelo_model_inference_time * 1000
             metrics['nelo_assembly_ms'] = t.nelo_matrix_assembly_time * 1000
             metrics['nelo_total_ms'] = t.nelo_total_time * 1000
+
+        # --- Downstream solve timings ---
+        if t.gt_geodesic_solve_time > 0:
+            metrics['gt_geodesic_solve_ms'] = t.gt_geodesic_solve_time * 1000
+        if t.pred_geodesic_solve_time > 0:
+            metrics['pred_geodesic_solve_ms'] = t.pred_geodesic_solve_time * 1000
+        if t.robust_geodesic_solve_time > 0:
+            metrics['robust_geodesic_solve_ms'] = t.robust_geodesic_solve_time * 1000
+        if t.nelo_geodesic_solve_time > 0:
+            metrics['nelo_geodesic_solve_ms'] = t.nelo_geodesic_solve_time * 1000
+
+        if t.gt_greens_solve_time > 0:
+            metrics['gt_greens_solve_ms'] = t.gt_greens_solve_time * 1000
+        if t.pred_greens_solve_time > 0:
+            metrics['pred_greens_solve_ms'] = t.pred_greens_solve_time * 1000
+        if t.robust_greens_solve_time > 0:
+            metrics['robust_greens_solve_ms'] = t.robust_greens_solve_time * 1000
+        if t.nelo_greens_solve_time > 0:
+            metrics['nelo_greens_solve_ms'] = t.nelo_greens_solve_time * 1000
+
+        # --- E2E timing: assembly + downstream solve ---
+        if t.pred_geodesic_solve_time > 0:
+            metrics['pred_e2e_geodesic_ms'] = t.pred_total_time * 1000 + t.pred_geodesic_solve_time * 1000
+        if t.pred_greens_solve_time > 0:
+            metrics['pred_e2e_greens_ms'] = t.pred_total_time * 1000 + t.pred_greens_solve_time * 1000
+
+        if t.robust_geodesic_solve_time > 0:
+            metrics['robust_e2e_geodesic_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_geodesic_solve_time * 1000
+        if t.robust_greens_solve_time > 0:
+            metrics['robust_e2e_greens_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_greens_solve_time * 1000
+
+        if t.nelo_total_time > 0 and t.nelo_geodesic_solve_time > 0:
+            metrics['nelo_e2e_geodesic_ms'] = t.nelo_total_time * 1000 + t.nelo_geodesic_solve_time * 1000
+        if t.nelo_total_time > 0 and t.nelo_greens_solve_time > 0:
+            metrics['nelo_e2e_greens_ms'] = t.nelo_total_time * 1000 + t.nelo_greens_solve_time * 1000
+
+        if t.gt_geodesic_solve_time > 0:
+            metrics['gt_e2e_geodesic_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_geodesic_solve_time * 1000
+        if t.gt_greens_solve_time > 0:
+            metrics['gt_e2e_greens_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_greens_solve_time * 1000
 
         # --- Eigenvector cosine similarity ---
         for method_label, sims in [
@@ -5516,13 +5749,6 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         geodesic_metrics = ['geodesic_corr', 'geodesic_mae', 'geodesic_monotonicity']
         geodesic_labels = ['Correlation', 'MAE', 'Monotonicity']
-        # Map method labels to geodesic result keys
-        geodesic_method_map = {
-            'pred': 'pred',
-            'robust': 'robust_pp3d',
-            'nelo': 'nelo',
-            'gt': 'gt',
-        }
         geo_methods = ['gt', 'pred', 'nelo', 'robust']
         geo_colors = {'gt': '#30B030', 'pred': '#E07020', 'nelo': '#9040E0', 'robust': '#2090D0'}
 
@@ -5538,8 +5764,10 @@ class RealTimeEigenanalysisVisualizer:
             bar_colors_list = []
 
             for m in geo_methods:
-                geo_key = geodesic_method_map.get(m, m)
-                key = f'{geo_key}_{metric_suffix}'
+                # Try both key patterns for Robust (pp3d vs heat mode)
+                key = f'{m}_{metric_suffix}'
+                if key not in agg_stats and m == 'robust':
+                    key = f'robust_pp3d_{metric_suffix}'
                 if key in agg_stats:
                     bar_vals.append(agg_stats[key]['mean'])
                     bar_errs.append(agg_stats[key]['std'])
@@ -5701,6 +5929,52 @@ class RealTimeEigenanalysisVisualizer:
         plt.close(fig)
         print(f"[OK] Chart saved: {chart_path}")
 
+        # =====================================================================
+        # Chart 7: E2E timing comparison (assembly + downstream solve)
+        # =====================================================================
+        e2e_tasks = [
+            ('e2e_geodesic_ms', "E2E Geodesic\n(assembly + heat method)"),
+            ('e2e_greens_ms', "E2E Green's Function\n(assembly + solve)"),
+        ]
+        all_methods_e2e = ['gt', 'pred', 'nelo', 'robust']
+
+        fig, axes = plt.subplots(1, len(e2e_tasks), figsize=(6 * len(e2e_tasks), 6))
+        if len(e2e_tasks) == 1:
+            axes = [axes]
+
+        for ax_idx, (metric_suffix, metric_title) in enumerate(e2e_tasks):
+            ax = axes[ax_idx]
+            bar_vals = []
+            bar_errs = []
+            bar_labels = []
+            bar_colors_list = []
+
+            for m in all_methods_e2e:
+                key = f'{m}_{metric_suffix}'
+                if key in agg_stats:
+                    bar_vals.append(agg_stats[key]['mean'])
+                    bar_errs.append(agg_stats[key]['std'])
+                    bar_labels.append(method_labels.get(m, m.upper()))
+                    bar_colors_list.append(geo_colors.get(m, '#888888'))
+
+            if bar_vals:
+                x = np.arange(len(bar_vals))
+                ax.bar(x, bar_vals, yerr=bar_errs, capsize=4,
+                       color=bar_colors_list, alpha=0.85, edgecolor='black', linewidth=0.5)
+                ax.set_xticks(x)
+                ax.set_xticklabels(bar_labels, fontsize=11)
+                ax.set_ylabel('Time (ms)', fontsize=12)
+                ax.set_title(metric_title, fontsize=11)
+                ax.set_ylim(bottom=0)
+                ax.grid(True, axis='y', alpha=0.3)
+
+        fig.suptitle(f'End-to-End Timing: Assembly + Downstream Solve (n={n_meshes} meshes)', fontsize=14)
+        fig.tight_layout()
+        chart_path = charts_dir / 'e2e_timing_comparison.png'
+        fig.savefig(chart_path, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Chart saved: {chart_path}")
+
     def run_dataset_iteration(self, cfg: DictConfig):
         """Run visualization on all meshes in the dataset."""
         print(f"\n{'=' * 80}")
@@ -5726,14 +6000,23 @@ class RealTimeEigenanalysisVisualizer:
         diagnostic_mode = getattr(cfg, 'diagnostic_mode', False)
         skip_robust = getattr(cfg, 'skip_robust', False)  # Debug: skip robust computation
         quantitative_mode = getattr(cfg, 'quantitative_mode', False)  # Headless metrics-only mode
+        use_compile = getattr(cfg, 'torch_compile', True)  # Enable/disable torch.compile
+        robust_geodesic_heat = getattr(cfg, 'robust_geodesic_heat', False)  # Use heat method for Robust geodesics
+
+        if not use_compile:
+            print("[INFO] torch.compile disabled (torch_compile=false)")
 
         if diagnostic_mode:
             print("\n" + "!" * 80)
             print("DIAGNOSTIC MODE ENABLED - Optimizations disabled for debugging")
             print("!" * 80 + "\n")
+            use_compile = False
 
         if skip_robust:
             print("[DEBUG] skip_robust=True: Robust-laplacian computation will be skipped")
+
+        if robust_geodesic_heat:
+            print("[INFO] robust_geodesic_heat=true: Robust geodesics will use heat method with matched pcdiff operators")
 
         if quantitative_mode:
             print("\n" + "=" * 80)
@@ -5744,9 +6027,12 @@ class RealTimeEigenanalysisVisualizer:
         self._diagnostic_mode = diagnostic_mode
         self._skip_robust = skip_robust
         self._quantitative_mode = quantitative_mode
+        self._robust_geodesic_heat = robust_geodesic_heat
 
         # Load trained model
-        model = self.load_trained_model(ckpt_path, device, cfg, diagnostic_mode=diagnostic_mode)
+        model = self.load_trained_model(ckpt_path, device, cfg,
+                                         use_torch_compile=use_compile,
+                                         diagnostic_mode=diagnostic_mode)
 
         # Load NeLo pipeline if checkpoint path provided
         nelo_ckpt = getattr(cfg, 'nelo_ckpt_path', None)
@@ -5789,10 +6075,10 @@ class RealTimeEigenanalysisVisualizer:
         print(f"Detected k={actual_k} from dataset")
 
         # Warmup for torch.compile with ACTUAL k from dataset
-        if not diagnostic_mode:
+        if use_compile:
             self._warmup_model(model, device, k=actual_k)
         else:
-            print("[DIAGNOSTIC] Skipping warmup")
+            print("[INFO] Skipping warmup (torch.compile disabled)")
 
         # Re-create dataloader since we consumed it (reset iterator)
         # Also reset seed to ensure same data order

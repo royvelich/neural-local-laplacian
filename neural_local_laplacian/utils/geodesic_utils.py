@@ -32,6 +32,28 @@ except ImportError:
     HAS_IGL = False
 
 
+def ensure_psd(L: scipy.sparse.spmatrix) -> scipy.sparse.spmatrix:
+    """
+    Ensure a Laplacian matrix follows positive semi-definite convention
+    (positive diagonal, negative off-diagonal).
+
+    If the diagonal is predominantly negative (NSD convention), negates L.
+    This eliminates sign ambiguity in all downstream solves (heat method,
+    Green's function, etc.) without needing double-solve workarounds.
+
+    Args:
+        L: Sparse Laplacian matrix (N, N)
+
+    Returns:
+        L in PSD convention (may be negated copy, or original if already PSD)
+    """
+    diag = np.array(L.diagonal()).flatten()
+    # Check median of diagonal (robust to a few outlier entries)
+    if np.median(diag) < 0:
+        return -L
+    return L
+
+
 @dataclass
 class GeodesicMetrics:
     """Metrics comparing computed geodesics against exact ground truth."""
@@ -254,8 +276,8 @@ def compute_heat_geodesic_pointcloud(
     """
     n = n_vertices
 
-    # Ensure float64 for numerical stability
-    L = L.astype(np.float64)
+    # Ensure float64 for numerical stability and PSD convention
+    L = ensure_psd(L.astype(np.float64))
     M = M.astype(np.float64)
 
     # Time step: t = h^2 where h is mean point spacing
@@ -268,15 +290,20 @@ def compute_heat_geodesic_pointcloud(
         t = h ** 2
 
     try:
+        import warnings
+
         # Step I: Heat diffusion
         # Solve (M + t*L) u = delta_source
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
         A = M + t * L
-        u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+            u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
 
         if not np.all(np.isfinite(u)):
+            print(f"  [!] Heat Method (pointcloud): heat diffusion produced non-finite values, skipping")
             return None
 
         # Step II: Compute and normalize gradient (2D in tangent plane)
@@ -297,8 +324,10 @@ def compute_heat_geodesic_pointcloud(
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        phi_pos = scipy.sparse.linalg.spsolve(L_reg.tocsc(), div_X)
-        phi_neg = scipy.sparse.linalg.spsolve(L_reg.tocsc(), -div_X)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+            phi_pos = scipy.sparse.linalg.spsolve(L_reg.tocsc(), div_X)
+            phi_neg = scipy.sparse.linalg.spsolve(L_reg.tocsc(), -div_X)
 
         # The correct sign should have the source at or near the minimum
         phi_pos_shifted = phi_pos - phi_pos.min()
@@ -312,6 +341,10 @@ def compute_heat_geodesic_pointcloud(
             phi = phi_pos_shifted
         else:
             phi = phi_neg_shifted
+
+        # Warn if distances are unreasonably large (but still return them)
+        if phi.max() > 1e3:
+            print(f"  [!] Heat Method (pointcloud): WARNING — unreasonable max distance {phi.max():.1f}")
 
         return phi
 
@@ -349,8 +382,8 @@ def compute_heat_geodesic_mesh(
     n = n_vertices
     nF = len(face_areas)
 
-    # Ensure float64 for numerical stability
-    L = L.astype(np.float64)
+    # Ensure float64 for numerical stability and PSD convention
+    L = ensure_psd(L.astype(np.float64))
     M = M.astype(np.float64)
 
     # Time step: t = h^2 where h is mean edge length
@@ -360,14 +393,19 @@ def compute_heat_geodesic_mesh(
         t = h ** 2
 
     try:
+        import warnings
+
         # Step I: Heat diffusion
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
         A = M + t * L
-        u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+            u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
 
         if not np.all(np.isfinite(u)):
+            print(f"  [!] Heat Method (mesh): heat diffusion produced non-finite values, skipping")
             return None
 
         # Step II: Compute per-face gradient and normalize
@@ -393,17 +431,31 @@ def compute_heat_geodesic_mesh(
         # RHS for Poisson (the negatives cancel)
         rhs = grad_op.T @ X_weighted_flat  # (nV,)
 
-        # Step IV: Solve Poisson
+        # Step IV: Solve Poisson — try both signs to handle sign ambiguity
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        phi = scipy.sparse.linalg.spsolve(L_reg.tocsc(), rhs)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+            phi_pos = scipy.sparse.linalg.spsolve(L_reg.tocsc(), rhs)
+            phi_neg = scipy.sparse.linalg.spsolve(L_reg.tocsc(), -rhs)
 
-        # Shift so source has distance 0
-        phi = phi - phi[source_idx]
+        if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
+            print(f"  [!] Heat Method (mesh): Poisson solve produced non-finite values, skipping")
+            return None
 
-        # Shift so minimum is 0 (source should be the minimum)
-        phi = phi - phi.min()
+        # Pick the sign where source is closest to the minimum
+        phi_pos_shifted = phi_pos - phi_pos.min() if np.all(np.isfinite(phi_pos)) else np.full(n, np.inf)
+        phi_neg_shifted = phi_neg - phi_neg.min() if np.all(np.isfinite(phi_neg)) else np.full(n, np.inf)
+
+        source_rank_pos = (phi_pos_shifted < phi_pos_shifted[source_idx]).sum()
+        source_rank_neg = (phi_neg_shifted < phi_neg_shifted[source_idx]).sum()
+
+        phi = phi_pos_shifted if source_rank_pos < source_rank_neg else phi_neg_shifted
+
+        # Warn if distances are unreasonably large (but still return them)
+        if phi.max() > 1e3:
+            print(f"  [!] Heat Method (mesh): WARNING — unreasonable max distance {phi.max():.1f}")
 
         return phi
 
@@ -456,7 +508,7 @@ def compute_heat_geodesic_learned(
     n = n_vertices
 
     # Ensure float64 for numerical stability
-    S = S.astype(np.float64)
+    S = ensure_psd(S.astype(np.float64))
     M = M.astype(np.float64)
     G = G.astype(np.float64)
 
@@ -470,14 +522,19 @@ def compute_heat_geodesic_learned(
         t = h ** 2
 
     try:
+        import warnings
+
         # Step 1: Heat diffusion â€” solve (M + tS) u = Î´_source
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
         A = M + t * S
-        u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+            u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
 
         if not np.all(np.isfinite(u)):
+            print(f"  [!] Heat Method (learned): heat diffusion produced non-finite values, skipping")
             return None
 
         # Step 2: Compute gradient and normalize to unit vectors
@@ -497,14 +554,29 @@ def compute_heat_geodesic_learned(
 
         eps = 1e-8
         S_reg = S + eps * scipy.sparse.eye(n)
-        phi = scipy.sparse.linalg.spsolve(S_reg.tocsc(), rhs)
 
-        if not np.all(np.isfinite(phi)):
+        # Try both signs to handle sign ambiguity in divergence
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+            phi_pos = scipy.sparse.linalg.spsolve(S_reg.tocsc(), rhs)
+            phi_neg = scipy.sparse.linalg.spsolve(S_reg.tocsc(), -rhs)
+
+        if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
+            print(f"  [!] Heat Method (learned): Poisson solve produced non-finite values, skipping")
             return None
 
-        # Shift so source has distance 0, minimum is 0
-        phi = phi - phi[source_idx]
-        phi = phi - phi.min()
+        # Pick the sign where source is closest to the minimum
+        phi_pos_shifted = phi_pos - phi_pos.min() if np.all(np.isfinite(phi_pos)) else np.full(n, np.inf)
+        phi_neg_shifted = phi_neg - phi_neg.min() if np.all(np.isfinite(phi_neg)) else np.full(n, np.inf)
+
+        source_rank_pos = (phi_pos_shifted < phi_pos_shifted[source_idx]).sum()
+        source_rank_neg = (phi_neg_shifted < phi_neg_shifted[source_idx]).sum()
+
+        phi = phi_pos_shifted if source_rank_pos < source_rank_neg else phi_neg_shifted
+
+        # Warn if distances are unreasonably large (but still return them)
+        if phi.max() > 1e3:
+            print(f"  [!] Heat Method (learned): WARNING — unreasonable max distance {phi.max():.1f}")
 
         return phi
 
