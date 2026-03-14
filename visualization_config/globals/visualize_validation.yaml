@@ -3,6 +3,6 @@ validation_seed: 3
 num_eigenvalues: 50
 ckpt_path: null
 seed: 2
-k_pred: 8
+k_pred: 20
 k_robust: 30
-k_nelo: 8
+k_nelo: 20

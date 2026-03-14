@@ -172,6 +172,11 @@ class ReconstructionSettings:
     current_pred_k: int = 20  # Will be updated with actual k from dataset
     current_robust_k: int = 20  # Independent k for robust-laplacian
 
+    # Top-k weight pruning for PRED
+    enable_top_k_pruning: bool = False  # When enabled, prune to top_k highest weights per patch
+    pred_top_k: int = 6  # Number of highest weights to keep per patch
+    symmetry_policy: str = "union"  # "union" or "intersection"
+
 
 class ColorPalette:
     """Color palette for different visualization elements."""
@@ -457,6 +462,7 @@ class RealTimeEigenanalysisVisualizer:
         self._diagnostic_mode = False
         self._skip_robust = False
         self._quantitative_mode = False
+        self._robust_geodesic_heat = False
 
         # NeLo state
         self.nelo_pipeline = None          # loaded once at startup via load_nelo_pipeline(); None = disabled
@@ -549,6 +555,55 @@ class RealTimeEigenanalysisVisualizer:
             psim.Text("k-NN input: (no data loaded)")
 
         psim.Text("(Press Enter to apply changes)")
+
+        # --- Top-k weight pruning for PRED ---
+        psim.Text("")
+        psim.Separator()
+        psim.Text("PRED Top-k Weight Pruning:")
+
+        topk_changed, new_topk_enabled = psim.Checkbox(
+            "Enable top-k pruning",
+            self.reconstruction_settings.enable_top_k_pruning
+        )
+        if topk_changed:
+            self.reconstruction_settings.enable_top_k_pruning = new_topk_enabled
+            print(f"[*] Top-k pruning: {'enabled' if new_topk_enabled else 'disabled'}")
+            if self._has_current_batch_data():
+                self._update_pred_with_new_k(self.reconstruction_settings.current_pred_k)
+
+        if self.reconstruction_settings.enable_top_k_pruning:
+            topk_k_changed, new_topk_k = psim.InputInt(
+                "Top-k (weights to keep)",
+                self.reconstruction_settings.pred_top_k,
+                flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+            )
+            new_topk_k = max(3, min(self.reconstruction_settings.current_pred_k - 1, new_topk_k))
+
+            if topk_k_changed and new_topk_k != self.reconstruction_settings.pred_top_k:
+                self.reconstruction_settings.pred_top_k = new_topk_k
+                print(f"[*] Top-k value changed: {new_topk_k}")
+                if self._has_current_batch_data():
+                    self._update_pred_with_new_k(self.reconstruction_settings.current_pred_k)
+
+            # Symmetry policy combo box
+            policies = ["union", "intersection"]
+            current_idx = policies.index(self.reconstruction_settings.symmetry_policy) if self.reconstruction_settings.symmetry_policy in policies else 0
+            policy_changed, new_policy_idx = psim.Combo(
+                "Symmetry policy",
+                current_idx,
+                policies
+            )
+            if policy_changed and policies[new_policy_idx] != self.reconstruction_settings.symmetry_policy:
+                self.reconstruction_settings.symmetry_policy = policies[new_policy_idx]
+                print(f"[*] Symmetry policy changed: {policies[new_policy_idx]}")
+                if self._has_current_batch_data():
+                    self._update_pred_with_new_k(self.reconstruction_settings.current_pred_k)
+
+            psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                f"k1={self.reconstruction_settings.current_pred_k} (receptive field) -> "
+                f"k2={self.reconstruction_settings.pred_top_k} (operator support), "
+                f"policy={self.reconstruction_settings.symmetry_policy}"
+            )
 
         psim.Text("")
         psim.Text("Current Settings:")
@@ -668,7 +723,10 @@ class RealTimeEigenanalysisVisualizer:
                     ('NeLo',   (0.7, 0.3, 1.0, 1.0), t.nelo_total_time,             t.nelo_geodesic_solve_time,   t.nelo_greens_solve_time),
                     ('Robust', (0.0, 0.7, 1.0, 1.0), t.robust_matrix_assembly_time, t.robust_geodesic_solve_time, t.robust_greens_solve_time),
                 ]:
-                    geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
+                    if label == 'Robust' and not self._robust_geodesic_heat and geo_t > 0:
+                        geo_str = f"{geo_t * 1000:>10.1f}"
+                    else:
+                        geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
                     grn_str = f"{(total + grn_t) * 1000:>10.1f}" if grn_t > 0 else f"{'N/A':>10}"
                     psim.TextColored(color, f"{label:<12} {geo_str} {grn_str}")
         else:
@@ -1000,6 +1058,42 @@ class RealTimeEigenanalysisVisualizer:
                 if method_key == 'GT':
                     self._greens_gt_values = greens_values
 
+                # Refresh Polyscope visualizations
+                mesh_structure = self.current_mesh_structure
+                if mesh_structure is not None and not self._quantitative_mode:
+                    mesh_structure.add_scalar_quantity(
+                        name=f"J1 Green's Function - {method_key}",
+                        values=greens_values,
+                        enabled=False,
+                        cmap='coolwarm'
+                    )
+                    g_shifted = greens_values - greens_values.min()
+                    mesh_structure.add_scalar_quantity(
+                        name=f"J2 Green's Function (shifted) - {method_key}",
+                        values=g_shifted,
+                        enabled=False,
+                        cmap='viridis'
+                    )
+                    # Violation mask
+                    source_val = greens_values[source_idx]
+                    violation_mask = (greens_values > source_val + 1e-10).astype(np.float32)
+                    if violation_mask.sum() > 0:
+                        mesh_structure.add_scalar_quantity(
+                            name=f"J3 Max Principle Violations - {method_key}",
+                            values=violation_mask,
+                            enabled=False,
+                            cmap='reds'
+                        )
+                    # Update difference with GT if applicable
+                    if method_key == 'PRED' and self._greens_gt_values is not None:
+                        diff = greens_values - self._greens_gt_values
+                        mesh_structure.add_scalar_quantity(
+                            name="J4 Green's Fn Diff (PRED - GT)",
+                            values=diff,
+                            enabled=False,
+                            cmap='coolwarm'
+                        )
+
             # Update solve timing
             greens_elapsed = time.perf_counter() - _t_greens_start
             timing_field = {'GT': 'gt_greens_solve_time', 'PRED': 'pred_greens_solve_time',
@@ -1134,11 +1228,14 @@ class RealTimeEigenanalysisVisualizer:
                 mesh_structure = self.current_mesh_structure
                 if mesh_structure is not None and not self._quantitative_mode:
                     d_norm = normalize_distances(distances)
+                    is_bad = distances.max() > 1e3
+                    label_suffix = " [!]" if is_bad else ""
+                    cmap = 'hot' if is_bad else 'viridis'
                     mesh_structure.add_scalar_quantity(
-                        name=f"K1 Geodesic (norm) - {result_key}",
+                        name=f"K1 Geodesic (norm) - {result_key}{label_suffix}",
                         values=d_norm,
                         enabled=False,
-                        cmap='viridis'
+                        cmap=cmap
                     )
                     exact_norm = normalize_distances(exact_distances)
                     error = np.abs(d_norm - exact_norm)
@@ -1406,13 +1503,17 @@ class RealTimeEigenanalysisVisualizer:
         attention_mask = torch.ones(num_patches, new_k, dtype=torch.bool, device=corrected_weights.device)
 
         # Assemble new stiffness and mass matrices
+        top_k = self.reconstruction_settings.pred_top_k if self.reconstruction_settings.enable_top_k_pruning else None
+        sym_policy = self.reconstruction_settings.symmetry_policy
         new_stiffness_matrix, new_mass_matrix = assemble_stiffness_and_mass_matrices(
             stiffness_weights=corrected_weights,
             areas=self.current_areas,
             attention_mask=attention_mask,
             vertex_indices=new_vertex_indices,
             center_indices=new_center_indices,
-            batch_indices=new_batch_indices
+            batch_indices=new_batch_indices,
+            top_k=top_k,
+            symmetry_policy=sym_policy
         )
 
         print(f"  Assembled new stiffness matrix: {new_stiffness_matrix.shape} ({new_stiffness_matrix.nnz} non-zeros)")
@@ -1816,7 +1917,11 @@ class RealTimeEigenanalysisVisualizer:
                 ('NeLo',   t.nelo_total_time,             t.nelo_geodesic_solve_time,   t.nelo_greens_solve_time),
                 ('Robust', t.robust_matrix_assembly_time, t.robust_geodesic_solve_time, t.robust_greens_solve_time),
             ]:
-                geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
+                if label == 'Robust' and not self._robust_geodesic_heat and geo_t > 0:
+                    # pp3d mode: solve is self-contained (includes its own Laplacian)
+                    geo_str = f"{geo_t * 1000:>10.1f}"
+                else:
+                    geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
                 grn_str = f"{(total + grn_t) * 1000:>10.1f}" if grn_t > 0 else f"{'N/A':>10}"
                 print(f"{label:<25} {geo_str:>14} {grn_str:>14}")
 
@@ -1923,6 +2028,14 @@ class RealTimeEigenanalysisVisualizer:
 
         # Update eigenvector visualizations on the mesh
         self._update_eigenvector_visualizations()
+
+        # Refresh PRED curvature/normal visualizations (Polyscope overwrites same-named quantities)
+        mesh_structure = self.current_mesh_structure
+        if mesh_structure is not None:
+            self.add_comprehensive_curvature_visualizations(
+                mesh_structure, self.current_gt_data,
+                self.current_predicted_data, self.current_inference_result
+            )
 
         # STEP 5: Recompute all downstream validations (Green's fn, geodesics, sparsity)
         print(f"STEP 5: Recomputing downstream validations for PRED...")
@@ -2522,13 +2635,17 @@ class RealTimeEigenanalysisVisualizer:
             t_assembly_start = time.perf_counter()
 
             # Assemble separate stiffness and mass matrices
+            top_k = self.reconstruction_settings.pred_top_k if self.reconstruction_settings.enable_top_k_pruning else None
+            sym_policy = self.reconstruction_settings.symmetry_policy
             stiffness_matrix, mass_matrix = assemble_stiffness_and_mass_matrices(
                 stiffness_weights=stiffness_weights,
                 areas=areas,
                 attention_mask=attention_mask,
                 vertex_indices=batch_data.vertex_indices,
                 center_indices=batch_data.center_indices,
-                batch_indices=batch_indices
+                batch_indices=batch_indices,
+                top_k=top_k,
+                symmetry_policy=sym_policy
             )
 
             t_assembly_end = time.perf_counter()
@@ -5360,7 +5477,12 @@ class RealTimeEigenanalysisVisualizer:
             metrics['pred_e2e_greens_ms'] = t.pred_total_time * 1000 + t.pred_greens_solve_time * 1000
 
         if t.robust_geodesic_solve_time > 0:
-            metrics['robust_e2e_geodesic_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_geodesic_solve_time * 1000
+            if self._robust_geodesic_heat:
+                # Heat method: assembly + solve (reuses our Laplacian)
+                metrics['robust_e2e_geodesic_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_geodesic_solve_time * 1000
+            else:
+                # pp3d mode: self-contained pipeline (builds its own Laplacian internally)
+                metrics['robust_e2e_geodesic_ms'] = t.robust_geodesic_solve_time * 1000
         if t.robust_greens_solve_time > 0:
             metrics['robust_e2e_greens_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_greens_solve_time * 1000
 

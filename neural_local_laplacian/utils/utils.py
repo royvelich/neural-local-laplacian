@@ -1,5 +1,5 @@
 # standard library
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 # scipy
 import scipy.sparse
@@ -197,17 +197,14 @@ def assemble_stiffness_and_mass_matrices(
         attention_mask: torch.Tensor,
         vertex_indices: torch.Tensor,
         center_indices: torch.Tensor,
-        batch_indices: torch.Tensor
+        batch_indices: torch.Tensor,
+        top_k: Optional[int] = None,
+        symmetry_policy: str = "union"
 ) -> Tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
     """
     Assemble separate stiffness and mass matrices from predicted weights and areas.
 
     GPU-OPTIMIZED VERSION: All computation stays on GPU until final scipy conversion.
-    Key optimizations:
-    - Fully vectorized position-in-patch calculation (no Python loops)
-    - GPU-based scatter operations for row sums and diagonal
-    - Single CPU transfer at the end
-    - Vectorized mass matrix construction
 
     The stiffness matrix S is symmetric and contains the edge weights.
     The mass matrix M is diagonal and contains the vertex areas.
@@ -220,6 +217,12 @@ def assemble_stiffness_and_mass_matrices(
         vertex_indices: Neighbor vertex indices of shape (total_points,)
         center_indices: Center vertex index for each patch, shape (num_patches,)
         batch_indices: Batch indices of shape (total_points,)
+        top_k: If set, keep only the top_k highest weights per patch (must be < max_k).
+            This decouples the receptive field (max_k neighbors seen by the model)
+            from the operator support (top_k edges in the assembled Laplacian).
+        symmetry_policy: How to symmetrize after top-k pruning. Only matters when top_k is set.
+            - "union": Keep edge if either direction was selected (default, most edges).
+            - "intersection": Keep edge only if both directions were selected (fewest edges).
 
     Returns:
         Tuple of (S, M):
@@ -232,6 +235,24 @@ def assemble_stiffness_and_mass_matrices(
 
     # Get number of vertices
     num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
+
+    # === STEP 0 (optional): Top-k pruning per patch ===
+    # Keep only the top_k highest weights per patch, masking out the rest.
+    if top_k is not None and top_k < max_k:
+        # For each patch, find the top_k highest weights among valid entries
+        # Set masked (invalid) weights to -inf so they're never selected
+        weights_for_topk = stiffness_weights.clone()
+        weights_for_topk[~attention_mask] = float('-inf')
+
+        # Get indices of top_k highest weights per patch
+        _, topk_indices = torch.topk(weights_for_topk, k=min(top_k, max_k), dim=1)
+
+        # Build new attention mask: only top_k entries are valid
+        topk_mask = torch.zeros_like(attention_mask)
+        topk_mask.scatter_(1, topk_indices, True)
+
+        # AND with original mask (in case top_k > actual valid count for some patches)
+        attention_mask = attention_mask & topk_mask
 
     # === STEP 1: Filter valid weights (GPU) ===
     weights_flat = stiffness_weights.flatten()  # (num_patches * max_k,)
@@ -309,8 +330,36 @@ def assemble_stiffness_and_mass_matrices(
     stiffness_csr = stiffness_coo.tocsr()
     stiffness_csr.sum_duplicates()
 
-    # Symmetrize: S = (S + S^T) / 2
-    stiffness_csr = 0.5 * (stiffness_csr + stiffness_csr.T)
+    # Symmetrize based on policy
+    if top_k is not None and symmetry_policy == "intersection":
+        # Intersection: only keep edges that appear in BOTH directions
+        # An edge (i,j) is kept only if both patch-i selected j AND patch-j selected i
+        S = stiffness_csr
+        S_T = S.T.tocsr()
+
+        # Non-zero pattern of S and S^T (ignoring diagonal)
+        S_pattern = S.copy()
+        S_pattern.data = np.ones_like(S_pattern.data)
+        S_T_pattern = S_T.copy()
+        S_T_pattern.data = np.ones_like(S_T_pattern.data)
+
+        # Intersection mask: element-wise multiply of patterns gives 1 only where both exist
+        intersection_mask = S_pattern.multiply(S_T_pattern)
+
+        # Apply mask: zero out entries not in intersection, then symmetrize
+        S_intersected = S.multiply(intersection_mask)
+        stiffness_csr = 0.5 * (S_intersected + S_intersected.T)
+
+        # Recompute diagonal to ensure zero row sums
+        stiffness_csr = stiffness_csr.tolil()
+        for i in range(num_vertices):
+            row = stiffness_csr.getrow(i).toarray().flatten()
+            off_diag_sum = row.sum() - row[i]
+            stiffness_csr[i, i] = -off_diag_sum
+        stiffness_csr = stiffness_csr.tocsr()
+    else:
+        # Union (default): keep edge if either direction selected it
+        stiffness_csr = 0.5 * (stiffness_csr + stiffness_csr.T)
 
     # === STEP 7: Build mass matrix (vectorized, no Python loop) ===
     center_indices_np = center_indices.cpu().numpy()
