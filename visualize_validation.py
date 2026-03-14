@@ -79,6 +79,7 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_geodesic_metrics,
     compute_exact_geodesics,
     ensure_psd,
+    sparse_solve,
     normalize_distances,
     build_pointcloud_grad_div_operators,
     edge_index_from_knn_indices,
@@ -1037,7 +1038,9 @@ class RealTimeEigenanalysisVisualizer:
         try:
             print(f"\nRecomputing Green's function for {method_key}...")
             _t_greens_start = time.perf_counter()
-            result = self.compute_greens_function(L, M, source_idx)
+            # Use GPU CG for PRED/NeLo, CPU scipy for GT/Robust
+            device = self.current_device if method_key in ('PRED', 'NeLo') else None
+            result = self.compute_greens_function(L, M, source_idx, device=device)
             if result is not None:
                 greens_values, residual = result
                 validation = self.validate_maximum_principle(
@@ -1150,7 +1153,8 @@ class RealTimeEigenanalysisVisualizer:
                             print(f"\nRecomputing Heat Method geodesic for PRED (learned G)...")
                             distances = compute_heat_geodesic_learned(
                                 S=L, M=M, G=self.current_learned_gradient_op,
-                                source_idx=source_idx, n_vertices=n
+                                source_idx=source_idx, n_vertices=n,
+                                device=self.current_device
                             )
                     else:
                         # Stiffness mode: use pcdiff operators
@@ -1158,7 +1162,8 @@ class RealTimeEigenanalysisVisualizer:
                             print(f"\nRecomputing Heat Method geodesic for PRED (pcdiff)...")
                             distances = compute_heat_geodesic_pointcloud(
                                 L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
-                                source_idx=source_idx, n_vertices=n
+                                source_idx=source_idx, n_vertices=n,
+                                device=self.current_device
                             )
 
             elif method_key == 'Robust':
@@ -1192,7 +1197,8 @@ class RealTimeEigenanalysisVisualizer:
                         print(f"\nRecomputing Heat Method geodesic for NeLo (pcdiff)...")
                         distances = compute_heat_geodesic_pointcloud(
                             L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
-                            source_idx=source_idx, n_vertices=n
+                            source_idx=source_idx, n_vertices=n,
+                            device=self.current_device
                         )
 
             if distances is not None:
@@ -1987,6 +1993,13 @@ class RealTimeEigenanalysisVisualizer:
         self.current_stiffness_weights = torch.from_numpy(new_inference_result['stiffness_weights'])
         self.current_areas = torch.from_numpy(new_inference_result['areas'])
 
+        # Weight distribution diagnostic for new k
+        if new_inference_result.get('attention_mask') is not None:
+            mask = torch.from_numpy(new_inference_result['attention_mask'])
+        else:
+            mask = torch.ones_like(self.current_stiffness_weights, dtype=torch.bool)
+        self._print_weight_distribution_diagnostic(self.current_stiffness_weights, mask)
+
         # Reassemble learned gradient operator if in gradient mode
         operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness')
         new_forward_result = new_inference_result.get('forward_result')
@@ -2523,6 +2536,80 @@ class RealTimeEigenanalysisVisualizer:
             'robust_vertex_areas': None
         }
 
+    def _print_weight_distribution_diagnostic(
+            self, stiffness_weights: torch.Tensor, attention_mask: torch.Tensor):
+        """
+        Print diagnostic statistics about the stiffness weight distribution.
+
+        Helps determine whether the model concentrates weight on a few neighbors
+        (sparse, good for pruning) or spreads it uniformly (dense, pruning loses info).
+
+        Args:
+            stiffness_weights: (num_patches, k) positive weights
+            attention_mask: (num_patches, k) bool mask for valid entries
+        """
+        w = stiffness_weights.float()
+        mask = attention_mask
+
+        # Mask invalid entries
+        w = w.masked_fill(~mask, 0.0)
+
+        # Per-patch statistics
+        k = w.shape[1]
+        w_sum = w.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        w_norm = w / w_sum  # normalized to probability distribution
+
+        # Entropy: 0 = all weight on one neighbor, log(k) = perfectly uniform
+        log_w = torch.where(w_norm > 1e-12, w_norm.log(), torch.zeros_like(w_norm))
+        entropy = -(w_norm * log_w).sum(dim=-1)  # (num_patches,)
+        max_entropy = float(np.log(k))
+
+        # Gini coefficient per patch: 0 = perfectly equal, 1 = all weight on one
+        w_sorted, _ = w.sort(dim=-1)
+        n = mask.sum(dim=-1).float()  # actual neighbors per patch
+        cumw = w_sorted.cumsum(dim=-1)
+        # Gini = 1 - 2 * (area under Lorenz curve) / (area under uniform)
+        indices = torch.arange(1, k + 1, device=w.device).float().unsqueeze(0)
+        gini = 1.0 - 2.0 * (cumw / w_sum).sum(dim=-1) / n + 1.0 / n
+
+        # Top-k concentration: what fraction of total weight is in top-N neighbors
+        w_desc, _ = w.sort(dim=-1, descending=True)
+        total = w_sum.squeeze(-1)
+        top1_frac = (w_desc[:, 0] / total) if k >= 1 else torch.zeros(1)
+        top3_frac = (w_desc[:, :min(3, k)].sum(dim=-1) / total) if k >= 3 else top1_frac
+        top6_frac = (w_desc[:, :min(6, k)].sum(dim=-1) / total) if k >= 6 else top3_frac
+
+        # Weight ratio: max / min (among valid entries)
+        w_valid = w.clone()
+        w_valid[~mask] = float('inf')
+        w_min_per_patch = w_valid.min(dim=-1).values
+        w_valid[~mask] = float('-inf')
+        w_max_per_patch = w_valid.max(dim=-1).values
+        ratio = (w_max_per_patch / w_min_per_patch.clamp(min=1e-12))
+
+        print(f"\n{'=' * 70}")
+        print(f"STIFFNESS WEIGHT DISTRIBUTION (k={k})")
+        print(f"{'=' * 70}")
+        print(f"  Raw weights:       mean={w[mask].mean():.4f}, std={w[mask].std():.4f}, "
+              f"min={w[mask].min():.4f}, max={w[mask].max():.4f}")
+        print(f"  Max/min ratio:     mean={ratio.mean():.1f}, median={ratio.median():.1f}, "
+              f"max={ratio.max():.1f}")
+        print(f"  Entropy:           mean={entropy.mean():.3f} / {max_entropy:.3f} "
+              f"({entropy.mean() / max_entropy * 100:.1f}% of uniform)")
+        print(f"                     min={entropy.min():.3f}, max={entropy.max():.3f}")
+        print(f"  Gini coefficient:  mean={gini.mean():.3f}, median={gini.median():.3f} "
+              f"(0=equal, 1=concentrated)")
+        print(f"  Weight concentration:")
+        print(f"    Top-1 / total:   mean={top1_frac.mean():.3f}, median={top1_frac.median():.3f}")
+        if k >= 3:
+            print(f"    Top-3 / total:   mean={top3_frac.mean():.3f}, median={top3_frac.median():.3f}")
+        if k >= 6:
+            print(f"    Top-6 / total:   mean={top6_frac.mean():.3f}, median={top6_frac.median():.3f}")
+        if k > 6:
+            remaining = 1.0 - top6_frac.mean()
+            print(f"    Remaining {k-6}:    mean={remaining:.3f} of total weight")
+        print(f"{'=' * 70}\n")
+
     def perform_model_inference(self, model: LaplacianTransformerModule, batch_data: Data, device: torch.device) -> Dict[str, Any]:
         """
         Perform model inference and compute predicted quantities.
@@ -2627,6 +2714,9 @@ class RealTimeEigenanalysisVisualizer:
             print(f"Got attention mask shape: {attention_mask.shape}")
             print(f"Got batch sizes: {batch_sizes}")
             print(f"Area statistics: mean={areas.mean():.6f}, std={areas.std():.6f}, min={areas.min():.6f}, max={areas.max():.6f}")
+
+            # === WEIGHT DISTRIBUTION DIAGNOSTIC ===
+            self._print_weight_distribution_diagnostic(stiffness_weights, attention_mask)
 
             # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
             batch_indices = getattr(batch_data, 'patch_idx', batch_data.batch)
@@ -3724,7 +3814,8 @@ class RealTimeEigenanalysisVisualizer:
             laplacian_matrix: scipy.sparse.csr_matrix,
             mass_matrix: Optional[scipy.sparse.csr_matrix],
             source_vertex_idx: int,
-            regularization: float = 1e-6
+            regularization: float = 1e-6,
+            device: Optional[torch.device] = None
     ) -> Optional[Tuple[np.ndarray, float]]:
         """
         Compute the harmonic Green's function by solving (L + ÃƒÅ½Ã‚ÂµM)g = ÃƒÅ½Ã‚Â´.
@@ -3792,10 +3883,7 @@ class RealTimeEigenanalysisVisualizer:
             A = L + adaptive_reg * M
 
             # Solve the linear system
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-                g_raw = scipy.sparse.linalg.spsolve(A, delta)
+            g_raw = sparse_solve(A, delta, device)
 
             if not np.isfinite(g_raw).all():
                 print(f"  [!] Solution contains NaN or Inf values")
@@ -4324,7 +4412,8 @@ class RealTimeEigenanalysisVisualizer:
                     print(f"  [!] WARNING: PRED Laplacian has negative diagonal entries - may indicate sign issue")
 
                 _t_greens_start = time.perf_counter()
-                result = self.compute_greens_function(L_pred, M_pred, source_vertex_idx)
+                result = self.compute_greens_function(L_pred, M_pred, source_vertex_idx,
+                                                      device=self.current_device)
 
                 if result is not None:
                     pred_greens, pred_residual = result
@@ -4395,7 +4484,8 @@ class RealTimeEigenanalysisVisualizer:
             print("\nComputing NeLo Green's function...")
             try:
                 _t_greens_start = time.perf_counter()
-                result = self.compute_greens_function(self.current_nelo_L, self.current_nelo_M, source_vertex_idx)
+                result = self.compute_greens_function(self.current_nelo_L, self.current_nelo_M, source_vertex_idx,
+                                                      device=self.current_device)
                 if result is not None:
                     nelo_greens, nelo_residual = result
                     results['NeLo'] = self.validate_maximum_principle(
@@ -4815,27 +4905,27 @@ class RealTimeEigenanalysisVisualizer:
         # These wrap the shared functions from geodesic_utils with timing/logging
         # =====================================================================
 
-        def compute_heat_geodesic_mesh_local(L, M, grad_op, face_areas, method_name, t=None):
+        def compute_heat_geodesic_mesh_local(L, M, grad_op, face_areas, method_name, t=None, device=None):
             """Wrapper around shared compute_heat_geodesic_mesh with timing."""
             start_time = time.time()
 
             # Use shared function from geodesic_utils
             distances = compute_heat_geodesic_mesh(
                 L=L, M=M, grad_op=grad_op, face_areas=face_areas,
-                source_idx=source_vertex_idx, n_vertices=n, t=t
+                source_idx=source_vertex_idx, n_vertices=n, t=t, device=device
             )
 
             elapsed_ms = (time.time() - start_time) * 1000
             return distances, t, elapsed_ms
 
-        def compute_heat_geodesic_pointcloud_local(L, M, grad_op, div_op, method_name, t=None):
+        def compute_heat_geodesic_pointcloud_local(L, M, grad_op, div_op, method_name, t=None, device=None):
             """Wrapper around shared compute_heat_geodesic_pointcloud with timing."""
             start_time = time.time()
 
             # Use shared function from geodesic_utils
             distances = compute_heat_geodesic_pointcloud(
                 L=L, M=M, grad_op=grad_op, div_op=div_op,
-                source_idx=source_vertex_idx, n_vertices=n, t=t
+                source_idx=source_vertex_idx, n_vertices=n, t=t, device=device
             )
 
             elapsed_ms = (time.time() - start_time) * 1000
@@ -4881,7 +4971,8 @@ class RealTimeEigenanalysisVisualizer:
                         start_time = time.time()
                         distances = compute_heat_geodesic_learned(
                             S=L_pred, M=M_pred, G=gradient_operator,
-                            source_idx=source_vertex_idx, n_vertices=n
+                            source_idx=source_vertex_idx, n_vertices=n,
+                            device=self.current_device
                         )
                         elapsed_ms = (time.time() - start_time) * 1000
 
@@ -4903,7 +4994,8 @@ class RealTimeEigenanalysisVisualizer:
                 if pc_grad_op is not None and pc_div_op is not None:
                     print(f"\nComputing Heat Method geodesic with PRED Laplacian (matched k-NN)...")
                     distances, t, elapsed_ms = compute_heat_geodesic_pointcloud_local(
-                        L_pred, M_pred, pc_grad_op, pc_div_op, "PRED"
+                        L_pred, M_pred, pc_grad_op, pc_div_op, "PRED",
+                        device=self.current_device
                     )
                     if distances is not None:
                         geodesic_distances["PRED"] = distances
@@ -4951,7 +5043,8 @@ class RealTimeEigenanalysisVisualizer:
             if nelo_grad_op is not None and nelo_div_op is not None:
                 print(f"\nComputing Heat Method geodesic with NeLo Laplacian (matched k={self.nelo_k})...")
                 distances, _t, elapsed_ms = compute_heat_geodesic_pointcloud_local(
-                    self.current_nelo_L, self.current_nelo_M, nelo_grad_op, nelo_div_op, "NeLo"
+                    self.current_nelo_L, self.current_nelo_M, nelo_grad_op, nelo_div_op, "NeLo",
+                    device=self.current_device
                 )
                 if distances is not None:
                     geodesic_distances["NeLo"] = distances

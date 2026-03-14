@@ -14,6 +14,7 @@ Used by:
 import numpy as np
 import scipy.sparse
 import scipy.sparse.linalg
+import torch
 from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
 
@@ -52,6 +53,85 @@ def ensure_psd(L: scipy.sparse.spmatrix) -> scipy.sparse.spmatrix:
     if np.median(diag) < 0:
         return -L
     return L
+
+
+def _scipy_to_torch_sparse(A: scipy.sparse.spmatrix, device: torch.device) -> torch.Tensor:
+    """Convert scipy sparse matrix to torch sparse COO tensor on the given device."""
+    A_coo = A.tocoo()
+    indices = torch.tensor(np.vstack([A_coo.row, A_coo.col]), dtype=torch.long, device=device)
+    values = torch.tensor(A_coo.data, dtype=torch.float64, device=device)
+    return torch.sparse_coo_tensor(indices, values, size=A_coo.shape).coalesce()
+
+
+def _cg_solve_gpu(
+    A: torch.Tensor,
+    b: torch.Tensor,
+    tol: float = 1e-6,
+    max_iter: int = 1000
+) -> torch.Tensor:
+    """
+    Conjugate Gradient solver for SPD sparse systems on GPU.
+
+    Solves Ax = b where A is symmetric positive definite.
+
+    Args:
+        A: Sparse torch tensor (N, N) on GPU
+        b: Dense torch tensor (N,) on GPU
+        tol: Convergence tolerance (relative residual)
+        max_iter: Maximum iterations
+
+    Returns:
+        Solution x as dense torch tensor (N,) on GPU
+    """
+    x = torch.zeros_like(b)
+    r = b.clone()
+    p = r.clone()
+    r_dot = r.dot(r)
+    r0_norm = r.norm()
+
+    if r0_norm < 1e-15:
+        return x
+
+    for i in range(max_iter):
+        Ap = torch.sparse.mm(A, p.unsqueeze(1)).squeeze(1)
+        alpha = r_dot / p.dot(Ap)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        r_dot_new = r.dot(r)
+
+        if r.norm() / r0_norm < tol:
+            break
+
+        beta = r_dot_new / r_dot
+        p = r + beta * p
+        r_dot = r_dot_new
+
+    return x
+
+
+def sparse_solve(
+    A: scipy.sparse.spmatrix,
+    b: np.ndarray,
+    device: Optional[torch.device] = None
+) -> np.ndarray:
+    """
+    Solve sparse linear system Ax = b using scipy's direct solver.
+
+    The device parameter is accepted for API compatibility but currently unused —
+    all solves go through scipy.sparse.linalg.spsolve on CPU.
+
+    Args:
+        A: Sparse matrix (N, N)
+        b: Right-hand side (N,)
+        device: Unused (kept for API compatibility)
+
+    Returns:
+        Solution x as numpy array (N,)
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+        return scipy.sparse.linalg.spsolve(A.tocsc(), b)
 
 
 @dataclass
@@ -252,7 +332,8 @@ def compute_heat_geodesic_pointcloud(
     div_op: scipy.sparse.spmatrix,
     source_idx: int,
     n_vertices: int,
-    t: Optional[float] = None
+    t: Optional[float] = None,
+    device: Optional[torch.device] = None
 ) -> Optional[np.ndarray]:
     """
     Compute geodesic distances using Heat Method with point cloud operators.
@@ -290,7 +371,6 @@ def compute_heat_geodesic_pointcloud(
         t = h ** 2
 
     try:
-        import warnings
 
         # Step I: Heat diffusion
         # Solve (M + t*L) u = delta_source
@@ -298,9 +378,7 @@ def compute_heat_geodesic_pointcloud(
         delta[source_idx] = 1.0
 
         A = M + t * L
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-            u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
+        u = sparse_solve(A, delta, device)
 
         if not np.all(np.isfinite(u)):
             print(f"  [!] Heat Method (pointcloud): heat diffusion produced non-finite values, skipping")
@@ -324,10 +402,8 @@ def compute_heat_geodesic_pointcloud(
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-            phi_pos = scipy.sparse.linalg.spsolve(L_reg.tocsc(), div_X)
-            phi_neg = scipy.sparse.linalg.spsolve(L_reg.tocsc(), -div_X)
+        phi_pos = sparse_solve(L_reg, div_X, device)
+        phi_neg = sparse_solve(L_reg, -div_X, device)
 
         # The correct sign should have the source at or near the minimum
         phi_pos_shifted = phi_pos - phi_pos.min()
@@ -360,7 +436,8 @@ def compute_heat_geodesic_mesh(
     face_areas: np.ndarray,
     source_idx: int,
     n_vertices: int,
-    t: Optional[float] = None
+    t: Optional[float] = None,
+    device: Optional[torch.device] = None
 ) -> Optional[np.ndarray]:
     """
     Compute geodesic distances using Heat Method with mesh-based gradient.
@@ -393,16 +470,13 @@ def compute_heat_geodesic_mesh(
         t = h ** 2
 
     try:
-        import warnings
 
         # Step I: Heat diffusion
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
         A = M + t * L
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-            u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
+        u = sparse_solve(A, delta, device)
 
         if not np.all(np.isfinite(u)):
             print(f"  [!] Heat Method (mesh): heat diffusion produced non-finite values, skipping")
@@ -435,10 +509,8 @@ def compute_heat_geodesic_mesh(
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-            phi_pos = scipy.sparse.linalg.spsolve(L_reg.tocsc(), rhs)
-            phi_neg = scipy.sparse.linalg.spsolve(L_reg.tocsc(), -rhs)
+        phi_pos = sparse_solve(L_reg, rhs, device)
+        phi_neg = sparse_solve(L_reg, -rhs, device)
 
         if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
             print(f"  [!] Heat Method (mesh): Poisson solve produced non-finite values, skipping")
@@ -470,7 +542,8 @@ def compute_heat_geodesic_learned(
     G: scipy.sparse.spmatrix,
     source_idx: int,
     n_vertices: int,
-    t: Optional[float] = None
+    t: Optional[float] = None,
+    device: Optional[torch.device] = None
 ) -> Optional[np.ndarray]:
     """
     Compute geodesic distances using Heat Method with fully learned operators.
@@ -522,16 +595,13 @@ def compute_heat_geodesic_learned(
         t = h ** 2
 
     try:
-        import warnings
 
         # Step 1: Heat diffusion â€” solve (M + tS) u = Î´_source
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
         A = M + t * S
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-            u = scipy.sparse.linalg.spsolve(A.tocsc(), delta)
+        u = sparse_solve(A, delta, device)
 
         if not np.all(np.isfinite(u)):
             print(f"  [!] Heat Method (learned): heat diffusion produced non-finite values, skipping")
@@ -556,10 +626,8 @@ def compute_heat_geodesic_learned(
         S_reg = S + eps * scipy.sparse.eye(n)
 
         # Try both signs to handle sign ambiguity in divergence
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-            phi_pos = scipy.sparse.linalg.spsolve(S_reg.tocsc(), rhs)
-            phi_neg = scipy.sparse.linalg.spsolve(S_reg.tocsc(), -rhs)
+        phi_pos = sparse_solve(S_reg, rhs, device)
+        phi_neg = sparse_solve(S_reg, -rhs, device)
 
         if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
             print(f"  [!] Heat Method (learned): Poisson solve produced non-finite values, skipping")
