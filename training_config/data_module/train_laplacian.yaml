@@ -13,7 +13,7 @@ module:
       order_range: [2, 3]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
-          num_points_range: 8
+          num_points_range: 60
       conv_k_nearest: null
       pose_transformers: null
 #        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
@@ -34,14 +34,21 @@ module:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        max_meshes: 60
-        file_size_range_mb: [0.3, 5]
+
+        mesh_folder_path: 'F:\input\Thingi10k'
+        max_meshes: 100
+        file_size_range_mb: [0.5, 4]
+        num_components_range: [1, 1]
+
+#        mesh_folder_paths:
+#          - 'F:\input\mpz14'
+#          - 'F:\input\deftransfer'
+#          - 'F:\input\shrec15'
+#        max_meshes: 60
+#        file_size_range_mb: [0.3, 5]
+
         shuffle: True
-        mesh_folder_paths:
-          - 'F:\input\mpz14'
-          - 'F:\input\deftransfer'
-          - 'F:\input\shrec15'
-        k: 6
+        k: 8
         pose_transformers:
           - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
         num_geodesic_sources: 1

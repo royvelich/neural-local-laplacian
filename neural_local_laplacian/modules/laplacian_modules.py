@@ -982,6 +982,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             normals=getattr(batch_data, 'normal', None),
             attention_mask=forward_result['attention_mask'],
             areas=forward_result['areas'],
+            stiffness_weights=forward_result['stiffness_weights'],
         )
 
         # Apply all losses through unified loss_configs pipeline

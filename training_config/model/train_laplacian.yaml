@@ -21,7 +21,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 5.0
+      weight: 2.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
@@ -36,3 +36,7 @@ module:
         num_random_probes: 1000
         probe_mode: 'random'
       weight: 0.25
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.WeightEntropyLoss
+#      weight: 5.0

@@ -28,6 +28,7 @@ class LossContext:
     normals: Optional[torch.Tensor] = None
     attention_mask: Optional[torch.Tensor] = None
     areas: Optional[torch.Tensor] = None
+    stiffness_weights: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -543,5 +544,124 @@ class GramOffDiagonalLoss(nn.Module):
             return per_patch.sum()
         elif self.reduction == 'none':
             return per_patch
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+class WeightEntropyLoss(nn.Module):
+    """
+    Sparsity-inducing loss that penalizes high entropy in stiffness weight distributions.
+
+    Normalizes the per-patch stiffness weights into a probability distribution
+    and computes the Shannon entropy. High entropy means weights are spread
+    uniformly across all k neighbors (dense Laplacian, slow downstream solves).
+    Low entropy means weight is concentrated on a few important neighbors
+    (sparse Laplacian, enabling effective top-k pruning).
+
+    The loss is the normalized entropy: H / log(k), so it's in [0, 1] regardless of k.
+    At entropy=0, all weight is on one neighbor. At entropy=1, weights are perfectly uniform.
+
+    Typical values before training with this loss: ~0.97 (nearly uniform).
+    Target after training: ~0.5-0.7 (concentrated but not degenerate).
+    """
+
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-12):
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        """
+        Compute normalized entropy of stiffness weight distribution.
+
+        Args:
+            ctx: LossContext with stiffness_weights and attention_mask
+
+        Returns:
+            Scalar loss in [0, 1] (normalized entropy)
+        """
+        w = ctx.stiffness_weights  # (B, k), positive
+        mask = ctx.attention_mask   # (B, k)
+
+        # Mask invalid entries
+        w = w.masked_fill(~mask, 0.0)
+
+        # Normalize to probability distribution per patch
+        w_sum = w.sum(dim=-1, keepdim=True).clamp(min=self.eps)
+        p = w / w_sum  # (B, k)
+
+        # Shannon entropy: H = -sum(p * log(p))
+        log_p = torch.where(p > self.eps, p.log(), torch.zeros_like(p))
+        entropy = -(p * log_p).sum(dim=-1)  # (B,)
+
+        # Normalize by max entropy log(k) so loss is in [0, 1]
+        k = mask.sum(dim=-1).float().clamp(min=1.0)  # actual k per patch
+        max_entropy = k.log().clamp(min=self.eps)
+        normalized_entropy = entropy / max_entropy  # (B,)
+
+        if self.reduction == 'mean':
+            return normalized_entropy.mean()
+        elif self.reduction == 'sum':
+            return normalized_entropy.sum()
+        elif self.reduction == 'none':
+            return normalized_entropy
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class WeightL1Loss(nn.Module):
+    """
+    L1 sparsity loss on stiffness weights.
+
+    Penalizes the mean absolute value of weights, encouraging small weights
+    to go to zero. Simpler than entropy but applies uniform pressure on all
+    weights rather than encouraging a peaked distribution.
+
+    The loss is the coefficient of variation (std/mean), which is
+    scale-invariant and measures relative spread. For uniform weights CV ~ 0,
+    for peaked weights CV >> 0. We return 1/(1+CV) so the loss is in [0, 1]
+    and lower is sparser.
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        """
+        Compute inverse coefficient of variation of weights per patch.
+
+        Args:
+            ctx: LossContext with stiffness_weights and attention_mask
+
+        Returns:
+            Scalar loss in [0, 1] (lower = more peaked weights)
+        """
+        w = ctx.stiffness_weights  # (B, k), positive
+        mask = ctx.attention_mask   # (B, k)
+
+        # Mask invalid entries
+        w = w.masked_fill(~mask, 0.0)
+        k = mask.sum(dim=-1).float().clamp(min=1.0)  # (B,)
+
+        # Per-patch mean and std
+        w_sum = w.sum(dim=-1)
+        w_mean = w_sum / k  # (B,)
+        w_sq_sum = (w ** 2).sum(dim=-1)
+        w_var = w_sq_sum / k - w_mean ** 2  # (B,)
+        w_std = w_var.clamp(min=0).sqrt()  # (B,)
+
+        # Coefficient of variation: std/mean
+        cv = w_std / w_mean.clamp(min=1e-12)  # (B,)
+
+        # Inverse: 1/(1+CV), so lower = more spread, higher = more peaked
+        # We want to MINIMIZE this (penalize low CV = uniform weights)
+        inv_cv = 1.0 / (1.0 + cv)  # (B,), in [0, 1]
+
+        if self.reduction == 'mean':
+            return inv_cv.mean()
+        elif self.reduction == 'sum':
+            return inv_cv.sum()
+        elif self.reduction == 'none':
+            return inv_cv
         else:
             raise ValueError(f"Invalid reduction mode: {self.reduction}")

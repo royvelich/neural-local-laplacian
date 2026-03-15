@@ -469,6 +469,10 @@ class RealTimeEigenanalysisVisualizer:
         self.nelo_pipeline = None          # loaded once at startup via load_nelo_pipeline(); None = disabled
         self.nelo_k = 30                    # independent k slider (default = 30, matching PRED/Robust)
 
+        # Weight neighborhood visualization (FPS-sampled vertices + their kNN colored by weight)
+        self._weight_nbr_sample_indices: Optional[np.ndarray] = None
+        self._weight_nbr_num_samples = 8
+
         self.current_nelo_L = None
         self.current_nelo_M = None
         self.current_nelo_eigenvectors = None
@@ -1325,6 +1329,7 @@ class RealTimeEigenanalysisVisualizer:
         self._exact_geodesic_distances = None
         self._pc_grad_op = None
         self._pc_div_op = None
+        self._weight_nbr_sample_indices = None
 
         # Force garbage collection
         import gc
@@ -2050,6 +2055,9 @@ class RealTimeEigenanalysisVisualizer:
                 self.current_predicted_data, self.current_inference_result
             )
 
+        # Refresh weight neighborhood visualizations (same FPS samples, new k/weights)
+        self._add_weight_neighborhood_visualization()
+
         # STEP 5: Recompute all downstream validations (Green's fn, geodesics, sparsity)
         print(f"STEP 5: Recomputing downstream validations for PRED...")
         self._recompute_validations_after_k_change("PRED")
@@ -2536,6 +2544,118 @@ class RealTimeEigenanalysisVisualizer:
             'robust_vertex_areas': None
         }
 
+    def _add_weight_neighborhood_visualization(self):
+        """
+        Visualize PRED stiffness weights on k-NN neighborhoods for FPS-sampled vertices.
+
+        For each sampled vertex, registers:
+        - A point cloud of its k-NN neighbors colored by stiffness weight (viridis)
+        - A separate red point cloud for the center vertex
+
+        Uses stored FPS sample indices (computed once per mesh, reused on k-change).
+        """
+        import polyscope as ps
+
+        vertices = self.current_original_vertices
+        weights = self.current_stiffness_weights  # (N, k)
+        vertex_indices = self.current_vertex_indices  # (N*k,) flat
+        center_indices = self.current_center_indices  # (N,)
+        batch_indices = self.current_batch_indices    # (N*k,)
+
+        if vertices is None or weights is None or vertex_indices is None:
+            return
+
+        # Move to CPU/numpy
+        weights_np = weights.cpu().numpy() if torch.is_tensor(weights) else weights
+        vertex_indices_np = vertex_indices.cpu().numpy() if torch.is_tensor(vertex_indices) else vertex_indices
+        center_indices_np = center_indices.cpu().numpy() if torch.is_tensor(center_indices) else center_indices
+        batch_indices_np = batch_indices.cpu().numpy() if torch.is_tensor(batch_indices) else batch_indices
+
+        n_patches = weights_np.shape[0]
+        k = weights_np.shape[1]
+
+        # Compute batch sizes and starts to index into flat vertex_indices
+        batch_sizes = np.bincount(batch_indices_np, minlength=n_patches)
+        starts = np.concatenate([[0], np.cumsum(batch_sizes)[:-1]])
+
+        # FPS sample indices: compute once per mesh, reuse on k-change
+        if self._weight_nbr_sample_indices is None:
+            self._weight_nbr_sample_indices = select_multiple_geodesic_sources(
+                vertices, num_sources=self._weight_nbr_num_samples,
+                method="farthest_point_sampling"
+            )
+
+        sample_indices = self._weight_nbr_sample_indices
+
+        # First remove old neighborhood visualizations
+        self._remove_weight_neighborhood_visualizations()
+
+        # Global min/max for consistent color scale across all samples
+        all_weights = weights_np.flatten()
+        w_min, w_max = float(all_weights.min()), float(all_weights.max())
+
+        print(f"\nAdding weight neighborhood visualizations for {len(sample_indices)} FPS-sampled vertices (k={k})...")
+
+        for idx, center_vtx in enumerate(sample_indices):
+            # Find the patch index for this center vertex
+            # center_indices maps patch_i -> vertex_id, so we need to find patch with this vertex
+            patch_matches = np.where(center_indices_np == center_vtx)[0]
+            if len(patch_matches) == 0:
+                continue
+            patch_idx = patch_matches[0]
+
+            # Get neighbor vertex indices for this patch
+            start = starts[patch_idx]
+            actual_k = batch_sizes[patch_idx]
+            neighbor_vtx_indices = vertex_indices_np[start:start + actual_k]
+
+            # Get neighbor positions and weights
+            neighbor_positions = vertices[neighbor_vtx_indices]  # (actual_k, 3)
+            patch_weights = weights_np[patch_idx, :actual_k]      # (actual_k,)
+
+            # Register neighbor point cloud colored by weight
+            nbr_name = f"W_Nbr {idx} (vtx {center_vtx})"
+            pc = ps.register_point_cloud(
+                name=nbr_name,
+                points=neighbor_positions,
+                radius=0.004,
+                enabled=True
+            )
+            pc.add_scalar_quantity(
+                name="stiffness_weight",
+                values=patch_weights,
+                enabled=True,
+                cmap='viridis'
+            )
+
+            # Register center vertex as red dot
+            center_name = f"W_Ctr {idx} (vtx {center_vtx})"
+            ps.register_point_cloud(
+                name=center_name,
+                points=vertices[center_vtx:center_vtx + 1],
+                radius=0.006,
+                color=(1.0, 0.0, 0.0),
+                enabled=True
+            )
+
+        print(f"  Added {len(sample_indices)} neighborhood visualizations")
+
+    def _remove_weight_neighborhood_visualizations(self):
+        """Remove all existing weight neighborhood point clouds."""
+        import polyscope as ps
+        try:
+            all_structures = ps.get_all_structures()
+        except Exception:
+            return
+
+        for kind_dict in all_structures.values():
+            for name in list(kind_dict.keys()):
+                if name.startswith("W_Nbr ") or name.startswith("W_Ctr "):
+                    try:
+                        ps.remove_point_cloud(name)
+                    except Exception:
+                        pass
+
     def _print_weight_distribution_diagnostic(
             self, stiffness_weights: torch.Tensor, attention_mask: torch.Tensor):
         """
@@ -2608,6 +2728,18 @@ class RealTimeEigenanalysisVisualizer:
         if k > 6:
             remaining = 1.0 - top6_frac.mean()
             print(f"    Remaining {k-6}:    mean={remaining:.3f} of total weight")
+
+        # Per-position average weight (is 1st neighbor heavier than k-th?)
+        # w_norm columns correspond to kNN order: col 0 = nearest, col k-1 = farthest
+        per_pos_mean = w_norm.mean(dim=0)  # (k,)
+        uniform_val = 1.0 / k
+        print(f"  Per-position avg weight (kNN order, uniform={uniform_val:.4f}):")
+        # Print in compact rows of 10
+        for row_start in range(0, k, 10):
+            row_end = min(row_start + 10, k)
+            vals = [f"{per_pos_mean[i]:.4f}" for i in range(row_start, row_end)]
+            labels = [f"{i:>2}" for i in range(row_start, row_end)]
+            print(f"    pos [{row_start:>2}-{row_end-1:>2}]: {' '.join(vals)}")
         print(f"{'=' * 70}\n")
 
     def perform_model_inference(self, model: LaplacianTransformerModule, batch_data: Data, device: torch.device) -> Dict[str, Any]:
@@ -5426,6 +5558,10 @@ class RealTimeEigenanalysisVisualizer:
             )
 
             self.add_comprehensive_curvature_visualizations(mesh_structure, gt_data, predicted_data, inference_result)
+
+            # Add weight neighborhood visualizations (FPS-sampled vertices)
+            self._weight_nbr_sample_indices = None  # reset for new mesh
+            self._add_weight_neighborhood_visualization()
 
             # Add mesh reconstructions using eigenvectors
             print(f"\nSTEP 7: Computing and visualizing mesh reconstructions")
