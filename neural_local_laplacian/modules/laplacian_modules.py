@@ -41,14 +41,16 @@ import trimesh
 from pyFM.mesh import TriMesh
 
 # neural laplacian
-from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, assemble_gradient_operator, compute_laplacian_eigendecomposition
+from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, assemble_gradient_operator, compute_laplacian_eigendecomposition, build_patches_from_vertices
 from neural_local_laplacian.modules.losses import LossConfig, LossContext
 from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_pointcloud,
     compute_heat_geodesic_learned,
     compute_geodesic_metrics,
-    compute_multisource_geodesic_metrics
+    compute_multisource_geodesic_metrics,
+    build_pointcloud_grad_div_operators,
+    edge_index_from_knn_indices
 )
 
 
@@ -1091,18 +1093,27 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         Validate a single mesh by comparing predicted vs ground-truth eigendecomposition
         and geodesic distances.
 
-        Uses the generalized eigenvalue problem S @ v = lambda * M @ v where:
-        - S is the symmetric stiffness matrix
-        - M is the diagonal mass matrix
+        MeshDataset now returns raw mesh data (vertices, faces, normals).
+        Patch extraction (kNN) happens here on GPU via build_patches_from_vertices.
 
         Args:
-            mesh_data: PyTorch Geometric Data object for a single mesh
+            mesh_data: Data object with raw_vertices, raw_faces, gt_eigen, geodesic_data, etc.
 
         Returns:
             Dictionary with validation metrics for this mesh
         """
+        # Get device from model parameters
+        device = next(self.parameters()).device
+
+        # Extract raw vertices and build patches on GPU
+        vertices = mesh_data.raw_vertices  # (N, 3) tensor
+        k = int(mesh_data.k_neighbors) if hasattr(mesh_data, 'k_neighbors') else 20
+
+        patch_data = build_patches_from_vertices(vertices, k, device=device)
+
         # Convert single Data to Batch for forward pass
-        mesh_batch = Batch.from_data_list([mesh_data])
+        mesh_batch = Batch.from_data_list([patch_data])
+        mesh_batch = mesh_batch.to(device)
         forward_result = self.forward(mesh_batch)
 
         # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
@@ -1243,9 +1254,17 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                         n_vertices=n_vertices
                     )
             else:
-                # === Stiffness mode: frankenstein heat method (pcdiff grad/div) ===
-                pc_grad_op = geodesic_data['pc_grad_op']
-                pc_div_op = geodesic_data['pc_div_op']
+                # === Stiffness mode: build pcdiff operators from kNN connectivity ===
+                try:
+                    vertices_np = mesh_data.raw_vertices.cpu().numpy() if torch.is_tensor(mesh_data.raw_vertices) else mesh_data.raw_vertices
+                    vertex_indices_np = mesh_batch.vertex_indices.cpu().numpy()
+                    center_indices_np = mesh_batch.center_indices.cpu().numpy()
+                    batch_indices_np = (getattr(mesh_batch, 'patch_idx', mesh_batch.batch)).cpu().numpy()
+                    k_val = int(np.bincount(batch_indices_np).max())
+                    edge_index = edge_index_from_knn_indices(vertex_indices_np, center_indices_np, k_val)
+                    pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices_np, edge_index)
+                except Exception:
+                    return {}
 
                 def compute_pred_geodesics(source_idx):
                     return compute_heat_geodesic_pointcloud(

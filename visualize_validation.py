@@ -70,7 +70,8 @@ from neural_local_laplacian.utils.utils import (
     normalize_mesh_vertices,
     assemble_stiffness_and_mass_matrices,
     assemble_gradient_operator,
-    compute_laplacian_eigendecomposition
+    compute_laplacian_eigendecomposition,
+    build_patches_from_vertices
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_pointcloud,
@@ -1550,7 +1551,8 @@ class RealTimeEigenanalysisVisualizer:
         """
         Extract k-NN patches from mesh vertices for model inference.
 
-        This replicates MeshDataset._extract_all_patches logic with configurable k.
+        Uses torch_geometric.nn.pool.knn_graph on GPU for fast neighbor search,
+        falling back to sklearn on CPU if unavailable.
 
         Args:
             vertices: Mesh vertices of shape (N, 3)
@@ -1559,24 +1561,53 @@ class RealTimeEigenanalysisVisualizer:
         Returns:
             Data object ready for model inference
         """
-        from sklearn.neighbors import NearestNeighbors
         from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
 
         num_vertices = len(vertices)
 
-        # Build k-NN index
-        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices)
-        distances, neighbor_indices = nbrs.kneighbors(vertices)  # Shape: (N, k+1)
+        # Try GPU kNN via PyG (much faster for large meshes)
+        device = self.current_device if self.current_device is not None else torch.device('cpu')
+        use_gpu_knn = device.type == 'cuda'
 
-        # Remove center point from neighbors (vectorized)
-        center_positions = np.arange(num_vertices)[:, np.newaxis]
-        is_center_mask = neighbor_indices == center_positions
-        keep_mask = ~is_center_mask
-        keep_positions = np.cumsum(keep_mask, axis=1)
-        final_mask = (keep_positions <= k) & keep_mask
+        if use_gpu_knn:
+            try:
+                from torch_geometric.nn.pool import knn_graph as pyg_knn_graph
 
-        neighbor_indices_flat = neighbor_indices[final_mask]
-        neighbor_indices_filtered = neighbor_indices_flat.reshape(num_vertices, k)
+                # Move vertices to GPU
+                pos_gpu = torch.from_numpy(vertices).float().to(device)
+
+                # knn_graph returns edge_index (2, N*k): [0]=center, [1]=neighbor
+                edge_index = pyg_knn_graph(pos_gpu, k=k, loop=False, flow='source_to_target')
+
+                # Reshape neighbor indices to (N, k)
+                # edge_index[1] contains neighbor vertex indices, grouped by center
+                neighbor_indices_filtered = edge_index[1].reshape(num_vertices, k).cpu().numpy()
+
+                if not getattr(self, '_logged_gpu_knn', False):
+                    print("  [kNN] Using torch_geometric knn_graph on GPU")
+                    self._logged_gpu_knn = True
+
+            except (ImportError, RuntimeError) as e:
+                if not getattr(self, '_logged_gpu_knn_fail', False):
+                    print(f"  [kNN] GPU knn_graph failed ({e}), using sklearn CPU fallback")
+                    self._logged_gpu_knn_fail = True
+                use_gpu_knn = False
+
+        if not use_gpu_knn:
+            from sklearn.neighbors import NearestNeighbors
+
+            nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices)
+            distances, neighbor_indices = nbrs.kneighbors(vertices)  # Shape: (N, k+1)
+
+            # Remove center point from neighbors (vectorized)
+            center_positions = np.arange(num_vertices)[:, np.newaxis]
+            is_center_mask = neighbor_indices == center_positions
+            keep_mask = ~is_center_mask
+            keep_positions = np.cumsum(keep_mask, axis=1)
+            final_mask = (keep_positions <= k) & keep_mask
+
+            neighbor_indices_flat = neighbor_indices[final_mask]
+            neighbor_indices_filtered = neighbor_indices_flat.reshape(num_vertices, k)
 
         # Extract neighbor positions and translate to origin
         all_neighbor_positions = vertices[neighbor_indices_filtered]  # (N, k, 3)
@@ -1961,12 +1992,17 @@ class RealTimeEigenanalysisVisualizer:
         print(f"STEP 1: Re-extracting patches with k={new_k}...")
 
         # === TIME: PRED patch extraction (k-NN search + data preparation) ===
+        if self.current_device is not None and self.current_device.type == 'cuda':
+            torch.cuda.synchronize()
         t_extraction_start = time.perf_counter()
 
-        new_patch_data = self._extract_patches_for_mesh_with_k(
-            self.current_original_vertices, new_k
+        new_patch_data = build_patches_from_vertices(
+            torch.from_numpy(self.current_original_vertices).float(),
+            new_k, device=self.current_device
         )
 
+        if self.current_device is not None and self.current_device.type == 'cuda':
+            torch.cuda.synchronize()
         t_extraction_end = time.perf_counter()
         pred_extraction_time = t_extraction_end - t_extraction_start
         self.timing_results.pred_patch_extraction_time = pred_extraction_time
@@ -5351,12 +5387,12 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"Mesh file: {Path(mesh_file_path).name}")
         print(f"Original vertices: {original_num_vertices}")
-        print(f"Total patch points: {len(data.pos)}")
-        print(f"Number of patches: {len(data.center_indices)}")
 
-        # Calculate original k from dataset
-        original_k = len(data.pos) // len(data.center_indices)
-        print(f"Original k (from dataset): {original_k}")
+        # New MeshDataset format: raw_vertices instead of patches
+        num_vertices = int(data.num_mesh_vertices[0]) if hasattr(data, 'num_mesh_vertices') else len(data.raw_vertices)
+        original_k = int(data.k_neighbors) if hasattr(data, 'k_neighbors') else 30
+        print(f"Mesh vertices: {num_vertices}")
+        print(f"Dataset k: {original_k}")
 
         # STEP 2: Load original mesh for GT computation
         print(f"\nSTEP 2: Loading original mesh for GT computation")
@@ -5368,15 +5404,20 @@ class RealTimeEigenanalysisVisualizer:
                   f"(likely degenerate triangles), skipping this mesh")
             return False
 
-        # STEP 2.5: Re-extract patches with PRED k for timing comparison
-        # (MeshDataset does k-NN during data loading, but we need to time it for comparison
-        # since robust_laplacian includes k-NN search in its timing)
+        # STEP 2.5: Build patches with PRED k using GPU kNN
         pred_k = self._initial_k_pred
         print(f"\nSTEP 2.5: Extracting patches with k={pred_k} (for timing comparison)...")
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
         t_extraction_start = time.perf_counter()
 
-        patch_data = self._extract_patches_for_mesh_with_k(gt_data['vertices'], pred_k)
+        patch_data = build_patches_from_vertices(
+            torch.from_numpy(gt_data['vertices']).float(), pred_k, device=device
+        )
 
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
         t_extraction_end = time.perf_counter()
         pred_extraction_time = t_extraction_end - t_extraction_start
         self.timing_results.pred_patch_extraction_time = pred_extraction_time
@@ -6422,7 +6463,7 @@ class RealTimeEigenanalysisVisualizer:
             first_data = first_batch[0]
         else:
             first_data = first_batch
-        actual_k = len(first_data.pos) // len(first_data.center_indices)
+        actual_k = int(first_data.k_neighbors) if hasattr(first_data, 'k_neighbors') else 30
         print(f"Detected k={actual_k} from dataset")
 
         # Warmup for torch.compile with ACTUAL k from dataset

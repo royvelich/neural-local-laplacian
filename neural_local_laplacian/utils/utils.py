@@ -12,7 +12,125 @@ import torch
 import numpy as np
 
 # torch geometric
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch, Data
+
+
+def build_patches_from_vertices(
+    vertices: torch.Tensor,
+    k: int,
+    device: Optional[torch.device] = None
+) -> Data:
+    """
+    Build k-NN patches from mesh vertices, ready for model inference.
+
+    Uses GPU-accelerated kNN (torch_geometric.nn.pool.knn_graph) when device is CUDA,
+    with automatic fallback to sklearn on CPU. When on GPU, all operations stay on GPU
+    (no CPU roundtrips).
+
+    Args:
+        vertices: Vertex positions as torch tensor (N, 3), any device
+        k: Number of nearest neighbors per vertex
+        device: Target device. If CUDA, uses GPU kNN and keeps tensors on GPU.
+            If None, uses CPU sklearn.
+
+    Returns:
+        Data object (on target device) with:
+        - pos: (N*k, 3) center-subtracted neighbor positions
+        - x: (N*k, 3) same as pos (shared, not cloned)
+        - patch_idx: (N*k,) patch assignment indices
+        - vertex_indices: (N*k,) global vertex indices of neighbors
+        - center_indices: (N,) center vertex indices (0..N-1)
+        - neighbor_index_matrix: (N, k) neighbor indices per vertex
+    """
+    from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
+
+    if not torch.is_tensor(vertices):
+        vertices = torch.from_numpy(np.ascontiguousarray(vertices)).float()
+
+    num_vertices = len(vertices)
+    k = int(k)
+    use_gpu = device is not None and device.type == 'cuda'
+
+    # =========================================================================
+    # GPU path: everything stays on GPU, no numpy
+    # =========================================================================
+    if use_gpu:
+        try:
+            from torch_geometric.nn.pool import knn_graph as pyg_knn_graph
+
+            pos_gpu = vertices.float().to(device)
+
+            # GPU kNN: edge_index[0]=neighbor (source), edge_index[1]=center (target)
+            edge_index = pyg_knn_graph(pos_gpu, k=k, loop=False, flow='source_to_target')
+            neighbor_matrix = edge_index[0].reshape(num_vertices, k)  # (N, k) on GPU
+
+            if not getattr(build_patches_from_vertices, '_logged_gpu_knn', False):
+                print("  [kNN] Using torch_geometric knn_graph on GPU")
+                build_patches_from_vertices._logged_gpu_knn = True
+
+            # Build patch positions on GPU (no numpy)
+            neighbor_positions = pos_gpu[neighbor_matrix]           # (N, k, 3)
+            center_expanded = pos_gpu.unsqueeze(1)                  # (N, 1, 3)
+            patch_positions = neighbor_positions - center_expanded  # (N, k, 3)
+
+            # Flatten for PyG — all on GPU
+            pos_flat = patch_positions.reshape(-1, 3)                          # (N*k, 3)
+            vertex_indices = neighbor_matrix.reshape(-1)                       # (N*k,)
+            center_indices = torch.arange(num_vertices, device=device)         # (N,)
+            patch_idx = torch.arange(num_vertices, device=device).repeat_interleave(k)  # (N*k,)
+
+            data = MeshPatchData(
+                pos=pos_flat,
+                x=pos_flat,  # shared reference, not a clone
+                patch_idx=patch_idx,
+                vertex_indices=vertex_indices,
+                center_indices=center_indices
+            )
+            data.neighbor_index_matrix = neighbor_matrix
+            return data
+
+        except (ImportError, RuntimeError) as e:
+            if not getattr(build_patches_from_vertices, '_logged_gpu_knn_fail', False):
+                print(f"  [kNN] GPU knn_graph failed ({e}), using sklearn CPU fallback")
+                build_patches_from_vertices._logged_gpu_knn_fail = True
+
+    # =========================================================================
+    # CPU fallback path: sklearn + numpy
+    # =========================================================================
+    from sklearn.neighbors import NearestNeighbors
+    vertices_np = vertices.cpu().numpy() if vertices.is_cuda else vertices.numpy()
+
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
+    _, neighbor_indices = nbrs.kneighbors(vertices_np)
+
+    # Remove self from neighbors
+    center_positions = np.arange(num_vertices)[:, np.newaxis]
+    is_center = neighbor_indices == center_positions
+    keep = ~is_center
+    keep_positions = np.cumsum(keep, axis=1)
+    final_mask = (keep_positions <= k) & keep
+    nbr_idx_np = neighbor_indices[final_mask].reshape(num_vertices, k)
+
+    # Build patch positions
+    all_neighbor_positions = vertices_np[nbr_idx_np]
+    center_expanded = vertices_np[:, np.newaxis, :]
+    patch_positions = all_neighbor_positions - center_expanded
+
+    # Flatten and convert to tensors
+    pos_tensor = torch.from_numpy(patch_positions.reshape(-1, 3)).float()
+    patch_idx_tensor = torch.arange(num_vertices).repeat_interleave(k)
+    vertex_indices_tensor = torch.from_numpy(nbr_idx_np.flatten()).long()
+    center_indices_tensor = torch.arange(num_vertices).long()
+
+    data = MeshPatchData(
+        pos=pos_tensor,
+        x=pos_tensor,  # shared reference
+        patch_idx=patch_idx_tensor,
+        vertex_indices=vertex_indices_tensor,
+        center_indices=center_indices_tensor
+    )
+    data.neighbor_index_matrix = torch.from_numpy(nbr_idx_np).long()
+    return data
 
 
 def centroid_to_origin(points: np.ndarray) -> np.ndarray:

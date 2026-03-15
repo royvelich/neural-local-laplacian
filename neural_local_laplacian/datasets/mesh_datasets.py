@@ -20,11 +20,8 @@ from neural_local_laplacian.datasets.base_datasets import PoseType
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 from neural_local_laplacian.utils import utils
 from neural_local_laplacian.utils.geodesic_utils import (
-    build_pointcloud_grad_div_operators,
-    edge_index_from_knn_indices,
     compute_exact_geodesics,
     select_multiple_geodesic_sources,
-    HAS_PCDIFF
 )
 
 
@@ -486,13 +483,23 @@ class MeshDataset(Dataset):
 
     def get(self, idx: int) -> Data:
         """
-        Load and process a mesh file, returning local patches for each vertex.
+        Load and process a mesh file, returning raw mesh data.
+
+        Does NOT compute k-NN or extract patches — that's done by the consumer
+        (model validation_step or visualize_validation) using build_patches_from_vertices(),
+        which can run on GPU for much faster neighbor search.
 
         Args:
             idx: Index of the mesh file to load
 
         Returns:
-            Data object with all local patches
+            Data object with raw mesh data:
+            - raw_vertices: (N, 3) normalized vertex positions
+            - raw_faces: (F, 3) face indices
+            - vertex_normals: (N, 3) per-vertex normals
+            - gt_eigen: tuple of (eigenvalues, eigenvectors)
+            - geodesic_data: dict with source_indices + exact geodesics
+            - mesh_file_path, original_num_vertices, etc.
         """
         if idx >= len(self._mesh_file_paths):
             raise IndexError(f"Index {idx} out of range for {len(self._mesh_file_paths)} mesh files")
@@ -530,7 +537,6 @@ class MeshDataset(Dataset):
             vertices = utils.normalize_mesh_vertices(raw_vertices)
 
             # Calculate vertex normals using trimesh with normalized vertices
-            # Update the mesh with normalized vertices for normal computation
             if _v: print(f"    [diag] vertex_normals ...", flush=True)
             mesh.vertices = vertices
             if hasattr(mesh, 'vertex_normals'):
@@ -547,34 +553,36 @@ class MeshDataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Failed to load mesh {mesh_file_path}: {e}")
 
-        # Check if we have enough vertices
-        if len(vertices) < self._k + 1:  # Need k neighbors + 1 center
+        # Check if we have enough vertices for the intended k
+        if len(vertices) < self._k + 1:
             raise ValueError(f"Mesh has only {len(vertices)} vertices, need at least {self._k + 1}")
 
-        # Extract local patches for all vertices
-        if _v: print(f"    [diag] extract_all_patches (k={self._k}) ...", flush=True)
-        patches_data = self._extract_all_patches(vertices, vertex_normals)
-
-        # Add mesh metadata as individual attributes (more robust for PyTorch Geometric batching)
-        patches_data.mesh_file_path = str(mesh_file_path)
-        patches_data.original_num_vertices = original_num_vertices
-        patches_data.original_num_faces = original_num_faces
-        patches_data.mesh_idx = idx
-        patches_data.normalized_num_vertices = len(vertices)
-        patches_data.k_neighbors = self._k
-
-        # Store ground-truth eigendecomposition as a tuple (PyG doesn't concatenate tuples)
-        patches_data.gt_eigen = (gt_eigenvalues, gt_eigenvectors)
-
-        # Compute and store geodesic validation data
+        # Compute geodesic validation data (source selection + exact geodesics, no pcdiff operators)
         if _v: print(f"    [diag] geodesic_validation_data ...", flush=True)
-        geodesic_data = self._compute_geodesic_validation_data(
-            vertices, faces, patches_data.vertex_indices.numpy()
-        )
-        patches_data.geodesic_data = geodesic_data
+        geodesic_data = self._compute_geodesic_validation_data(vertices, faces)
+
+        # Build Data object with raw mesh information
+        data = Data()
+        data.raw_vertices = torch.from_numpy(vertices).float()        # (N, 3)
+        data.raw_faces = torch.from_numpy(faces).long()               # (F, 3)
+        data.vertex_normals = torch.from_numpy(vertex_normals).float() # (N, 3)
+        data.num_mesh_vertices = torch.tensor([len(vertices)])         # scalar as tensor for batching
+
+        # Metadata
+        data.mesh_file_path = str(mesh_file_path)
+        data.original_num_vertices = original_num_vertices
+        data.original_num_faces = original_num_faces
+        data.mesh_idx = idx
+        data.k_neighbors = self._k
+
+        # Ground-truth eigendecomposition (stored as tuple, PyG won't concatenate)
+        data.gt_eigen = (gt_eigenvalues, gt_eigenvectors)
+
+        # Geodesic data (source indices + exact geodesics, no pcdiff operators)
+        data.geodesic_data = geodesic_data
 
         if _v: print(f"    [diag] Done: {mesh_file_path.name}", flush=True)
-        return patches_data
+        return data
 
     def _compute_ground_truth_eigendecomposition(
             self,
@@ -606,34 +614,28 @@ class MeshDataset(Dataset):
     def _compute_geodesic_validation_data(
             self,
             vertices: np.ndarray,
-            faces: np.ndarray,
-            vertex_indices: np.ndarray
+            faces: np.ndarray
     ) -> dict:
         """
-        Compute geodesic validation data: exact geodesics and point cloud grad/div operators.
+        Compute geodesic validation data: source vertices and exact geodesics.
 
-        The grad/div operators are built from the same k-NN connectivity used for patches,
-        ensuring they match the PRED Laplacian topology.
+        Point cloud grad/div operators (pcdiff) are NOT built here — they depend
+        on k and should be built at inference time by the consumer, matching the
+        actual k used for the PRED Laplacian.
 
         Args:
             vertices: Mesh vertices of shape (N, 3)
             faces: Mesh faces of shape (F, 3)
-            vertex_indices: Flat k-NN neighbor indices (N*k,) from patch extraction
 
         Returns:
             Dictionary with:
             - source_indices: Array of source vertex indices (num_sources,)
             - exact_geodesics: Dict mapping source_idx -> exact distances (N,)
-            - pc_grad_op: Point cloud gradient operator (sparse matrix)
-            - pc_div_op: Point cloud divergence operator (sparse matrix)
             - has_geodesic_data: Whether geodesic data was successfully computed
         """
-        n_vertices = len(vertices)
         result = {
             'source_indices': None,
             'exact_geodesics': None,
-            'pc_grad_op': None,
-            'pc_div_op': None,
             'has_geodesic_data': False
         }
 
@@ -659,27 +661,7 @@ class MeshDataset(Dataset):
             return result
 
         result['exact_geodesics'] = exact_geodesics
-
-        # Build point cloud grad/div operators from the same k-NN used for patches
-        if not HAS_PCDIFF:
-            print(f"Warning: pcdiff not available, skipping geodesic validation operators")
-            return result
-
-        try:
-            # Convert vertex_indices to edge_index format
-            center_indices = np.arange(n_vertices)
-            edge_index = edge_index_from_knn_indices(vertex_indices, center_indices, self._k)
-
-            # Build grad/div operators using the exact same connectivity
-            if self._verbose: print(f"    [diag] build_pointcloud_grad_div_operators ...", flush=True)
-            pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
-
-            result['pc_grad_op'] = pc_grad_op
-            result['pc_div_op'] = pc_div_op
-            result['has_geodesic_data'] = True
-
-        except Exception as e:
-            print(f"Warning: Failed to build geodesic operators: {e}")
+        result['has_geodesic_data'] = True
 
         return result
 
