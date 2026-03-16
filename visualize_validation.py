@@ -81,6 +81,7 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_exact_geodesics,
     ensure_psd,
     sparse_solve,
+    set_solver_backend,
     normalize_distances,
     build_pointcloud_grad_div_operators,
     edge_index_from_knn_indices,
@@ -415,6 +416,7 @@ class RealTimeEigenanalysisVisualizer:
         self.current_stiffness_weights = None
         self.current_areas = None
         self.current_original_vertices = None
+        self._current_vertices_tensor = None  # cached GPU tensor of vertices
         self.original_k = None
         self.current_vertex_indices = None
         self.current_center_indices = None
@@ -1312,6 +1314,7 @@ class RealTimeEigenanalysisVisualizer:
         # Clear GPU tensors
         self.current_stiffness_weights = None
         self.current_areas = None
+        self._current_vertices_tensor = None
         self.current_vertex_indices = None
         self.current_center_indices = None
         self.current_batch_indices = None
@@ -1349,7 +1352,8 @@ class RealTimeEigenanalysisVisualizer:
             return None
 
         if inference_result.get('areas') is not None:
-            predicted_vertex_areas = inference_result['areas']
+            areas = inference_result['areas']
+            predicted_vertex_areas = areas.cpu().numpy() if torch.is_tensor(areas) else areas
             print(f"Using predicted areas from model (range: [{predicted_vertex_areas.min():.6f}, {predicted_vertex_areas.max():.6f}])")
             return predicted_vertex_areas
         else:
@@ -1997,8 +2001,7 @@ class RealTimeEigenanalysisVisualizer:
         t_extraction_start = time.perf_counter()
 
         new_patch_data = build_patches_from_vertices(
-            torch.from_numpy(self.current_original_vertices).float(),
-            new_k, device=self.current_device
+            self._current_vertices_tensor, new_k, device=self.current_device
         )
 
         if self.current_device is not None and self.current_device.type == 'cuda':
@@ -2031,13 +2034,12 @@ class RealTimeEigenanalysisVisualizer:
         print(f"  PRED eigenvalue range: [{new_inference_result['predicted_eigenvalues'][0]:.2e}, {new_inference_result['predicted_eigenvalues'][-1]:.6f}]")
 
         # Update stored raw weights and areas to stay in sync
-        self.current_stiffness_weights = torch.from_numpy(new_inference_result['stiffness_weights'])
-        self.current_areas = torch.from_numpy(new_inference_result['areas'])
+        self.current_stiffness_weights = new_inference_result['stiffness_weights']
+        self.current_areas = new_inference_result['areas']
 
         # Weight distribution diagnostic for new k
-        if new_inference_result.get('attention_mask') is not None:
-            mask = torch.from_numpy(new_inference_result['attention_mask'])
-        else:
+        mask = new_inference_result.get('attention_mask')
+        if mask is None:
             mask = torch.ones_like(self.current_stiffness_weights, dtype=torch.bool)
         self._print_weight_distribution_diagnostic(self.current_stiffness_weights, mask)
 
@@ -2890,6 +2892,8 @@ class RealTimeEigenanalysisVisualizer:
             batch_indices = getattr(batch_data, 'patch_idx', batch_data.batch)
 
             # === TIME: Matrix assembly ===
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
             t_assembly_start = time.perf_counter()
 
             # Assemble separate stiffness and mass matrices
@@ -2934,10 +2938,10 @@ class RealTimeEigenanalysisVisualizer:
             'mass_matrix': mass_matrix,
             'predicted_eigenvalues': predicted_eigenvalues,
             'predicted_eigenvectors': predicted_eigenvectors,
-            'stiffness_weights': stiffness_weights.cpu().numpy(),
-            'areas': areas.cpu().numpy(),
-            'attention_mask': attention_mask.cpu().numpy(),
-            'batch_sizes': batch_sizes.cpu().numpy(),
+            'stiffness_weights': stiffness_weights.detach(),  # keep as tensor (GPU or CPU)
+            'areas': areas.detach(),
+            'attention_mask': attention_mask.detach(),
+            'batch_sizes': batch_sizes.detach(),
             'forward_result': forward_result  # Store complete forward result
         }
 
@@ -3538,9 +3542,10 @@ class RealTimeEigenanalysisVisualizer:
             )
 
         if inference_result is not None and inference_result.get('areas') is not None:
+            areas_np = inference_result['areas'].cpu().numpy() if torch.is_tensor(inference_result['areas']) else inference_result['areas']
             mesh_structure.add_scalar_quantity(
                 name="I Vertex Areas - PRED",
-                values=inference_result['areas'],
+                values=areas_np,
                 enabled=False,
                 cmap='viridis'
             )
@@ -5124,17 +5129,10 @@ class RealTimeEigenanalysisVisualizer:
                 # === Gradient mode: self-consistent heat method using learned G ===
                 print(f"\nComputing Heat Method geodesic with PRED Laplacian (learned gradient operator)...")
                 try:
-                    forward_result = self.current_inference_result.get('forward_result') if self.current_inference_result else None
-                    if forward_result is not None and forward_result.get('grad_coeffs') is not None:
-                        batch_indices = getattr(self.current_batch_indices, 'clone', lambda: self.current_batch_indices)()
-                        gradient_operator = assemble_gradient_operator(
-                            grad_coeffs=forward_result['grad_coeffs'],
-                            attention_mask=forward_result['attention_mask'],
-                            vertex_indices=self.current_vertex_indices,
-                            center_indices=self.current_center_indices,
-                            batch_indices=batch_indices if torch.is_tensor(batch_indices) else torch.tensor(batch_indices)
-                        )
-                        print(f"  Assembled gradient operator G: {gradient_operator.shape} ({gradient_operator.nnz} non-zeros)")
+                    # Reuse the gradient operator already assembled in step 5
+                    gradient_operator = self.current_learned_gradient_op
+                    if gradient_operator is not None:
+                        print(f"  Using cached gradient operator G: {gradient_operator.shape} ({gradient_operator.nnz} non-zeros)")
 
                         start_time = time.time()
                         distances = compute_heat_geodesic_learned(
@@ -5152,7 +5150,7 @@ class RealTimeEigenanalysisVisualizer:
                         else:
                             print(f"  [!] Learned heat method returned None")
                     else:
-                        print(f"  [!] grad_coeffs not available in forward_result, skipping")
+                        print(f"  [!] Learned gradient operator not available, skipping")
                 except Exception as e:
                     print(f"  [!] Learned heat method failed: {e}")
                     import traceback
@@ -5408,12 +5406,15 @@ class RealTimeEigenanalysisVisualizer:
         pred_k = self._initial_k_pred
         print(f"\nSTEP 2.5: Extracting patches with k={pred_k} (for timing comparison)...")
 
+        # Cache vertices tensor on GPU (reused for k-change updates)
+        self._current_vertices_tensor = torch.from_numpy(gt_data['vertices']).float().to(device)
+
         if device.type == 'cuda':
             torch.cuda.synchronize()
         t_extraction_start = time.perf_counter()
 
         patch_data = build_patches_from_vertices(
-            torch.from_numpy(gt_data['vertices']).float(), pred_k, device=device
+            self._current_vertices_tensor, pred_k, device=device
         )
 
         if device.type == 'cuda':
@@ -5460,8 +5461,8 @@ class RealTimeEigenanalysisVisualizer:
         self.current_predicted_data = predicted_data
 
         # Store raw data for k-NN slider updates
-        self.current_stiffness_weights = torch.from_numpy(inference_result['stiffness_weights'])
-        self.current_areas = torch.from_numpy(inference_result['areas'])
+        self.current_stiffness_weights = inference_result['stiffness_weights']
+        self.current_areas = inference_result['areas']
         self.current_original_vertices = gt_data['vertices']
         self.original_k = original_k  # Use the k calculated earlier
         self.current_vertex_indices = patch_data.vertex_indices.to(device)

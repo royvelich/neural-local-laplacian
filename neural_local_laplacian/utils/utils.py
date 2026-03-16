@@ -673,15 +673,35 @@ def compute_laplacian_eigendecomposition(
         mass_matrix = mass_matrix.astype(np.float64)
 
     # Use shift-invert mode with sigma close to 0 to find smallest eigenvalues
+    # Pre-factorize the shift-invert operator for speed (uses best available backend:
+    # pypardiso/MKL if installed, otherwise scipy splu)
+    sigma = 1e-8 if mass_matrix is not None else -0.01
+    OPinv = None
+
+    try:
+        from neural_local_laplacian.utils.geodesic_utils import sparse_factorize
+        if mass_matrix is not None:
+            OP = laplacian_matrix - sigma * mass_matrix
+        else:
+            OP = laplacian_matrix - sigma * scipy.sparse.eye(laplacian_matrix.shape[0])
+        factor = sparse_factorize(OP)
+        OPinv = scipy.sparse.linalg.LinearOperator(
+            shape=OP.shape,
+            matvec=lambda x: factor.solve(x),
+            dtype=np.float64
+        )
+    except Exception:
+        pass  # Fall back to eigsh's internal factorization
+
     if mass_matrix is not None:
-        # Generalized eigenvalue problem: L @ v = lambda * M @ v
         eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
-            laplacian_matrix, k=num_eigenvalues, M=mass_matrix, sigma=1e-8, which='LM'
+            laplacian_matrix, k=num_eigenvalues, M=mass_matrix,
+            sigma=sigma, which='LM', OPinv=OPinv
         )
     else:
-        # Standard eigenvalue problem
         eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
-            laplacian_matrix, k=num_eigenvalues, sigma=-0.01, which='LM'
+            laplacian_matrix, k=num_eigenvalues,
+            sigma=sigma, which='LM', OPinv=OPinv
         )
 
     # Sort by eigenvalue (ascending)

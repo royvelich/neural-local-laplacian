@@ -19,6 +19,130 @@ from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
 
 
+# =============================================================================
+# Sparse solver backend: auto-detect best available, with manual override
+#
+# Priority: pypardiso (Intel MKL, multi-threaded) > scipy splu (single-threaded)
+#
+# To override at runtime:
+#   from neural_local_laplacian.utils.geodesic_utils import set_solver_backend
+#   set_solver_backend('scipy')   # force scipy
+#   set_solver_backend('auto')    # re-detect best available
+# =============================================================================
+
+_HAS_PARDISO = False
+try:
+    import pypardiso
+    _HAS_PARDISO = True
+except ImportError:
+    pass
+
+_SOLVER_BACKEND = 'pypardiso' if _HAS_PARDISO else 'scipy'
+print(f"[sparse solver] Backend: {_SOLVER_BACKEND}" +
+      (" (pypardiso available but not selected)" if _HAS_PARDISO and _SOLVER_BACKEND != 'pypardiso' else ""))
+
+
+def set_solver_backend(backend: str):
+    """
+    Switch sparse solver backend at runtime.
+
+    Args:
+        backend: 'pypardiso', 'scipy', or 'auto' (re-detect best available)
+    """
+    global _SOLVER_BACKEND
+    if backend == 'auto':
+        _SOLVER_BACKEND = 'pypardiso' if _HAS_PARDISO else 'scipy'
+    elif backend in ('pypardiso', 'scipy'):
+        if backend == 'pypardiso' and not _HAS_PARDISO:
+            print("[sparse solver] pypardiso not installed, falling back to scipy")
+            _SOLVER_BACKEND = 'scipy'
+        else:
+            _SOLVER_BACKEND = backend
+    else:
+        raise ValueError(f"Unknown solver backend: {backend}. Use 'pypardiso', 'scipy', or 'auto'.")
+    print(f"[sparse solver] Backend set to: {_SOLVER_BACKEND}")
+
+
+class SparseFactorization:
+    """
+    Cached sparse matrix factorization for solving Ax=b with multiple right-hand sides.
+
+    Backend-aware: uses pypardiso (Intel MKL PARDISO, multi-threaded) when available,
+    otherwise scipy splu (single-threaded SuperLU).
+
+    Usage:
+        factor = SparseFactorization(A)
+        x1 = factor.solve(b1)
+        x2 = factor.solve(b2)  # reuses factorization
+    """
+
+    # Shared pypardiso solver instance (only one allowed per process on Windows)
+    _shared_pardiso_solver = None
+
+    def __init__(self, A: scipy.sparse.spmatrix):
+        if _SOLVER_BACKEND == 'pypardiso' and _HAS_PARDISO:
+            # pypardiso: use shared solver, factorize once, keep A reference
+            if SparseFactorization._shared_pardiso_solver is None:
+                SparseFactorization._shared_pardiso_solver = pypardiso.PyPardisoSolver()
+            self._solver = SparseFactorization._shared_pardiso_solver
+            self._A_csr = A.tocsr()  # pardiso prefers CSR
+            self._solver.factorize(self._A_csr)
+            self._backend = 'pypardiso'
+        else:
+            # scipy: LU factorization via SuperLU
+            self._factor = scipy.sparse.linalg.splu(A.tocsc())
+            self._backend = 'scipy'
+
+    def solve(self, b: np.ndarray) -> np.ndarray:
+        """Solve Ax = b using the cached factorization."""
+        if self._backend == 'pypardiso':
+            return self._solver.solve(self._A_csr, b)
+        else:
+            return self._factor.solve(b)
+
+
+def sparse_factorize(A: scipy.sparse.spmatrix) -> SparseFactorization:
+    """
+    Factorize a sparse matrix for repeated solves.
+
+    Returns a SparseFactorization object whose .solve(b) method is fast.
+    """
+    return SparseFactorization(A)
+
+
+def sparse_solve(
+    A: scipy.sparse.spmatrix,
+    b: np.ndarray,
+    device: Optional[torch.device] = None,
+    factor: Optional[SparseFactorization] = None
+) -> np.ndarray:
+    """
+    Solve sparse linear system Ax = b.
+
+    If a pre-computed factorization is provided, uses it (fast triangular solve).
+    Otherwise uses the best available single-solve backend.
+
+    Args:
+        A: Sparse matrix (N, N)
+        b: Right-hand side (N,)
+        device: Unused (kept for API compatibility)
+        factor: Optional pre-computed SparseFactorization for reuse
+
+    Returns:
+        Solution x as numpy array (N,)
+    """
+    if factor is not None:
+        return factor.solve(b)
+
+    if _SOLVER_BACKEND == 'pypardiso' and _HAS_PARDISO:
+        return pypardiso.spsolve(A.tocsc(), b)
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+        return scipy.sparse.linalg.spsolve(A.tocsc(), b)
+
+
 # Optional imports with graceful fallback
 try:
     from pcdiff import knn_graph, estimate_basis, build_grad_div
@@ -109,29 +233,6 @@ def _cg_solve_gpu(
     return x
 
 
-def sparse_solve(
-    A: scipy.sparse.spmatrix,
-    b: np.ndarray,
-    device: Optional[torch.device] = None
-) -> np.ndarray:
-    """
-    Solve sparse linear system Ax = b using scipy's direct solver.
-
-    The device parameter is accepted for API compatibility but currently unused —
-    all solves go through scipy.sparse.linalg.spsolve on CPU.
-
-    Args:
-        A: Sparse matrix (N, N)
-        b: Right-hand side (N,)
-        device: Unused (kept for API compatibility)
-
-    Returns:
-        Solution x as numpy array (N,)
-    """
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
-        return scipy.sparse.linalg.spsolve(A.tocsc(), b)
 
 
 @dataclass
@@ -402,8 +503,10 @@ def compute_heat_geodesic_pointcloud(
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        phi_pos = sparse_solve(L_reg, div_X, device)
-        phi_neg = sparse_solve(L_reg, -div_X, device)
+        # Factorize once, solve twice (±rhs)
+        poisson_factor = sparse_factorize(L_reg)
+        phi_pos = poisson_factor.solve(div_X)
+        phi_neg = poisson_factor.solve(-div_X)
 
         # The correct sign should have the source at or near the minimum
         phi_pos_shifted = phi_pos - phi_pos.min()
@@ -509,8 +612,10 @@ def compute_heat_geodesic_mesh(
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        phi_pos = sparse_solve(L_reg, rhs, device)
-        phi_neg = sparse_solve(L_reg, -rhs, device)
+        # Factorize once, solve twice (±rhs)
+        poisson_factor = sparse_factorize(L_reg)
+        phi_pos = poisson_factor.solve(rhs)
+        phi_neg = poisson_factor.solve(-rhs)
 
         if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
             print(f"  [!] Heat Method (mesh): Poisson solve produced non-finite values, skipping")
@@ -625,9 +730,10 @@ def compute_heat_geodesic_learned(
         eps = 1e-8
         S_reg = S + eps * scipy.sparse.eye(n)
 
-        # Try both signs to handle sign ambiguity in divergence
-        phi_pos = sparse_solve(S_reg, rhs, device)
-        phi_neg = sparse_solve(S_reg, -rhs, device)
+        # Factorize once, solve twice (±rhs)
+        poisson_factor = sparse_factorize(S_reg)
+        phi_pos = poisson_factor.solve(rhs)
+        phi_neg = poisson_factor.solve(-rhs)
 
         if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
             print(f"  [!] Heat Method (learned): Poisson solve produced non-finite values, skipping")
