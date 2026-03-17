@@ -34,3 +34,5 @@ trimesh
 kornia
 pcdiff
 peft
+pynndescent
+pypardiso

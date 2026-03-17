@@ -71,7 +71,8 @@ from neural_local_laplacian.utils.utils import (
     assemble_stiffness_and_mass_matrices,
     assemble_gradient_operator,
     compute_laplacian_eigendecomposition,
-    build_patches_from_vertices
+    build_patches_from_vertices,
+    set_knn_backend
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_pointcloud,
@@ -166,6 +167,7 @@ class VisualizationConfig:
     num_eigenvectors_to_show: int = 8
     enable_eigenvalue_info: bool = True
     enable_correlation_analysis: bool = True
+    num_validation_sources: int = 5  # Number of FPS-sampled source vertices for geodesic/Green's validation
 
 
 @dataclass
@@ -179,6 +181,9 @@ class ReconstructionSettings:
     enable_top_k_pruning: bool = False  # When enabled, prune to top_k highest weights per patch
     pred_top_k: int = 6  # Number of highest weights to keep per patch
     symmetry_policy: str = "union"  # "union" or "intersection"
+
+    # kNN backend: 0='pyg', 1='brute', 2='cKDTree', 3='pynndescent'
+    knn_backend_idx: int = 2
 
 
 class ColorPalette:
@@ -264,9 +269,15 @@ class LaplacianTimingResults:
     robust_greens_solve_time: float = 0.0
     nelo_greens_solve_time: float = 0.0
 
+    # Gradient operator build times (seconds) — needed for geodesics
+    gt_grad_op_time: float = 0.0       # igl.grad + igl.doublearea
+    pred_grad_op_time: float = 0.0     # assemble_gradient_operator
+    nelo_grad_op_time: float = 0.0     # build_pointcloud_grad_div_operators
+
+    # Pure geodesic solve times (seconds) — excludes operator construction
     gt_geodesic_solve_time: float = 0.0
     pred_geodesic_solve_time: float = 0.0
-    robust_geodesic_solve_time: float = 0.0
+    robust_geodesic_solve_time: float = 0.0  # pp3d: self-contained (includes everything)
     nelo_geodesic_solve_time: float = 0.0
 
     # Mesh info
@@ -395,6 +406,30 @@ class HeatMethodGeodesicResult:
                 f"{self.mean_absolute_error:>10.6f} {self.relative_error_percent:>8.2f}%")
 
 
+@dataclass
+class AggregatedValidationMetrics:
+    """Aggregated metrics across multiple source vertices."""
+    method_name: str
+    n_sources: int = 0
+
+    # Geodesic metrics (mean ± std across sources)
+    corr_mean: float = 0.0
+    corr_std: float = 0.0
+    mae_mean: float = 0.0
+    mae_std: float = 0.0
+    max_err_mean: float = 0.0
+    max_err_std: float = 0.0
+    mono_mean: float = 0.0
+    mono_std: float = 0.0
+
+    # Green's function metrics
+    greens_corr_with_gt_mean: float = 0.0
+    greens_corr_with_gt_std: float = 0.0
+    greens_mono_mean: float = 0.0
+    greens_mono_std: float = 0.0
+    greens_max_principle_pass_rate: float = 0.0  # fraction passing max principle
+
+
 class RealTimeEigenanalysisVisualizer:
     """Real-time eigenanalysis visualizer using MeshDataset and model inference."""
 
@@ -455,10 +490,26 @@ class RealTimeEigenanalysisVisualizer:
         self.current_sparsity_stats: Dict[str, LaplacianSparsityStats] = {}
 
         # Cached state for targeted per-method validation recomputation
-        self._greens_source_vertex_idx: Optional[int] = None
-        self._greens_gt_values: Optional[np.ndarray] = None  # GT Green's fn for correlation
-        self._geodesic_source_vertex_idx: Optional[int] = None
-        self._exact_geodesic_distances: Optional[np.ndarray] = None
+        # Multi-source support: source vertices shared by Green's and geodesics
+        self._source_indices: Optional[List[int]] = None  # Multiple source vertices (FPS-sampled)
+        self._exact_geodesics: Optional[Dict[int, np.ndarray]] = None  # source_idx -> exact distances
+        self._greens_gt_values: Optional[Dict[int, np.ndarray]] = None  # source_idx -> GT Green's fn
+
+        # Per-source results (all sources × all methods)
+        self._all_greens_results: Dict[int, Dict[str, 'GreensFunctionResult']] = {}  # source_idx -> {method -> result}
+        self._all_geodesic_results: Dict[int, Dict[str, 'HeatMethodGeodesicResult']] = {}
+
+        # Raw cached values for instant slider refresh (source_idx -> method -> array(N,))
+        self._all_greens_values: Dict[int, Dict[str, np.ndarray]] = {}
+        self._all_geodesic_distances: Dict[int, Dict[str, np.ndarray]] = {}
+
+        # Aggregated metrics across all sources
+        self._aggregated_geodesic_metrics: Dict[str, AggregatedValidationMetrics] = {}
+        self._aggregated_greens_metrics: Dict[str, AggregatedValidationMetrics] = {}
+
+        # Currently displayed source (for Polyscope visualization)
+        self._current_source_display_idx: int = 0  # Index into _source_indices
+
         self._pc_grad_op = None   # pcdiff point cloud gradient operator
         self._pc_div_op = None    # pcdiff point cloud divergence operator
 
@@ -563,6 +614,23 @@ class RealTimeEigenanalysisVisualizer:
             psim.Text("k-NN input: (no data loaded)")
 
         psim.Text("(Press Enter to apply changes)")
+
+        # --- kNN backend toggle ---
+        knn_backends = ['pyg (torch_geometric)', 'brute (cdist+topk)', 'cKDTree (scipy)', 'pynndescent (approx)']
+        knn_backend_names = ['pyg', 'brute', 'cKDTree', 'pynndescent']
+        knn_changed, new_knn_idx = psim.Combo(
+            "kNN Backend",
+            self.reconstruction_settings.knn_backend_idx,
+            knn_backends
+        )
+        if knn_changed:
+            self.reconstruction_settings.knn_backend_idx = new_knn_idx
+            set_knn_backend(knn_backend_names[new_knn_idx])
+            # Reset one-time log flags so next kNN call logs the backend
+            build_patches_from_vertices._logged_gpu_knn = False
+            from neural_local_laplacian.utils.utils import _knn_cpu
+            _knn_cpu._logged = False
+            _knn_cpu._logged_pynn = False
 
         # --- Top-k weight pruning for PRED ---
         psim.Text("")
@@ -720,23 +788,46 @@ class RealTimeEigenanalysisVisualizer:
             has_e2e = (t.pred_geodesic_solve_time > 0 or t.pred_greens_solve_time > 0 or
                        t.gt_geodesic_solve_time > 0 or t.gt_greens_solve_time > 0)
             if has_e2e:
+                n_src = len(self._source_indices) if self._source_indices else 1
+                src_note = f" (avg/{n_src}src)" if n_src > 1 else ""
                 psim.Text("")
                 psim.Separator()
-                psim.Text("E2E: Assembly + Downstream Solve (ms):")
-                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<12} {'Geodesic':>10} {'Greens':>10}")
+                psim.Text(f"Geodesic E2E: L,M + Grad + Solve{src_note} (ms):")
+                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<12} {'L,M':>7} {'Grad':>7} {'Solve':>7} {'TOTAL':>7}")
 
-                for label, color, total, geo_t, grn_t in [
-                    ('GT',     (0.0, 1.0, 0.0, 1.0), t.gt_matrix_assembly_time,     t.gt_geodesic_solve_time,     t.gt_greens_solve_time),
-                    ('PRED',   (1.0, 0.5, 0.0, 1.0), t.pred_total_time,             t.pred_geodesic_solve_time,   t.pred_greens_solve_time),
-                    ('NeLo',   (0.7, 0.3, 1.0, 1.0), t.nelo_total_time,             t.nelo_geodesic_solve_time,   t.nelo_greens_solve_time),
-                    ('Robust', (0.0, 0.7, 1.0, 1.0), t.robust_matrix_assembly_time, t.robust_geodesic_solve_time, t.robust_greens_solve_time),
+                for label, color, lm_t, grad_t, geo_t in [
+                    ('GT',     (0.0, 1.0, 0.0, 1.0), t.gt_matrix_assembly_time,     t.gt_grad_op_time,   t.gt_geodesic_solve_time),
+                    ('PRED',   (1.0, 0.5, 0.0, 1.0), t.pred_total_time,             t.pred_grad_op_time, t.pred_geodesic_solve_time),
+                    ('NeLo',   (0.7, 0.3, 1.0, 1.0), t.nelo_total_time,             t.nelo_grad_op_time, t.nelo_geodesic_solve_time),
                 ]:
-                    if label == 'Robust' and not self._robust_geodesic_heat and geo_t > 0:
-                        geo_str = f"{geo_t * 1000:>10.1f}"
+                    if geo_t > 0:
+                        geo_avg = geo_t / n_src
+                        total = lm_t + grad_t + geo_avg
+                        psim.TextColored(color, f"{label:<12} {lm_t*1000:>7.0f} {grad_t*1000:>7.0f} {geo_avg*1000:>7.0f} {total*1000:>7.0f}")
+
+                # Robust pp3d: self-contained
+                if t.robust_geodesic_solve_time > 0:
+                    geo_avg = t.robust_geodesic_solve_time / n_src
+                    if self._robust_geodesic_heat:
+                        total = t.robust_matrix_assembly_time + geo_avg
+                        psim.TextColored((0.0, 0.7, 1.0, 1.0), f"{'Robust':<12} {t.robust_matrix_assembly_time*1000:>7.0f} {'incl.':>7} {geo_avg*1000:>7.0f} {total*1000:>7.0f}")
                     else:
-                        geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
-                    grn_str = f"{(total + grn_t) * 1000:>10.1f}" if grn_t > 0 else f"{'N/A':>10}"
-                    psim.TextColored(color, f"{label:<12} {geo_str} {grn_str}")
+                        psim.TextColored((0.0, 0.7, 1.0, 1.0), f"{'Robust(pp3d)':<12} {'—':>7} {'—':>7} {geo_avg*1000:>7.0f} {geo_avg*1000:>7.0f}")
+
+                psim.Text("")
+                psim.Text(f"Green's E2E: L,M + Solve{src_note} (ms):")
+                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<12} {'L,M':>7} {'Solve':>7} {'TOTAL':>7}")
+
+                for label, color, lm_t, grn_t in [
+                    ('GT',     (0.0, 1.0, 0.0, 1.0), t.gt_matrix_assembly_time,     t.gt_greens_solve_time),
+                    ('PRED',   (1.0, 0.5, 0.0, 1.0), t.pred_total_time,             t.pred_greens_solve_time),
+                    ('NeLo',   (0.7, 0.3, 1.0, 1.0), t.nelo_total_time,             t.nelo_greens_solve_time),
+                    ('Robust', (0.0, 0.7, 1.0, 1.0), t.robust_matrix_assembly_time, t.robust_greens_solve_time),
+                ]:
+                    if grn_t > 0:
+                        grn_avg = grn_t / n_src
+                        total = lm_t + grn_avg
+                        psim.TextColored(color, f"{label:<12} {lm_t*1000:>7.0f} {grn_avg*1000:>7.0f} {total*1000:>7.0f}")
         else:
             psim.Text("(No timing data yet)")
 
@@ -745,8 +836,19 @@ class RealTimeEigenanalysisVisualizer:
         psim.Separator()
         psim.Text("Maximum Principle Validation:")
 
-        if self.current_greens_results is not None and len(self.current_greens_results) > 0:
-            # Show results for each method
+        # Aggregated pass rate (multi-source)
+        if self._aggregated_greens_metrics:
+            n_src = len(self._source_indices) if self._source_indices else 0
+            for method, agg in self._aggregated_greens_metrics.items():
+                n_pass = int(round(agg.greens_max_principle_pass_rate * agg.n_sources))
+                if n_pass == agg.n_sources:
+                    psim.TextColored((0.0, 1.0, 0.0, 1.0),
+                                     f"  {method}: {n_pass}/{agg.n_sources} passed ({agg.greens_max_principle_pass_rate:.0%})")
+                else:
+                    psim.TextColored((1.0, 0.0, 0.0, 1.0),
+                                     f"  {method}: {n_pass}/{agg.n_sources} passed ({agg.greens_max_principle_pass_rate:.0%})")
+        elif self.current_greens_results is not None and len(self.current_greens_results) > 0:
+            # Fallback: single source display
             for method_name, result in self.current_greens_results.items():
                 if result.satisfies_maximum_principle:
                     psim.TextColored((0.0, 1.0, 0.0, 1.0), f"  {method_name}: [OK] PASS")
@@ -754,8 +856,6 @@ class RealTimeEigenanalysisVisualizer:
                     psim.TextColored((1.0, 0.0, 0.0, 1.0), f"  {method_name}: [X] FAIL")
                     if result.num_violations > 0:
                         psim.Text(f"    {result.num_violations} vertices above source")
-                    if not result.max_at_source:
-                        psim.Text(f"    Max at vertex {result.worst_violation_vertex}")
         else:
             psim.Text("(Not computed yet)")
 
@@ -792,6 +892,31 @@ class RealTimeEigenanalysisVisualizer:
                     label = f"  {method_name:<16} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}"
 
                 psim.TextColored(color, label)
+
+            # Multi-source aggregated metrics
+            if self._aggregated_geodesic_metrics:
+                psim.Text("")
+                n_src = len(self._source_indices) if self._source_indices else 0
+                psim.Text(f"Aggregated ({n_src} sources, mean±std):")
+                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<16} {'Corr':>14} {'MAE':>14} {'Mono':>14}")
+                for method, agg in self._aggregated_geodesic_metrics.items():
+                    psim.Text(f"  {method:<16} {agg.corr_mean:.3f}±{agg.corr_std:.3f}"
+                              f"  {agg.mae_mean:.3f}±{agg.mae_std:.3f}"
+                              f"  {agg.mono_mean:.3f}±{agg.mono_std:.3f}")
+
+            # Source vertex selector
+            if self._source_indices and len(self._source_indices) > 1:
+                psim.Text("")
+                src_changed, new_src_idx = psim.SliderInt(
+                    "Display source",
+                    self._current_source_display_idx,
+                    v_min=0, v_max=len(self._source_indices) - 1
+                )
+                if src_changed:
+                    self._current_source_display_idx = new_src_idx
+                    self._refresh_source_display()
+                src_vtx = self._source_indices[self._current_source_display_idx]
+                psim.Text(f"  Source vertex: {src_vtx}")
         else:
             psim.Text("(Not computed yet)")
 
@@ -1024,249 +1149,339 @@ class RealTimeEigenanalysisVisualizer:
 
         self._print_sparsity_comparison()
 
-    def _update_greens_for_method(self, method_key: str):
-        """Recompute Green's function validation for a single method, keeping others unchanged.
+    def _aggregate_greens_metrics(self):
+        """Aggregate Green's function metrics across all sources into summary stats."""
+        self._aggregated_greens_metrics = {}
+        if not self._all_greens_results:
+            return
 
-        Uses the cached source vertex from the initial computation.
+        # Collect per-method stats across all sources
+        method_keys = set()
+        for src_results in self._all_greens_results.values():
+            method_keys.update(src_results.keys())
+
+        for method in method_keys:
+            corrs_gt = []
+            monos = []
+            max_principle_pass = []
+            for src_idx, src_results in self._all_greens_results.items():
+                if method not in src_results:
+                    continue
+                r = src_results[method]
+                corrs_gt.append(r.correlation_with_gt)
+                monos.append(r.monotonicity_score)
+                max_principle_pass.append(1.0 if r.satisfies_maximum_principle else 0.0)
+
+            n = len(corrs_gt)
+            if n == 0:
+                continue
+            agg = AggregatedValidationMetrics(method_name=method, n_sources=n)
+            agg.greens_corr_with_gt_mean = float(np.mean(corrs_gt))
+            agg.greens_corr_with_gt_std = float(np.std(corrs_gt))
+            agg.greens_mono_mean = float(np.mean(monos))
+            agg.greens_mono_std = float(np.std(monos))
+            agg.greens_max_principle_pass_rate = float(np.mean(max_principle_pass))
+            self._aggregated_greens_metrics[method] = agg
+
+    def _aggregate_geodesic_metrics(self):
+        """Aggregate geodesic metrics across all sources into summary stats."""
+        self._aggregated_geodesic_metrics = {}
+        if not self._all_geodesic_results:
+            return
+
+        method_keys = set()
+        for src_results in self._all_geodesic_results.values():
+            method_keys.update(src_results.keys())
+
+        for method in method_keys:
+            corrs = []
+            maes = []
+            max_errs = []
+            monos = []
+            for src_idx, src_results in self._all_geodesic_results.items():
+                if method not in src_results:
+                    continue
+                r = src_results[method]
+                corrs.append(r.correlation_with_reference)
+                maes.append(r.mean_absolute_error)
+                max_errs.append(r.max_absolute_error)
+                monos.append(r.monotonicity_score)
+
+            n = len(corrs)
+            if n == 0:
+                continue
+            agg = AggregatedValidationMetrics(method_name=method, n_sources=n)
+            agg.corr_mean = float(np.mean(corrs))
+            agg.corr_std = float(np.std(corrs))
+            agg.mae_mean = float(np.mean(maes))
+            agg.mae_std = float(np.std(maes))
+            agg.max_err_mean = float(np.mean(max_errs))
+            agg.max_err_std = float(np.std(max_errs))
+            agg.mono_mean = float(np.mean(monos))
+            agg.mono_std = float(np.std(monos))
+            self._aggregated_geodesic_metrics[method] = agg
+
+    def _update_greens_for_method(self, method_key: str):
+        """Recompute Green's function for a single method across ALL sources.
+
+        Uses the cached source vertices from initial computation.
         """
-        if self.current_gt_data is None:
+        if self.current_gt_data is None or not self._source_indices:
             return
 
         vertices = self.current_gt_data['vertices']
         faces = self.current_gt_data['faces']
-        source_idx = self._greens_source_vertex_idx
-        if source_idx is None:
-            source_idx = self.select_source_vertex(vertices, method="centroid")
 
         L, M = self._get_method_L_M(method_key)
         if L is None:
             return
 
         try:
-            print(f"\nRecomputing Green's function for {method_key}...")
+            print(f"\nRecomputing Green's function for {method_key} ({len(self._source_indices)} sources)...")
             _t_greens_start = time.perf_counter()
-            # Use GPU CG for PRED/NeLo, CPU scipy for GT/Robust
             device = self.current_device if method_key in ('PRED', 'NeLo') else None
-            result = self.compute_greens_function(L, M, source_idx, device=device)
-            if result is not None:
-                greens_values, residual = result
-                validation = self.validate_maximum_principle(
-                    greens_values, source_idx, method_key,
-                    vertices=vertices,
-                    faces=faces,
-                    laplacian_residual_norm=residual,
-                    gt_greens_function=self._greens_gt_values
-                )
 
-                # Merge into existing results
-                if self.current_greens_results is None:
-                    self.current_greens_results = {}
-                self.current_greens_results[method_key] = validation
-                print(f"  {method_key} Green's function: min={greens_values.min():.6f}, max={greens_values.max():.6f}")
-
-                # Update GT cache if we just recomputed GT
-                if method_key == 'GT':
-                    self._greens_gt_values = greens_values
-
-                # Refresh Polyscope visualizations
-                mesh_structure = self.current_mesh_structure
-                if mesh_structure is not None and not self._quantitative_mode:
-                    mesh_structure.add_scalar_quantity(
-                        name=f"J1 Green's Function - {method_key}",
-                        values=greens_values,
-                        enabled=False,
-                        cmap='coolwarm'
+            for source_idx in self._source_indices:
+                result = self.compute_greens_function(L, M, source_idx, device=device)
+                if result is not None:
+                    greens_values, residual = result
+                    gt_greens = self._greens_gt_values.get(source_idx) if self._greens_gt_values else None
+                    validation = self.validate_maximum_principle(
+                        greens_values, source_idx, method_key,
+                        vertices=vertices, faces=faces,
+                        laplacian_residual_norm=residual,
+                        gt_greens_function=gt_greens
                     )
-                    g_shifted = greens_values - greens_values.min()
-                    mesh_structure.add_scalar_quantity(
-                        name=f"J2 Green's Function (shifted) - {method_key}",
-                        values=g_shifted,
-                        enabled=False,
-                        cmap='viridis'
-                    )
-                    # Violation mask
-                    source_val = greens_values[source_idx]
-                    violation_mask = (greens_values > source_val + 1e-10).astype(np.float32)
-                    if violation_mask.sum() > 0:
-                        mesh_structure.add_scalar_quantity(
-                            name=f"J3 Max Principle Violations - {method_key}",
-                            values=violation_mask,
-                            enabled=False,
-                            cmap='reds'
-                        )
-                    # Update difference with GT if applicable
-                    if method_key == 'PRED' and self._greens_gt_values is not None:
-                        diff = greens_values - self._greens_gt_values
-                        mesh_structure.add_scalar_quantity(
-                            name="J4 Green's Fn Diff (PRED - GT)",
-                            values=diff,
-                            enabled=False,
-                            cmap='coolwarm'
-                        )
 
-            # Update solve timing
+                    if source_idx not in self._all_greens_results:
+                        self._all_greens_results[source_idx] = {}
+                    self._all_greens_results[source_idx][method_key] = validation
+
+                    # Cache raw values for slider refresh
+                    if source_idx not in self._all_greens_values:
+                        self._all_greens_values[source_idx] = {}
+                    self._all_greens_values[source_idx][method_key] = greens_values
+
+                    if method_key == 'GT':
+                        if self._greens_gt_values is None:
+                            self._greens_gt_values = {}
+                        self._greens_gt_values[source_idx] = greens_values
+
             greens_elapsed = time.perf_counter() - _t_greens_start
             timing_field = {'GT': 'gt_greens_solve_time', 'PRED': 'pred_greens_solve_time',
                             'Robust': 'robust_greens_solve_time', 'NeLo': 'nelo_greens_solve_time'}.get(method_key)
             if timing_field:
                 setattr(self.timing_results, timing_field, greens_elapsed)
+
+            self._aggregate_greens_metrics()
+
+            # Update current_greens_results to first source for Polyscope display
+            first_src = self._source_indices[0]
+            if first_src in self._all_greens_results:
+                self.current_greens_results = self._all_greens_results[first_src]
+
+            # Update Polyscope visualization for first source
+            display_src = self._source_indices[self._current_source_display_idx]
+            mesh_structure = self.current_mesh_structure
+            if mesh_structure is not None and not self._quantitative_mode:
+                if display_src in self._all_greens_results and method_key in self._all_greens_results[display_src]:
+                    # Recompute greens_values for display source
+                    result = self.compute_greens_function(L, M, display_src, device=device)
+                    if result is not None:
+                        greens_values, _ = result
+                        mesh_structure.add_scalar_quantity(
+                            name=f"J1 Green's Function - {method_key}",
+                            values=greens_values, enabled=False, cmap='coolwarm'
+                        )
+
+            agg = self._aggregated_greens_metrics.get(method_key)
+            if agg:
+                print(f"  {method_key}: GT corr={agg.greens_corr_with_gt_mean:.4f}±{agg.greens_corr_with_gt_std:.4f}, "
+                      f"max principle pass={agg.greens_max_principle_pass_rate:.0%} ({agg.n_sources} sources)")
+
         except Exception as e:
             print(f"  [!] Green's function recomputation for {method_key} failed: {e}")
             import traceback
             traceback.print_exc()
 
-    def _update_geodesics_for_method(self, method_key: str):
-        """Recompute heat method geodesics for a single method, keeping others unchanged.
+    def _compute_geodesic_single_source(self, method_key: str, source_idx: int,
+                                          vertices: np.ndarray, L, M,
+                                          mesh_grad_op=None, mesh_face_areas=None) -> Optional[np.ndarray]:
+        """Compute heat method geodesic distances from a single source for one method.
 
-        Uses the cached source vertex and exact geodesic distances from the
-        initial computation.
+        Returns distances array (N,) or None if computation fails.
         """
-        if self.current_gt_data is None:
+        n = len(vertices)
+        operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
+
+        if method_key == 'GT':
+            if HAS_IGL and L is not None and M is not None and mesh_grad_op is not None:
+                return compute_heat_geodesic_mesh(
+                    L=L, M=M, grad_op=mesh_grad_op, face_areas=mesh_face_areas,
+                    source_idx=source_idx, n_vertices=n
+                )
+
+        elif method_key == 'PRED':
+            if L is not None and M is not None:
+                if operator_mode == "gradient" and self.current_learned_gradient_op is not None:
+                    return compute_heat_geodesic_learned(
+                        S=L, M=M, G=self.current_learned_gradient_op,
+                        source_idx=source_idx, n_vertices=n,
+                        device=self.current_device
+                    )
+                elif self._pc_grad_op is not None and self._pc_div_op is not None:
+                    return compute_heat_geodesic_pointcloud(
+                        L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
+                        source_idx=source_idx, n_vertices=n,
+                        device=self.current_device
+                    )
+
+        elif method_key == 'Robust':
+            if self._robust_geodesic_heat:
+                if L is not None and M is not None and HAS_PCDIFF:
+                    robust_k = self.reconstruction_settings.current_robust_k
+                    robust_edge_index = knn_graph(vertices, k=robust_k)
+                    robust_grad_op, robust_div_op = build_pointcloud_grad_div_operators(vertices, robust_edge_index)
+                    return compute_heat_geodesic_pointcloud(
+                        L=L, M=M, grad_op=robust_grad_op, div_op=robust_div_op,
+                        source_idx=source_idx, n_vertices=n
+                    )
+            else:
+                import potpourri3d as pp3d
+                pc_solver = pp3d.PointCloudHeatSolver(vertices)
+                return pc_solver.compute_distance(source_idx)
+
+        elif method_key == 'NeLo':
+            if L is not None and M is not None and self._pc_grad_op is not None:
+                return compute_heat_geodesic_pointcloud(
+                    L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
+                    source_idx=source_idx, n_vertices=n,
+                    device=self.current_device
+                )
+
+        return None
+
+    def _update_geodesics_for_method(self, method_key: str):
+        """Recompute heat method geodesics for a single method across ALL sources.
+
+        Times gradient operator construction separately from solves.
+        """
+        if self.current_gt_data is None or not self._source_indices or not self._exact_geodesics:
+            print(f"  [!] Multi-source geodesic state not available, skipping {method_key}")
             return
 
         vertices = self.current_gt_data['vertices'].astype(np.float64)
         n = len(vertices)
-        source_idx = self._geodesic_source_vertex_idx
-        exact_distances = self._exact_geodesic_distances
-
-        if source_idx is None or exact_distances is None:
-            print(f"  [!] Cached geodesic state not available, skipping {method_key} geodesic update")
-            return
-
         L, M = self._get_method_L_M(method_key)
 
-        operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
-        distances = None
-        _t_geo_start = time.perf_counter()
+        result_key = method_key
+        if method_key == "Robust" and not self._robust_geodesic_heat:
+            result_key = "Robust (pp3d)"
+
+        grad_op_elapsed = 0.0
+        mesh_grad_op = None
+        mesh_face_areas = None
 
         try:
-            if method_key == 'GT':
-                # Mesh-based gradient
-                if HAS_IGL and L is not None and M is not None:
-                    faces = self.current_gt_data['faces'].astype(np.int32)
-                    mesh_grad_op = igl.grad(vertices, faces)
-                    mesh_face_areas = igl.doublearea(vertices, faces).flatten() / 2.0
-                    print(f"\nRecomputing Heat Method geodesic for GT...")
-                    distances = compute_heat_geodesic_mesh(
-                        L=L, M=M, grad_op=mesh_grad_op, face_areas=mesh_face_areas,
-                        source_idx=source_idx, n_vertices=n
-                    )
+            # Build gradient operator once (not per-source)
+            if method_key == 'GT' and HAS_IGL and L is not None:
+                faces = self.current_gt_data['faces'].astype(np.int32)
+                _t_grad = time.perf_counter()
+                mesh_grad_op = igl.grad(vertices, faces)
+                mesh_face_areas = igl.doublearea(vertices, faces).flatten() / 2.0
+                grad_op_elapsed = time.perf_counter() - _t_grad
 
-            elif method_key == 'PRED':
-                if L is not None and M is not None:
-                    if operator_mode == "gradient":
-                        # Use learned gradient operator
-                        if self.current_learned_gradient_op is not None:
-                            print(f"\nRecomputing Heat Method geodesic for PRED (learned G)...")
-                            distances = compute_heat_geodesic_learned(
-                                S=L, M=M, G=self.current_learned_gradient_op,
-                                source_idx=source_idx, n_vertices=n,
-                                device=self.current_device
-                            )
-                    else:
-                        # Stiffness mode: use pcdiff operators
-                        if self._pc_grad_op is not None and self._pc_div_op is not None:
-                            print(f"\nRecomputing Heat Method geodesic for PRED (pcdiff)...")
-                            distances = compute_heat_geodesic_pointcloud(
-                                L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
-                                source_idx=source_idx, n_vertices=n,
-                                device=self.current_device
-                            )
+            n_sources = len(self._source_indices)
+            print(f"\nRecomputing Heat Method geodesic for {method_key} ({n_sources} sources)...")
 
-            elif method_key == 'Robust':
-                if self._robust_geodesic_heat:
-                    # Heat method with Robust's own L, M and fresh pcdiff operators
-                    if L is not None and M is not None and HAS_PCDIFF:
-                        try:
-                            robust_k = self.reconstruction_settings.current_robust_k
-                            print(f"\nRecomputing Heat Method geodesic for Robust (k={robust_k})...")
-                            robust_edge_index = knn_graph(vertices, k=robust_k)
-                            robust_grad_op, robust_div_op = build_pointcloud_grad_div_operators(vertices, robust_edge_index)
-                            distances = compute_heat_geodesic_pointcloud(
-                                L=L, M=M, grad_op=robust_grad_op, div_op=robust_div_op,
-                                source_idx=source_idx, n_vertices=n
-                            )
-                        except Exception as e:
-                            print(f"  [!] Robust heat method failed: {e}")
-                else:
-                    # Default: potpourri3d
-                    print(f"\nRecomputing geodesic for Robust (pp3d)...")
-                    try:
-                        import potpourri3d as pp3d
-                        pc_solver = pp3d.PointCloudHeatSolver(vertices)
-                        distances = pc_solver.compute_distance(source_idx)
-                    except Exception as e:
-                        print(f"  [!] potpourri3d solver failed: {e}")
+            _t_solve = time.perf_counter()
+            for source_idx in self._source_indices:
+                exact_distances = self._exact_geodesics.get(source_idx)
+                if exact_distances is None:
+                    continue
 
-            elif method_key == 'NeLo':
-                if L is not None and M is not None:
-                    if self._pc_grad_op is not None and self._pc_div_op is not None:
-                        print(f"\nRecomputing Heat Method geodesic for NeLo (pcdiff)...")
-                        distances = compute_heat_geodesic_pointcloud(
-                            L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
-                            source_idx=source_idx, n_vertices=n,
-                            device=self.current_device
-                        )
-
-            if distances is not None:
-                # Result key depends on the geodesic mode
-                if method_key == "Robust":
-                    result_key = "Robust" if self._robust_geodesic_heat else "Robust (pp3d)"
-                else:
-                    result_key = method_key
-
-                metrics = compute_geodesic_metrics(distances, exact_distances)
-                result = HeatMethodGeodesicResult(
-                    method_name=result_key,
-                    source_vertex_idx=source_idx,
-                    num_vertices=n,
-                    min_distance=float(distances.min()),
-                    max_distance=float(distances.max()),
-                    mean_distance=float(distances.mean()),
-                    distance_at_source=float(distances[source_idx]),
-                    correlation_with_reference=float(metrics.correlation),
-                    mean_absolute_error=float(metrics.mae_normalized),
-                    max_absolute_error=float(metrics.max_error_normalized),
-                    relative_error_percent=float(metrics.mae_normalized * 100),
-                    monotonicity_score=float(metrics.monotonicity),
+                distances = self._compute_geodesic_single_source(
+                    method_key, source_idx, vertices, L, M,
+                    mesh_grad_op=mesh_grad_op, mesh_face_areas=mesh_face_areas
                 )
 
-                if self.current_heat_geodesic_results is None:
-                    self.current_heat_geodesic_results = {}
-                self.current_heat_geodesic_results[result_key] = result
+                if distances is not None:
+                    metrics = compute_geodesic_metrics(distances, exact_distances)
+                    result = HeatMethodGeodesicResult(
+                        method_name=result_key,
+                        source_vertex_idx=source_idx,
+                        num_vertices=n,
+                        min_distance=float(distances.min()),
+                        max_distance=float(distances.max()),
+                        mean_distance=float(distances.mean()),
+                        distance_at_source=float(distances[source_idx]),
+                        correlation_with_reference=float(metrics.correlation),
+                        mean_absolute_error=float(metrics.mae_normalized),
+                        max_absolute_error=float(metrics.max_error_normalized),
+                        relative_error_percent=float(metrics.mae_normalized * 100),
+                        monotonicity_score=float(metrics.monotonicity),
+                    )
 
-                print(f"  {result_key}: corr={metrics.correlation:.4f}, MAE={metrics.mae_normalized:.4f}")
+                    if source_idx not in self._all_geodesic_results:
+                        self._all_geodesic_results[source_idx] = {}
+                    self._all_geodesic_results[source_idx][result_key] = result
 
-                # Update visualization if available
-                mesh_structure = self.current_mesh_structure
-                if mesh_structure is not None and not self._quantitative_mode:
+                    # Cache raw distances for slider refresh
+                    if source_idx not in self._all_geodesic_distances:
+                        self._all_geodesic_distances[source_idx] = {}
+                    self._all_geodesic_distances[source_idx][result_key] = distances
+
+            solve_elapsed = time.perf_counter() - _t_solve
+
+            self._aggregate_geodesic_metrics()
+
+            # Update current_heat_geodesic_results to first source for Polyscope
+            first_src = self._source_indices[0]
+            if first_src in self._all_geodesic_results:
+                self.current_heat_geodesic_results = self._all_geodesic_results[first_src]
+
+            # Update Polyscope visualization for display source
+            display_src = self._source_indices[self._current_source_display_idx]
+            mesh_structure = self.current_mesh_structure
+            if mesh_structure is not None and not self._quantitative_mode:
+                exact_distances = self._exact_geodesics.get(display_src)
+                distances = self._compute_geodesic_single_source(
+                    method_key, display_src, vertices, L, M,
+                    mesh_grad_op=mesh_grad_op, mesh_face_areas=mesh_face_areas
+                )
+                if distances is not None and exact_distances is not None:
                     d_norm = normalize_distances(distances)
                     is_bad = distances.max() > 1e3
                     label_suffix = " [!]" if is_bad else ""
                     cmap = 'hot' if is_bad else 'viridis'
                     mesh_structure.add_scalar_quantity(
                         name=f"K1 Geodesic (norm) - {result_key}{label_suffix}",
-                        values=d_norm,
-                        enabled=False,
-                        cmap=cmap
+                        values=d_norm, enabled=False, cmap=cmap
                     )
                     exact_norm = normalize_distances(exact_distances)
                     error = np.abs(d_norm - exact_norm)
                     mesh_structure.add_scalar_quantity(
                         name=f"K2 Geodesic Error - {result_key}",
-                        values=error,
-                        enabled=False,
-                        cmap='reds'
+                        values=error, enabled=False, cmap='reds'
                     )
-            else:
-                print(f"  [!] No geodesic distances computed for {method_key}")
 
-            # Update solve timing
-            geo_elapsed = time.perf_counter() - _t_geo_start
-            timing_field = {'GT': 'gt_geodesic_solve_time', 'PRED': 'pred_geodesic_solve_time',
-                            'Robust': 'robust_geodesic_solve_time', 'NeLo': 'nelo_geodesic_solve_time'}.get(method_key)
-            if timing_field:
-                setattr(self.timing_results, timing_field, geo_elapsed)
+            # Print aggregated summary
+            agg = self._aggregated_geodesic_metrics.get(result_key)
+            if agg:
+                print(f"  {result_key}: corr={agg.corr_mean:.4f}±{agg.corr_std:.4f}, "
+                      f"MAE={agg.mae_mean:.4f}±{agg.mae_std:.4f} ({agg.n_sources} sources)")
+
+            # Store timing
+            if grad_op_elapsed > 0:
+                grad_op_field = {'GT': 'gt_grad_op_time', 'PRED': 'pred_grad_op_time',
+                                 'NeLo': 'nelo_grad_op_time'}.get(method_key)
+                if grad_op_field:
+                    setattr(self.timing_results, grad_op_field, grad_op_elapsed)
+
+            solve_field = {'GT': 'gt_geodesic_solve_time', 'PRED': 'pred_geodesic_solve_time',
+                           'Robust': 'robust_geodesic_solve_time', 'NeLo': 'nelo_geodesic_solve_time'}.get(method_key)
+            if solve_field:
+                setattr(self.timing_results, solve_field, solve_elapsed)
 
         except Exception as e:
             print(f"  [!] Geodesic recomputation for {method_key} failed: {e}")
@@ -1327,10 +1542,16 @@ class RealTimeEigenanalysisVisualizer:
         self.current_sparsity_stats = {}
 
         # Clear cached validation state
-        self._greens_source_vertex_idx = None
+        self._source_indices = None
+        self._exact_geodesics = None
         self._greens_gt_values = None
-        self._geodesic_source_vertex_idx = None
-        self._exact_geodesic_distances = None
+        self._all_greens_results = {}
+        self._all_geodesic_results = {}
+        self._all_greens_values = {}
+        self._all_geodesic_distances = {}
+        self._aggregated_geodesic_metrics = {}
+        self._aggregated_greens_metrics = {}
+        self._current_source_display_idx = 0
         self._pc_grad_op = None
         self._pc_div_op = None
         self._weight_nbr_sample_indices = None
@@ -1884,10 +2105,97 @@ class RealTimeEigenanalysisVisualizer:
 
         self._print_timing_summary()
 
+    def _refresh_source_display(self):
+        """Update Polyscope visualization when source slider changes. No recomputation."""
+        if not self._source_indices:
+            return
+        src_idx = self._source_indices[self._current_source_display_idx]
+        mesh = self.current_mesh_structure
+        if mesh is None:
+            return
+
+        # Update Green's function coloring
+        for method, values in self._all_greens_values.get(src_idx, {}).items():
+            mesh.add_scalar_quantity(
+                f"J1 Green's Function - {method}", values, enabled=False, cmap='coolwarm'
+            )
+
+        # Update geodesic coloring
+        exact = self._exact_geodesics.get(src_idx) if self._exact_geodesics else None
+        for method, dists in self._all_geodesic_distances.get(src_idx, {}).items():
+            d_norm = normalize_distances(dists)
+            is_bad = dists.max() > 1e3
+            label_suffix = " [!]" if is_bad else ""
+            cmap = 'hot' if is_bad else 'viridis'
+            mesh.add_scalar_quantity(
+                f"K1 Geodesic (norm) - {method}{label_suffix}",
+                d_norm, enabled=False, cmap=cmap
+            )
+            if exact is not None:
+                exact_norm = normalize_distances(exact)
+                error = np.abs(d_norm - exact_norm)
+                mesh.add_scalar_quantity(
+                    f"K2 Geodesic Error - {method}", error, enabled=False, cmap='reds'
+                )
+
+        # Update exact geodesic visualization
+        if exact is not None:
+            mesh.add_scalar_quantity(
+                "K1 Geodesic (norm) - Exact", normalize_distances(exact),
+                enabled=False, cmap='viridis'
+            )
+
+        # Update per-source result dicts so UI tables refresh automatically
+        self.current_greens_results = self._all_greens_results.get(src_idx, {})
+        self.current_heat_geodesic_results = self._all_geodesic_results.get(src_idx, {})
+
+        # Source point marker
+        if self.current_original_vertices is not None:
+            pos = self.current_original_vertices[src_idx:src_idx + 1]
+            ps.register_point_cloud("Source Vertex", pos, radius=0.025, color=(0.6, 0.0, 0.8))
+
+    def _print_multisource_summary(self):
+        """Print aggregated metrics across all source vertices."""
+        n_sources = len(self._source_indices) if self._source_indices else 0
+        if n_sources == 0:
+            return
+
+        print(f"\n{'=' * 80}")
+        print(f"MULTI-SOURCE VALIDATION SUMMARY ({n_sources} FPS-sampled sources)")
+        print(f"{'=' * 80}")
+
+        # Geodesic table
+        if self._aggregated_geodesic_metrics:
+            print(f"\nGEODESIC QUALITY (averaged over {n_sources} sources, normalized [0,1])")
+            print(f"{'-' * 80}")
+            print(f"{'Method':<16} {'Corr':>14} {'MAE':>14} {'MaxErr':>14} {'Mono':>14}")
+            print(f"{'-' * 80}")
+            for method, agg in self._aggregated_geodesic_metrics.items():
+                print(f"{method:<16} {agg.corr_mean:>6.4f}±{agg.corr_std:<5.4f}"
+                      f" {agg.mae_mean:>6.4f}±{agg.mae_std:<5.4f}"
+                      f" {agg.max_err_mean:>6.4f}±{agg.max_err_std:<5.4f}"
+                      f" {agg.mono_mean:>6.4f}±{agg.mono_std:<5.4f}")
+
+        # Green's function table
+        if self._aggregated_greens_metrics:
+            print(f"\nGREEN'S FUNCTION QUALITY (averaged over {n_sources} sources)")
+            print(f"{'-' * 80}")
+            print(f"{'Method':<16} {'GT Corr':>14} {'Mono':>14} {'MaxPrinc Pass':>14}")
+            print(f"{'-' * 80}")
+            for method, agg in self._aggregated_greens_metrics.items():
+                print(f"{method:<16} {agg.greens_corr_with_gt_mean:>6.4f}±{agg.greens_corr_with_gt_std:<5.4f}"
+                      f" {agg.greens_mono_mean:>6.4f}±{agg.greens_mono_std:<5.4f}"
+                      f" {agg.greens_max_principle_pass_rate:>12.0%}")
+
+        print(f"{'=' * 80}\n")
+
     def _print_timing_summary(self):
-        """Print a summary table comparing matrix assembly times for all methods."""
+        """Print timing comparison tables: assembly, geodesic E2E, Green's E2E."""
         t = self.timing_results
 
+        # =====================================================================
+        # TABLE 1: Laplacian Assembly (L, M)
+        # =====================================================================
         print(f"\n{'=' * 70}")
         print("LAPLACIAN MATRIX ASSEMBLY TIMING COMPARISON")
         print(f"{'=' * 70}")
@@ -1927,7 +2235,7 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"{'-' * 70}")
 
-        # Speedup comparison (if GT is non-zero)
+        # Speedup comparison
         if t.gt_matrix_assembly_time > 0:
             pred_vs_gt = t.pred_total_time / t.gt_matrix_assembly_time
             robust_vs_gt = t.robust_matrix_assembly_time / t.gt_matrix_assembly_time if t.robust_matrix_assembly_time > 0 else 0
@@ -1947,29 +2255,61 @@ class RealTimeEigenanalysisVisualizer:
             pred_vs_nelo = t.pred_total_time / t.nelo_total_time
             print(f"PRED vs NeLo:    {pred_vs_nelo:.2f}x")
 
-        # E2E timing: assembly + downstream solve
-        has_e2e = (t.pred_geodesic_solve_time > 0 or t.pred_greens_solve_time > 0 or
-                   t.gt_geodesic_solve_time > 0 or t.gt_greens_solve_time > 0)
-        if has_e2e:
+        # =====================================================================
+        # TABLE 2: Geodesic E2E (L,M assembly + grad operator + solve)
+        # =====================================================================
+        has_geodesic = (t.gt_geodesic_solve_time > 0 or t.pred_geodesic_solve_time > 0)
+        if has_geodesic:
+            n_src = len(self._source_indices) if self._source_indices else 1
+            src_note = f" (avg over {n_src} sources)" if n_src > 1 else ""
             print(f"\n{'-' * 70}")
-            print(f"END-TO-END: Assembly + Downstream Solve")
+            print(f"GEODESIC E2E: L,M Assembly + Grad Operator + Solve{src_note}")
             print(f"{'-' * 70}")
-            print(f"{'Method':<25} {'Geodesic (ms)':>14} {'Greens (ms)':>14}")
+            print(f"{'Method':<14} {'L,M (ms)':>10} {'Grad (ms)':>10} {'Solve (ms)':>10} {'TOTAL (ms)':>10}")
             print(f"{'-' * 70}")
 
-            for label, total, geo_t, grn_t in [
-                ('GT',     t.gt_matrix_assembly_time,     t.gt_geodesic_solve_time,     t.gt_greens_solve_time),
-                ('PRED',   t.pred_total_time,             t.pred_geodesic_solve_time,   t.pred_greens_solve_time),
-                ('NeLo',   t.nelo_total_time,             t.nelo_geodesic_solve_time,   t.nelo_greens_solve_time),
-                ('Robust', t.robust_matrix_assembly_time, t.robust_geodesic_solve_time, t.robust_greens_solve_time),
+            for label, lm_time, grad_time, solve_time in [
+                ('GT',     t.gt_matrix_assembly_time,     t.gt_grad_op_time,   t.gt_geodesic_solve_time),
+                ('PRED',   t.pred_total_time,             t.pred_grad_op_time, t.pred_geodesic_solve_time),
+                ('NeLo',   t.nelo_total_time,             t.nelo_grad_op_time, t.nelo_geodesic_solve_time),
             ]:
-                if label == 'Robust' and not self._robust_geodesic_heat and geo_t > 0:
-                    # pp3d mode: solve is self-contained (includes its own Laplacian)
-                    geo_str = f"{geo_t * 1000:>10.1f}"
+                if solve_time > 0:
+                    solve_avg = solve_time / n_src
+                    total = lm_time + grad_time + solve_avg
+                    print(f"{label:<14} {lm_time * 1000:>10.1f} {grad_time * 1000:>10.1f} {solve_avg * 1000:>10.1f} {total * 1000:>10.1f}")
+
+            # Robust: pp3d is self-contained
+            if t.robust_geodesic_solve_time > 0:
+                solve_avg = t.robust_geodesic_solve_time / n_src
+                if self._robust_geodesic_heat:
+                    total = t.robust_matrix_assembly_time + solve_avg
+                    print(f"{'Robust':<14} {t.robust_matrix_assembly_time * 1000:>10.1f} {'(incl.)':>10} {solve_avg * 1000:>10.1f} {total * 1000:>10.1f}")
                 else:
-                    geo_str = f"{(total + geo_t) * 1000:>10.1f}" if geo_t > 0 else f"{'N/A':>10}"
-                grn_str = f"{(total + grn_t) * 1000:>10.1f}" if grn_t > 0 else f"{'N/A':>10}"
-                print(f"{label:<25} {geo_str:>14} {grn_str:>14}")
+                    print(f"{'Robust (pp3d)':<14} {'—':>10} {'—':>10} {solve_avg * 1000:>10.1f} {solve_avg * 1000:>10.1f}")
+
+        # =====================================================================
+        # TABLE 3: Green's Function E2E (L,M assembly + solve)
+        # =====================================================================
+        has_greens = (t.gt_greens_solve_time > 0 or t.pred_greens_solve_time > 0)
+        if has_greens:
+            n_src = len(self._source_indices) if self._source_indices else 1
+            src_note = f" (avg over {n_src} sources)" if n_src > 1 else ""
+            print(f"\n{'-' * 70}")
+            print(f"GREEN'S FUNCTION E2E: L,M Assembly + Solve{src_note}")
+            print(f"{'-' * 70}")
+            print(f"{'Method':<14} {'L,M (ms)':>10} {'Solve (ms)':>10} {'TOTAL (ms)':>10}")
+            print(f"{'-' * 70}")
+
+            for label, lm_time, solve_time in [
+                ('GT',     t.gt_matrix_assembly_time,     t.gt_greens_solve_time),
+                ('PRED',   t.pred_total_time,             t.pred_greens_solve_time),
+                ('NeLo',   t.nelo_total_time,             t.nelo_greens_solve_time),
+                ('Robust', t.robust_matrix_assembly_time, t.robust_greens_solve_time),
+            ]:
+                if solve_time > 0:
+                    solve_avg = solve_time / n_src
+                    total = lm_time + solve_avg
+                    print(f"{label:<14} {lm_time * 1000:>10.1f} {solve_avg * 1000:>10.1f} {total * 1000:>10.1f}")
 
         print(f"{'=' * 70}\n")
 
@@ -2049,6 +2389,7 @@ class RealTimeEigenanalysisVisualizer:
         if operator_mode == "gradient" and new_forward_result is not None and new_forward_result.get('grad_coeffs') is not None:
             try:
                 print("  Reassembling learned gradient operator G for new k...")
+                _t_grad_op = time.perf_counter()
                 batch_indices_for_g = self.current_batch_indices.clone()
                 self.current_learned_gradient_op = assemble_gradient_operator(
                     grad_coeffs=new_forward_result['grad_coeffs'],
@@ -2057,7 +2398,9 @@ class RealTimeEigenanalysisVisualizer:
                     center_indices=self.current_center_indices,
                     batch_indices=batch_indices_for_g
                 )
+                self.timing_results.pred_grad_op_time = time.perf_counter() - _t_grad_op
                 print(f"  Updated learned G: {self.current_learned_gradient_op.shape} ({self.current_learned_gradient_op.nnz} non-zeros)")
+                print(f"  [TIMING] Gradient operator assembly: {self.timing_results.pred_grad_op_time * 1000:.2f} ms")
             except Exception as e:
                 print(f"  [!] Failed to reassemble learned gradient operator: {e}")
                 self.current_learned_gradient_op = None
@@ -4055,8 +4398,8 @@ class RealTimeEigenanalysisVisualizer:
             L = ensure_psd(L)
             A = L + adaptive_reg * M
 
-            # Solve the linear system
-            g_raw = sparse_solve(A, delta, device)
+            # Solve the linear system (L + reg*M is SPD)
+            g_raw = sparse_solve(A, delta, device, spd=True)
 
             if not np.isfinite(g_raw).all():
                 print(f"  [!] Solution contains NaN or Inf values")
@@ -4503,8 +4846,8 @@ class RealTimeEigenanalysisVisualizer:
         if source_vertex_idx is None:
             source_vertex_idx = self.select_source_vertex(vertices, method="centroid")
 
-        # Cache source vertex for targeted recomputation
-        self._greens_source_vertex_idx = source_vertex_idx
+        # Cache source vertex (backward compat — multi-source state is in _source_indices)
+        # This source_vertex_idx is used within this function only
 
         source_pos = vertices[source_vertex_idx]
         print(f"Source vertex: {source_vertex_idx} at position ({source_pos[0]:.4f}, {source_pos[1]:.4f}, {source_pos[2]:.4f})")
@@ -4552,7 +4895,10 @@ class RealTimeEigenanalysisVisualizer:
                         gt_greens_function=None  # This IS the GT
                     )
                     greens_functions['GT'] = gt_greens
-                    self._greens_gt_values = gt_greens  # Cache for per-method recomputation
+                    # Cache GT Green's function for per-method recomputation (multi-source dict)
+                    if self._greens_gt_values is None:
+                        self._greens_gt_values = {}
+                    self._greens_gt_values[source_vertex_idx] = gt_greens
                     print(f"  GT Green's function: min={gt_greens.min():.6f}, max={gt_greens.max():.6f}")
                 self.timing_results.gt_greens_solve_time = time.perf_counter() - _t_greens_start
 
@@ -4677,6 +5023,13 @@ class RealTimeEigenanalysisVisualizer:
                 traceback.print_exc()
 
         # =====================================================================
+        # Cache raw Green's function values for slider refresh
+        if source_vertex_idx is not None and greens_functions:
+            if source_vertex_idx not in self._all_greens_values:
+                self._all_greens_values[source_vertex_idx] = {}
+            for mk, gv in greens_functions.items():
+                self._all_greens_values[source_vertex_idx][mk] = gv
+
         # Print comparison table
         # =====================================================================
         print(f"\n" + "=" * 90)
@@ -4933,8 +5286,8 @@ class RealTimeEigenanalysisVisualizer:
         if source_vertex_idx is None:
             source_vertex_idx = select_geodesic_source_vertex(vertices, method="centroid")
 
-        # Cache source vertex for targeted recomputation
-        self._geodesic_source_vertex_idx = source_vertex_idx
+        # Cache source vertex (backward compat — multi-source state is in _source_indices)
+        # This source_vertex_idx is used within this function only
 
         source_pos = vertices[source_vertex_idx]
         print(f"Source vertex: {source_vertex_idx} at ({source_pos[0]:.4f}, {source_pos[1]:.4f}, {source_pos[2]:.4f})")
@@ -4953,9 +5306,12 @@ class RealTimeEigenanalysisVisualizer:
             try:
                 V = vertices.astype(np.float64)
                 F = faces.astype(np.int32)
+                _t_gt_grad = time.perf_counter()
                 mesh_grad_op = igl.grad(V, F)  # (3*nF x nV) matrix
                 mesh_face_areas = igl.doublearea(V, F).flatten() / 2.0  # (nF,)
+                self.timing_results.gt_grad_op_time = time.perf_counter() - _t_gt_grad
                 print(f"  Mesh gradient operator (igl): {mesh_grad_op.shape}")
+                print(f"  [TIMING] GT grad operator (igl.grad + doublearea): {self.timing_results.gt_grad_op_time * 1000:.2f} ms")
             except Exception as e:
                 print(f"  [!] igl.grad() failed: {e}")
 
@@ -5008,10 +5364,13 @@ class RealTimeEigenanalysisVisualizer:
             try:
                 nelo_k = self.nelo_k
                 print(f"\nBuilding point cloud gradient/divergence operators for NeLo (k={nelo_k})...")
+                _t_nelo_grad = time.perf_counter()
                 nelo_edge_index = knn_graph(vertices, k=nelo_k)
                 nelo_grad_op, nelo_div_op = build_pointcloud_grad_div_operators(vertices, nelo_edge_index)
+                self.timing_results.nelo_grad_op_time = time.perf_counter() - _t_nelo_grad
                 print(f"  NeLo gradient operator: {nelo_grad_op.shape}")
                 print(f"  NeLo divergence operator: {nelo_div_op.shape}")
+                print(f"  [TIMING] NeLo grad/div operators: {self.timing_results.nelo_grad_op_time * 1000:.2f} ms")
             except Exception as e:
                 print(f"  [!] pcdiff operators (NeLo) failed: {e}")
                 import traceback
@@ -5038,13 +5397,21 @@ class RealTimeEigenanalysisVisualizer:
         # =====================================================================
         print("\nComputing EXACT geodesic distances (ground truth)...")
 
-        # Use shared function for exact geodesics
-        exact_distances = compute_exact_geodesics(vertices, faces, source_vertex_idx)
+        # Use precomputed exact geodesics if available from Step 7.5
+        exact_distances = None
+        exact_method = None
+        if self._exact_geodesics and source_vertex_idx in self._exact_geodesics:
+            exact_distances = self._exact_geodesics[source_vertex_idx]
+            exact_method = "pygeodesic/igl (precomputed)"
+            print(f"  Using precomputed exact geodesics for source {source_vertex_idx}")
+        else:
+            # Compute from scratch
+            exact_distances = compute_exact_geodesics(vertices, faces, source_vertex_idx)
 
-        if exact_distances is not None:
+        if exact_distances is not None and exact_method is None:
             exact_method = "pygeodesic/igl"
             print(f"  Exact geodesics computed successfully")
-        else:
+        elif exact_distances is None:
             # Fallback to potpourri3d heat method (approximate)
             try:
                 import potpourri3d as pp3d
@@ -5065,8 +5432,10 @@ class RealTimeEigenanalysisVisualizer:
         reference_distances = exact_distances
         reference_method = exact_method
 
-        # Cache exact distances for targeted recomputation
-        self._exact_geodesic_distances = exact_distances
+        # Cache exact distances in multi-source structure
+        if self._exact_geodesics is None:
+            self._exact_geodesics = {}
+        self._exact_geodesics[source_vertex_idx] = exact_distances
 
         # =====================================================================
         # NOTE: normalize_distances and compute_geodesic_metrics are imported
@@ -5222,6 +5591,14 @@ class RealTimeEigenanalysisVisualizer:
 
         # Add exact geodesics to the comparison set
         geodesic_distances["Exact"] = exact_distances
+
+        # Cache raw geodesic distances for slider refresh
+        if source_vertex_idx is not None:
+            if source_vertex_idx not in self._all_geodesic_distances:
+                self._all_geodesic_distances[source_vertex_idx] = {}
+            for mk, dv in geodesic_distances.items():
+                if mk != "Exact":
+                    self._all_geodesic_distances[source_vertex_idx][mk] = dv
 
         # =====================================================================
         # Compute quality metrics for each method vs EXACT geodesics
@@ -5482,6 +5859,7 @@ class RealTimeEigenanalysisVisualizer:
         if operator_mode == "gradient" and forward_result is not None and forward_result.get('grad_coeffs') is not None:
             try:
                 print("Assembling learned gradient operator G...")
+                _t_grad_op = time.perf_counter()
                 batch_indices_for_g = self.current_batch_indices.clone()
                 self.current_learned_gradient_op = assemble_gradient_operator(
                     grad_coeffs=forward_result['grad_coeffs'],
@@ -5490,7 +5868,9 @@ class RealTimeEigenanalysisVisualizer:
                     center_indices=self.current_center_indices,
                     batch_indices=batch_indices_for_g
                 )
+                self.timing_results.pred_grad_op_time = time.perf_counter() - _t_grad_op
                 print(f"  Learned G: {self.current_learned_gradient_op.shape} ({self.current_learned_gradient_op.nnz} non-zeros)")
+                print(f"  [TIMING] Gradient operator assembly: {self.timing_results.pred_grad_op_time * 1000:.2f} ms")
             except Exception as e:
                 print(f"  [!] Failed to assemble learned gradient operator: {e}")
                 self.current_learned_gradient_op = None
@@ -5611,7 +5991,36 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print(f"\nSTEP 7: Skipping mesh reconstructions (quantitative_mode=True)")
 
+        # STEP 7.5: Select multiple source vertices for Green's + geodesic validation
+        vertices_for_sources = gt_data['vertices'].astype(np.float64)
+        self._source_indices = select_multiple_geodesic_sources(
+            vertices_for_sources, num_sources=self.config.num_validation_sources, method="farthest_point_sampling", seed=42
+        ).tolist()
+        self._exact_geodesics = {}
+        self._greens_gt_values = {}
+        self._all_greens_results = {}
+        self._all_geodesic_results = {}
+        self._all_greens_values = {}
+        self._all_geodesic_distances = {}
+        self._current_source_display_idx = 0
+        print(f"\nSelected {len(self._source_indices)} source vertices (FPS): {self._source_indices}")
+
+        # Precompute exact geodesics for all sources
+        print("Precomputing exact geodesics for all sources...")
+        for src_idx in self._source_indices:
+            exact = compute_exact_geodesics(vertices_for_sources, gt_data['faces'], int(src_idx))
+            if exact is not None:
+                self._exact_geodesics[src_idx] = exact
+        print(f"  Exact geodesics computed for {len(self._exact_geodesics)}/{len(self._source_indices)} sources")
+
+        # Register initial source point marker
+        if not self._quantitative_mode and self._source_indices:
+            first_src = self._source_indices[0]
+            src_pos = gt_data['vertices'][first_src:first_src + 1]
+            ps.register_point_cloud("Source Vertex", src_pos, radius=0.025, color=(0.6, 0.0, 0.8))
+
         # STEP 8: Green's function maximum principle validation
+        # (Uses first source for full Polyscope visualization)
         print(f"\nSTEP 8: Green's function maximum principle validation")
         L_gt = None
         M_gt = None
@@ -5621,13 +6030,13 @@ class RealTimeEigenanalysisVisualizer:
         M_robust = None
         try:
             greens_results = self.compute_and_visualize_greens_functions(
-                mesh_structure, gt_data, inference_result
+                mesh_structure, gt_data, inference_result,
+                source_vertex_idx=self._source_indices[0]  # First source for viz
             )
-            # Store results for potential UI display
+            # Store results in both old (display) and new (multi-source) structures
             self.current_greens_results = greens_results
-
-            # Extract Laplacians for Step 9 (they're built in step 8)
-            # We'll rebuild them here for Step 9 since they're local to compute_and_visualize_greens_functions
+            first_src = self._source_indices[0]
+            self._all_greens_results[first_src] = dict(greens_results) if greens_results else {}
         except Exception as e:
             print(f"  [!] Green's function validation failed: {e}")
             import traceback
@@ -5657,7 +6066,7 @@ class RealTimeEigenanalysisVisualizer:
                 k = self.reconstruction_settings.current_robust_k
                 L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
 
-            # Run Heat Method geodesic validation
+            # Run Heat Method geodesic validation (first source for full viz)
             heat_geodesic_results = self.validate_heat_method_geodesics_step9(
                 vertices=vertices,
                 faces=faces,
@@ -5667,16 +6076,160 @@ class RealTimeEigenanalysisVisualizer:
                 M_pred=M_pred,
                 L_robust=L_robust,
                 M_robust=M_robust,
-                source_vertex_idx=None,  # Will auto-select centroid
+                source_vertex_idx=self._source_indices[0],
                 mesh_structure=mesh_structure,
                 k_neighbors=self.reconstruction_settings.current_pred_k
             )
             self.current_heat_geodesic_results = heat_geodesic_results
 
+            # Store first source results in multi-source structure
+            first_src = self._source_indices[0]
+            if heat_geodesic_results:
+                self._all_geodesic_results[first_src] = dict(heat_geodesic_results)
+
         except Exception as e:
             print(f"  [!] Heat Method geodesic validation failed: {e}")
             import traceback
             traceback.print_exc()
+
+        # STEP 9.5: Multi-source validation (remaining sources, metrics only)
+        if len(self._source_indices) > 1 and len(self._exact_geodesics) > 0:
+            print(f"\nSTEP 9.5: Multi-source validation ({len(self._source_indices) - 1} additional sources)")
+            try:
+                remaining_sources = self._source_indices[1:]
+
+                # Cache L/M per method once (avoid recomputing Robust Laplacian per source)
+                method_LM = {}
+                for mk in ['GT', 'PRED', 'Robust', 'NeLo']:
+                    method_LM[mk] = self._get_method_L_M(mk)
+
+                # Cache GT grad ops once
+                mesh_grad_op_ms = None
+                mesh_face_areas_ms = None
+                if HAS_IGL:
+                    V_ms = gt_data['vertices'].astype(np.float64)
+                    F_ms = gt_data['faces'].astype(np.int32)
+                    mesh_grad_op_ms = igl.grad(V_ms, F_ms)
+                    mesh_face_areas_ms = igl.doublearea(V_ms, F_ms).flatten() / 2.0
+
+                # Timing accumulators for additional sources
+                greens_time_accum = {}  # method -> total seconds
+                geodesic_time_accum = {}  # method -> total seconds
+
+                for src_idx in remaining_sources:
+                    exact_distances = self._exact_geodesics.get(src_idx)
+                    if exact_distances is None:
+                        continue
+
+                    # Green's function for all methods
+                    for method_key in ['GT', 'PRED', 'Robust', 'NeLo']:
+                        Lm, Mm = method_LM[method_key]
+                        if Lm is None:
+                            continue
+                        try:
+                            device = self.current_device if method_key in ('PRED', 'NeLo') else None
+                            _t = time.perf_counter()
+                            result = self.compute_greens_function(Lm, Mm, src_idx, device=device)
+                            elapsed = time.perf_counter() - _t
+                            greens_time_accum[method_key] = greens_time_accum.get(method_key, 0.0) + elapsed
+                            if result is not None:
+                                greens_values, residual = result
+                                gt_greens = self._greens_gt_values.get(src_idx)
+                                validation = self.validate_maximum_principle(
+                                    greens_values, src_idx, method_key,
+                                    vertices=gt_data['vertices'], faces=gt_data['faces'],
+                                    laplacian_residual_norm=residual,
+                                    gt_greens_function=gt_greens
+                                )
+                                if src_idx not in self._all_greens_results:
+                                    self._all_greens_results[src_idx] = {}
+                                self._all_greens_results[src_idx][method_key] = validation
+
+                                # Cache raw values for slider refresh
+                                if src_idx not in self._all_greens_values:
+                                    self._all_greens_values[src_idx] = {}
+                                self._all_greens_values[src_idx][method_key] = greens_values
+
+                                if method_key == 'GT':
+                                    self._greens_gt_values[src_idx] = greens_values
+                        except Exception:
+                            pass  # Silent failure for additional sources
+
+                    # Geodesics for all methods
+                    for method_key in ['GT', 'PRED', 'NeLo', 'Robust']:
+                        try:
+                            Lm, Mm = method_LM[method_key]
+                            if Lm is None and method_key != 'Robust':
+                                continue
+
+                            _t = time.perf_counter()
+                            distances = self._compute_geodesic_single_source(
+                                method_key, src_idx,
+                                gt_data['vertices'].astype(np.float64), Lm, Mm,
+                                mesh_grad_op=mesh_grad_op_ms if method_key == 'GT' else None,
+                                mesh_face_areas=mesh_face_areas_ms if method_key == 'GT' else None
+                            )
+                            elapsed = time.perf_counter() - _t
+                            geodesic_time_accum[method_key] = geodesic_time_accum.get(method_key, 0.0) + elapsed
+                            if distances is not None:
+                                result_key = method_key
+                                if method_key == "Robust" and not self._robust_geodesic_heat:
+                                    result_key = "Robust (pp3d)"
+                                metrics = compute_geodesic_metrics(distances, exact_distances)
+                                n_verts = len(gt_data['vertices'])
+                                result = HeatMethodGeodesicResult(
+                                    method_name=result_key,
+                                    source_vertex_idx=src_idx,
+                                    num_vertices=n_verts,
+                                    min_distance=float(distances.min()),
+                                    max_distance=float(distances.max()),
+                                    mean_distance=float(distances.mean()),
+                                    distance_at_source=float(distances[src_idx]),
+                                    correlation_with_reference=float(metrics.correlation),
+                                    mean_absolute_error=float(metrics.mae_normalized),
+                                    max_absolute_error=float(metrics.max_error_normalized),
+                                    relative_error_percent=float(metrics.mae_normalized * 100),
+                                    monotonicity_score=float(metrics.monotonicity),
+                                )
+                                if src_idx not in self._all_geodesic_results:
+                                    self._all_geodesic_results[src_idx] = {}
+                                self._all_geodesic_results[src_idx][result_key] = result
+
+                                # Cache raw distances for slider refresh
+                                if src_idx not in self._all_geodesic_distances:
+                                    self._all_geodesic_distances[src_idx] = {}
+                                self._all_geodesic_distances[src_idx][result_key] = distances
+                        except Exception:
+                            pass  # Silent failure for additional sources
+
+                    print(f"  Source {src_idx}: done")
+
+                # Accumulate timing from additional sources into timing fields
+                greens_field_map = {'GT': 'gt_greens_solve_time', 'PRED': 'pred_greens_solve_time',
+                                    'Robust': 'robust_greens_solve_time', 'NeLo': 'nelo_greens_solve_time'}
+                for mk, field in greens_field_map.items():
+                    if mk in greens_time_accum:
+                        current = getattr(self.timing_results, field, 0.0)
+                        setattr(self.timing_results, field, current + greens_time_accum[mk])
+
+                geodesic_field_map = {'GT': 'gt_geodesic_solve_time', 'PRED': 'pred_geodesic_solve_time',
+                                      'Robust': 'robust_geodesic_solve_time', 'NeLo': 'nelo_geodesic_solve_time'}
+                for mk, field in geodesic_field_map.items():
+                    if mk in geodesic_time_accum:
+                        current = getattr(self.timing_results, field, 0.0)
+                        setattr(self.timing_results, field, current + geodesic_time_accum[mk])
+
+                # Aggregate all sources
+                self._aggregate_greens_metrics()
+                self._aggregate_geodesic_metrics()
+
+                # Print aggregated summary
+                self._print_multisource_summary()
+
+            except Exception as e:
+                print(f"  [!] Multi-source validation failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         # Print timing summary to console
         self._print_timing_summary()
@@ -5722,50 +6275,49 @@ class RealTimeEigenanalysisVisualizer:
             metrics['nelo_assembly_ms'] = t.nelo_matrix_assembly_time * 1000
             metrics['nelo_total_ms'] = t.nelo_total_time * 1000
 
-        # --- Downstream solve timings ---
+        # --- Downstream solve timings (per-source average) ---
+        n_src = len(self._source_indices) if self._source_indices else 1
         if t.gt_geodesic_solve_time > 0:
-            metrics['gt_geodesic_solve_ms'] = t.gt_geodesic_solve_time * 1000
+            metrics['gt_geodesic_solve_avg_ms'] = t.gt_geodesic_solve_time / n_src * 1000
         if t.pred_geodesic_solve_time > 0:
-            metrics['pred_geodesic_solve_ms'] = t.pred_geodesic_solve_time * 1000
+            metrics['pred_geodesic_solve_avg_ms'] = t.pred_geodesic_solve_time / n_src * 1000
         if t.robust_geodesic_solve_time > 0:
-            metrics['robust_geodesic_solve_ms'] = t.robust_geodesic_solve_time * 1000
+            metrics['robust_geodesic_solve_avg_ms'] = t.robust_geodesic_solve_time / n_src * 1000
         if t.nelo_geodesic_solve_time > 0:
-            metrics['nelo_geodesic_solve_ms'] = t.nelo_geodesic_solve_time * 1000
+            metrics['nelo_geodesic_solve_avg_ms'] = t.nelo_geodesic_solve_time / n_src * 1000
 
         if t.gt_greens_solve_time > 0:
-            metrics['gt_greens_solve_ms'] = t.gt_greens_solve_time * 1000
+            metrics['gt_greens_solve_avg_ms'] = t.gt_greens_solve_time / n_src * 1000
         if t.pred_greens_solve_time > 0:
-            metrics['pred_greens_solve_ms'] = t.pred_greens_solve_time * 1000
+            metrics['pred_greens_solve_avg_ms'] = t.pred_greens_solve_time / n_src * 1000
         if t.robust_greens_solve_time > 0:
-            metrics['robust_greens_solve_ms'] = t.robust_greens_solve_time * 1000
+            metrics['robust_greens_solve_avg_ms'] = t.robust_greens_solve_time / n_src * 1000
         if t.nelo_greens_solve_time > 0:
-            metrics['nelo_greens_solve_ms'] = t.nelo_greens_solve_time * 1000
+            metrics['nelo_greens_solve_avg_ms'] = t.nelo_greens_solve_time / n_src * 1000
 
-        # --- E2E timing: assembly + downstream solve ---
+        # --- E2E timing: assembly + per-source avg downstream solve ---
         if t.pred_geodesic_solve_time > 0:
-            metrics['pred_e2e_geodesic_ms'] = t.pred_total_time * 1000 + t.pred_geodesic_solve_time * 1000
+            metrics['pred_e2e_geodesic_ms'] = t.pred_total_time * 1000 + t.pred_geodesic_solve_time / n_src * 1000
         if t.pred_greens_solve_time > 0:
-            metrics['pred_e2e_greens_ms'] = t.pred_total_time * 1000 + t.pred_greens_solve_time * 1000
+            metrics['pred_e2e_greens_ms'] = t.pred_total_time * 1000 + t.pred_greens_solve_time / n_src * 1000
 
         if t.robust_geodesic_solve_time > 0:
             if self._robust_geodesic_heat:
-                # Heat method: assembly + solve (reuses our Laplacian)
-                metrics['robust_e2e_geodesic_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_geodesic_solve_time * 1000
+                metrics['robust_e2e_geodesic_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_geodesic_solve_time / n_src * 1000
             else:
-                # pp3d mode: self-contained pipeline (builds its own Laplacian internally)
-                metrics['robust_e2e_geodesic_ms'] = t.robust_geodesic_solve_time * 1000
+                metrics['robust_e2e_geodesic_ms'] = t.robust_geodesic_solve_time / n_src * 1000
         if t.robust_greens_solve_time > 0:
-            metrics['robust_e2e_greens_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_greens_solve_time * 1000
+            metrics['robust_e2e_greens_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_greens_solve_time / n_src * 1000
 
         if t.nelo_total_time > 0 and t.nelo_geodesic_solve_time > 0:
-            metrics['nelo_e2e_geodesic_ms'] = t.nelo_total_time * 1000 + t.nelo_geodesic_solve_time * 1000
+            metrics['nelo_e2e_geodesic_ms'] = t.nelo_total_time * 1000 + t.nelo_geodesic_solve_time / n_src * 1000
         if t.nelo_total_time > 0 and t.nelo_greens_solve_time > 0:
-            metrics['nelo_e2e_greens_ms'] = t.nelo_total_time * 1000 + t.nelo_greens_solve_time * 1000
+            metrics['nelo_e2e_greens_ms'] = t.nelo_total_time * 1000 + t.nelo_greens_solve_time / n_src * 1000
 
         if t.gt_geodesic_solve_time > 0:
-            metrics['gt_e2e_geodesic_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_geodesic_solve_time * 1000
+            metrics['gt_e2e_geodesic_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_geodesic_solve_time / n_src * 1000
         if t.gt_greens_solve_time > 0:
-            metrics['gt_e2e_greens_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_greens_solve_time * 1000
+            metrics['gt_e2e_greens_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_greens_solve_time / n_src * 1000
 
         # --- Eigenvector cosine similarity ---
         for method_label, sims in [
@@ -5818,25 +6370,46 @@ class RealTimeEigenanalysisVisualizer:
                             metrics[f'{method_label}_eval_rel_err_mean'] = float(rel_err.mean())
                             metrics[f'{method_label}_eval_rel_err_max'] = float(rel_err.max())
 
-        # --- Green's function maximum principle ---
-        if self.current_greens_results is not None:
+        # --- Green's function maximum principle (multi-source aggregated) ---
+        if self._aggregated_greens_metrics:
+            n_src = len(self._source_indices) if self._source_indices else 1
+            metrics['num_validation_sources'] = n_src
+            for method, agg in self._aggregated_greens_metrics.items():
+                prefix = method.lower().replace(' ', '_').replace('(', '').replace(')', '')
+                metrics[f'{prefix}_greens_max_principle_pass_rate'] = agg.greens_max_principle_pass_rate
+                metrics[f'{prefix}_greens_monotonicity_mean'] = agg.greens_mono_mean
+                metrics[f'{prefix}_greens_monotonicity_std'] = agg.greens_mono_std
+                metrics[f'{prefix}_greens_gt_corr_mean'] = agg.greens_corr_with_gt_mean
+                metrics[f'{prefix}_greens_gt_corr_std'] = agg.greens_corr_with_gt_std
+        elif self.current_greens_results is not None:
+            # Fallback: single source
+            metrics['num_validation_sources'] = 1
             for method_key, result in self.current_greens_results.items():
                 prefix = method_key.lower().replace(' ', '_').replace('(', '').replace(')', '')
-                metrics[f'{prefix}_greens_max_principle'] = 1.0 if result.satisfies_maximum_principle else 0.0
-                metrics[f'{prefix}_greens_monotonicity'] = result.monotonicity_score
-                metrics[f'{prefix}_greens_distance_corr'] = result.distance_correlation
-                metrics[f'{prefix}_greens_residual'] = result.laplacian_residual_norm
-                if result.correlation_with_gt > 0:
-                    metrics[f'{prefix}_greens_gt_corr'] = result.correlation_with_gt
+                metrics[f'{prefix}_greens_max_principle_pass_rate'] = 1.0 if result.satisfies_maximum_principle else 0.0
+                metrics[f'{prefix}_greens_monotonicity_mean'] = result.monotonicity_score
+                metrics[f'{prefix}_greens_gt_corr_mean'] = result.correlation_with_gt
 
-        # --- Heat method geodesics ---
-        if self.current_heat_geodesic_results is not None:
+        # --- Heat method geodesics (multi-source aggregated) ---
+        if self._aggregated_geodesic_metrics:
+            for method, agg in self._aggregated_geodesic_metrics.items():
+                prefix = method.lower().replace(' ', '_').replace('(', '').replace(')', '')
+                metrics[f'{prefix}_geodesic_corr_mean'] = agg.corr_mean
+                metrics[f'{prefix}_geodesic_corr_std'] = agg.corr_std
+                metrics[f'{prefix}_geodesic_mae_mean'] = agg.mae_mean
+                metrics[f'{prefix}_geodesic_mae_std'] = agg.mae_std
+                metrics[f'{prefix}_geodesic_max_err_mean'] = agg.max_err_mean
+                metrics[f'{prefix}_geodesic_max_err_std'] = agg.max_err_std
+                metrics[f'{prefix}_geodesic_monotonicity_mean'] = agg.mono_mean
+                metrics[f'{prefix}_geodesic_monotonicity_std'] = agg.mono_std
+        elif self.current_heat_geodesic_results is not None:
+            # Fallback: single source
             for method_key, result in self.current_heat_geodesic_results.items():
                 prefix = method_key.lower().replace(' ', '_').replace('(', '').replace(')', '')
-                metrics[f'{prefix}_geodesic_corr'] = result.correlation_with_reference
-                metrics[f'{prefix}_geodesic_mae'] = result.mean_absolute_error
-                metrics[f'{prefix}_geodesic_max_err'] = result.max_absolute_error
-                metrics[f'{prefix}_geodesic_monotonicity'] = result.monotonicity_score
+                metrics[f'{prefix}_geodesic_corr_mean'] = result.correlation_with_reference
+                metrics[f'{prefix}_geodesic_mae_mean'] = result.mean_absolute_error
+                metrics[f'{prefix}_geodesic_max_err_mean'] = result.max_absolute_error
+                metrics[f'{prefix}_geodesic_monotonicity_mean'] = result.monotonicity_score
 
         # --- Sparsity ---
         for method_key, stats in self.current_sparsity_stats.items():
@@ -6547,7 +7120,8 @@ def main(cfg: DictConfig) -> None:
         num_eigenvectors_to_show=60,
         colormap='coolwarm',
         enable_eigenvalue_info=True,
-        enable_correlation_analysis=True
+        enable_correlation_analysis=True,
+        num_validation_sources=getattr(cfg.globals, 'num_validation_sources', 5)
     )
 
     # Check dependencies

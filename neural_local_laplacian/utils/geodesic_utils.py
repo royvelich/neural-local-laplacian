@@ -67,7 +67,7 @@ class SparseFactorization:
     """
     Cached sparse matrix factorization for solving Ax=b with multiple right-hand sides.
 
-    Backend-aware: uses pypardiso (Intel MKL PARDISO, multi-threaded) when available,
+    Uses pypardiso (Intel MKL PARDISO, multi-threaded) when available,
     otherwise scipy splu (single-threaded SuperLU).
 
     Usage:
@@ -76,20 +76,18 @@ class SparseFactorization:
         x2 = factor.solve(b2)  # reuses factorization
     """
 
-    # Shared pypardiso solver instance (only one allowed per process on Windows)
-    _shared_pardiso_solver = None
+    # Single shared pypardiso solver (Windows allows only one instance)
+    _shared_solver = None
 
-    def __init__(self, A: scipy.sparse.spmatrix):
+    def __init__(self, A: scipy.sparse.spmatrix, spd: bool = False):
         if _SOLVER_BACKEND == 'pypardiso' and _HAS_PARDISO:
-            # pypardiso: use shared solver, factorize once, keep A reference
-            if SparseFactorization._shared_pardiso_solver is None:
-                SparseFactorization._shared_pardiso_solver = pypardiso.PyPardisoSolver()
-            self._solver = SparseFactorization._shared_pardiso_solver
-            self._A_csr = A.tocsr()  # pardiso prefers CSR
+            if SparseFactorization._shared_solver is None:
+                SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
+            self._solver = SparseFactorization._shared_solver
+            self._A_csr = A.tocsr()
             self._solver.factorize(self._A_csr)
             self._backend = 'pypardiso'
         else:
-            # scipy: LU factorization via SuperLU
             self._factor = scipy.sparse.linalg.splu(A.tocsc())
             self._backend = 'scipy'
 
@@ -101,32 +99,38 @@ class SparseFactorization:
             return self._factor.solve(b)
 
 
-def sparse_factorize(A: scipy.sparse.spmatrix) -> SparseFactorization:
+def sparse_factorize(A: scipy.sparse.spmatrix, spd: bool = False) -> SparseFactorization:
     """
     Factorize a sparse matrix for repeated solves.
 
-    Returns a SparseFactorization object whose .solve(b) method is fast.
+    Args:
+        A: Sparse matrix (N, N)
+        spd: Accepted for API compatibility but currently unused.
+            (mtype=2 Cholesky requires a single solver instance per type,
+            which conflicts with Windows PARDISO limitations.)
+
+    Returns:
+        SparseFactorization object whose .solve(b) method is fast.
     """
-    return SparseFactorization(A)
+    return SparseFactorization(A, spd=spd)
 
 
 def sparse_solve(
     A: scipy.sparse.spmatrix,
     b: np.ndarray,
     device: Optional[torch.device] = None,
-    factor: Optional[SparseFactorization] = None
+    factor: Optional[SparseFactorization] = None,
+    spd: bool = False
 ) -> np.ndarray:
     """
     Solve sparse linear system Ax = b.
-
-    If a pre-computed factorization is provided, uses it (fast triangular solve).
-    Otherwise uses the best available single-solve backend.
 
     Args:
         A: Sparse matrix (N, N)
         b: Right-hand side (N,)
         device: Unused (kept for API compatibility)
         factor: Optional pre-computed SparseFactorization for reuse
+        spd: Accepted for API compatibility but currently unused.
 
     Returns:
         Solution x as numpy array (N,)
@@ -135,7 +139,7 @@ def sparse_solve(
         return factor.solve(b)
 
     if _SOLVER_BACKEND == 'pypardiso' and _HAS_PARDISO:
-        return pypardiso.spsolve(A.tocsc(), b)
+        return pypardiso.spsolve(A.tocsr(), b)
 
     import warnings
     with warnings.catch_warnings():
@@ -479,7 +483,7 @@ def compute_heat_geodesic_pointcloud(
         delta[source_idx] = 1.0
 
         A = M + t * L
-        u = sparse_solve(A, delta, device)
+        u = sparse_solve(A, delta, device, spd=True)
 
         if not np.all(np.isfinite(u)):
             print(f"  [!] Heat Method (pointcloud): heat diffusion produced non-finite values, skipping")
@@ -503,8 +507,8 @@ def compute_heat_geodesic_pointcloud(
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        # Factorize once, solve twice (±rhs)
-        poisson_factor = sparse_factorize(L_reg)
+        # Factorize once, solve twice (±rhs) — SPD after regularization
+        poisson_factor = sparse_factorize(L_reg, spd=True)
         phi_pos = poisson_factor.solve(div_X)
         phi_neg = poisson_factor.solve(-div_X)
 
@@ -579,7 +583,7 @@ def compute_heat_geodesic_mesh(
         delta[source_idx] = 1.0
 
         A = M + t * L
-        u = sparse_solve(A, delta, device)
+        u = sparse_solve(A, delta, device, spd=True)
 
         if not np.all(np.isfinite(u)):
             print(f"  [!] Heat Method (mesh): heat diffusion produced non-finite values, skipping")
@@ -612,8 +616,8 @@ def compute_heat_geodesic_mesh(
         eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
-        # Factorize once, solve twice (±rhs)
-        poisson_factor = sparse_factorize(L_reg)
+        # Factorize once, solve twice (±rhs) — SPD after regularization
+        poisson_factor = sparse_factorize(L_reg, spd=True)
         phi_pos = poisson_factor.solve(rhs)
         phi_neg = poisson_factor.solve(-rhs)
 
@@ -706,7 +710,7 @@ def compute_heat_geodesic_learned(
         delta[source_idx] = 1.0
 
         A = M + t * S
-        u = sparse_solve(A, delta, device)
+        u = sparse_solve(A, delta, device, spd=True)
 
         if not np.all(np.isfinite(u)):
             print(f"  [!] Heat Method (learned): heat diffusion produced non-finite values, skipping")
@@ -730,8 +734,8 @@ def compute_heat_geodesic_learned(
         eps = 1e-8
         S_reg = S + eps * scipy.sparse.eye(n)
 
-        # Factorize once, solve twice (±rhs)
-        poisson_factor = sparse_factorize(S_reg)
+        # Factorize once, solve twice (±rhs) — SPD after regularization
+        poisson_factor = sparse_factorize(S_reg, spd=True)
         phi_pos = poisson_factor.solve(rhs)
         phi_neg = poisson_factor.solve(-rhs)
 

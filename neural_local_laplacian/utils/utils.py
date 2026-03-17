@@ -15,6 +15,79 @@ import numpy as np
 from torch_geometric.data import Batch, Data
 
 
+# kNN backend selection
+# GPU: 'pyg' (torch_geometric knn_graph), 'brute' (torch.cdist + topk)
+# CPU: 'cKDTree' (scipy, exact), 'pynndescent' (approximate)
+_KNN_BACKEND = 'cKDTree'
+
+def set_knn_backend(backend: str):
+    """Set the kNN backend for build_patches_from_vertices.
+
+    Args:
+        backend: 'pyg' for torch_geometric knn_graph (GPU, default),
+                 'brute' for torch.cdist + topk (GPU, k-independent cost),
+                 'cKDTree' for scipy.spatial.cKDTree (CPU, exact, fast),
+                 'pynndescent' for PyNNDescent (CPU, approximate).
+    """
+    global _KNN_BACKEND
+    valid = ('pyg', 'brute', 'cKDTree', 'pynndescent')
+    if backend not in valid:
+        raise ValueError(f"Unknown kNN backend: {backend}. Use one of {valid}.")
+    _KNN_BACKEND = backend
+    print(f"[kNN] Backend set to: {_KNN_BACKEND}")
+
+
+def _knn_cpu(vertices_np: np.ndarray, k: int) -> np.ndarray:
+    """CPU kNN dispatch — returns (N, k) neighbor index matrix (no self)."""
+
+    if _KNN_BACKEND == 'cKDTree':
+        from scipy.spatial import cKDTree
+        tree = cKDTree(vertices_np)
+        _, indices = tree.query(vertices_np, k=k + 1, workers=-1)  # (N, k+1)
+        # First column is self (distance=0), drop it
+        nbr_idx = indices[:, 1:]  # (N, k)
+
+        if not getattr(_knn_cpu, '_logged', False):
+            print("  [kNN] Using scipy.spatial.cKDTree on CPU")
+            _knn_cpu._logged = True
+        return nbr_idx
+
+    elif _KNN_BACKEND == 'pynndescent':
+        try:
+            from pynndescent import NNDescent
+            # n_neighbors includes self for pynndescent
+            index = NNDescent(vertices_np, n_neighbors=k + 1, metric='euclidean',
+                              n_jobs=-1, random_state=42)
+            indices, _ = index.neighbor_graph  # (N, k+1)
+            # First column is self, drop it
+            nbr_idx = indices[:, 1:]  # (N, k)
+
+            if not getattr(_knn_cpu, '_logged_pynn', False):
+                print("  [kNN] Using PyNNDescent on CPU (approximate)")
+                _knn_cpu._logged_pynn = True
+            return nbr_idx
+        except ImportError:
+            print("  [kNN] pynndescent not installed, falling back to cKDTree")
+            from scipy.spatial import cKDTree
+            tree = cKDTree(vertices_np)
+            _, indices = tree.query(vertices_np, k=k + 1, workers=-1)
+            return indices[:, 1:]
+
+    else:
+        # Fallback: sklearn (should not normally be reached)
+        from sklearn.neighbors import NearestNeighbors
+        num_vertices = len(vertices_np)
+        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
+        _, neighbor_indices = nbrs.kneighbors(vertices_np)
+
+        center_positions = np.arange(num_vertices)[:, np.newaxis]
+        is_center = neighbor_indices == center_positions
+        keep = ~is_center
+        keep_positions = np.cumsum(keep, axis=1)
+        final_mask = (keep_positions <= k) & keep
+        return neighbor_indices[final_mask].reshape(num_vertices, k)
+
+
 def build_patches_from_vertices(
     vertices: torch.Tensor,
     k: int,
@@ -23,15 +96,18 @@ def build_patches_from_vertices(
     """
     Build k-NN patches from mesh vertices, ready for model inference.
 
-    Uses GPU-accelerated kNN (torch_geometric.nn.pool.knn_graph) when device is CUDA,
-    with automatic fallback to sklearn on CPU. When on GPU, all operations stay on GPU
-    (no CPU roundtrips).
+    GPU backends:
+    - 'pyg': torch_geometric knn_graph — spatial hashing, scales to large meshes
+    - 'brute': torch.cdist + topk — fast for N < ~20k, cost independent of k
+
+    CPU backends:
+    - 'cKDTree': scipy.spatial.cKDTree — exact, fast C implementation
+    - 'pynndescent': PyNNDescent — approximate, very fast for large N
 
     Args:
         vertices: Vertex positions as torch tensor (N, 3), any device
         k: Number of nearest neighbors per vertex
-        device: Target device. If CUDA, uses GPU kNN and keeps tensors on GPU.
-            If None, uses CPU sklearn.
+        device: Target device. If CUDA and GPU backend selected, uses GPU kNN.
 
     Returns:
         Data object (on target device) with:
@@ -50,23 +126,31 @@ def build_patches_from_vertices(
     num_vertices = len(vertices)
     k = int(k)
     use_gpu = device is not None and device.type == 'cuda'
+    is_gpu_backend = _KNN_BACKEND in ('pyg', 'brute')
 
     # =========================================================================
-    # GPU path: everything stays on GPU, no numpy
+    # GPU path: brute-force (cdist + topk) or torch_geometric knn_graph
     # =========================================================================
-    if use_gpu:
+    if use_gpu and is_gpu_backend:
         try:
-            from torch_geometric.nn.pool import knn_graph as pyg_knn_graph
-
             pos_gpu = vertices.float().to(device)
 
-            # GPU kNN: edge_index[0]=neighbor (source), edge_index[1]=center (target)
-            edge_index = pyg_knn_graph(pos_gpu, k=k, loop=False, flow='source_to_target')
-            neighbor_matrix = edge_index[0].reshape(num_vertices, k)  # (N, k) on GPU
+            if _KNN_BACKEND == 'brute':
+                dists = torch.cdist(pos_gpu, pos_gpu)  # (N, N)
+                _, topk_indices = dists.topk(k + 1, dim=1, largest=False)  # (N, k+1)
+                neighbor_matrix = topk_indices[:, 1:]  # (N, k) — skip self
 
-            if not getattr(build_patches_from_vertices, '_logged_gpu_knn', False):
-                print("  [kNN] Using torch_geometric knn_graph on GPU")
-                build_patches_from_vertices._logged_gpu_knn = True
+                if not getattr(build_patches_from_vertices, '_logged_gpu_knn', False):
+                    print("  [kNN] Using brute-force (cdist + topk) on GPU")
+                    build_patches_from_vertices._logged_gpu_knn = True
+            else:
+                from torch_geometric.nn.pool import knn_graph as pyg_knn_graph
+                edge_index = pyg_knn_graph(pos_gpu, k=k, loop=False, flow='source_to_target')
+                neighbor_matrix = edge_index[0].reshape(num_vertices, k)  # (N, k)
+
+                if not getattr(build_patches_from_vertices, '_logged_gpu_knn', False):
+                    print("  [kNN] Using torch_geometric knn_graph on GPU")
+                    build_patches_from_vertices._logged_gpu_knn = True
 
             # Build patch positions on GPU (no numpy)
             neighbor_positions = pos_gpu[neighbor_matrix]           # (N, k, 3)
@@ -81,7 +165,7 @@ def build_patches_from_vertices(
 
             data = MeshPatchData(
                 pos=pos_flat,
-                x=pos_flat,  # shared reference, not a clone
+                x=pos_flat,
                 patch_idx=patch_idx,
                 vertex_indices=vertex_indices,
                 center_indices=center_indices
@@ -91,25 +175,14 @@ def build_patches_from_vertices(
 
         except (ImportError, RuntimeError) as e:
             if not getattr(build_patches_from_vertices, '_logged_gpu_knn_fail', False):
-                print(f"  [kNN] GPU knn_graph failed ({e}), using sklearn CPU fallback")
+                print(f"  [kNN] GPU kNN failed ({e}), falling back to CPU")
                 build_patches_from_vertices._logged_gpu_knn_fail = True
 
     # =========================================================================
-    # CPU fallback path: sklearn + numpy
+    # CPU path: cKDTree, pynndescent, or sklearn fallback
     # =========================================================================
-    from sklearn.neighbors import NearestNeighbors
     vertices_np = vertices.cpu().numpy() if vertices.is_cuda else vertices.numpy()
-
-    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
-    _, neighbor_indices = nbrs.kneighbors(vertices_np)
-
-    # Remove self from neighbors
-    center_positions = np.arange(num_vertices)[:, np.newaxis]
-    is_center = neighbor_indices == center_positions
-    keep = ~is_center
-    keep_positions = np.cumsum(keep, axis=1)
-    final_mask = (keep_positions <= k) & keep
-    nbr_idx_np = neighbor_indices[final_mask].reshape(num_vertices, k)
+    nbr_idx_np = _knn_cpu(vertices_np, k)  # (N, k)
 
     # Build patch positions
     all_neighbor_positions = vertices_np[nbr_idx_np]
@@ -117,19 +190,20 @@ def build_patches_from_vertices(
     patch_positions = all_neighbor_positions - center_expanded
 
     # Flatten and convert to tensors
-    pos_tensor = torch.from_numpy(patch_positions.reshape(-1, 3)).float()
-    patch_idx_tensor = torch.arange(num_vertices).repeat_interleave(k)
-    vertex_indices_tensor = torch.from_numpy(nbr_idx_np.flatten()).long()
-    center_indices_tensor = torch.arange(num_vertices).long()
+    target_device = device if device is not None else torch.device('cpu')
+    pos_tensor = torch.from_numpy(patch_positions.reshape(-1, 3)).float().to(target_device)
+    patch_idx_tensor = torch.arange(num_vertices).repeat_interleave(k).to(target_device)
+    vertex_indices_tensor = torch.from_numpy(nbr_idx_np.flatten()).long().to(target_device)
+    center_indices_tensor = torch.arange(num_vertices).long().to(target_device)
 
     data = MeshPatchData(
         pos=pos_tensor,
-        x=pos_tensor,  # shared reference
+        x=pos_tensor,
         patch_idx=patch_idx_tensor,
         vertex_indices=vertex_indices_tensor,
         center_indices=center_indices_tensor
     )
-    data.neighbor_index_matrix = torch.from_numpy(nbr_idx_np).long()
+    data.neighbor_index_matrix = torch.from_numpy(nbr_idx_np.copy()).long().to(target_device)
     return data
 
 
@@ -684,7 +758,7 @@ def compute_laplacian_eigendecomposition(
             OP = laplacian_matrix - sigma * mass_matrix
         else:
             OP = laplacian_matrix - sigma * scipy.sparse.eye(laplacian_matrix.shape[0])
-        factor = sparse_factorize(OP)
+        factor = sparse_factorize(OP, spd=True)
         OPinv = scipy.sparse.linalg.LinearOperator(
             shape=OP.shape,
             matvec=lambda x: factor.solve(x),
