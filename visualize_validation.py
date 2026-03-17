@@ -513,6 +513,11 @@ class RealTimeEigenanalysisVisualizer:
         self._pc_grad_op = None   # pcdiff point cloud gradient operator
         self._pc_div_op = None    # pcdiff point cloud divergence operator
 
+        # New metric results
+        self._probe_function_results: Dict[str, Dict] = {}   # method -> {mse, failure_rate}
+        self._descriptor_results: Dict[str, Dict] = {}       # method -> {hks_l2, hks_corr, wks_l2, wks_corr}
+        self._compression_results: Dict[str, Dict] = {}      # method -> {k -> {mean_l2, max_l2}}
+
         # Debug flags (set from config in run_dataset_iteration)
         self._diagnostic_mode = False
         self._skip_robust = False
@@ -976,6 +981,75 @@ class RealTimeEigenanalysisVisualizer:
                     color = (0.8, 0.8, 0.8, 1.0)
 
                 psim.TextColored(color, f"  {count:>8}  {pred_str}  {nelo_str}  {robust_str}  {delta_str}")
+        else:
+            psim.Text("(Not computed yet)")
+
+        # === PROBE FUNCTION MSE (Lf ERROR) ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Probe Function MSE (Lf error, NeLo Table 1):")
+
+        if self._probe_function_results:
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<16} {'Raw MSE':>10} {'nMSE':>10} {'R_MSE>1':>10}")
+            for method, res in self._probe_function_results.items():
+                raw_mse = res['mse']
+                nmse = res.get('normalized_mse', raw_mse)
+                fr = res['failure_rate']
+                if method == 'GT':
+                    color = (0.5, 0.5, 0.5, 1.0)
+                elif nmse < 0.01:
+                    color = (0.0, 1.0, 0.0, 1.0)
+                elif nmse < 0.1:
+                    color = (1.0, 1.0, 0.0, 1.0)
+                else:
+                    color = (1.0, 0.3, 0.0, 1.0)
+                psim.TextColored(color, f"  {method:<16} {raw_mse:>10.6f} {nmse:>10.6f} {fr:>9.1%}")
+        else:
+            psim.Text("(Not computed yet)")
+
+        # === HKS / WKS DESCRIPTOR ERROR ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Shape Descriptors (HKS/WKS vs GT):")
+
+        if self._descriptor_results:
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<12} {'HKS L2':>8} {'HKS Corr':>9} {'WKS L2':>8} {'WKS Corr':>9}")
+            for method, res in self._descriptor_results.items():
+                h_l2 = res['hks_l2_error']
+                h_c = res['hks_correlation']
+                w_l2 = res['wks_l2_error']
+                w_c = res['wks_correlation']
+                if h_c > 0.95 and w_c > 0.95:
+                    color = (0.0, 1.0, 0.0, 1.0)
+                elif h_c > 0.8 and w_c > 0.8:
+                    color = (1.0, 1.0, 0.0, 1.0)
+                else:
+                    color = (1.0, 0.3, 0.0, 1.0)
+                psim.TextColored(color, f"  {method:<12} {h_l2:>8.4f} {h_c:>9.4f} {w_l2:>8.4f} {w_c:>9.4f}")
+        else:
+            psim.Text("(Not computed yet)")
+
+        # === SPECTRAL COMPRESSION ERROR ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Spectral Compression (mean vertex L2):")
+
+        if self._compression_results:
+            key_counts = [5, 10, 20, 50]
+            header = f"  {'Method':<12}" + "".join(f" {'k=' + str(k):>8}" for k in key_counts)
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), header)
+            for method, k_res in self._compression_results.items():
+                line = f"  {method:<12}"
+                for k in key_counts:
+                    if k in k_res:
+                        line += f" {k_res[k]['mean_l2']:>8.5f}"
+                    else:
+                        line += f" {'N/A':>8}"
+                if method == 'GT':
+                    color = (0.0, 1.0, 0.0, 1.0)
+                else:
+                    color = (1.0, 0.5, 0.0, 1.0)
+                psim.TextColored(color, line)
         else:
             psim.Text("(Not computed yet)")
 
@@ -1520,6 +1594,26 @@ class RealTimeEigenanalysisVisualizer:
         self._update_greens_for_method(changed_method)
         self._update_geodesics_for_method(changed_method)
 
+        # Recompute new metrics (probe MSE, descriptors, compression)
+        # These are cheap (no solves) and depend on L/M/eigenpairs which changed
+        print(f"  Recomputing probe function MSE...")
+        try:
+            self._compute_probe_function_mse()
+        except Exception as e:
+            print(f"  [!] Probe function MSE failed: {e}")
+
+        print(f"  Recomputing HKS/WKS descriptors...")
+        try:
+            self._compute_descriptor_comparison()
+        except Exception as e:
+            print(f"  [!] Descriptor comparison failed: {e}")
+
+        print(f"  Recomputing spectral compression error...")
+        try:
+            self._compute_spectral_compression_error()
+        except Exception as e:
+            print(f"  [!] Spectral compression error failed: {e}")
+
     def _clear_stored_references(self):
         """Clear stored references from previous batch to free memory.
 
@@ -1554,6 +1648,9 @@ class RealTimeEigenanalysisVisualizer:
         self._current_source_display_idx = 0
         self._pc_grad_op = None
         self._pc_div_op = None
+        self._probe_function_results = {}
+        self._descriptor_results = {}
+        self._compression_results = {}
         self._weight_nbr_sample_indices = None
 
         # Force garbage collection
@@ -2153,6 +2250,335 @@ class RealTimeEigenanalysisVisualizer:
         if self.current_original_vertices is not None:
             pos = self.current_original_vertices[src_idx:src_idx + 1]
             ps.register_point_cloud("Source Vertex", pos, radius=0.025, color=(0.6, 0.0, 0.8))
+
+    # =========================================================================
+    # NEW METRICS: Probe Function MSE, HKS/WKS Descriptors, Spectral Compression
+    # =========================================================================
+
+    def _compute_probe_function_mse(self):
+        """Compute Lf probe function MSE for all methods (NeLo paper Table 1 metric).
+
+        Uses 112 probe functions: 64 spectral (scaled eigenvectors) + 42 trig + 6 polynomial.
+
+        Reports two variants:
+        - Raw MSE (NeLo paper convention): mean ||M^-1 Lf - M_gt^-1 L_gt f||^2, clipped at 1.0
+        - Normalized MSE (scale-invariant): per-probe relative error, normalized by GT response magnitude
+          This handles the case where eigenvalues are scaled differently but eigenvectors are correct.
+        """
+        if self.current_gt_data is None:
+            return
+
+        vertices = self.current_gt_data['vertices'].astype(np.float64)
+        n = len(vertices)
+        gt_evals = self.current_gt_data.get('gt_eigenvalues')
+        gt_evecs = self.current_gt_data.get('gt_eigenvectors')
+        if gt_evals is None or gt_evecs is None:
+            print("  [!] GT eigenpairs not available, skipping probe function MSE")
+            return
+
+        # --- Build probe functions ---
+        probes = []
+
+        # 1) Spectral probes: first 64 non-constant eigenvectors, scaled by 1/(λ + 0.1)
+        n_spectral = min(64, len(gt_evals) - 1)
+        for i in range(1, n_spectral + 1):  # skip constant eigenvector
+            f = gt_evecs[:, i] / (gt_evals[i] + 0.1)
+            probes.append(f)
+
+        # 2) Trigonometric probes: sin(k*t + phi) / (2k)
+        coords = [vertices[:, 0], vertices[:, 1], vertices[:, 2]]
+        for k_val in [1, 2, 4, 8, 16, 32, 64]:
+            for coord in coords:
+                for phi in [0.0, np.pi / 2.0]:
+                    f = np.sin(k_val * coord + phi) / (2.0 * k_val)
+                    probes.append(f)
+
+        # 3) Polynomial probes: x, y, z, x^2, y^2, z^2
+        for d in range(3):
+            probes.append(vertices[:, d])
+        for d in range(3):
+            probes.append(vertices[:, d] ** 2)
+
+        probes = np.column_stack(probes)  # (N, n_probes)
+        n_probes = probes.shape[1]
+
+        # --- Compute GT reference: M_gt^-1 L_gt f ---
+        L_gt, M_gt = self._get_method_L_M('GT')
+        if L_gt is None or M_gt is None:
+            return
+
+        M_gt_diag = np.array(M_gt.diagonal()).flatten()
+        M_gt_inv_diag = np.where(M_gt_diag > 1e-15, 1.0 / M_gt_diag, 0.0)
+
+        gt_Lf = L_gt @ probes  # (N, n_probes)
+        gt_result = M_gt_inv_diag[:, None] * gt_Lf  # M_gt^-1 L_gt f
+
+        # Per-probe GT response magnitude for normalization (NeLo Eq. 5 style)
+        gt_response_mag = np.mean(np.abs(gt_result), axis=0)  # (n_probes,)
+        epsilon = 0.1
+
+        # --- Evaluate each method ---
+        self._probe_function_results = {}
+        for method_key in ['GT', 'PRED', 'Robust', 'NeLo']:
+            L, M = self._get_method_L_M(method_key)
+            if L is None or M is None:
+                continue
+
+            try:
+                M_diag = np.array(M.diagonal()).flatten()
+                M_inv_diag = np.where(M_diag > 1e-15, 1.0 / M_diag, 0.0)
+
+                method_Lf = L @ probes
+                method_result = M_inv_diag[:, None] * method_Lf
+
+                diff = method_result - gt_result  # (N, n_probes)
+
+                # --- Raw MSE (NeLo paper convention) ---
+                per_probe_mse = np.mean(diff ** 2, axis=0)  # (n_probes,)
+                clipped_mse = np.minimum(per_probe_mse, 1.0)
+                raw_mse = float(clipped_mse.mean())
+                failure_rate = float(np.mean(per_probe_mse > 1.0))
+
+                # --- Normalized MSE (scale-invariant) ---
+                # Divide each probe's MSE by (mean|gt_response| + ε)^2
+                # This is equivalent to NeLo's balance weight w_f
+                norm_factors = (gt_response_mag + epsilon) ** 2  # (n_probes,)
+                per_probe_nmse = per_probe_mse / norm_factors
+                normalized_mse = float(per_probe_nmse.mean())
+
+                self._probe_function_results[method_key] = {
+                    'mse': raw_mse,
+                    'normalized_mse': normalized_mse,
+                    'failure_rate': failure_rate,
+                    'n_probes': n_probes,
+                }
+                print(f"  {method_key}: Lf MSE={raw_mse:.6f} (raw), nMSE={normalized_mse:.6f} (normalized), "
+                      f"R_MSE>1={failure_rate:.1%} ({n_probes} probes)")
+
+            except Exception as e:
+                print(f"  [!] Probe function MSE for {method_key} failed: {e}")
+
+    def _compute_descriptor_comparison(self):
+        """Compute HKS and WKS descriptor error vs GT for all methods."""
+        if self.current_gt_data is None:
+            return
+
+        gt_evals = self.current_gt_data.get('gt_eigenvalues')
+        gt_evecs = self.current_gt_data.get('gt_eigenvectors')
+        if gt_evals is None or gt_evecs is None:
+            return
+
+        def compute_hks(eigenvalues, eigenvectors, n_scales=100):
+            """Compute HKS descriptor (N, n_scales) from eigenpairs."""
+            # Skip zero eigenvalue
+            evals = eigenvalues[1:]
+            evecs = eigenvectors[:, 1:]
+            k = min(len(evals), 50)
+            evals = evals[:k]
+            evecs = evecs[:, :k]
+
+            if evals[-1] <= 0 or evals[0] <= 0:
+                return None
+
+            # Log-spaced time values: 4*ln(10)/λ_max to 4*ln(10)/λ_2
+            t_min = 4.0 * np.log(10.0) / evals[-1]
+            t_max = 4.0 * np.log(10.0) / evals[0]
+            t_values = np.exp(np.linspace(np.log(t_min), np.log(t_max), n_scales))
+
+            # HKS(x, t) = Σ exp(-λ_i * t) * φ_i(x)^2
+            phi_sq = evecs ** 2  # (N, k)
+            exp_terms = np.exp(-evals[None, :] * t_values[:, None])  # (n_scales, k)
+            hks = phi_sq @ exp_terms.T  # (N, n_scales)
+            return hks
+
+        def compute_wks(eigenvalues, eigenvectors, n_scales=100):
+            """Compute WKS descriptor (N, n_scales) from eigenpairs."""
+            evals = eigenvalues[1:]
+            evecs = eigenvectors[:, 1:]
+            k = min(len(evals), 50)
+            evals = evals[:k]
+            evecs = evecs[:, :k]
+
+            if evals[-1] <= 0 or evals[0] <= 0:
+                return None
+
+            log_evals = np.log(evals)
+            e_min = log_evals[0]
+            e_max = log_evals[-1]
+            sigma = 7.0 * (e_max - e_min) / n_scales
+            if sigma < 1e-10:
+                return None
+
+            e_values = np.linspace(e_min, e_max, n_scales)
+
+            # WKS(x, e) = Σ exp(-(e - ln(λ_i))^2 / 2σ^2) * φ_i(x)^2
+            phi_sq = evecs ** 2  # (N, k)
+            weights = np.exp(-((e_values[:, None] - log_evals[None, :]) ** 2) / (2 * sigma ** 2))  # (n_scales, k)
+            wks = phi_sq @ weights.T  # (N, n_scales)
+            return wks
+
+        def compare_descriptors(desc_method, desc_gt):
+            """Compute normalized L2 error and correlation between descriptor fields."""
+            if desc_method is None or desc_gt is None:
+                return None, None
+            n_scales = desc_gt.shape[1]
+            l2_errors = []
+            correlations = []
+            for s in range(n_scales):
+                gt_col = desc_gt[:, s]
+                m_col = desc_method[:, s]
+                gt_norm = np.linalg.norm(gt_col)
+                if gt_norm < 1e-15:
+                    continue
+                l2_errors.append(np.linalg.norm(m_col - gt_col) / gt_norm)
+                if np.std(gt_col) > 1e-15 and np.std(m_col) > 1e-15:
+                    correlations.append(float(np.corrcoef(m_col, gt_col)[0, 1]))
+            mean_l2 = float(np.mean(l2_errors)) if l2_errors else 1.0
+            mean_corr = float(np.mean(correlations)) if correlations else 0.0
+            return mean_l2, mean_corr
+
+        # GT descriptors (reference)
+        hks_gt = compute_hks(gt_evals, gt_evecs)
+        wks_gt = compute_wks(gt_evals, gt_evecs)
+
+        if hks_gt is None and wks_gt is None:
+            print("  [!] Could not compute GT HKS/WKS (bad eigenvalues)")
+            return
+
+        self._descriptor_results = {}
+
+        # Collect eigenpairs per method
+        method_eigenpairs = {}
+        pred_evals = self.current_inference_result.get('predicted_eigenvalues') if self.current_inference_result else None
+        pred_evecs = self.current_inference_result.get('predicted_eigenvectors') if self.current_inference_result else None
+        if pred_evals is not None and pred_evecs is not None:
+            method_eigenpairs['PRED'] = (pred_evals, pred_evecs)
+
+        robust_evals = self.current_gt_data.get('robust_eigenvalues')
+        robust_evecs = self.current_gt_data.get('robust_eigenvectors')
+        if robust_evals is not None and robust_evecs is not None:
+            method_eigenpairs['Robust'] = (robust_evals, robust_evecs)
+
+        if self.current_nelo_eigenvalues is not None and self.current_nelo_eigenvectors is not None:
+            method_eigenpairs['NeLo'] = (self.current_nelo_eigenvalues, self.current_nelo_eigenvectors)
+
+        for method_key, (evals, evecs) in method_eigenpairs.items():
+            try:
+                evals_np = evals.cpu().numpy() if torch.is_tensor(evals) else np.asarray(evals)
+                evecs_np = evecs.cpu().numpy() if torch.is_tensor(evecs) else np.asarray(evecs)
+
+                hks_m = compute_hks(evals_np, evecs_np)
+                wks_m = compute_wks(evals_np, evecs_np)
+
+                hks_l2, hks_corr = compare_descriptors(hks_m, hks_gt)
+                wks_l2, wks_corr = compare_descriptors(wks_m, wks_gt)
+
+                self._descriptor_results[method_key] = {
+                    'hks_l2_error': hks_l2 if hks_l2 is not None else -1.0,
+                    'hks_correlation': hks_corr if hks_corr is not None else 0.0,
+                    'wks_l2_error': wks_l2 if wks_l2 is not None else -1.0,
+                    'wks_correlation': wks_corr if wks_corr is not None else 0.0,
+                }
+                print(f"  {method_key}: HKS L2={hks_l2:.4f} corr={hks_corr:.4f}, "
+                      f"WKS L2={wks_l2:.4f} corr={wks_corr:.4f}")
+
+            except Exception as e:
+                print(f"  [!] Descriptor comparison for {method_key} failed: {e}")
+
+    def _compute_spectral_compression_error(self):
+        """Compute spectral mesh compression error at key eigenvector counts.
+
+        For each method, project original vertices onto k eigenvectors and
+        measure per-vertex L2 reconstruction error.
+        """
+        if self.current_gt_data is None:
+            return
+
+        vertices = self.current_gt_data['vertices'].astype(np.float64)
+        gt_evecs = self.current_gt_data.get('gt_eigenvectors')
+        if gt_evecs is None:
+            return
+
+        key_counts = [5, 10, 20, 50]
+
+        def compute_reconstruction_error(eigenvectors, mass_matrix, verts, k_values):
+            """Compute vertex L2 error for spectral reconstruction at each k."""
+            evecs = eigenvectors.cpu().numpy() if torch.is_tensor(eigenvectors) else np.asarray(eigenvectors)
+            if mass_matrix is not None:
+                M_diag = np.array(mass_matrix.diagonal()).flatten() if scipy.sparse.issparse(mass_matrix) else np.diag(mass_matrix)
+            else:
+                M_diag = np.ones(len(verts))
+
+            max_k = min(evecs.shape[1], max(k_values))
+            # Coefficients: φᵀ M x for each coordinate
+            M_verts = M_diag[:, None] * verts  # (N, 3)
+            coeffs = evecs[:, :max_k].T @ M_verts  # (max_k, 3)
+
+            results = {}
+            for k in k_values:
+                if k > evecs.shape[1]:
+                    continue
+                recon = evecs[:, :k] @ coeffs[:k]  # (N, 3)
+                per_vertex_error = np.linalg.norm(verts - recon, axis=1)
+                results[k] = {
+                    'mean_l2': float(per_vertex_error.mean()),
+                    'max_l2': float(per_vertex_error.max()),
+                }
+            return results
+
+        self._compression_results = {}
+
+        # GT
+        L_gt, M_gt = self._get_method_L_M('GT')
+        if gt_evecs is not None and M_gt is not None:
+            try:
+                self._compression_results['GT'] = compute_reconstruction_error(
+                    gt_evecs, M_gt, vertices, key_counts)
+            except Exception as e:
+                print(f"  [!] GT compression error failed: {e}")
+
+        # PRED
+        pred_evecs = self.current_inference_result.get('predicted_eigenvectors') if self.current_inference_result else None
+        pred_M = self.current_inference_result.get('mass_matrix') if self.current_inference_result else None
+        if pred_evecs is not None:
+            try:
+                self._compression_results['PRED'] = compute_reconstruction_error(
+                    pred_evecs, pred_M, vertices, key_counts)
+            except Exception as e:
+                print(f"  [!] PRED compression error failed: {e}")
+
+        # Robust
+        robust_evecs = self.current_gt_data.get('robust_eigenvectors')
+        _, M_robust = self._get_method_L_M('Robust') if not self._skip_robust else (None, None)
+        if robust_evecs is not None and M_robust is not None:
+            try:
+                self._compression_results['Robust'] = compute_reconstruction_error(
+                    robust_evecs, M_robust, vertices, key_counts)
+            except Exception as e:
+                print(f"  [!] Robust compression error failed: {e}")
+
+        # NeLo
+        if self.current_nelo_eigenvectors is not None and self.current_nelo_M is not None:
+            try:
+                self._compression_results['NeLo'] = compute_reconstruction_error(
+                    self.current_nelo_eigenvectors, self.current_nelo_M, vertices, key_counts)
+            except Exception as e:
+                print(f"  [!] NeLo compression error failed: {e}")
+
+        # Print summary
+        if self._compression_results:
+            print(f"\n  {'Method':<12}", end="")
+            for k in key_counts:
+                print(f"  {'k=' + str(k):>8}", end="")
+            print()
+            for method, k_results in self._compression_results.items():
+                print(f"  {method:<12}", end="")
+                for k in key_counts:
+                    if k in k_results:
+                        print(f"  {k_results[k]['mean_l2']:>8.5f}", end="")
+                    else:
+                        print(f"  {'N/A':>8}", end="")
+                print()
 
     def _print_multisource_summary(self):
         """Print aggregated metrics across all source vertices."""
@@ -6231,6 +6657,33 @@ class RealTimeEigenanalysisVisualizer:
                 import traceback
                 traceback.print_exc()
 
+        # STEP 9.6: Probe function MSE (Lf error, NeLo paper Table 1 metric)
+        print(f"\nSTEP 9.6: Probe function MSE (Lf error)")
+        try:
+            self._compute_probe_function_mse()
+        except Exception as e:
+            print(f"  [!] Probe function MSE failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # STEP 9.7: HKS / WKS descriptor comparison
+        print(f"\nSTEP 9.7: Shape descriptor comparison (HKS / WKS)")
+        try:
+            self._compute_descriptor_comparison()
+        except Exception as e:
+            print(f"  [!] Descriptor comparison failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # STEP 9.8: Spectral mesh compression error
+        print(f"\nSTEP 9.8: Spectral compression error")
+        try:
+            self._compute_spectral_compression_error()
+        except Exception as e:
+            print(f"  [!] Spectral compression error failed: {e}")
+            import traceback
+            traceback.print_exc()
+
         # Print timing summary to console
         self._print_timing_summary()
 
@@ -6410,6 +6863,28 @@ class RealTimeEigenanalysisVisualizer:
                 metrics[f'{prefix}_geodesic_mae_mean'] = result.mean_absolute_error
                 metrics[f'{prefix}_geodesic_max_err_mean'] = result.max_absolute_error
                 metrics[f'{prefix}_geodesic_monotonicity_mean'] = result.monotonicity_score
+
+        # --- Probe Function MSE (Lf error) ---
+        for method, res in self._probe_function_results.items():
+            prefix = method.lower().replace(' ', '_').replace('(', '').replace(')', '')
+            metrics[f'{prefix}_probe_mse'] = res['mse']
+            metrics[f'{prefix}_probe_nmse'] = res.get('normalized_mse', res['mse'])
+            metrics[f'{prefix}_probe_failure_rate'] = res['failure_rate']
+
+        # --- HKS / WKS Descriptor Error ---
+        for method, res in self._descriptor_results.items():
+            prefix = method.lower().replace(' ', '_').replace('(', '').replace(')', '')
+            metrics[f'{prefix}_hks_l2_error'] = res['hks_l2_error']
+            metrics[f'{prefix}_hks_correlation'] = res['hks_correlation']
+            metrics[f'{prefix}_wks_l2_error'] = res['wks_l2_error']
+            metrics[f'{prefix}_wks_correlation'] = res['wks_correlation']
+
+        # --- Spectral Compression Error ---
+        for method, k_res in self._compression_results.items():
+            prefix = method.lower().replace(' ', '_').replace('(', '').replace(')', '')
+            for k, vals in k_res.items():
+                metrics[f'{prefix}_compression_mean_k{k}'] = vals['mean_l2']
+                metrics[f'{prefix}_compression_max_k{k}'] = vals['max_l2']
 
         # --- Sparsity ---
         for method_key, stats in self.current_sparsity_stats.items():
