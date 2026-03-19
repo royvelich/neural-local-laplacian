@@ -50,7 +50,6 @@ import numpy as np
 import scipy.sparse
 import torch
 import torch.nn.functional as F
-from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Batch
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
@@ -652,15 +651,10 @@ class DT4DPairGenerator(PairGenerator):
 
 def compute_knn(vertices_np: np.ndarray, k: int) -> np.ndarray:
     """Compute k-nearest neighbors excluding self. Returns (N, k) indices."""
-    n = len(vertices_np)
-    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
-    _, indices = nbrs.kneighbors(vertices_np)  # (N, k+1)
-    # Remove self from neighbor list (vectorized)
-    center = np.arange(n)[:, np.newaxis]
-    keep = ~(indices == center)
-    keep_pos = np.cumsum(keep, axis=1)
-    final = (keep_pos <= k) & keep
-    return indices[final].reshape(n, k)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(vertices_np)
+    _, indices = tree.query(vertices_np, k=k + 1, workers=-1)  # (N, k+1)
+    return indices[:, 1:]  # drop self (first column)
 
 
 def build_patch_data(vertices_t, knn, device):
@@ -1145,9 +1139,12 @@ def _correspondence_metrics(
 
     # Pointwise correspondence: project A into B's spectral space, NN search
     projected_a = eigvecs_a[:n_a] @ C.T
-    from sklearn.neighbors import NearestNeighbors as NN
-    nbrs = NN(n_neighbors=min(10, eigvecs_b.shape[0]), algorithm='auto').fit(eigvecs_b)
-    dists, indices = nbrs.kneighbors(projected_a)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(eigvecs_b)
+    n_query = min(10, eigvecs_b.shape[0])
+    dists, indices = tree.query(projected_a, k=n_query)
+    if n_query == 1:
+        indices = indices[:, np.newaxis]
     pred_corr = indices[:, 0]
 
     gt = gt_corr[:n_a]
@@ -1187,9 +1184,9 @@ def _build_gt_corr_from_pair(pair: PairSample) -> Optional[np.ndarray]:
     if unmapped.any():
         mapped_mask = ~unmapped
         if mapped_mask.any():
-            from sklearn.neighbors import NearestNeighbors as NN
-            nbrs = NN(n_neighbors=1).fit(pair.verts_a[mapped_mask])
-            _, idx = nbrs.kneighbors(pair.verts_a[unmapped])
+            from scipy.spatial import cKDTree
+            tree = cKDTree(pair.verts_a[mapped_mask])
+            _, idx = tree.query(pair.verts_a[unmapped])
             mapped_indices = np.where(mapped_mask)[0]
             gt_corr[unmapped] = gt_corr[mapped_indices[idx.flatten()]]
 

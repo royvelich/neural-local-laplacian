@@ -307,6 +307,65 @@ class LogMagnitudeLoss(nn.Module):
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
 
 
+class AreaOnlyLogMagnitudeLoss(nn.Module):
+    """
+    Log-magnitude loss that backpropagates ONLY through the area head.
+
+    The MCV magnitude is ||mcv|| = ||Σ w_ij p_j|| / a_i.
+    Standard LogMagnitudeLoss backprops through both w_ij (stiffness/gradient)
+    and a_i (area head), causing magnitude and direction losses to conflict.
+
+    This loss detaches the stiffness contribution (numerator), so gradients
+    flow only through a_i. The area head learns to scale M correctly without
+    disturbing the weight ratios that DirectionCosineLoss carefully trained.
+
+    Mathematically:
+        loss = (log(||detach(Σ w_ij p_j)|| / a_i) - log(||target_mcv||))^2
+             = (log(||detach(Σ w_ij p_j)||) - log(a_i) - log(||target_mcv||))^2
+
+    Only d/d(a_i) is non-zero.
+    """
+
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8):
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        """
+        Compute log-magnitude loss with gradients only through areas.
+
+        Requires ctx.areas to be set (predicted areas from the area head).
+        """
+        if ctx.areas is None:
+            raise ValueError("AreaOnlyLogMagnitudeLoss requires ctx.areas to be set")
+
+        # Reconstruct stiffness_sum = mcv * areas, then detach
+        # This removes gradient flow through g_ij / stiffness_weights
+        stiffness_sum = ctx.predicted_mcv * ctx.areas.unsqueeze(-1)  # (batch_size, 3)
+        stiffness_sum_detached = stiffness_sum.detach()  # no grad through weights
+
+        # Recompute magnitude with detached numerator: ||detach(sum)|| / areas
+        numerator_magnitude = torch.norm(stiffness_sum_detached, p=2, dim=1)  # (batch_size,)
+        predicted_magnitude = numerator_magnitude / (ctx.areas + self.eps)  # (batch_size,)
+
+        target_magnitude = torch.norm(ctx.target_mcv, p=2, dim=1)  # (batch_size,)
+
+        # Log-space MSE (same as LogMagnitudeLoss)
+        log_pred = torch.log(predicted_magnitude + self.eps)
+        log_target = torch.log(target_magnitude + self.eps)
+        log_error_sq = (log_pred - log_target) ** 2
+
+        if self.reduction == 'mean':
+            return torch.mean(log_error_sq)
+        elif self.reduction == 'sum':
+            return torch.sum(log_error_sq)
+        elif self.reduction == 'none':
+            return log_error_sq
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
 class TangentPlaneProjectorLoss(nn.Module):
     """
     Gradient supervision loss via the tangent plane projector.

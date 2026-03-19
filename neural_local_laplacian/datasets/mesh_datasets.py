@@ -8,7 +8,7 @@ import json
 import numpy as np
 import torch
 from torch_geometric.data import Dataset, Data
-from sklearn.neighbors import NearestNeighbors
+from scipy.spatial import cKDTree
 import robust_laplacian
 import scipy.sparse
 
@@ -678,28 +678,11 @@ class MeshDataset(Dataset):
         """
         num_vertices = len(vertices)
 
-        # Build k-NN index for the entire mesh
-        nbrs = NearestNeighbors(n_neighbors=self._k + 1, algorithm='auto').fit(vertices)
-
-        # Get k+1 nearest neighbors for ALL vertices at once
-        distances, neighbor_indices = nbrs.kneighbors(vertices)  # Shape: (N, k+1)
-
-        # Vectorized removal of center point from neighbors
-        # Create a mask to identify where each vertex appears in its own neighbor list
-        center_positions = np.arange(num_vertices)[:, np.newaxis]  # Shape: (N, 1)
-        is_center_mask = neighbor_indices == center_positions  # Shape: (N, k+1)
-
-        # Create mask to keep only non-center neighbors
-        keep_mask = ~is_center_mask  # Shape: (N, k+1)
-
-        # For each row, we want to keep the first k True values in keep_mask
-        # Use cumsum to get the position of each True value
-        keep_positions = np.cumsum(keep_mask, axis=1)  # Shape: (N, k+1)
-        final_mask = (keep_positions <= self._k) & keep_mask  # Shape: (N, k+1)
-
-        # Extract neighbor indices using the mask
-        neighbor_indices_flat = neighbor_indices[final_mask]  # Shape: (N*k,)
-        neighbor_indices_filtered = neighbor_indices_flat.reshape(num_vertices, self._k)  # Shape: (N, k)
+        # Build k-NN index using cKDTree
+        tree = cKDTree(vertices)
+        _, neighbor_indices = tree.query(vertices, k=self._k + 1, workers=-1)  # (N, k+1)
+        # First column is self (distance=0), drop it
+        neighbor_indices_filtered = neighbor_indices[:, 1:]  # (N, k)
 
         # Vectorized extraction of neighbor positions
         all_neighbor_positions = vertices[neighbor_indices_filtered]  # Shape: (N, k, 3)

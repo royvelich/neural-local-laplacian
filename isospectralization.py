@@ -31,7 +31,6 @@ import torch.nn as nn
 import polyscope as ps
 import polyscope.imgui as psim
 import trimesh
-from sklearn.neighbors import NearestNeighbors
 import robust_laplacian
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
@@ -97,18 +96,10 @@ def compute_knn(vertices_np: np.ndarray, k: int) -> np.ndarray:
         neighbor_indices: (N, k) numpy array of neighbor indices
     """
     num_vertices = len(vertices_np)
-    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
-    _, neighbor_indices = nbrs.kneighbors(vertices_np)  # (N, k+1)
-
-    # Remove self from neighbor list (vectorized)
-    center_positions = np.arange(num_vertices)[:, np.newaxis]
-    is_center = neighbor_indices == center_positions
-    keep_mask = ~is_center
-    keep_positions = np.cumsum(keep_mask, axis=1)
-    final_mask = (keep_positions <= k) & keep_mask
-
-    neighbor_indices_flat = neighbor_indices[final_mask]
-    return neighbor_indices_flat.reshape(num_vertices, k)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(vertices_np)
+    _, indices = tree.query(vertices_np, k=k + 1, workers=-1)  # (N, k+1)
+    return indices[:, 1:]  # drop self (first column)
 
 
 def chamfer_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

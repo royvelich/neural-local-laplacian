@@ -185,6 +185,10 @@ class ReconstructionSettings:
     # kNN backend: 0='pyg', 1='brute', 2='cKDTree', 3='pynndescent'
     knn_backend_idx: int = 2
 
+    # Weyl's law eigenvalue self-calibration for PRED
+    enable_weyl_calibration: bool = False
+    weyl_area_source: str = "gt"  # "gt" or "pred"
+
 
 class ColorPalette:
     """Color palette for different visualization elements."""
@@ -518,6 +522,10 @@ class RealTimeEigenanalysisVisualizer:
         self._descriptor_results: Dict[str, Dict] = {}       # method -> {hks_l2, hks_corr, wks_l2, wks_corr}
         self._compression_results: Dict[str, Dict] = {}      # method -> {k -> {mean_l2, max_l2}}
 
+        # Weyl's law eigenvalue self-calibration
+        self._weyl_calibration_factor: Optional[float] = None  # α: PRED eigs / expected eigs
+        self._weyl_calibrated_evals: Optional[np.ndarray] = None  # PRED eigenvalues / α
+
         # Debug flags (set from config in run_dataset_iteration)
         self._diagnostic_mode = False
         self._skip_robust = False
@@ -685,6 +693,58 @@ class RealTimeEigenanalysisVisualizer:
                 f"k2={self.reconstruction_settings.pred_top_k} (operator support), "
                 f"policy={self.reconstruction_settings.symmetry_policy}"
             )
+
+        # --- Weyl's Law Eigenvalue Calibration ---
+        psim.Text("")
+        psim.Separator()
+        psim.Text("PRED Eigenvalue Self-Calibration:")
+
+        weyl_changed, new_weyl = psim.Checkbox(
+            "Weyl's law calibration",
+            self.reconstruction_settings.enable_weyl_calibration
+        )
+        if weyl_changed:
+            self.reconstruction_settings.enable_weyl_calibration = new_weyl
+            if new_weyl:
+                print("[*] Weyl calibration enabled")
+                self._apply_weyl_calibration()
+            else:
+                print("[*] Weyl calibration disabled")
+                self._revert_weyl_calibration()
+
+        # Area source selector (only show when calibration is available)
+        if self.reconstruction_settings.enable_weyl_calibration or self._weyl_calibration_factor is not None:
+            area_sources = ["gt", "pred"]
+            area_labels = ["GT areas (from mesh)", "PRED areas (self-supervised)"]
+            current_area_idx = area_sources.index(self.reconstruction_settings.weyl_area_source) if self.reconstruction_settings.weyl_area_source in area_sources else 0
+            area_changed, new_area_idx = psim.Combo(
+                "Area source",
+                current_area_idx,
+                area_labels
+            )
+            if area_changed and area_sources[new_area_idx] != self.reconstruction_settings.weyl_area_source:
+                self.reconstruction_settings.weyl_area_source = area_sources[new_area_idx]
+                print(f"[*] Weyl area source changed: {area_sources[new_area_idx]}")
+                # Recompute with new area source
+                self._weyl_calibration_factor = None
+                self._weyl_calibrated_evals = None
+                self._compute_weyl_calibration()
+                if self.reconstruction_settings.enable_weyl_calibration:
+                    self._compute_descriptor_comparison()
+
+        # Show calibration info
+        if self.reconstruction_settings.enable_weyl_calibration and self._weyl_calibration_factor is not None:
+            alpha = self._weyl_calibration_factor
+            src_label = "PRED" if self.reconstruction_settings.weyl_area_source == "pred" else "GT"
+            psim.TextColored((0.0, 1.0, 1.0, 1.0), f"  Factor: {alpha:.2f}x ({src_label} areas)")
+            if self._weyl_calibrated_evals is not None:
+                cal = self._weyl_calibrated_evals
+                pos_cal = cal[cal > 1e-10]
+                if len(pos_cal) > 0:
+                    psim.Text(f"  Calibrated range: [{pos_cal[0]:.4f}, {pos_cal[-1]:.4f}]")
+                if self.current_gt_data is not None and self.current_gt_data.get('gt_eigenvalues') is not None:
+                    gt_evals = self.current_gt_data['gt_eigenvalues']
+                    psim.Text(f"  GT range:         [{gt_evals[1]:.4f}, {gt_evals[-1]:.4f}]")
 
         psim.Text("")
         psim.Text("Current Settings:")
@@ -990,27 +1050,31 @@ class RealTimeEigenanalysisVisualizer:
         psim.Text("Probe Function MSE (Lf error, NeLo Table 1):")
 
         if self._probe_function_results:
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<16} {'Raw MSE':>10} {'nMSE':>10} {'R_MSE>1':>10}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<16} {'Raw MSE':>10} {'Cos Sim':>10} {'R_MSE>1':>10}")
             for method, res in self._probe_function_results.items():
                 raw_mse = res['mse']
-                nmse = res.get('normalized_mse', raw_mse)
+                cos_sim = res.get('cosine_similarity', 0.0)
                 fr = res['failure_rate']
                 if method == 'GT':
                     color = (0.5, 0.5, 0.5, 1.0)
-                elif nmse < 0.01:
+                elif cos_sim > 0.95:
                     color = (0.0, 1.0, 0.0, 1.0)
-                elif nmse < 0.1:
+                elif cos_sim > 0.8:
                     color = (1.0, 1.0, 0.0, 1.0)
                 else:
                     color = (1.0, 0.3, 0.0, 1.0)
-                psim.TextColored(color, f"  {method:<16} {raw_mse:>10.6f} {nmse:>10.6f} {fr:>9.1%}")
+                psim.TextColored(color, f"  {method:<16} {raw_mse:>10.6f} {cos_sim:>10.6f} {fr:>9.1%}")
         else:
             psim.Text("(Not computed yet)")
 
         # === HKS / WKS DESCRIPTOR ERROR ===
         psim.Text("")
         psim.Separator()
-        psim.Text("Shape Descriptors (HKS/WKS vs GT):")
+        if self.reconstruction_settings.enable_weyl_calibration and self._weyl_calibration_factor is not None:
+            src_label = "PRED" if self.reconstruction_settings.weyl_area_source == "pred" else "GT"
+            psim.TextColored((0.0, 1.0, 1.0, 1.0), f"Shape Descriptors (HKS/WKS vs GT) [Weyl calibrated, {src_label} areas]:")
+        else:
+            psim.Text("Shape Descriptors (HKS/WKS vs GT):")
 
         if self._descriptor_results:
             psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<12} {'HKS L2':>8} {'HKS Corr':>9} {'WKS L2':>8} {'WKS Corr':>9}")
@@ -1604,6 +1668,10 @@ class RealTimeEigenanalysisVisualizer:
 
         print(f"  Recomputing HKS/WKS descriptors...")
         try:
+            # Recompute Weyl calibration (eigenvalues changed)
+            self._weyl_calibration_factor = None
+            self._weyl_calibrated_evals = None
+            self._compute_weyl_calibration()
             self._compute_descriptor_comparison()
         except Exception as e:
             print(f"  [!] Descriptor comparison failed: {e}")
@@ -1651,6 +1719,8 @@ class RealTimeEigenanalysisVisualizer:
         self._probe_function_results = {}
         self._descriptor_results = {}
         self._compression_results = {}
+        self._weyl_calibration_factor = None
+        self._weyl_calibrated_evals = None
         self._weight_nbr_sample_indices = None
 
         # Force garbage collection
@@ -1770,27 +1840,11 @@ class RealTimeEigenanalysisVisualizer:
         vertices = self.current_original_vertices
         num_vertices = len(vertices)
 
-        # Build k-NN index for the entire mesh
-        from sklearn.neighbors import NearestNeighbors
-        nbrs = NearestNeighbors(n_neighbors=new_k + 1, algorithm='auto').fit(vertices)
-
-        # Get k+1 nearest neighbors for ALL vertices at once
-        distances, neighbor_indices = nbrs.kneighbors(vertices)  # Shape: (N, k+1)
-
-        # Vectorized removal of center point from neighbors
-        center_positions = np.arange(num_vertices)[:, np.newaxis]  # Shape: (N, 1)
-        is_center_mask = neighbor_indices == center_positions  # Shape: (N, k+1)
-
-        # Create mask to keep only non-center neighbors
-        keep_mask = ~is_center_mask  # Shape: (N, k+1)
-
-        # For each row, we want to keep the first k True values in keep_mask
-        keep_positions = np.cumsum(keep_mask, axis=1)  # Shape: (N, k+1)
-        final_mask = (keep_positions <= new_k) & keep_mask  # Shape: (N, k+1)
-
-        # Extract neighbor indices using the mask
-        neighbor_indices_flat = neighbor_indices[final_mask]  # Shape: (N*k,)
-        neighbor_indices_filtered = neighbor_indices_flat.reshape(num_vertices, new_k)  # Shape: (N, k)
+        # Build k-NN index using cKDTree
+        from scipy.spatial import cKDTree
+        tree = cKDTree(vertices)
+        _, neighbor_indices = tree.query(vertices, k=new_k + 1, workers=-1)  # (N, k+1)
+        neighbor_indices_filtered = neighbor_indices[:, 1:]  # (N, k) — drop self
 
         # Create new connectivity tensors
         vertex_indices = torch.from_numpy(neighbor_indices_filtered.flatten()).long()  # Shape: (N*k,)
@@ -1916,20 +1970,11 @@ class RealTimeEigenanalysisVisualizer:
                 use_gpu_knn = False
 
         if not use_gpu_knn:
-            from sklearn.neighbors import NearestNeighbors
+            from scipy.spatial import cKDTree
 
-            nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices)
-            distances, neighbor_indices = nbrs.kneighbors(vertices)  # Shape: (N, k+1)
-
-            # Remove center point from neighbors (vectorized)
-            center_positions = np.arange(num_vertices)[:, np.newaxis]
-            is_center_mask = neighbor_indices == center_positions
-            keep_mask = ~is_center_mask
-            keep_positions = np.cumsum(keep_mask, axis=1)
-            final_mask = (keep_positions <= k) & keep_mask
-
-            neighbor_indices_flat = neighbor_indices[final_mask]
-            neighbor_indices_filtered = neighbor_indices_flat.reshape(num_vertices, k)
+            tree = cKDTree(vertices)
+            _, neighbor_indices = tree.query(vertices, k=k + 1, workers=-1)  # (N, k+1)
+            neighbor_indices_filtered = neighbor_indices[:, 1:]  # (N, k) — drop self
 
         # Extract neighbor positions and translate to origin
         all_neighbor_positions = vertices[neighbor_indices_filtered]  # (N, k, 3)
@@ -2252,6 +2297,110 @@ class RealTimeEigenanalysisVisualizer:
             ps.register_point_cloud("Source Vertex", pos, radius=0.025, color=(0.6, 0.0, 0.8))
 
     # =========================================================================
+    # WEYL'S LAW EIGENVALUE SELF-CALIBRATION
+    # =========================================================================
+
+    def _compute_weyl_calibration(self):
+        """Compute Weyl's law self-calibration factor for PRED eigenvalues.
+
+        For a closed 2-manifold of area A, Weyl's law gives:
+            λ_k ~ 4πk / A
+
+        The calibration factor α = median(λ_pred_k / λ_weyl_k) for k=1..K.
+        Calibrated eigenvalues = λ_pred / α.
+
+        Area source is controlled by reconstruction_settings.weyl_area_source:
+        - "gt": GT surface area from PyFM vertex areas (requires mesh)
+        - "pred": predicted surface area from model's area head (self-supervised)
+        """
+        if self.current_inference_result is None or self.current_gt_data is None:
+            return
+
+        pred_evals = self.current_inference_result.get('predicted_eigenvalues')
+        if pred_evals is None:
+            return
+
+        pred_evals = pred_evals.cpu().numpy() if torch.is_tensor(pred_evals) else np.asarray(pred_evals)
+
+        area_source = self.reconstruction_settings.weyl_area_source
+
+        if area_source == "pred":
+            # Self-supervised: use predicted areas from model
+            pred_areas = self.current_inference_result.get('areas')
+            if pred_areas is not None:
+                pred_areas_np = pred_areas.cpu().numpy() if torch.is_tensor(pred_areas) else np.asarray(pred_areas)
+                total_area = float(np.sum(pred_areas_np))
+            else:
+                print("  [!] Weyl calibration: no predicted areas available")
+                return
+        else:
+            # GT area from PyFM vertex areas
+            gt_areas = self.current_gt_data.get('vertex_areas')
+            if gt_areas is not None:
+                total_area = float(np.sum(gt_areas))
+            else:
+                gt_M = self.current_gt_data.get('gt_mass_matrix')
+                if gt_M is not None:
+                    total_area = float(gt_M.diagonal().sum())
+                else:
+                    print("  [!] Weyl calibration: no GT area available")
+                    return
+
+        if total_area <= 0:
+            print(f"  [!] Weyl calibration: invalid total area {total_area}")
+            return
+
+        # Compute Weyl expected eigenvalues: λ_k = 4πk / A (skip k=0)
+        K = len(pred_evals)
+        k_indices = np.arange(1, K)  # k = 1, 2, ..., K-1
+        weyl_evals = 4.0 * np.pi * k_indices / total_area
+
+        # Only use positive PRED eigenvalues for robust median
+        pred_positive = pred_evals[1:]  # skip λ_0
+        valid_mask = pred_positive > 1e-10
+        if valid_mask.sum() < 2:
+            print("  [!] Weyl calibration: not enough positive PRED eigenvalues")
+            return
+
+        ratios = pred_positive[valid_mask] / weyl_evals[valid_mask]
+        alpha = float(np.median(ratios))
+
+        if alpha <= 0:
+            print(f"  [!] Weyl calibration: invalid factor {alpha}")
+            return
+
+        self._weyl_calibration_factor = alpha
+        self._weyl_calibrated_evals = pred_evals / alpha
+
+        src_label = "PRED areas" if area_source == "pred" else "GT areas"
+        print(f"\n  [Weyl Calibration] Area source: {src_label}, total area: {total_area:.6f}")
+        print(f"  [Weyl Calibration] Factor α = {alpha:.2f} (PRED evals are {alpha:.1f}× Weyl expectation)")
+        print(f"  [Weyl Calibration] Calibrated eigenvalue range: [{self._weyl_calibrated_evals[0]:.4e}, {self._weyl_calibrated_evals[-1]:.4f}]")
+        if self.current_gt_data.get('gt_eigenvalues') is not None:
+            gt_evals = self.current_gt_data['gt_eigenvalues']
+            print(f"  [Weyl Calibration] GT eigenvalue range:         [{gt_evals[0]:.4e}, {gt_evals[-1]:.4f}]")
+
+    def _apply_weyl_calibration(self):
+        """Recompute HKS/WKS descriptors and probe cosine similarity with calibrated eigenvalues."""
+        if self._weyl_calibration_factor is None:
+            self._compute_weyl_calibration()
+
+        if self._weyl_calibration_factor is None:
+            return  # calibration failed
+
+        print("\n  Recomputing metrics with Weyl-calibrated PRED eigenvalues...")
+        # Recompute descriptors (HKS/WKS use eigenvalues directly)
+        self._compute_descriptor_comparison()
+        print("  [OK] Descriptors recomputed with calibrated eigenvalues")
+
+    def _revert_weyl_calibration(self):
+        """Revert to original PRED eigenvalues and recompute metrics."""
+        # Don't clear _weyl_calibration_factor — keep it cached for quick re-enable
+        print("\n  Reverting to original PRED eigenvalues...")
+        self._compute_descriptor_comparison()
+        print("  [OK] Descriptors recomputed with original eigenvalues")
+
+    # =========================================================================
     # NEW METRICS: Probe Function MSE, HKS/WKS Descriptors, Spectral Compression
     # =========================================================================
 
@@ -2313,10 +2462,6 @@ class RealTimeEigenanalysisVisualizer:
         gt_Lf = L_gt @ probes  # (N, n_probes)
         gt_result = M_gt_inv_diag[:, None] * gt_Lf  # M_gt^-1 L_gt f
 
-        # Per-probe GT response magnitude for normalization (NeLo Eq. 5 style)
-        gt_response_mag = np.mean(np.abs(gt_result), axis=0)  # (n_probes,)
-        epsilon = 0.1
-
         # --- Evaluate each method ---
         self._probe_function_results = {}
         for method_key in ['GT', 'PRED', 'Robust', 'NeLo']:
@@ -2339,20 +2484,25 @@ class RealTimeEigenanalysisVisualizer:
                 raw_mse = float(clipped_mse.mean())
                 failure_rate = float(np.mean(per_probe_mse > 1.0))
 
-                # --- Normalized MSE (scale-invariant) ---
-                # Divide each probe's MSE by (mean|gt_response| + ε)^2
-                # This is equivalent to NeLo's balance weight w_f
-                norm_factors = (gt_response_mag + epsilon) ** 2  # (n_probes,)
-                per_probe_nmse = per_probe_mse / norm_factors
-                normalized_mse = float(per_probe_nmse.mean())
+                # --- Cosine similarity (truly scale-invariant) ---
+                # Measures whether Lf produces the same *shape* of response, ignoring global scale
+                cosine_sims = []
+                for p in range(n_probes):
+                    gt_col = gt_result[:, p]
+                    m_col = method_result[:, p]
+                    gt_norm = np.linalg.norm(gt_col)
+                    m_norm = np.linalg.norm(m_col)
+                    if gt_norm > 1e-15 and m_norm > 1e-15:
+                        cosine_sims.append(float(np.dot(gt_col, m_col) / (gt_norm * m_norm)))
+                mean_cosine = float(np.mean(cosine_sims)) if cosine_sims else 0.0
 
                 self._probe_function_results[method_key] = {
                     'mse': raw_mse,
-                    'normalized_mse': normalized_mse,
+                    'cosine_similarity': mean_cosine,
                     'failure_rate': failure_rate,
                     'n_probes': n_probes,
                 }
-                print(f"  {method_key}: Lf MSE={raw_mse:.6f} (raw), nMSE={normalized_mse:.6f} (normalized), "
+                print(f"  {method_key}: Lf MSE={raw_mse:.6f} (raw), cos_sim={mean_cosine:.6f}, "
                       f"R_MSE>1={failure_rate:.1%} ({n_probes} probes)")
 
             except Exception as e:
@@ -2368,22 +2518,21 @@ class RealTimeEigenanalysisVisualizer:
         if gt_evals is None or gt_evecs is None:
             return
 
-        def compute_hks(eigenvalues, eigenvectors, n_scales=100):
-            """Compute HKS descriptor (N, n_scales) from eigenpairs."""
-            # Skip zero eigenvalue
+        def compute_hks(eigenvalues, eigenvectors, t_values):
+            """Compute HKS descriptor (N, n_scales) at given time scales."""
             evals = eigenvalues[1:]
             evecs = eigenvectors[:, 1:]
+
+            # Filter out negative/zero eigenvalues
+            pos_mask = evals > 1e-10
+            evals = evals[pos_mask]
+            evecs = evecs[:, pos_mask]
+
             k = min(len(evals), 50)
+            if k < 2:
+                return None
             evals = evals[:k]
             evecs = evecs[:, :k]
-
-            if evals[-1] <= 0 or evals[0] <= 0:
-                return None
-
-            # Log-spaced time values: 4*ln(10)/λ_max to 4*ln(10)/λ_2
-            t_min = 4.0 * np.log(10.0) / evals[-1]
-            t_max = 4.0 * np.log(10.0) / evals[0]
-            t_values = np.exp(np.linspace(np.log(t_min), np.log(t_max), n_scales))
 
             # HKS(x, t) = Σ exp(-λ_i * t) * φ_i(x)^2
             phi_sq = evecs ** 2  # (N, k)
@@ -2391,25 +2540,23 @@ class RealTimeEigenanalysisVisualizer:
             hks = phi_sq @ exp_terms.T  # (N, n_scales)
             return hks
 
-        def compute_wks(eigenvalues, eigenvectors, n_scales=100):
-            """Compute WKS descriptor (N, n_scales) from eigenpairs."""
+        def compute_wks(eigenvalues, eigenvectors, e_values, sigma):
+            """Compute WKS descriptor (N, n_scales) at given energy scales."""
             evals = eigenvalues[1:]
             evecs = eigenvectors[:, 1:]
+
+            # Filter out negative/zero eigenvalues
+            pos_mask = evals > 1e-10
+            evals = evals[pos_mask]
+            evecs = evecs[:, pos_mask]
+
             k = min(len(evals), 50)
+            if k < 2:
+                return None
             evals = evals[:k]
             evecs = evecs[:, :k]
 
-            if evals[-1] <= 0 or evals[0] <= 0:
-                return None
-
             log_evals = np.log(evals)
-            e_min = log_evals[0]
-            e_max = log_evals[-1]
-            sigma = 7.0 * (e_max - e_min) / n_scales
-            if sigma < 1e-10:
-                return None
-
-            e_values = np.linspace(e_min, e_max, n_scales)
 
             # WKS(x, e) = Σ exp(-(e - ln(λ_i))^2 / 2σ^2) * φ_i(x)^2
             phi_sq = evecs ** 2  # (N, k)
@@ -2437,9 +2584,33 @@ class RealTimeEigenanalysisVisualizer:
             mean_corr = float(np.mean(correlations)) if correlations else 0.0
             return mean_l2, mean_corr
 
+        # Compute GT time/energy scales (used for ALL methods for fair comparison)
+        gt_evals_pos = gt_evals[1:]
+        gt_evals_pos = gt_evals_pos[gt_evals_pos > 1e-10]
+        if len(gt_evals_pos) < 2:
+            print("  [!] Not enough positive GT eigenvalues for HKS/WKS")
+            return
+
+        n_scales = 100
+        # HKS time scales from GT eigenvalue range
+        t_min = 4.0 * np.log(10.0) / gt_evals_pos[min(len(gt_evals_pos)-1, 49)]
+        t_max = 4.0 * np.log(10.0) / gt_evals_pos[0]
+        hks_t_values = np.exp(np.linspace(np.log(t_min), np.log(t_max), n_scales))
+
+        # WKS energy scales from GT eigenvalue range
+        log_gt_evals = np.log(gt_evals_pos[:min(len(gt_evals_pos), 50)])
+        wks_e_min = log_gt_evals[0]
+        wks_e_max = log_gt_evals[-1]
+        wks_sigma = 7.0 * (wks_e_max - wks_e_min) / n_scales
+        wks_e_values = np.linspace(wks_e_min, wks_e_max, n_scales)
+
+        if wks_sigma < 1e-10:
+            print("  [!] GT eigenvalue range too narrow for WKS")
+            wks_e_values = None
+
         # GT descriptors (reference)
-        hks_gt = compute_hks(gt_evals, gt_evecs)
-        wks_gt = compute_wks(gt_evals, gt_evecs)
+        hks_gt = compute_hks(gt_evals, gt_evecs, hks_t_values)
+        wks_gt = compute_wks(gt_evals, gt_evecs, wks_e_values, wks_sigma) if wks_e_values is not None else None
 
         if hks_gt is None and wks_gt is None:
             print("  [!] Could not compute GT HKS/WKS (bad eigenvalues)")
@@ -2452,7 +2623,11 @@ class RealTimeEigenanalysisVisualizer:
         pred_evals = self.current_inference_result.get('predicted_eigenvalues') if self.current_inference_result else None
         pred_evecs = self.current_inference_result.get('predicted_eigenvectors') if self.current_inference_result else None
         if pred_evals is not None and pred_evecs is not None:
-            method_eigenpairs['PRED'] = (pred_evals, pred_evecs)
+            # Use Weyl-calibrated eigenvalues if enabled (eigenvectors unchanged)
+            if self._weyl_calibrated_evals is not None and self.reconstruction_settings.enable_weyl_calibration:
+                method_eigenpairs['PRED'] = (self._weyl_calibrated_evals, pred_evecs)
+            else:
+                method_eigenpairs['PRED'] = (pred_evals, pred_evecs)
 
         robust_evals = self.current_gt_data.get('robust_eigenvalues')
         robust_evecs = self.current_gt_data.get('robust_eigenvectors')
@@ -2467,8 +2642,9 @@ class RealTimeEigenanalysisVisualizer:
                 evals_np = evals.cpu().numpy() if torch.is_tensor(evals) else np.asarray(evals)
                 evecs_np = evecs.cpu().numpy() if torch.is_tensor(evecs) else np.asarray(evecs)
 
-                hks_m = compute_hks(evals_np, evecs_np)
-                wks_m = compute_wks(evals_np, evecs_np)
+                # Use GT's time/energy scales for all methods
+                hks_m = compute_hks(evals_np, evecs_np, hks_t_values)
+                wks_m = compute_wks(evals_np, evecs_np, wks_e_values, wks_sigma) if wks_e_values is not None else None
 
                 hks_l2, hks_corr = compare_descriptors(hks_m, hks_gt)
                 wks_l2, wks_corr = compare_descriptors(wks_m, wks_gt)
@@ -2479,8 +2655,9 @@ class RealTimeEigenanalysisVisualizer:
                     'wks_l2_error': wks_l2 if wks_l2 is not None else -1.0,
                     'wks_correlation': wks_corr if wks_corr is not None else 0.0,
                 }
-                print(f"  {method_key}: HKS L2={hks_l2:.4f} corr={hks_corr:.4f}, "
-                      f"WKS L2={wks_l2:.4f} corr={wks_corr:.4f}")
+                res = self._descriptor_results[method_key]
+                print(f"  {method_key}: HKS L2={res['hks_l2_error']:.4f} corr={res['hks_correlation']:.4f}, "
+                      f"WKS L2={res['wks_l2_error']:.4f} corr={res['wks_correlation']:.4f}")
 
             except Exception as e:
                 print(f"  [!] Descriptor comparison for {method_key} failed: {e}")
@@ -6667,6 +6844,12 @@ class RealTimeEigenanalysisVisualizer:
             traceback.print_exc()
 
         # STEP 9.7: HKS / WKS descriptor comparison
+        # Pre-compute Weyl calibration factor (cheap, always available for checkbox toggle)
+        try:
+            self._compute_weyl_calibration()
+        except Exception as e:
+            print(f"  [!] Weyl calibration failed: {e}")
+
         print(f"\nSTEP 9.7: Shape descriptor comparison (HKS / WKS)")
         try:
             self._compute_descriptor_comparison()
@@ -6868,7 +7051,7 @@ class RealTimeEigenanalysisVisualizer:
         for method, res in self._probe_function_results.items():
             prefix = method.lower().replace(' ', '_').replace('(', '').replace(')', '')
             metrics[f'{prefix}_probe_mse'] = res['mse']
-            metrics[f'{prefix}_probe_nmse'] = res.get('normalized_mse', res['mse'])
+            metrics[f'{prefix}_probe_cosine_sim'] = res.get('cosine_similarity', 0.0)
             metrics[f'{prefix}_probe_failure_rate'] = res['failure_rate']
 
         # --- HKS / WKS Descriptor Error ---
@@ -6878,6 +7061,11 @@ class RealTimeEigenanalysisVisualizer:
             metrics[f'{prefix}_hks_correlation'] = res['hks_correlation']
             metrics[f'{prefix}_wks_l2_error'] = res['wks_l2_error']
             metrics[f'{prefix}_wks_correlation'] = res['wks_correlation']
+
+        # --- Weyl Calibration ---
+        if self._weyl_calibration_factor is not None:
+            metrics['pred_weyl_calibration_factor'] = self._weyl_calibration_factor
+            metrics['pred_weyl_area_source'] = self.reconstruction_settings.weyl_area_source
 
         # --- Spectral Compression Error ---
         for method, k_res in self._compression_results.items():

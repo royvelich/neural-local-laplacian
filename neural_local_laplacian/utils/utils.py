@@ -74,18 +74,7 @@ def _knn_cpu(vertices_np: np.ndarray, k: int) -> np.ndarray:
             return indices[:, 1:]
 
     else:
-        # Fallback: sklearn (should not normally be reached)
-        from sklearn.neighbors import NearestNeighbors
-        num_vertices = len(vertices_np)
-        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
-        _, neighbor_indices = nbrs.kneighbors(vertices_np)
-
-        center_positions = np.arange(num_vertices)[:, np.newaxis]
-        is_center = neighbor_indices == center_positions
-        keep = ~is_center
-        keep_positions = np.cumsum(keep, axis=1)
-        final_mask = (keep_positions <= k) & keep
-        return neighbor_indices[final_mask].reshape(num_vertices, k)
+        raise ValueError(f"Unknown kNN backend: {_KNN_BACKEND}. Use 'cKDTree' or 'pynndescent'.")
 
 
 def build_patches_from_vertices(

@@ -21,21 +21,25 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 2.0
+      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+      weight: 3.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
-      weight: 0.0
+      weight: null
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-      weight: 0.0
+      weight: null
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
         num_random_probes: 1000
         probe_mode: 'random'
-      weight: 0.25
+      weight: null
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.WeightEntropyLoss

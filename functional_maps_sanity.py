@@ -48,7 +48,6 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import trimesh
-from sklearn.neighbors import NearestNeighbors
 import robust_laplacian
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
@@ -239,14 +238,10 @@ def load_model(ckpt_path: str, device: torch.device) -> LaplacianTransformerModu
 
 def compute_knn(vertices_np: np.ndarray, k: int) -> np.ndarray:
     """Compute k-NN indices excluding self. Returns (N, k)."""
-    n = len(vertices_np)
-    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
-    _, idx = nbrs.kneighbors(vertices_np)
-    center = np.arange(n)[:, np.newaxis]
-    keep = ~(idx == center)
-    keep_pos = np.cumsum(keep, axis=1)
-    final = (keep_pos <= k) & keep
-    return idx[final].reshape(n, k)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(vertices_np)
+    _, indices = tree.query(vertices_np, k=k + 1, workers=-1)  # (N, k+1)
+    return indices[:, 1:]  # drop self (first column)
 
 
 def build_patch_data(vertices: torch.Tensor, neighbor_indices: np.ndarray,
@@ -418,8 +413,9 @@ def functional_map_to_pointwise(
     projected_a = eigvecs_a @ C.T  # (N_A, k)
 
     # Find nearest neighbor in Φ_B
-    nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(eigvecs_b)
-    _, indices = nbrs.kneighbors(projected_a)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(eigvecs_b)
+    _, indices = tree.query(projected_a)
 
     return indices.flatten()
 
