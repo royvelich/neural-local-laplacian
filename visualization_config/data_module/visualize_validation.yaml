@@ -4,7 +4,7 @@ val_dataset_specifications:
   - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
     dataset:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-      mesh_folder_path: 'F:\input\Thingi10k'
+      mesh_folder_path: 'F:\input\shrec15'
       max_meshes: 100
       file_size_range_mb: [0.2, 2]
       num_components_range: [1, 1]
