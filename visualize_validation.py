@@ -526,6 +526,12 @@ class RealTimeEigenanalysisVisualizer:
         self._weyl_calibration_factor: Optional[float] = None  # α: PRED eigs / expected eigs
         self._weyl_calibrated_evals: Optional[np.ndarray] = None  # PRED eigenvalues / α
 
+        # Weight distribution stats (stored for CSV export)
+        self._weight_distribution_stats: Dict[str, float] = {}
+
+        # Mesh boundary info (stored for CSV export)
+        self._mesh_boundary_info: Dict[str, Any] = {}
+
         # Debug flags (set from config in run_dataset_iteration)
         self._diagnostic_mode = False
         self._skip_robust = False
@@ -1139,6 +1145,137 @@ class RealTimeEigenanalysisVisualizer:
         else:
             psim.Text("(Not computed yet)")
 
+        # === EIGENVALUE COMPARISON ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Eigenvalue Comparison:")
+
+        gt_evals = self.current_gt_data.get('gt_eigenvalues') if self.current_gt_data else None
+        pred_evals = self.current_inference_result.get('predicted_eigenvalues') if self.current_inference_result else None
+        robust_evals = self.current_gt_data.get('robust_eigenvalues') if self.current_gt_data else None
+        nelo_evals = self.current_nelo_eigenvalues
+
+        if gt_evals is not None:
+            gt_np = gt_evals.cpu().numpy() if torch.is_tensor(gt_evals) else np.asarray(gt_evals)
+
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<12} {'λ₁(Fiedler)':>12} {'λ_max':>12} {'Scale':>8}")
+            psim.Separator()
+
+            for label, evals, color in [
+                ('GT', gt_evals, (0.0, 1.0, 0.0, 1.0)),
+                ('PRED', pred_evals, (1.0, 0.5, 0.0, 1.0)),
+                ('Robust', robust_evals, (0.0, 0.7, 1.0, 1.0)),
+                ('NeLo', nelo_evals, (0.7, 0.3, 1.0, 1.0)),
+            ]:
+                if evals is not None:
+                    e_np = evals.cpu().numpy() if torch.is_tensor(evals) else np.asarray(evals)
+                    if len(e_np) > 1:
+                        fiedler = e_np[1]
+                        emax = e_np[-1]
+                        # Scale ratio vs GT
+                        if label != 'GT' and len(gt_np) > 1:
+                            gt_pos = gt_np[1:]
+                            m_pos = e_np[1:min(len(e_np), len(gt_np))]
+                            valid = (gt_pos[:len(m_pos)] > 1e-10) & (m_pos > 1e-10)
+                            ratio_str = f"{float(np.median(m_pos[valid] / gt_pos[:len(m_pos)][valid])):.1f}×" if valid.sum() > 0 else "N/A"
+                        else:
+                            ratio_str = "1.0×"
+                        psim.TextColored(color, f"  {label:<12} {fiedler:>12.4f} {emax:>12.4f} {ratio_str:>8}")
+        else:
+            psim.Text("(Not computed yet)")
+
+        # === VERTEX AREA COMPARISON ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Vertex Area Comparison:")
+
+        gt_areas = self.current_gt_data.get('vertex_areas') if self.current_gt_data else None
+        pred_areas_raw = self.current_inference_result.get('areas') if self.current_inference_result else None
+
+        if gt_areas is not None or pred_areas_raw is not None:
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Source':<12} {'Total':>12} {'Mean':>12} {'Std':>12}")
+            psim.Separator()
+
+            if gt_areas is not None:
+                psim.TextColored((0.0, 1.0, 0.0, 1.0),
+                    f"  {'GT':<12} {float(np.sum(gt_areas)):>12.6f} {float(np.mean(gt_areas)):>12.6f} {float(np.std(gt_areas)):>12.6f}")
+
+            if pred_areas_raw is not None:
+                pa = pred_areas_raw.cpu().numpy() if torch.is_tensor(pred_areas_raw) else np.asarray(pred_areas_raw)
+                psim.TextColored((1.0, 0.5, 0.0, 1.0),
+                    f"  {'PRED':<12} {float(np.sum(pa)):>12.6f} {float(np.mean(pa)):>12.6f} {float(np.std(pa)):>12.6f}")
+
+                if gt_areas is not None:
+                    ratio = float(np.sum(pa)) / float(np.sum(gt_areas)) if float(np.sum(gt_areas)) > 1e-15 else 0.0
+                    if len(pa) == len(gt_areas):
+                        corr = np.corrcoef(pa, gt_areas)[0, 1]
+                        corr = float(corr) if np.isfinite(corr) else 0.0
+                    else:
+                        corr = 0.0
+                    color = (0.0, 1.0, 0.0, 1.0) if 0.8 < ratio < 1.2 else (1.0, 0.3, 0.0, 1.0)
+                    psim.TextColored(color, f"  Ratio PRED/GT: {ratio:.4f}   Corr: {corr:.4f}")
+        else:
+            psim.Text("(Not computed yet)")
+
+        # === MEAN CURVATURE COMPARISON ===
+        psim.Text("")
+        psim.Separator()
+        psim.Text("Mean Curvature Comparison:")
+
+        gt_H = self.current_gt_data.get('gt_mean_curvature') if self.current_gt_data else None
+        pred_H = self.current_predicted_data.get('predicted_mean_curvature') if self.current_predicted_data else None
+
+        if gt_H is not None or pred_H is not None:
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Source':<12} {'Min':>10} {'Max':>10} {'Mean':>10} {'Std':>10}")
+            psim.Separator()
+
+            if gt_H is not None:
+                psim.TextColored((0.0, 1.0, 0.0, 1.0),
+                    f"  {'GT':<12} {float(gt_H.min()):>10.4f} {float(gt_H.max()):>10.4f} {float(np.mean(gt_H)):>10.4f} {float(np.std(gt_H)):>10.4f}")
+
+            if pred_H is not None:
+                psim.TextColored((1.0, 0.5, 0.0, 1.0),
+                    f"  {'PRED |H|':<12} {float(pred_H.min()):>10.4f} {float(pred_H.max()):>10.4f} {float(np.mean(pred_H)):>10.4f} {float(np.std(pred_H)):>10.4f}")
+
+            if gt_H is not None and pred_H is not None:
+                valid = np.isfinite(gt_H) & np.isfinite(pred_H)
+                if valid.sum() > 2:
+                    corr = np.corrcoef(np.abs(gt_H[valid]), pred_H[valid])[0, 1]
+                    corr = float(corr) if np.isfinite(corr) else 0.0
+                    color = (0.0, 1.0, 0.0, 1.0) if corr > 0.8 else (1.0, 0.3, 0.0, 1.0) if corr > 0.5 else (1.0, 0.0, 0.0, 1.0)
+                    psim.TextColored(color, f"  |H| Correlation (GT vs PRED): {corr:.4f}")
+        else:
+            psim.Text("(Not computed yet)")
+
+        # === MESH BOUNDARY INFO ===
+        if self._mesh_boundary_info:
+            psim.Text("")
+            psim.Separator()
+            info = self._mesh_boundary_info
+            is_closed = info.get('is_closed', True)
+            if is_closed:
+                psim.TextColored((0.0, 1.0, 0.0, 1.0), "Mesh: closed (no boundary)")
+            else:
+                n_be = info.get('num_boundary_edges', 0)
+                n_bv = info.get('num_boundary_vertices', 0)
+                n_loops = info.get('num_boundary_loops', 0)
+                psim.TextColored((1.0, 1.0, 0.0, 1.0),
+                    f"Mesh: open ({n_be} boundary edges, {n_bv} boundary verts, {n_loops} loops)")
+
+        # === PRED WEIGHT DISTRIBUTION ===
+        if self._weight_distribution_stats:
+            psim.Text("")
+            psim.Separator()
+            psim.Text("PRED Weight Distribution:")
+            ws = self._weight_distribution_stats
+            psim.Text(f"  Weights: mean={ws['weight_mean']:.4f}, std={ws['weight_std']:.4f}, "
+                       f"range=[{ws['weight_min']:.4f}, {ws['weight_max']:.4f}]")
+            psim.Text(f"  Entropy: {ws['entropy_ratio']:.1%} of uniform   "
+                       f"Gini: {ws['gini_mean']:.3f}")
+            psim.Text(f"  Top-1: {ws['top1_frac_mean']:.1%}   "
+                       f"Top-3: {ws['top3_frac_mean']:.1%}   "
+                       f"Top-6: {ws['top6_frac_mean']:.1%}")
+
     def _has_current_batch_data(self) -> bool:
         """Check if we have current batch data available for re-computation."""
         return (self.current_gt_data is not None and
@@ -1721,6 +1858,8 @@ class RealTimeEigenanalysisVisualizer:
         self._compression_results = {}
         self._weyl_calibration_factor = None
         self._weyl_calibrated_evals = None
+        self._weight_distribution_stats = {}
+        self._mesh_boundary_info = {}
         self._weight_nbr_sample_indices = None
 
         # Force garbage collection
@@ -3423,36 +3562,33 @@ class RealTimeEigenanalysisVisualizer:
             vertices_igl = vertices.astype(np.float64)
             faces_igl = faces.astype(np.int32)
 
-            # Curvature computation — only needed for visualization, skip in quantitative mode
-            if not self._quantitative_mode:
-                try:
-                    print("Computing GT mean curvature using libigl...")
+            # Curvature computation — needed for metrics export in all modes
+            try:
+                print("Computing GT mean curvature using libigl...")
 
-                    # Compute principal curvatures using libigl
-                    _, _, principal_curvature1, principal_curvature2, _ = igl.principal_curvature(
-                        vertices_igl, faces_igl
-                    )
+                # Compute principal curvatures using libigl
+                _, _, principal_curvature1, principal_curvature2, _ = igl.principal_curvature(
+                    vertices_igl, faces_igl
+                )
 
-                    # Mean curvature is the average of principal curvatures: H = (k1 + k2) / 2
-                    gt_mean_curvature = (principal_curvature1 + principal_curvature2) / 2.0
-                    gt_mean_curvature = gt_mean_curvature.astype(np.float32)
+                # Mean curvature is the average of principal curvatures: H = (k1 + k2) / 2
+                gt_mean_curvature = (principal_curvature1 + principal_curvature2) / 2.0
+                gt_mean_curvature = gt_mean_curvature.astype(np.float32)
 
-                    # Gaussian curvature: K = k1 * k2
-                    gt_gaussian_curvature = (principal_curvature1 * principal_curvature2).astype(np.float32)
+                # Gaussian curvature: K = k1 * k2
+                gt_gaussian_curvature = (principal_curvature1 * principal_curvature2).astype(np.float32)
 
-                    # GT mean curvature vector = GT normal * GT mean curvature
-                    gt_mean_curvature_vector = gt_vertex_normals * gt_mean_curvature[:, np.newaxis]
+                # GT mean curvature vector = GT normal * GT mean curvature
+                gt_mean_curvature_vector = gt_vertex_normals * gt_mean_curvature[:, np.newaxis]
 
-                    print(f"GT mean curvature range: [{gt_mean_curvature.min():.6f}, {gt_mean_curvature.max():.6f}]")
-                    print(f"GT Gaussian curvature range: [{gt_gaussian_curvature.min():.6f}, {gt_gaussian_curvature.max():.6f}]")
+                print(f"GT mean curvature range: [{gt_mean_curvature.min():.6f}, {gt_mean_curvature.max():.6f}]")
+                print(f"GT Gaussian curvature range: [{gt_gaussian_curvature.min():.6f}, {gt_gaussian_curvature.max():.6f}]")
 
-                except Exception as e:
-                    print(f"Warning: Failed to compute GT curvatures with libigl: {e}")
-                    gt_mean_curvature = None
-                    gt_mean_curvature_vector = None
-                    gt_gaussian_curvature = None
-            else:
-                print("Skipping GT curvature computation (quantitative_mode)")
+            except Exception as e:
+                print(f"Warning: Failed to compute GT curvatures with libigl: {e}")
+                gt_mean_curvature = None
+                gt_mean_curvature_vector = None
+                gt_gaussian_curvature = None
 
             # Gradient operator — always needed (used for GT heat method geodesics)
             try:
@@ -3725,6 +3861,25 @@ class RealTimeEigenanalysisVisualizer:
             labels = [f"{i:>2}" for i in range(row_start, row_end)]
             print(f"    pos [{row_start:>2}-{row_end-1:>2}]: {' '.join(vals)}")
         print(f"{'=' * 70}\n")
+
+        # Store stats for CSV export
+        self._weight_distribution_stats = {
+            'weight_mean': float(w[mask].mean()),
+            'weight_std': float(w[mask].std()),
+            'weight_min': float(w[mask].min()),
+            'weight_max': float(w[mask].max()),
+            'max_min_ratio_mean': float(ratio.mean()),
+            'max_min_ratio_median': float(ratio.median()),
+            'max_min_ratio_max': float(ratio.max()),
+            'entropy_mean': float(entropy.mean()),
+            'entropy_max_possible': max_entropy,
+            'entropy_ratio': float(entropy.mean() / max_entropy) if max_entropy > 0 else 0.0,
+            'gini_mean': float(gini.mean()),
+            'gini_median': float(gini.median()),
+            'top1_frac_mean': float(top1_frac.mean()),
+            'top3_frac_mean': float(top3_frac.mean()) if k >= 3 else float(top1_frac.mean()),
+            'top6_frac_mean': float(top6_frac.mean()) if k >= 6 else float(top3_frac.mean()),
+        }
 
     def perform_model_inference(self, model: LaplacianTransformerModule, batch_data: Data, device: torch.device) -> Dict[str, Any]:
         """
@@ -5440,8 +5595,22 @@ class RealTimeEigenanalysisVisualizer:
                     print(f"  [!] WARNING: Multiple boundary loops can cause patchy Green's function!")
             else:
                 print(f"  Mesh is closed (no boundaries)")
+
+            # Store boundary info for CSV export
+            self._mesh_boundary_info = {
+                'num_boundary_edges': len(boundary_edges),
+                'num_boundary_vertices': len(boundary_vertices),
+                'is_closed': len(boundary_edges) == 0,
+                'num_boundary_loops': num_loops if len(boundary_edges) > 0 else 0,
+            }
         except Exception as e:
             print(f"  [!] Could not check boundaries: {e}")
+
+        # Store connected components count
+        try:
+            self._mesh_boundary_info['num_components'] = n_components
+        except NameError:
+            pass
 
         print("-" * 70)
 
@@ -7080,6 +7249,106 @@ class RealTimeEigenanalysisVisualizer:
             metrics[f'{prefix}_nnz'] = stats.nnz
             metrics[f'{prefix}_density_pct'] = stats.density_percent
             metrics[f'{prefix}_avg_nnz_per_row'] = stats.avg_nnz_per_row
+
+        # --- Weight Distribution Stats ---
+        if self._weight_distribution_stats:
+            for key, val in self._weight_distribution_stats.items():
+                metrics[f'pred_{key}'] = val
+
+        # --- Mesh Boundary Info ---
+        if self._mesh_boundary_info:
+            for key, val in self._mesh_boundary_info.items():
+                if isinstance(val, bool):
+                    metrics[key] = int(val)
+                else:
+                    metrics[key] = val
+
+        # --- Curvature Comparison (GT vs PRED) ---
+        gt_H = self.current_gt_data.get('gt_mean_curvature') if self.current_gt_data else None
+        gt_K = self.current_gt_data.get('gt_gaussian_curvature') if self.current_gt_data else None
+        pred_H = self.current_predicted_data.get('predicted_mean_curvature') if self.current_predicted_data else None
+
+        if gt_H is not None:
+            metrics['gt_mean_curv_min'] = float(gt_H.min())
+            metrics['gt_mean_curv_max'] = float(gt_H.max())
+            metrics['gt_mean_curv_mean'] = float(np.mean(gt_H))
+            metrics['gt_mean_curv_std'] = float(np.std(gt_H))
+        if gt_K is not None:
+            metrics['gt_gauss_curv_min'] = float(gt_K.min())
+            metrics['gt_gauss_curv_max'] = float(gt_K.max())
+            metrics['gt_gauss_curv_mean'] = float(np.mean(gt_K))
+            metrics['gt_gauss_curv_std'] = float(np.std(gt_K))
+        if pred_H is not None:
+            metrics['pred_mean_curv_min'] = float(pred_H.min())
+            metrics['pred_mean_curv_max'] = float(pred_H.max())
+            metrics['pred_mean_curv_mean'] = float(np.mean(pred_H))
+            metrics['pred_mean_curv_std'] = float(np.std(pred_H))
+        # Curvature correlation (GT vs PRED)
+        if gt_H is not None and pred_H is not None:
+            valid = np.isfinite(gt_H) & np.isfinite(pred_H)
+            if valid.sum() > 2:
+                corr = np.corrcoef(np.abs(gt_H[valid]), pred_H[valid])[0, 1]
+                metrics['mean_curv_magnitude_corr'] = float(corr) if np.isfinite(corr) else 0.0
+
+        # --- Vertex Area Comparison (GT vs PRED) ---
+        gt_areas = self.current_gt_data.get('vertex_areas') if self.current_gt_data else None
+        pred_areas_raw = self.current_inference_result.get('areas') if self.current_inference_result else None
+
+        if gt_areas is not None:
+            metrics['gt_area_total'] = float(np.sum(gt_areas))
+            metrics['gt_area_mean'] = float(np.mean(gt_areas))
+            metrics['gt_area_std'] = float(np.std(gt_areas))
+            metrics['gt_area_min'] = float(np.min(gt_areas))
+            metrics['gt_area_max'] = float(np.max(gt_areas))
+
+        if pred_areas_raw is not None:
+            pred_areas_np = pred_areas_raw.cpu().numpy() if torch.is_tensor(pred_areas_raw) else np.asarray(pred_areas_raw)
+            metrics['pred_area_total'] = float(np.sum(pred_areas_np))
+            metrics['pred_area_mean'] = float(np.mean(pred_areas_np))
+            metrics['pred_area_std'] = float(np.std(pred_areas_np))
+            metrics['pred_area_min'] = float(np.min(pred_areas_np))
+            metrics['pred_area_max'] = float(np.max(pred_areas_np))
+
+            # Area ratio (PRED total / GT total)
+            if gt_areas is not None:
+                gt_total = float(np.sum(gt_areas))
+                if gt_total > 1e-15:
+                    metrics['area_total_ratio_pred_gt'] = float(np.sum(pred_areas_np)) / gt_total
+                # Per-vertex area correlation
+                if len(pred_areas_np) == len(gt_areas):
+                    corr = np.corrcoef(pred_areas_np, gt_areas)[0, 1]
+                    metrics['area_correlation'] = float(corr) if np.isfinite(corr) else 0.0
+
+        # --- Raw Eigenvalue Stats ---
+        gt_evals = self.current_gt_data.get('gt_eigenvalues') if self.current_gt_data else None
+        pred_evals = self.current_inference_result.get('predicted_eigenvalues') if self.current_inference_result else None
+        robust_evals = self.current_gt_data.get('robust_eigenvalues') if self.current_gt_data else None
+        nelo_evals = self.current_nelo_eigenvalues
+
+        for label, evals in [('gt', gt_evals), ('pred', pred_evals), ('robust', robust_evals), ('nelo', nelo_evals)]:
+            if evals is not None:
+                evals_np = evals.cpu().numpy() if torch.is_tensor(evals) else np.asarray(evals)
+                if len(evals_np) > 1:
+                    metrics[f'{label}_eval_0'] = float(evals_np[0])
+                    metrics[f'{label}_eval_1'] = float(evals_np[1])  # Fiedler
+                    metrics[f'{label}_eval_max'] = float(evals_np[-1])
+                    metrics[f'{label}_eval_median'] = float(np.median(evals_np[1:]))
+                    # Spectral gap
+                    metrics[f'{label}_spectral_gap'] = float(evals_np[1] - evals_np[0])
+
+        # Eigenvalue scale ratio (PRED / GT)
+        if gt_evals is not None and pred_evals is not None:
+            gt_np = gt_evals.cpu().numpy() if torch.is_tensor(gt_evals) else np.asarray(gt_evals)
+            pred_np = pred_evals.cpu().numpy() if torch.is_tensor(pred_evals) else np.asarray(pred_evals)
+            if len(gt_np) > 1 and len(pred_np) > 1:
+                # Median ratio of positive eigenvalues (skip λ_0)
+                gt_pos = gt_np[1:]
+                pred_pos = pred_np[1:]
+                valid = (gt_pos > 1e-10) & (pred_pos > 1e-10)
+                if valid.sum() > 0:
+                    ratios = pred_pos[valid] / gt_pos[valid]
+                    metrics['eval_scale_ratio_median'] = float(np.median(ratios))
+                    metrics['eval_scale_ratio_mean'] = float(np.mean(ratios))
 
         return metrics
 

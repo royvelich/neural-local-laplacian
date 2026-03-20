@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 512
-  nhead: 8
+  d_model: 768
+  nhead: 16
   num_encoder_layers: 1
-  dim_feedforward: 512
+  dim_feedforward: 768
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.0
   normalize_loss_weights: False
@@ -25,21 +25,21 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 3.0
+      weight: 1.5
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
       weight: null
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-      weight: null
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
-        num_random_probes: 1000
-        probe_mode: 'random'
-      weight: null
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
+#      weight: null
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
+#        num_random_probes: 1000
+#        probe_mode: 'random'
+#      weight: null
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.WeightEntropyLoss
