@@ -77,16 +77,23 @@ class SparseFactorization:
     Cached sparse matrix factorization for solving Ax=b with multiple right-hand sides.
 
     Uses exactly the backend specified by _SOLVER_BACKEND — no fallback.
+
+    NOTE: pypardiso uses a single shared solver instance. This means only ONE
+    factorization is active at a time. If you need two concurrent factorizations
+    (e.g. heat + Poisson), use sequential factorize-solve patterns instead.
     """
+
+    # Single shared pypardiso solver (MKL init is expensive per-instance)
+    _shared_solver = None
 
     def __init__(self, A: scipy.sparse.spmatrix, spd: bool = False):
         if _SOLVER_BACKEND == 'cholmod':
             self._cholmod_factor = cholmod_cholesky(A.tocsc())
             self._backend = 'cholmod'
         elif _SOLVER_BACKEND == 'pypardiso':
-            # Each factorization gets its own solver so multiple prefactored
-            # systems can coexist (e.g. heat + Poisson in the heat method).
-            self._solver = pypardiso.PyPardisoSolver()
+            if SparseFactorization._shared_solver is None:
+                SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
+            self._solver = SparseFactorization._shared_solver
             self._A_csr = A.tocsr()
             self._solver.factorize(self._A_csr)
             self._backend = 'pypardiso'
@@ -411,39 +418,36 @@ def edge_index_from_knn_indices(
     return edge_index
 
 
-class HeatMethodPrefactored:
-    """Prefactored heat method solver. Holds factorized matrices for fast per-source solves."""
-    __slots__ = ('heat_factor', 'poisson_factor', 'grad_and_div_fn', 'n')
+class HeatMethodMatrices:
+    """Pre-built matrices for the Heat Method. No factorization yet."""
+    __slots__ = ('A_heat', 'S_reg', 'grad_and_div_fn', 'n')
 
-    def __init__(self, heat_factor, poisson_factor, grad_and_div_fn, n):
-        self.heat_factor = heat_factor
-        self.poisson_factor = poisson_factor
+    def __init__(self, A_heat, S_reg, grad_and_div_fn, n):
+        self.A_heat = A_heat      # Heat diffusion matrix (M + tS + εI)
+        self.S_reg = S_reg        # Regularized stiffness (S + εI)
         self.grad_and_div_fn = grad_and_div_fn
         self.n = n
 
 
-def heat_method_prefactorize(
+def heat_method_build(
     S: scipy.sparse.spmatrix,
     M: scipy.sparse.spmatrix,
     n_vertices: int,
     grad_and_div_fn,
     t: Optional[float] = None,
-) -> HeatMethodPrefactored:
+) -> HeatMethodMatrices:
     """
-    Prefactorize the heat and Poisson systems for the Heat Method.
-
-    This is the one-time cost (analogous to pp3d.PointCloudHeatSolver constructor).
-    Call heat_method_solve() afterwards for fast per-source solves.
+    Build heat and Poisson matrices (no factorization).
 
     Args:
         S: Stiffness/Laplacian matrix (N, N)
         M: Mass matrix (N, N) -- diagonal
         n_vertices: Number of vertices
-        grad_and_div_fn: Callable(u) -> rhs (gradient + normalization + divergence)
+        grad_and_div_fn: Callable(u) -> rhs
         t: Diffusion time step (auto-computed from M if None)
 
     Returns:
-        HeatMethodPrefactored object for use with heat_method_solve().
+        HeatMethodMatrices with A_heat and S_reg ready for factorization.
     """
     n = n_vertices
     S = ensure_psd(S.astype(np.float64))
@@ -455,85 +459,79 @@ def heat_method_prefactorize(
         t = h ** 2
 
     eps = _HEAT_EPS
-    A = M + t * S + eps * scipy.sparse.eye(n)
+    A_heat = M + t * S + eps * scipy.sparse.eye(n)
     S_reg = S + eps * scipy.sparse.eye(n)
 
-    heat_factor = sparse_factorize(A)
-    poisson_factor = sparse_factorize(S_reg)
-
-    return HeatMethodPrefactored(heat_factor, poisson_factor, grad_and_div_fn, n)
+    return HeatMethodMatrices(A_heat, S_reg, grad_and_div_fn, n)
 
 
-def heat_method_solve(
-    prefactored: HeatMethodPrefactored,
+def heat_factorize(matrices: HeatMethodMatrices) -> SparseFactorization:
+    """Factorize the heat diffusion matrix. One-time cost."""
+    return sparse_factorize(matrices.A_heat)
+
+
+def heat_solve_all(
+    factor: SparseFactorization,
     source_indices: List[int],
-    verbose: bool = False,
+    matrices: HeatMethodMatrices,
 ) -> List[Optional[np.ndarray]]:
     """
-    Solve for geodesic distances from multiple sources using prefactored systems.
+    Forward-solve heat diffusion + apply grad/div for all sources.
 
-    This is the per-source cost (analogous to pp3d solver.compute_distance()).
+    Must be called while factor is still active (before poisson_factorize).
 
-    Args:
-        prefactored: HeatMethodPrefactored from heat_method_prefactorize()
-        source_indices: List of source vertex indices
-        verbose: If True, print internal timing breakdown
+    Returns:
+        List of Poisson RHS vectors per source, or None for failed sources.
+    """
+    n = matrices.n
+    grad_and_div_fn = matrices.grad_and_div_fn
+    rhs_list = []
+
+    for source_idx in source_indices:
+        try:
+            delta = np.zeros(n)
+            delta[source_idx] = 1.0
+            u = factor.solve(delta)
+
+            if not np.all(np.isfinite(u)):
+                rhs_list.append(None)
+                continue
+
+            rhs_list.append(grad_and_div_fn(u))
+        except Exception:
+            rhs_list.append(None)
+
+    return rhs_list
+
+
+def poisson_factorize(matrices: HeatMethodMatrices) -> SparseFactorization:
+    """Factorize the Poisson matrix. One-time cost."""
+    return sparse_factorize(matrices.S_reg)
+
+
+def poisson_solve_all(
+    factor: SparseFactorization,
+    source_indices: List[int],
+    rhs_list: List[Optional[np.ndarray]],
+    n: int,
+) -> List[Optional[np.ndarray]]:
+    """
+    Forward-solve Poisson equation for all sources -> geodesic distances.
 
     Returns:
         List of geodesic distances (N,) per source, or None for failed sources.
     """
-    import time as _time
-
-    n = prefactored.n
-    heat_factor = prefactored.heat_factor
-    poisson_factor = prefactored.poisson_factor
-    grad_and_div_fn = prefactored.grad_and_div_fn
-    num_sources = len(source_indices)
-
-    _t_heat = 0.0
-    _t_grad = 0.0
-    _t_poisson = 0.0
-
-    # ---- Pass 1: Heat diffusion ----
-    rhs_list = []
-    failed = [False] * num_sources
-
-    for i, source_idx in enumerate(source_indices):
-        try:
-            delta = np.zeros(n)
-            delta[source_idx] = 1.0
-
-            _t0 = _time.perf_counter()
-            u = heat_factor.solve(delta)
-            _t_heat += _time.perf_counter() - _t0
-
-            if not np.all(np.isfinite(u)):
-                failed[i] = True
-                rhs_list.append(None)
-                continue
-
-            _t0 = _time.perf_counter()
-            rhs_list.append(grad_and_div_fn(u))
-            _t_grad += _time.perf_counter() - _t0
-
-        except Exception:
-            failed[i] = True
-            rhs_list.append(None)
-
-    # ---- Pass 2: Poisson solve ----
     results = []
+
     for i, source_idx in enumerate(source_indices):
-        if failed[i] or rhs_list[i] is None:
+        if rhs_list[i] is None:
             results.append(None)
             continue
 
         try:
             rhs = rhs_list[i]
-
-            _t0 = _time.perf_counter()
-            phi_pos = poisson_factor.solve(rhs)
-            phi_neg = poisson_factor.solve(-rhs)
-            _t_poisson += _time.perf_counter() - _t0
+            phi_pos = factor.solve(rhs)
+            phi_neg = factor.solve(-rhs)
 
             if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
                 results.append(None)
@@ -551,13 +549,12 @@ def heat_method_solve(
         except Exception:
             results.append(None)
 
-    if verbose:
-        total = _t_heat + _t_grad + _t_poisson
-        print(f"    [heat_method_solve] {num_sources} sources: "
-              f"heat={_t_heat*1000:.1f}ms, grad_div={_t_grad*1000:.1f}ms, "
-              f"poisson={_t_poisson*1000:.1f}ms, total={total*1000:.1f}ms")
-
     return results
+
+
+# Backward-compatible aliases
+HeatMethodPrefactored = HeatMethodMatrices
+heat_method_prefactorize = heat_method_build
 
 
 def compute_heat_geodesics_batch(
@@ -571,25 +568,19 @@ def compute_heat_geodesics_batch(
     """
     Compute geodesic distances from multiple sources using the Heat Method.
 
-    Convenience wrapper: prefactorizes + solves in one call.
-
-    Args:
-        S: Stiffness/Laplacian matrix (N, N)
-        M: Mass matrix (N, N) -- diagonal
-        source_indices: List of source vertex indices
-        n_vertices: Number of vertices
-        grad_and_div_fn: Callable(u) -> rhs
-        t: Diffusion time step (auto-computed from M if None)
-
-    Returns:
-        List of geodesic distances (N,) per source, or None for failed sources.
+    Convenience wrapper: build + factorize + solve in one call.
     """
     try:
-        prefactored = heat_method_prefactorize(S, M, n_vertices, grad_and_div_fn, t=t)
+        matrices = heat_method_build(S, M, n_vertices, grad_and_div_fn, t=t)
     except Exception as e:
-        print(f"Heat Method batch: prefactorization failed: {e}")
+        print(f"Heat Method batch: matrix build failed: {e}")
         return [None] * len(source_indices)
-    return heat_method_solve(prefactored, source_indices)
+
+    hf = heat_factorize(matrices)
+    rhs_list = heat_solve_all(hf, source_indices, matrices)
+    pf = poisson_factorize(matrices)
+    return poisson_solve_all(pf, source_indices, rhs_list, matrices.n)
+
 
 
 # ---------------------------------------------------------------------------

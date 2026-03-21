@@ -40,10 +40,11 @@ from neural_local_laplacian.utils.utils import (
     cuda_warmup,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
-    compute_heat_geodesic_learned,
-    compute_heat_geodesic_learned_batch,
-    heat_method_prefactorize,
-    heat_method_solve,
+    heat_method_build,
+    heat_factorize,
+    heat_solve_all,
+    poisson_factorize,
+    poisson_solve_all,
     make_grad_div_learned,
     select_multiple_geodesic_sources,
 )
@@ -130,9 +131,8 @@ def main(cfg: DictConfig) -> None:
     # ---- Table header ----
     header = (
         f"{'#':>4}  {'Mesh':<14}  {'N':>6}"
-        f"  {'kNN':>7}  {'Fwd':>7}  {'Asm':>7}  {'GrOp':>7}  {'PrLM':>7}"
-        f"  {'PrFact':>7}  {'PrSlv':>7}  {'Pr/src':>7}"
-        f"  {'RbFact':>7}  {'RbSlv':>7}  {'Rb/src':>7}"
+        f"  {'PrLM':>7}  {'PrFact':>7}  {'PrSlv':>7}  {'PrOneT':>7}  {'Pr/src':>7}"
+        f"  {'RbOneT':>7}  {'RbSlv':>7}  {'Rb/src':>7}"
         f"  {'LMRat':>6}  {'E2ERat':>7}"
     )
     print(header)
@@ -224,26 +224,45 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.synchronize()
             t_grad_op = time.perf_counter() - t0
 
-        # PRED geodesic: split into prefactorize (one-time) + solve (per-source)
-        t_pred_prefactor = 0.0
-        t_pred_solve = 0.0
-        prefactored = None
+        # PRED geodesic: 4 timed steps
+        t_pred_build = 0.0
+        t_pred_heat_fact = 0.0
+        t_pred_heat_solve = 0.0
+        t_pred_poisson_fact = 0.0
+        t_pred_poisson_solve = 0.0
+        matrices = None
         if G_pred is not None:
             grad_div_fn = make_grad_div_learned(G_pred, M_pred)
 
+            # 1. Build matrices (no factorization)
             t0 = time.perf_counter()
-            prefactored = heat_method_prefactorize(
+            matrices = heat_method_build(
                 S=L_pred, M=M_pred, n_vertices=N, grad_and_div_fn=grad_div_fn,
             )
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            t_pred_prefactor = time.perf_counter() - t0
+            t_pred_build = time.perf_counter() - t0
 
+            # 2. Factorize heat matrix (one-time)
             t0 = time.perf_counter()
-            _ = heat_method_solve(prefactored, source_indices, verbose=True)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            t_pred_solve = time.perf_counter() - t0
+            hf = heat_factorize(matrices)
+            t_pred_heat_fact = time.perf_counter() - t0
+
+            # 3. Heat forward-solve + grad/div (per-source)
+            t0 = time.perf_counter()
+            rhs_list = heat_solve_all(hf, source_indices, matrices)
+            t_pred_heat_solve = time.perf_counter() - t0
+
+            # 4. Factorize Poisson matrix (one-time)
+            t0 = time.perf_counter()
+            pf = poisson_factorize(matrices)
+            t_pred_poisson_fact = time.perf_counter() - t0
+
+            # 5. Poisson forward-solve (per-source)
+            t0 = time.perf_counter()
+            _ = poisson_solve_all(pf, source_indices, rhs_list, N)
+            t_pred_poisson_solve = time.perf_counter() - t0
+
+        t_pred_factorize = t_pred_heat_fact + t_pred_poisson_fact
+        t_pred_solve = t_pred_heat_solve + t_pred_poisson_solve
 
         # ==============================================================
         # Robust: point_cloud_laplacian + pp3d geodesic
@@ -266,11 +285,19 @@ def main(cfg: DictConfig) -> None:
         n_src = len(source_indices)
         ratio_lm = pred_lm_total / t_robust_lm if t_robust_lm > 0 else float('inf')
 
-        # E2E totals for N sources (one-time + all solves)
-        pred_e2e_total = pred_lm_total + t_grad_op + t_pred_prefactor + t_pred_solve
-        robust_e2e_total = t_robust_prefactor + t_robust_solve
+        # One-time costs (not amortized)
+        pred_onetime = pred_lm_total + t_grad_op + t_pred_build + t_pred_factorize
+        robust_onetime = t_robust_prefactor
 
-        # Per-source amortized = one-time / N + solve / N
+        # Per-source costs (total for all sources)
+        pred_persrc_total = t_pred_solve
+        robust_persrc_total = t_robust_solve
+
+        # E2E totals for N sources
+        pred_e2e_total = pred_onetime + pred_persrc_total
+        robust_e2e_total = robust_onetime + robust_persrc_total
+
+        # Per-source amortized
         pred_per_src = pred_e2e_total / n_src
         robust_per_src = robust_e2e_total / n_src
 
@@ -281,12 +308,18 @@ def main(cfg: DictConfig) -> None:
             'knn_ms': t_knn * 1000, 'fwd_ms': t_fwd * 1000,
             'asm_ms': t_asm * 1000, 'grad_op_ms': t_grad_op * 1000,
             'pred_lm_ms': pred_lm_total * 1000,
-            'pred_prefactor_ms': t_pred_prefactor * 1000,
-            'pred_solve_ms': t_pred_solve * 1000,
+            'pred_build_ms': t_pred_build * 1000,
+            'pred_factorize_ms': t_pred_factorize * 1000,
+            'pred_heat_fact_ms': t_pred_heat_fact * 1000,
+            'pred_poisson_fact_ms': t_pred_poisson_fact * 1000,
+            'pred_heat_solve_ms': t_pred_heat_solve * 1000,
+            'pred_poisson_solve_ms': t_pred_poisson_solve * 1000,
+            'pred_onetime_ms': pred_onetime * 1000,
+            'pred_solve_ms': pred_persrc_total * 1000,
             'pred_per_src_ms': pred_per_src * 1000,
             'pred_e2e_ms': pred_e2e_total * 1000,
             'robust_lm_ms': t_robust_lm * 1000,
-            'robust_prefactor_ms': t_robust_prefactor * 1000,
+            'robust_onetime_ms': t_robust_prefactor * 1000,
             'robust_solve_ms': t_robust_solve * 1000,
             'robust_per_src_ms': robust_per_src * 1000,
             'robust_e2e_ms': robust_e2e_total * 1000,
@@ -296,13 +329,12 @@ def main(cfg: DictConfig) -> None:
 
         print(
             f"{batch_idx + 1:>4}  {mesh_name:<14}  {N:>6}"
-            f"  {t_knn * 1000:>7.1f}  {t_fwd * 1000:>7.1f}  {t_asm * 1000:>7.1f}  {t_grad_op * 1000:>7.1f}  {pred_lm_total * 1000:>7.1f}"
-            f"  {t_pred_prefactor * 1000:>7.1f}  {t_pred_solve * 1000:>7.1f}  {pred_per_src * 1000:>7.1f}"
+            f"  {pred_lm_total * 1000:>7.1f}  {t_pred_factorize * 1000:>7.1f}  {pred_persrc_total * 1000:>7.1f}  {pred_onetime * 1000:>7.1f}  {pred_per_src * 1000:>7.1f}"
             f"  {t_robust_prefactor * 1000:>7.1f}  {t_robust_solve * 1000:>7.1f}  {robust_per_src * 1000:>7.1f}"
             f"  {ratio_lm:>5.2f}x  {ratio_e2e:>6.2f}x"
         )
 
-        del patch_data, fwd_result, stiffness_w, areas, verts_tensor, G_pred, prefactored
+        del patch_data, fwd_result, stiffness_w, areas, verts_tensor, G_pred, matrices
 
         # Fence: ensure all async GPU work is done before next mesh
         if device.type == 'cuda':
@@ -343,22 +375,33 @@ def main(cfg: DictConfig) -> None:
 
         # --- E2E Geodesic: one-time + per-source breakdown ---
         print("  -- E2E Geodesic (one-time + solve) --")
-        print("  PRED breakdown:")
+        print("  PRED one-time breakdown:")
         for label, key in [
             ("  kNN",             "knn_ms"),
             ("  forward",         "fwd_ms"),
             ("  assembly",        "asm_ms"),
             ("  grad op",         "grad_op_ms"),
-            ("  prefactorize",    "pred_prefactor_ms"),
-            ("  solve (all src)", "pred_solve_ms"),
+            ("  matrix build",    "pred_build_ms"),
+            ("  heat factorize",  "pred_heat_fact_ms"),
+            ("  poisson factorize","pred_poisson_fact_ms"),
+            ("  TOTAL one-time",  "pred_onetime_ms"),
+        ]:
+            m, s, mn, mx = stats(key)
+            print(f"  {label:<20s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+
+        print("  PRED per-source (total for all sources):")
+        for label, key in [
+            ("  heat solve",      "pred_heat_solve_ms"),
+            ("  poisson solve",   "pred_poisson_solve_ms"),
+            ("  TOTAL solve",     "pred_solve_ms"),
         ]:
             m, s, mn, mx = stats(key)
             print(f"  {label:<20s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
 
         print("  Robust (pp3d) breakdown:")
         for label, key in [
-            ("  constructor",     "robust_prefactor_ms"),
-            ("  solve (all src)", "robust_solve_ms"),
+            ("  constructor",      "robust_onetime_ms"),
+            ("  solve (all src)",  "robust_solve_ms"),
         ]:
             m, s, mn, mx = stats(key)
             print(f"  {label:<20s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
