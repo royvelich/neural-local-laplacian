@@ -128,7 +128,7 @@ def main(cfg: DictConfig) -> None:
     header = (
         f"{'#':>4}  {'Mesh':<14}  {'N':>6}"
         f"  {'kNN':>8}  {'Fwd':>8}  {'Asm':>8}  {'GradOp':>8}  {'PRED LM':>9}"
-        f"  {'PRED Geo':>9}  {'PRED E2E':>9}  {'Rob LM':>9}  {'Rob pp3d':>9}  {'Rob E2E':>9}"
+        f"  {'PRED E2E':>9}  {'Rob LM':>9}  {'Rob E2E':>9}"
         f"  {'LM Rat':>7}  {'E2E Rat':>8}"
     )
     print(header)
@@ -270,7 +270,7 @@ def main(cfg: DictConfig) -> None:
         print(
             f"{batch_idx + 1:>4}  {mesh_name:<14}  {N:>6}"
             f"  {t_knn * 1000:>8.1f}  {t_fwd * 1000:>8.1f}  {t_asm * 1000:>8.1f}  {t_grad_op * 1000:>8.1f}  {pred_lm_total * 1000:>9.1f}"
-            f"  {t_pred_geo * 1000:>9.1f}  {pred_e2e * 1000:>9.1f}  {t_robust_lm * 1000:>9.1f}  {t_robust_geo * 1000:>9.1f}  {robust_e2e * 1000:>9.1f}"
+            f"  {pred_e2e * 1000:>9.1f}  {t_robust_lm * 1000:>9.1f}  {robust_e2e * 1000:>9.1f}"
             f"  {ratio_lm:>6.2f}x  {ratio_e2e:>7.2f}x"
         )
 
@@ -299,30 +299,36 @@ def main(cfg: DictConfig) -> None:
         print(f"{'':>20s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
         print(f"{'-' * 20} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
 
+        # --- L,M Assembly comparison ---
+        print("  -- L,M Assembly --")
         for label, key in [
             ("PRED kNN",       "knn_ms"),
             ("PRED forward",   "fwd_ms"),
             ("PRED assembly",  "asm_ms"),
             ("PRED grad op",   "grad_op_ms"),
-            ("PRED L,M total", "pred_lm_ms"),
-            ("PRED geodesic",  "pred_geo_ms"),
-            ("PRED E2E",       "pred_e2e_ms"),
-            ("Robust L,M",     "robust_lm_ms"),
-            ("Robust pp3d",   "robust_geo_ms"),
-            ("Robust E2E",     "robust_e2e_ms"),
+            ("PRED total",     "pred_lm_ms"),
+            ("Robust total",   "robust_lm_ms"),
         ]:
             m, s, mn, mx = stats(key)
             print(f"  {label:<18s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
 
         pred_lm = [r['pred_lm_ms'] for r in results]
         robust_lm = [r['robust_lm_ms'] for r in results]
+        print(f"  PRED/Robust:       {np.mean(pred_lm) / np.mean(robust_lm):.2f}x  (PRED wins {sum(1 for p, r in zip(pred_lm, robust_lm) if p < r)}/{n})")
+
+        # --- E2E Geodesic comparison ---
+        print("  -- E2E Geodesic (L,M + grad op + heat solve) --")
+        for label, key in [
+            ("PRED E2E",       "pred_e2e_ms"),
+            ("Robust E2E*",    "robust_e2e_ms"),
+        ]:
+            m, s, mn, mx = stats(key)
+            print(f"  {label:<18s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+
         pred_e2e = [r['pred_e2e_ms'] for r in results]
         robust_e2e = [r['robust_e2e_ms'] for r in results]
-
-        print(f"\n  L,M ratio (PRED/Robust):     {np.mean(pred_lm) / np.mean(robust_lm):.2f}x")
-        print(f"  E2E ratio (PRED/Robust):     {np.mean(pred_e2e) / np.mean(robust_e2e):.2f}x")
-        print(f"  PRED L,M wins:               {sum(1 for p, r in zip(pred_lm, robust_lm) if p < r)}/{n}")
-        print(f"  PRED E2E wins:               {sum(1 for p, r in zip(pred_e2e, robust_e2e) if p < r)}/{n}")
+        print(f"  PRED/Robust:       {np.mean(pred_e2e) / np.mean(robust_e2e):.2f}x  (PRED wins {sum(1 for p, r in zip(pred_e2e, robust_e2e) if p < r)}/{n})")
+        print(f"  * Robust E2E = pp3d (C++ solver with internal L,M)")
         print(f"{'=' * 75}")
 
 
