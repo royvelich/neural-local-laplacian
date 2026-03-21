@@ -20,15 +20,10 @@ from dataclasses import dataclass
 
 
 # =============================================================================
-# Sparse solver backend: auto-detect best available, with manual override
+# Sparse solver backend: explicit selection, no fallback
 #
-# Priority: cholmod (Cholesky, SPD only, fastest) > pypardiso (Intel MKL) > scipy splu
-#
-# To override at runtime:
-#   from neural_local_laplacian.utils.geodesic_utils import set_solver_backend
-#   set_solver_backend('scipy')      # force scipy
-#   set_solver_backend('pypardiso')  # force pypardiso
-#   set_solver_backend('auto')       # re-detect best available
+# Default: scipy (always available). Override with set_solver_backend() or
+# +solver=pypardiso / +solver=cholmod from timing scripts.
 # =============================================================================
 
 _HAS_CHOLMOD = False
@@ -45,10 +40,13 @@ try:
 except ImportError:
     pass
 
-_SOLVER_BACKEND = 'cholmod' if _HAS_CHOLMOD else ('pypardiso' if _HAS_PARDISO else 'scipy')
+_SOLVER_BACKEND = 'scipy'
 print(f"[sparse solver] Backend: {_SOLVER_BACKEND}"
-      + (f" (also available: pypardiso)" if _HAS_PARDISO and _SOLVER_BACKEND != 'pypardiso' else "")
-      + (f" (also available: cholmod)" if _HAS_CHOLMOD and _SOLVER_BACKEND != 'cholmod' else ""))
+      + (f" (available: pypardiso)" if _HAS_PARDISO else "")
+      + (f" (available: cholmod)" if _HAS_CHOLMOD else ""))
+
+# Regularization epsilon for heat method solves (ensures SPD for Cholesky, avoids singular matrices)
+_HEAT_EPS = 1e-8
 
 
 def set_solver_backend(backend: str):
@@ -56,22 +54,21 @@ def set_solver_backend(backend: str):
     Switch sparse solver backend at runtime.
 
     Args:
-        backend: 'cholmod', 'pypardiso', 'scipy', or 'auto' (re-detect best available)
+        backend: 'cholmod', 'pypardiso', or 'scipy'
     """
     global _SOLVER_BACKEND
-    if backend == 'auto':
-        _SOLVER_BACKEND = 'cholmod' if _HAS_CHOLMOD else ('pypardiso' if _HAS_PARDISO else 'scipy')
-    elif backend in ('cholmod', 'pypardiso', 'scipy'):
-        if backend == 'cholmod' and not _HAS_CHOLMOD:
-            print("[sparse solver] scikit-sparse (cholmod) not installed, falling back to auto")
-            _SOLVER_BACKEND = 'pypardiso' if _HAS_PARDISO else 'scipy'
-        elif backend == 'pypardiso' and not _HAS_PARDISO:
-            print("[sparse solver] pypardiso not installed, falling back to scipy")
-            _SOLVER_BACKEND = 'scipy'
-        else:
-            _SOLVER_BACKEND = backend
+    if backend == 'cholmod':
+        if not _HAS_CHOLMOD:
+            raise RuntimeError("scikit-sparse (cholmod) not installed")
+        _SOLVER_BACKEND = 'cholmod'
+    elif backend == 'pypardiso':
+        if not _HAS_PARDISO:
+            raise RuntimeError("pypardiso not installed")
+        _SOLVER_BACKEND = 'pypardiso'
+    elif backend == 'scipy':
+        _SOLVER_BACKEND = 'scipy'
     else:
-        raise ValueError(f"Unknown solver backend: {backend}. Use 'cholmod', 'pypardiso', 'scipy', or 'auto'.")
+        raise ValueError(f"Unknown solver backend: {backend}. Use 'cholmod', 'pypardiso', or 'scipy'.")
     print(f"[sparse solver] Backend set to: {_SOLVER_BACKEND}")
 
 
@@ -79,29 +76,17 @@ class SparseFactorization:
     """
     Cached sparse matrix factorization for solving Ax=b with multiple right-hand sides.
 
-    For SPD matrices: uses CHOLMOD (Cholesky, ~2× faster than LU) when available.
-    Otherwise: pypardiso (Intel MKL PARDISO, multi-threaded) or scipy splu.
-
-    Usage:
-        factor = SparseFactorization(A, spd=True)
-        x1 = factor.solve(b1)
-        x2 = factor.solve(b2)  # reuses factorization
+    Uses exactly the backend specified by _SOLVER_BACKEND — no fallback.
     """
 
     # Single shared pypardiso solver (Windows allows only one instance)
     _shared_solver = None
 
     def __init__(self, A: scipy.sparse.spmatrix, spd: bool = False):
-        # CHOLMOD: best for SPD matrices (Cholesky = half the work of LU)
-        if spd and _SOLVER_BACKEND == 'cholmod' and _HAS_CHOLMOD:
-            try:
-                self._cholmod_factor = cholmod_cholesky(A.tocsc())
-                self._backend = 'cholmod'
-                return
-            except Exception:
-                pass  # fall through to pypardiso/scipy
-
-        if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
+        if _SOLVER_BACKEND == 'cholmod':
+            self._cholmod_factor = cholmod_cholesky(A.tocsc())
+            self._backend = 'cholmod'
+        elif _SOLVER_BACKEND == 'pypardiso':
             if SparseFactorization._shared_solver is None:
                 SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
             self._solver = SparseFactorization._shared_solver
@@ -123,16 +108,7 @@ class SparseFactorization:
 
 
 def sparse_factorize(A: scipy.sparse.spmatrix, spd: bool = False) -> SparseFactorization:
-    """
-    Factorize a sparse matrix for repeated solves.
-
-    Args:
-        A: Sparse matrix (N, N)
-        spd: If True and CHOLMOD is available, uses Cholesky factorization (~2× faster).
-
-    Returns:
-        SparseFactorization object whose .solve(b) method is fast.
-    """
+    """Factorize a sparse matrix for repeated solves."""
     return SparseFactorization(A, spd=spd)
 
 
@@ -143,35 +119,15 @@ def sparse_solve(
     factor: Optional[SparseFactorization] = None,
     spd: bool = False
 ) -> np.ndarray:
-    """
-    Solve sparse linear system Ax = b.
-
-    Args:
-        A: Sparse matrix (N, N)
-        b: Right-hand side (N,)
-        device: Unused (kept for API compatibility)
-        factor: Optional pre-computed SparseFactorization for reuse
-        spd: If True and CHOLMOD is available, uses Cholesky (~2× faster).
-
-    Returns:
-        Solution x as numpy array (N,)
-    """
+    """Solve sparse linear system Ax = b using the selected backend."""
     if factor is not None:
         return factor.solve(b)
 
-    # CHOLMOD direct solve for SPD systems
-    if spd and _SOLVER_BACKEND == 'cholmod' and _HAS_CHOLMOD:
-        try:
-            return cholmod_cholesky(A.tocsc()).solve_A(b)
-        except Exception:
-            pass  # fall through
-
-    if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
+    if _SOLVER_BACKEND == 'cholmod':
+        return cholmod_cholesky(A.tocsc()).solve_A(b)
+    elif _SOLVER_BACKEND == 'pypardiso':
         return pypardiso.spsolve(A.tocsr(), b)
-
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+    else:
         return scipy.sparse.linalg.spsolve(A.tocsc(), b)
 
 
@@ -532,7 +488,7 @@ def compute_heat_geodesic_pointcloud(
         # Try both signs and pick the one where source has minimum distance
         div_X = div_op @ X_flat
 
-        eps = 1e-8
+        eps = _HEAT_EPS
         L_reg = L + eps * scipy.sparse.eye(n)
 
         # Factorize once, solve twice (±rhs) — SPD after regularization
@@ -641,7 +597,7 @@ def compute_heat_geodesic_mesh(
         rhs = grad_op.T @ X_weighted_flat  # (nV,)
 
         # Step IV: Solve Poisson — try both signs to handle sign ambiguity
-        eps = 1e-8
+        eps = _HEAT_EPS
         L_reg = L + eps * scipy.sparse.eye(n)
 
         # Factorize once, solve twice (±rhs) — SPD after regularization
@@ -759,7 +715,7 @@ def compute_heat_geodesic_learned(
         M_3 = np.repeat(areas_diag, 3)  # (3N,) â€” area_i repeated for x,y,z
         rhs = G.T @ (M_3 * X.flatten())  # (N,) â€” this is -M Â· div(X)
 
-        eps = 1e-8
+        eps = _HEAT_EPS
         S_reg = S + eps * scipy.sparse.eye(n)
 
         # Factorize once, solve twice (±rhs) — SPD after regularization
@@ -838,7 +794,7 @@ def compute_heat_geodesic_learned_batch(
         h = np.sqrt(areas.mean())
         t = h ** 2
 
-    eps = 1e-8
+    eps = _HEAT_EPS
 
     # Pre-compute shared quantities
     areas_diag = np.array(M.diagonal()).flatten()

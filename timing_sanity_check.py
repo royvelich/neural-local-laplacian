@@ -7,7 +7,7 @@ Single forward pass per mesh. CUDA warmup once at startup.
 
 Flags:
     +use_amp=False             Disable autocast / BF16 (default: True)
-    +solver=cholmod|pypardiso|scipy  Sparse solver backend (default: auto-detect best)
+    +solver=pypardiso|cholmod  Sparse solver backend (default: scipy)
 
 Usage:
     python timing_sanity_check.py +ckpt_path=model.ckpt \
@@ -102,8 +102,8 @@ def main(cfg: DictConfig) -> None:
 
     # ---- Sparse solver backend ----
     import neural_local_laplacian.utils.geodesic_utils as geo_utils
-    solver_backend = str(getattr(cfg, 'solver', 'auto'))
-    if solver_backend != 'auto':
+    solver_backend = str(getattr(cfg, 'solver', 'scipy'))
+    if solver_backend != 'scipy':
         geo_utils.set_solver_backend(solver_backend)
     print(f"Sparse solver: {geo_utils._SOLVER_BACKEND}")
 
