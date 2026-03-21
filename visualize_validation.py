@@ -18,6 +18,8 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
+import contextlib
+import os
 import sys
 import time
 
@@ -539,6 +541,7 @@ class RealTimeEigenanalysisVisualizer:
         self._skip_robust = False
         self._quantitative_mode = False
         self._robust_geodesic_heat = False
+        self._verbose = True  # If False, suppresses stdout during process_batch
 
         # NeLo state
         self.nelo_pipeline = None          # loaded once at startup via load_nelo_pipeline(); None = disabled
@@ -6429,6 +6432,20 @@ class RealTimeEigenanalysisVisualizer:
         Returns:
             True if processing succeeded, False if the mesh was skipped.
         """
+        if not self._verbose:
+            # Suppress all stdout from the processing pipeline
+            devnull = open(os.devnull, 'w')
+            saved_stdout = sys.stdout
+            sys.stdout = devnull
+        try:
+            return self._process_batch_impl(model, batch_data, batch_idx, device)
+        finally:
+            if not self._verbose:
+                sys.stdout = saved_stdout
+                devnull.close()
+
+    def _process_batch_impl(self, model: LaplacianTransformerModule, batch_data, batch_idx: int, device: torch.device) -> bool:
+        """Internal implementation of process_batch."""
         print(f"\n{'=' * 80}")
         print(f"PROCESSING BATCH {batch_idx + 1}")
         print('=' * 80)
@@ -7900,6 +7917,7 @@ class RealTimeEigenanalysisVisualizer:
         self._skip_robust = skip_robust
         self._quantitative_mode = quantitative_mode
         self._robust_geodesic_heat = robust_geodesic_heat
+        self._verbose = getattr(cfg, 'verbose', True)  # +verbose=False to suppress per-mesh output
 
         # Sparse solver backend (default: scipy)
         solver_backend = str(getattr(cfg, 'solver', 'scipy'))

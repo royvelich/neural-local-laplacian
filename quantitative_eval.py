@@ -81,6 +81,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     # ---- Create visualizer in quantitative mode ----
     visualizer = RealTimeEigenanalysisVisualizer(config=vis_config)
     visualizer._quantitative_mode = True
+    visualizer._verbose = getattr(cfg, 'verbose', False)  # Quiet by default for multi-GPU
     visualizer._skip_robust = getattr(cfg, 'skip_robust', False)
     visualizer._diagnostic_mode = False
     visualizer._robust_geodesic_heat = getattr(cfg, 'robust_geodesic_heat', False)
@@ -132,10 +133,10 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     # ---- Process meshes ----
     metrics_list: List[Dict[str, Any]] = []
     t_start = time.time()
+    n_total = len(my_indices)
 
     for local_idx, global_idx in enumerate(my_indices):
-        mesh_num = f"{local_idx + 1}/{len(my_indices)}"
-        print(f"\n{tag}Mesh {mesh_num} (global #{global_idx})")
+        t_mesh_start = time.time()
 
         try:
             # Load single mesh from dataset (returns a Data object)
@@ -148,18 +149,30 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
                 mesh_metrics = visualizer._collect_mesh_metrics()
                 if mesh_metrics is not None:
                     metrics_list.append(mesh_metrics)
-                    print(f"{tag}Mesh {mesh_num}: OK ({mesh_metrics.get('mesh_name', '?')})")
+                    mesh_name = mesh_metrics.get('mesh_name', '?')
+                    status = "OK"
+                else:
+                    mesh_name = "?"
+                    status = "no metrics"
             else:
-                print(f"{tag}Mesh {mesh_num}: skipped (process_batch returned False)")
+                mesh_name = "?"
+                status = "skipped"
 
         except Exception as e:
-            print(f"{tag}Mesh {mesh_num}: ERROR — {e}")
+            mesh_name = "?"
+            status = f"ERROR — {e}"
             import traceback
             traceback.print_exc()
 
+        t_mesh = time.time() - t_mesh_start
+        elapsed = time.time() - t_start
+        done = local_idx + 1
+        eta = (elapsed / done) * (n_total - done) if done > 0 else 0
+        print(f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<10s} ({t_mesh:.1f}s, ETA {eta:.0f}s)")
+
     elapsed = time.time() - t_start
     print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s "
-          f"({elapsed / max(len(my_indices), 1):.1f}s/mesh)")
+          f"({elapsed / max(n_total, 1):.1f}s/mesh)")
 
     # ---- Write per-rank CSV ----
     rank_csv = Path(output_dir) / f'metrics_rank{rank}.csv'
