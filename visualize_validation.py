@@ -5193,7 +5193,10 @@ class RealTimeEigenanalysisVisualizer:
 
         # Factorize ONCE
         try:
+            _t_fact = time.perf_counter()
             factor = sparse_factorize(A)
+            _t_fact_done = time.perf_counter()
+            print(f"    Factorize: {(_t_fact_done - _t_fact)*1000:.1f} ms (backend: {factor._backend})")
         except Exception as e:
             print(f"  [!] Green's function batch factorization failed: {e}")
             return {src: None for src in source_indices}
@@ -5202,6 +5205,7 @@ class RealTimeEigenanalysisVisualizer:
         total_mass = M_diag.sum()
 
         results = {}
+        _t_solve_start = time.perf_counter()
         for source_idx in source_indices:
             try:
                 delta = np.zeros(n, dtype=np.float64)
@@ -6958,20 +6962,36 @@ class RealTimeEigenanalysisVisualizer:
                 gt_grad_div_fn = make_grad_div_mesh(mesh_grad_op, mesh_face_areas)
                 gt_t = (1.52 * np.sqrt(mesh_face_areas.mean())) ** 2
 
+            # PRED: learned gradient operator or pointcloud fallback
             pred_grad_div_fn = None
             L_pred_geo = inference_result.get('stiffness_matrix')
             M_pred_geo = inference_result.get('mass_matrix')
             if L_pred_geo is not None and M_pred_geo is not None:
                 if operator_mode == 'gradient' and self.current_learned_gradient_op is not None:
                     pred_grad_div_fn = make_grad_div_learned(self.current_learned_gradient_op, M_pred_geo)
-                elif self._pc_grad_op is not None and self._pc_div_op is not None:
-                    pred_grad_div_fn = make_grad_div_pointcloud(self._pc_grad_op, self._pc_div_op)
+                elif HAS_PCDIFF and self.current_vertex_indices is not None:
+                    # Build pointcloud operators from PRED's k-NN
+                    vertex_indices_np = self.current_vertex_indices.cpu().numpy()
+                    center_indices_np = self.current_center_indices.cpu().numpy()
+                    k_pred = len(vertex_indices_np) // len(center_indices_np)
+                    edge_index = edge_index_from_knn_indices(vertex_indices_np, center_indices_np, k_pred)
+                    pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
+                    self._pc_grad_op = pc_grad_op
+                    self._pc_div_op = pc_div_op
+                    pred_grad_div_fn = make_grad_div_pointcloud(pc_grad_op, pc_div_op)
 
+            # NeLo: build pointcloud operators from NeLo's own k-NN
             nelo_grad_div_fn = None
             L_nelo_geo = self.current_nelo_L
             M_nelo_geo = self.current_nelo_M
-            if L_nelo_geo is not None and M_nelo_geo is not None and self._pc_grad_op is not None:
-                nelo_grad_div_fn = make_grad_div_pointcloud(self._pc_grad_op, self._pc_div_op)
+            if L_nelo_geo is not None and M_nelo_geo is not None and HAS_PCDIFF:
+                try:
+                    nelo_k = self.nelo_k
+                    nelo_edge_index = knn_graph(vertices, k=nelo_k)
+                    nelo_grad_op, nelo_div_op = build_pointcloud_grad_div_operators(vertices, nelo_edge_index)
+                    nelo_grad_div_fn = make_grad_div_pointcloud(nelo_grad_op, nelo_div_op)
+                except Exception as e:
+                    print(f"  [!] NeLo grad/div operators failed: {e}")
 
             # ---- Batch geodesics for GT, PRED, NeLo ----
             geodesic_times = {}
