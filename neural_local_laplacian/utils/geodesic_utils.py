@@ -747,7 +747,7 @@ def compute_heat_geodesic_learned(
 
     try:
 
-        eps = 1e-6
+        eps = 1e-4
 
         # Step 1: Heat diffusion — solve (M + tS) u = delta_source
         delta = np.zeros(n)
