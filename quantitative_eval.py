@@ -27,6 +27,7 @@ Compatible with Windows (uses 'spawn' start method).
 
 import csv
 import shutil
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -72,7 +73,18 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     torch.cuda.set_device(rank)
 
     tag = f"[GPU {rank}] " if world_size > 1 else ""
-    print(f"\n{tag}Starting on {device}")
+    verbose = getattr(OmegaConf.create(cfg_dict), 'verbose', False)
+
+    # ---- Suppress setup output when not verbose ----
+    if not verbose:
+        import os as _os
+        import warnings as _warnings
+        _devnull = open(_os.devnull, 'w')
+        _saved_stdout = sys.stdout
+        _saved_stderr = sys.stderr
+        sys.stdout = _devnull
+        sys.stderr = _devnull
+        _warnings.filterwarnings('ignore')
 
     # ---- Reconstruct config objects ----
     cfg = OmegaConf.create(cfg_dict)
@@ -81,7 +93,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     # ---- Create visualizer in quantitative mode ----
     visualizer = RealTimeEigenanalysisVisualizer(config=vis_config)
     visualizer._quantitative_mode = True
-    visualizer._verbose = getattr(cfg, 'verbose', False)  # Quiet by default for multi-GPU
+    visualizer._verbose = verbose
     visualizer._skip_robust = getattr(cfg, 'skip_robust', False)
     visualizer._diagnostic_mode = False
     visualizer._robust_geodesic_heat = getattr(cfg, 'robust_geodesic_heat', False)
@@ -102,9 +114,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     if nelo_ckpt is not None:
         try:
             visualizer.load_nelo_pipeline(str(nelo_ckpt), device=str(device))
-            print(f"{tag}NeLo loaded")
         except Exception as e:
-            print(f"{tag}NeLo load failed: {e} — skipping NeLo")
+            pass  # will be logged if verbose
 
     # ---- Configure k values ----
     default_k = getattr(cfg.globals, 'k', 30)
@@ -126,9 +137,16 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
         data_loader = data_loader[0]
     dataset = data_loader.dataset
 
+    # ---- Restore stdout/stderr after setup ----
+    if not verbose:
+        sys.stdout = _saved_stdout
+        sys.stderr = _saved_stderr
+        _devnull.close()
+        _warnings.resetwarnings()
+
     # ---- Compute this worker's mesh indices (interleaved for load balance) ----
     my_indices = list(range(rank, len(dataset), world_size))
-    print(f"{tag}Assigned {len(my_indices)}/{len(dataset)} meshes")
+    print(f"{tag}Ready — {len(my_indices)} meshes on {device}")
 
     # ---- Process meshes ----
     metrics_list: List[Dict[str, Any]] = []
