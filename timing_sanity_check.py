@@ -271,16 +271,27 @@ def main(cfg: DictConfig) -> None:
         # ==============================================================
         if matrices is not None:
             b_test = np.random.rand(N)
-            # Pure forward-solve (heat matrix)
+
+            # scipy splu forward-solve
             _hf = scipy.sparse.linalg.splu(matrices.A_heat.tocsc())
             _times = []
             for _ in range(20):
                 _t0 = time.perf_counter()
                 _hf.solve(b_test)
                 _times.append(time.perf_counter() - _t0)
-            t_fwd_solve = np.median(_times) * 1000
+            t_scipy_solve = np.median(_times) * 1000
 
-            # Pure grad_div call
+            # pypardiso forward-solve (using the shared solver)
+            from neural_local_laplacian.utils.geodesic_utils import SparseFactorization
+            _pf = SparseFactorization(matrices.A_heat)
+            _times = []
+            for _ in range(20):
+                _t0 = time.perf_counter()
+                _pf.solve(b_test)
+                _times.append(time.perf_counter() - _t0)
+            t_pardiso_solve = np.median(_times) * 1000
+
+            # grad_div call
             _times = []
             for _ in range(20):
                 _t0 = time.perf_counter()
@@ -288,7 +299,7 @@ def main(cfg: DictConfig) -> None:
                 _times.append(time.perf_counter() - _t0)
             t_grad_div_call = np.median(_times) * 1000
 
-            print(f"    [diag] fwd-solve={t_fwd_solve:.2f}ms, grad_div={t_grad_div_call:.2f}ms")
+            print(f"    [diag] scipy_fwd={t_scipy_solve:.2f}ms, pardiso_fwd={t_pardiso_solve:.2f}ms, grad_div={t_grad_div_call:.2f}ms")
 
         # ==============================================================
         # Robust: point_cloud_laplacian + pp3d geodesic
