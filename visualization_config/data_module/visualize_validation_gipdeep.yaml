@@ -5,7 +5,7 @@ val_dataset_specifications:
     dataset:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
       mesh_folder_path: '/home/royve/datasets/neural-laplacian/shrec15'
-      max_meshes: 2
+      max_meshes: 100
       file_size_range_mb: [0.2, 2]
       num_components_range: [1, 1]
       shuffle: True

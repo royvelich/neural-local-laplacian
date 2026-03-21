@@ -6,4 +6,4 @@ seed: 2
 k_pred: 8
 k_robust: 30
 k_nelo: 8
-num_validation_sources: 1
+num_validation_sources: 10
