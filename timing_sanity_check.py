@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+import scipy.sparse
+import scipy.sparse.linalg
 import torch
 import pytorch_lightning as pl
 import robust_laplacian
@@ -263,6 +265,30 @@ def main(cfg: DictConfig) -> None:
 
         t_pred_factorize = t_pred_heat_fact + t_pred_poisson_fact
         t_pred_solve = t_pred_heat_solve + t_pred_poisson_solve
+
+        # ==============================================================
+        # Diagnostic: isolate forward-solve vs grad_div cost
+        # ==============================================================
+        if matrices is not None:
+            b_test = np.random.rand(N)
+            # Pure forward-solve (heat matrix)
+            _hf = scipy.sparse.linalg.splu(matrices.A_heat.tocsc())
+            _times = []
+            for _ in range(20):
+                _t0 = time.perf_counter()
+                _hf.solve(b_test)
+                _times.append(time.perf_counter() - _t0)
+            t_fwd_solve = np.median(_times) * 1000
+
+            # Pure grad_div call
+            _times = []
+            for _ in range(20):
+                _t0 = time.perf_counter()
+                matrices.grad_and_div_fn(b_test)
+                _times.append(time.perf_counter() - _t0)
+            t_grad_div_call = np.median(_times) * 1000
+
+            print(f"    [diag] fwd-solve={t_fwd_solve:.2f}ms, grad_div={t_grad_div_call:.2f}ms")
 
         # ==============================================================
         # Robust: point_cloud_laplacian + pp3d geodesic
