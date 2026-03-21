@@ -2359,20 +2359,15 @@ class RealTimeEigenanalysisVisualizer:
         print(f"  [NeLo] [TIMING] Sparse assembly: {timing['assembly'] * 1000:.2f} ms")
         print(f"  [NeLo] [TIMING] Total (L,M):     {timing['total'] * 1000:.2f} ms")
 
-        # ---- Eigendecomposition (not timed — consistent with PRED/Robust) ----
-        # Ensure matching dtypes for ARPACK (eigsh)
-        L = L.astype(np.float64)
-        M = M.astype(np.float64)
-
+        # ---- Eigendecomposition (using shared function, consistent with GT/PRED/Robust) ----
         eigenvalues, eigenvectors = None, None
         try:
-            k_eig = min(num_eigenvectors + 1, N - 2)
-            eigenvalues, eigenvectors = sla.eigsh(L, k=k_eig, M=M, sigma=1e-6)
-            eigenvalues  = eigenvalues[1:]
-            eigenvectors = eigenvectors[:, 1:]
+            eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
+                L, num_eigenvectors, mass_matrix=M
+            )
             print(f"  [NeLo] Eigenvalue range: [{eigenvalues[0]:.2e}, {eigenvalues[-1]:.6f}]")
         except Exception as e:
-            print(f"  [NeLo] eigsh failed: {e}")
+            print(f"  [NeLo] eigendecomposition failed: {e}")
 
         return {
             'L': L,
@@ -3476,8 +3471,8 @@ class RealTimeEigenanalysisVisualizer:
         """
         try:
             # Use the centralized eigendecomposition function from utils
-            # Note: eigsh returns M-orthonormal eigenvectors (ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ = I)
-            # We preserve this property for correct area-weighted reconstruction
+
+
             eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
                 stiffness_matrix, k, mass_matrix=mass_matrix
             )
@@ -3567,38 +3562,33 @@ class RealTimeEigenanalysisVisualizer:
                 gt_mesh_grad_op = None
                 gt_face_areas = None
 
-        # Compute GT Laplacian eigendecomposition using PyFM
-        print("Computing GT Laplacian eigendecomposition using PyFM...")
+        # Compute GT Laplacian eigendecomposition
+        print("Computing GT Laplacian eigendecomposition...")
         gt_laplacian_time = 0.0
         try:
             import warnings
 
-            # Create PyFM TriMesh object
+            # Create PyFM TriMesh object for L,M construction only
             pyfm_mesh = TriMesh(vertices, faces)
 
-            # === TIME: GT Laplacian assembly (PyFM uses cotangent weights from mesh) ===
-            # Note: process() computes Laplacian AND eigendecomposition together
-            # We time the whole call but the Laplacian assembly is O(N) while eigen is O(N*k)
             t_gt_start = time.perf_counter()
 
-            # Process the mesh and compute the Laplacian spectrum
-            # Suppress PyFM warnings from degenerate triangles (divide by zero, invalid sqrt)
+            # Build cotangent Laplacian and area matrix via PyFM (no eigendecomposition)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
-                pyfm_mesh.process(k=self.config.num_eigenvectors_to_show, intrinsic=False, verbose=False)
+                pyfm_mesh.process(k=0, intrinsic=False, verbose=False)
+
+            # Compute eigendecomposition using shared function (same as PRED/Robust/NeLo)
+            gt_eigenvalues, gt_eigenvectors = compute_laplacian_eigendecomposition(
+                pyfm_mesh.W, self.config.num_eigenvectors_to_show, mass_matrix=pyfm_mesh.A
+            )
 
             t_gt_end = time.perf_counter()
             gt_laplacian_time = t_gt_end - t_gt_start
 
-            # Store timing (note: includes eigendecomposition)
             self.timing_results.gt_laplacian_time = gt_laplacian_time
-            print(f"[TIMING] GT (PyFM) Laplacian + eigen: {gt_laplacian_time * 1000:.2f} ms")
+            print(f"[TIMING] GT Laplacian + eigen: {gt_laplacian_time * 1000:.2f} ms")
 
-            # Retrieve eigenvalues, eigenfunctions, and vertex areas
-            # Note: PyFM returns M-orthonormal eigenvectors (ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦^T M ÃƒÆ’Ã†â€™Ãƒâ€¦Ã‚Â½ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ = I)
-            # We preserve this property for correct area-weighted reconstruction
-            gt_eigenvalues = pyfm_mesh.eigenvalues
-            gt_eigenvectors = pyfm_mesh.eigenvectors
             vertex_areas = pyfm_mesh.vertex_areas
 
             print(f"Computed {len(gt_eigenvalues)} GT eigenvalues")
@@ -3609,6 +3599,7 @@ class RealTimeEigenanalysisVisualizer:
             gt_eigenvalues = None
             gt_eigenvectors = None
             vertex_areas = None
+
 
         # Note: robust-laplacian is computed later in process_batch with the actual k value
         # to ensure it uses point_cloud_laplacian with the same k as PRED
