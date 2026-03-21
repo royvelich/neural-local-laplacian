@@ -414,64 +414,82 @@ def edge_index_from_knn_indices(
     return edge_index
 
 
-def compute_heat_geodesics_batch(
+class HeatMethodPrefactored:
+    """Prefactored heat method solver. Holds factorized matrices for fast per-source solves."""
+    __slots__ = ('heat_factor', 'poisson_factor', 'grad_and_div_fn', 'n')
+
+    def __init__(self, heat_factor, poisson_factor, grad_and_div_fn, n):
+        self.heat_factor = heat_factor
+        self.poisson_factor = poisson_factor
+        self.grad_and_div_fn = grad_and_div_fn
+        self.n = n
+
+
+def heat_method_prefactorize(
     S: scipy.sparse.spmatrix,
     M: scipy.sparse.spmatrix,
-    source_indices: List[int],
     n_vertices: int,
     grad_and_div_fn,
     t: Optional[float] = None,
-) -> List[Optional[np.ndarray]]:
+) -> HeatMethodPrefactored:
     """
-    Compute geodesic distances from multiple sources using the Heat Method.
+    Prefactorize the heat and Poisson systems for the Heat Method.
 
-    Unified implementation for all Laplacian types (GT mesh, learned, pointcloud).
-    Factorizes each matrix ONCE, then solves all sources -- avoiding re-factorization.
-
-    Heat Method (Crane et al. 2013):
-        1. Solve (M + tS + eI) u = d_source    -- heat diffusion
-        2. X = -grad(u) / |grad(u)|            -- normalized gradient
-        3. Solve (S + eI) phi = -div(X)         -- Poisson equation
-
-    Steps 2-3 differ per method and are encapsulated in grad_and_div_fn.
+    This is the one-time cost (analogous to pp3d.PointCloudHeatSolver constructor).
+    Call heat_method_solve() afterwards for fast per-source solves.
 
     Args:
         S: Stiffness/Laplacian matrix (N, N)
         M: Mass matrix (N, N) -- diagonal
-        source_indices: List of source vertex indices
         n_vertices: Number of vertices
-        grad_and_div_fn: Callable(u) -> rhs.
-            Takes heat solution u (N,), returns Poisson RHS (N,).
-            Encapsulates gradient computation, normalization, and divergence.
+        grad_and_div_fn: Callable(u) -> rhs (gradient + normalization + divergence)
         t: Diffusion time step (auto-computed from M if None)
 
     Returns:
-        List of geodesic distances (N,) per source, or None for failed sources.
+        HeatMethodPrefactored object for use with heat_method_solve().
     """
     n = n_vertices
-    num_sources = len(source_indices)
-
     S = ensure_psd(S.astype(np.float64))
     M = M.astype(np.float64)
 
-    # Auto time step: t = h^2 where h = sqrt(mean vertex area)
     if t is None:
         areas = np.array(M.diagonal()).flatten() if scipy.sparse.issparse(M) else np.diag(M)
         h = np.sqrt(areas.mean())
         t = h ** 2
 
     eps = _HEAT_EPS
-
     A = M + t * S + eps * scipy.sparse.eye(n)
     S_reg = S + eps * scipy.sparse.eye(n)
 
-    # ---- Pass 1: Heat diffusion (one factorization, N solves) ----
-    try:
-        heat_factor = sparse_factorize(A)
-    except Exception as e:
-        print(f"Heat Method batch: heat factorization failed: {e}")
-        return [None] * num_sources
+    heat_factor = sparse_factorize(A)
+    poisson_factor = sparse_factorize(S_reg)
 
+    return HeatMethodPrefactored(heat_factor, poisson_factor, grad_and_div_fn, n)
+
+
+def heat_method_solve(
+    prefactored: HeatMethodPrefactored,
+    source_indices: List[int],
+) -> List[Optional[np.ndarray]]:
+    """
+    Solve for geodesic distances from multiple sources using prefactored systems.
+
+    This is the per-source cost (analogous to pp3d solver.compute_distance()).
+
+    Args:
+        prefactored: HeatMethodPrefactored from heat_method_prefactorize()
+        source_indices: List of source vertex indices
+
+    Returns:
+        List of geodesic distances (N,) per source, or None for failed sources.
+    """
+    n = prefactored.n
+    heat_factor = prefactored.heat_factor
+    poisson_factor = prefactored.poisson_factor
+    grad_and_div_fn = prefactored.grad_and_div_fn
+    num_sources = len(source_indices)
+
+    # ---- Pass 1: Heat diffusion ----
     rhs_list = []
     failed = [False] * num_sources
 
@@ -492,13 +510,7 @@ def compute_heat_geodesics_batch(
             failed[i] = True
             rhs_list.append(None)
 
-    # ---- Pass 2: Poisson solve (one factorization, N solves) ----
-    try:
-        poisson_factor = sparse_factorize(S_reg)
-    except Exception as e:
-        print(f"Heat Method batch: Poisson factorization failed: {e}")
-        return [None] * num_sources
-
+    # ---- Pass 2: Poisson solve ----
     results = []
     for i, source_idx in enumerate(source_indices):
         if failed[i] or rhs_list[i] is None:
@@ -527,6 +539,38 @@ def compute_heat_geodesics_batch(
             results.append(None)
 
     return results
+
+
+def compute_heat_geodesics_batch(
+    S: scipy.sparse.spmatrix,
+    M: scipy.sparse.spmatrix,
+    source_indices: List[int],
+    n_vertices: int,
+    grad_and_div_fn,
+    t: Optional[float] = None,
+) -> List[Optional[np.ndarray]]:
+    """
+    Compute geodesic distances from multiple sources using the Heat Method.
+
+    Convenience wrapper: prefactorizes + solves in one call.
+
+    Args:
+        S: Stiffness/Laplacian matrix (N, N)
+        M: Mass matrix (N, N) -- diagonal
+        source_indices: List of source vertex indices
+        n_vertices: Number of vertices
+        grad_and_div_fn: Callable(u) -> rhs
+        t: Diffusion time step (auto-computed from M if None)
+
+    Returns:
+        List of geodesic distances (N,) per source, or None for failed sources.
+    """
+    try:
+        prefactored = heat_method_prefactorize(S, M, n_vertices, grad_and_div_fn, t=t)
+    except Exception as e:
+        print(f"Heat Method batch: prefactorization failed: {e}")
+        return [None] * len(source_indices)
+    return heat_method_solve(prefactored, source_indices)
 
 
 # ---------------------------------------------------------------------------

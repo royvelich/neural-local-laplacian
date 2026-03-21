@@ -42,6 +42,9 @@ from neural_local_laplacian.utils.utils import (
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_learned,
     compute_heat_geodesic_learned_batch,
+    heat_method_prefactorize,
+    heat_method_solve,
+    make_grad_div_learned,
     select_multiple_geodesic_sources,
 )
 
@@ -127,9 +130,10 @@ def main(cfg: DictConfig) -> None:
     # ---- Table header ----
     header = (
         f"{'#':>4}  {'Mesh':<14}  {'N':>6}"
-        f"  {'kNN':>8}  {'Fwd':>8}  {'Asm':>8}  {'GradOp':>8}  {'PRED LM':>9}"
-        f"  {'PRED E2E':>9}  {'Rob LM':>9}  {'Rob E2E':>9}"
-        f"  {'LM Rat':>7}  {'E2E Rat':>8}"
+        f"  {'kNN':>7}  {'Fwd':>7}  {'Asm':>7}  {'GrOp':>7}  {'PrLM':>7}"
+        f"  {'PrFact':>7}  {'PrSlv':>7}  {'Pr/src':>7}"
+        f"  {'RbFact':>7}  {'RbSlv':>7}  {'Rb/src':>7}"
+        f"  {'LMRat':>6}  {'E2ERat':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -220,17 +224,26 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.synchronize()
             t_grad_op = time.perf_counter() - t0
 
-        # PRED geodesic (heat method with learned operators, batch — factorize once)
-        t_pred_geo = 0.0
+        # PRED geodesic: split into prefactorize (one-time) + solve (per-source)
+        t_pred_prefactor = 0.0
+        t_pred_solve = 0.0
+        prefactored = None
         if G_pred is not None:
+            grad_div_fn = make_grad_div_learned(G_pred, M_pred)
+
             t0 = time.perf_counter()
-            _ = compute_heat_geodesic_learned_batch(
-                S=L_pred, M=M_pred, G=G_pred,
-                source_indices=source_indices, n_vertices=N, device=device,
+            prefactored = heat_method_prefactorize(
+                S=L_pred, M=M_pred, n_vertices=N, grad_and_div_fn=grad_div_fn,
             )
             if device.type == 'cuda':
                 torch.cuda.synchronize()
-            t_pred_geo = (time.perf_counter() - t0) / len(source_indices)
+            t_pred_prefactor = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            _ = heat_method_solve(prefactored, source_indices)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_pred_solve = time.perf_counter() - t0
 
         # ==============================================================
         # Robust: point_cloud_laplacian + pp3d geodesic
@@ -240,41 +253,56 @@ def main(cfg: DictConfig) -> None:
         L_rob, M_rob = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=robust_k)
         t_robust_lm = time.perf_counter() - t0
 
+        # pp3d: split into constructor (one-time) + solve (per-source)
         t0 = time.perf_counter()
-        solver = pp3d.PointCloudHeatSolver(vertices)
-        for src in source_indices:
-            _ = solver.compute_distance(src)
-        t_robust_geo = (time.perf_counter() - t0) / len(source_indices)
+        pp3d_solver = pp3d.PointCloudHeatSolver(vertices)
+        t_robust_prefactor = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
+        for src in source_indices:
+            _ = pp3d_solver.compute_distance(src)
+        t_robust_solve = time.perf_counter() - t0
+
+        n_src = len(source_indices)
         ratio_lm = pred_lm_total / t_robust_lm if t_robust_lm > 0 else float('inf')
-        pred_e2e = pred_lm_total + t_grad_op + t_pred_geo
-        # pp3d.PointCloudHeatSolver builds its own internal Laplacian in C++,
-        # so t_robust_geo already includes L,M assembly — don't add t_robust_lm.
-        robust_e2e = t_robust_geo
-        ratio_e2e = pred_e2e / robust_e2e if robust_e2e > 0 else float('inf')
+
+        # E2E totals for N sources (one-time + all solves)
+        pred_e2e_total = pred_lm_total + t_grad_op + t_pred_prefactor + t_pred_solve
+        robust_e2e_total = t_robust_prefactor + t_robust_solve
+
+        # Per-source amortized = one-time / N + solve / N
+        pred_per_src = pred_e2e_total / n_src
+        robust_per_src = robust_e2e_total / n_src
+
+        ratio_e2e = pred_e2e_total / robust_e2e_total if robust_e2e_total > 0 else float('inf')
 
         results.append({
-            'mesh': mesh_name, 'N': N,
+            'mesh': mesh_name, 'N': N, 'n_src': n_src,
             'knn_ms': t_knn * 1000, 'fwd_ms': t_fwd * 1000,
             'asm_ms': t_asm * 1000, 'grad_op_ms': t_grad_op * 1000,
             'pred_lm_ms': pred_lm_total * 1000,
-            'pred_geo_ms': t_pred_geo * 1000,
-            'pred_e2e_ms': pred_e2e * 1000,
+            'pred_prefactor_ms': t_pred_prefactor * 1000,
+            'pred_solve_ms': t_pred_solve * 1000,
+            'pred_per_src_ms': pred_per_src * 1000,
+            'pred_e2e_ms': pred_e2e_total * 1000,
             'robust_lm_ms': t_robust_lm * 1000,
-            'robust_geo_ms': t_robust_geo * 1000,
-            'robust_e2e_ms': robust_e2e * 1000,
+            'robust_prefactor_ms': t_robust_prefactor * 1000,
+            'robust_solve_ms': t_robust_solve * 1000,
+            'robust_per_src_ms': robust_per_src * 1000,
+            'robust_e2e_ms': robust_e2e_total * 1000,
             'ratio_lm': ratio_lm,
             'ratio_e2e': ratio_e2e,
         })
 
         print(
             f"{batch_idx + 1:>4}  {mesh_name:<14}  {N:>6}"
-            f"  {t_knn * 1000:>8.1f}  {t_fwd * 1000:>8.1f}  {t_asm * 1000:>8.1f}  {t_grad_op * 1000:>8.1f}  {pred_lm_total * 1000:>9.1f}"
-            f"  {pred_e2e * 1000:>9.1f}  {t_robust_lm * 1000:>9.1f}  {robust_e2e * 1000:>9.1f}"
-            f"  {ratio_lm:>6.2f}x  {ratio_e2e:>7.2f}x"
+            f"  {t_knn * 1000:>7.1f}  {t_fwd * 1000:>7.1f}  {t_asm * 1000:>7.1f}  {t_grad_op * 1000:>7.1f}  {pred_lm_total * 1000:>7.1f}"
+            f"  {t_pred_prefactor * 1000:>7.1f}  {t_pred_solve * 1000:>7.1f}  {pred_per_src * 1000:>7.1f}"
+            f"  {t_robust_prefactor * 1000:>7.1f}  {t_robust_solve * 1000:>7.1f}  {robust_per_src * 1000:>7.1f}"
+            f"  {ratio_lm:>5.2f}x  {ratio_e2e:>6.2f}x"
         )
 
-        del patch_data, fwd_result, stiffness_w, areas, verts_tensor, G_pred
+        del patch_data, fwd_result, stiffness_w, areas, verts_tensor, G_pred, prefactored
 
         # Fence: ensure all async GPU work is done before next mesh
         if device.type == 'cuda':
@@ -293,43 +321,60 @@ def main(cfg: DictConfig) -> None:
             return np.mean(vals), np.std(vals), np.min(vals), np.max(vals)
 
         W = 10
-        print(f"\n{'=' * 75}")
-        print(f"SUMMARY ({n} meshes, AMP={'ON' if use_amp else 'OFF'}, solver={geo_utils._SOLVER_BACKEND})")
-        print(f"{'=' * 75}")
-        print(f"{'':>20s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
-        print(f"{'-' * 20} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
+        n_src = results[0]['n_src']
+        print(f"\n{'=' * 80}")
+        print(f"SUMMARY ({n} meshes, {n_src} sources/mesh, AMP={'ON' if use_amp else 'OFF'}, solver={geo_utils._SOLVER_BACKEND})")
+        print(f"{'=' * 80}")
+        print(f"{'':>22s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
+        print(f"{'-' * 22} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
 
-        # --- L,M Assembly comparison ---
-        print("  -- L,M Assembly --")
+        # --- L,M Assembly (for non-geodesic tasks) ---
+        print("  -- L,M Assembly (for eigen/Green's/HKS) --")
         for label, key in [
-            ("PRED kNN",       "knn_ms"),
-            ("PRED forward",   "fwd_ms"),
-            ("PRED assembly",  "asm_ms"),
-            ("PRED grad op",   "grad_op_ms"),
-            ("PRED total",     "pred_lm_ms"),
-            ("Robust total",   "robust_lm_ms"),
+            ("PRED L,M",         "pred_lm_ms"),
+            ("Robust L,M",       "robust_lm_ms"),
         ]:
             m, s, mn, mx = stats(key)
-            print(f"  {label:<18s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+            print(f"  {label:<20s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
 
         pred_lm = [r['pred_lm_ms'] for r in results]
         robust_lm = [r['robust_lm_ms'] for r in results]
-        print(f"  PRED/Robust:       {np.mean(pred_lm) / np.mean(robust_lm):.2f}x  (PRED wins {sum(1 for p, r in zip(pred_lm, robust_lm) if p < r)}/{n})")
+        print(f"  PRED/Robust:         {np.mean(pred_lm) / np.mean(robust_lm):.2f}x  (PRED wins {sum(1 for p, r in zip(pred_lm, robust_lm) if p < r)}/{n})")
 
-        # --- E2E Geodesic comparison ---
-        print("  -- E2E Geodesic (L,M + grad op + heat solve) --")
+        # --- E2E Geodesic: one-time + per-source breakdown ---
+        print("  -- E2E Geodesic (one-time + solve) --")
+        print("  PRED breakdown:")
         for label, key in [
-            ("PRED E2E",       "pred_e2e_ms"),
-            ("Robust E2E*",    "robust_e2e_ms"),
+            ("  kNN",             "knn_ms"),
+            ("  forward",         "fwd_ms"),
+            ("  assembly",        "asm_ms"),
+            ("  grad op",         "grad_op_ms"),
+            ("  prefactorize",    "pred_prefactor_ms"),
+            ("  solve (all src)", "pred_solve_ms"),
         ]:
             m, s, mn, mx = stats(key)
-            print(f"  {label:<18s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+            print(f"  {label:<20s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+
+        print("  Robust (pp3d) breakdown:")
+        for label, key in [
+            ("  constructor",     "robust_prefactor_ms"),
+            ("  solve (all src)", "robust_solve_ms"),
+        ]:
+            m, s, mn, mx = stats(key)
+            print(f"  {label:<20s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+
+        print(f"  {'':>22s} {'PRED':>{W}s} {'Robust':>{W}s}")
+        print(f"  {'':>22s} {'-' * W} {'-' * W}")
 
         pred_e2e = [r['pred_e2e_ms'] for r in results]
         robust_e2e = [r['robust_e2e_ms'] for r in results]
-        print(f"  PRED/Robust:       {np.mean(pred_e2e) / np.mean(robust_e2e):.2f}x  (PRED wins {sum(1 for p, r in zip(pred_e2e, robust_e2e) if p < r)}/{n})")
-        print(f"  * Robust E2E = pp3d (C++ solver with internal L,M)")
-        print(f"{'=' * 75}")
+        pred_per_src = [r['pred_per_src_ms'] for r in results]
+        robust_per_src = [r['robust_per_src_ms'] for r in results]
+
+        print(f"  {'Total (' + str(n_src) + ' sources)':<22s} {np.mean(pred_e2e):>{W}.1f} {np.mean(robust_e2e):>{W}.1f}")
+        print(f"  {'Per source (amort.)':<22s} {np.mean(pred_per_src):>{W}.1f} {np.mean(robust_per_src):>{W}.1f}")
+        print(f"  PRED/Robust (total):  {np.mean(pred_e2e) / np.mean(robust_e2e):.2f}x  (PRED wins {sum(1 for p, r in zip(pred_e2e, robust_e2e) if p < r)}/{n})")
+        print(f"{'=' * 80}")
 
 
 if __name__ == "__main__":
