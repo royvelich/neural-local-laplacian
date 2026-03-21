@@ -414,404 +414,65 @@ def edge_index_from_knn_indices(
     return edge_index
 
 
-def compute_heat_geodesic_pointcloud(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    grad_op: scipy.sparse.spmatrix,
-    div_op: scipy.sparse.spmatrix,
-    source_idx: int,
-    n_vertices: int,
-    t: Optional[float] = None,
-    device: Optional[torch.device] = None
-) -> Optional[np.ndarray]:
-    """
-    Compute geodesic distances using Heat Method with point cloud operators.
-
-    The Heat Method (Crane et al. 2013):
-    1. Solve heat equation: (M + t*L) u = delta_source
-    2. Normalize gradient: X = -grad(u) / |grad(u)|
-    3. Solve Poisson: L @ phi = div(X)
-
-    Args:
-        L: Laplacian matrix (N, N) - should be positive semi-definite
-        M: Mass matrix (N, N) - diagonal
-        grad_op: Gradient operator (2N, N) from pcdiff
-        div_op: Divergence operator (N, 2N) from pcdiff
-        source_idx: Index of source vertex
-        n_vertices: Number of vertices
-        t: Time step (default: auto-computed from mass matrix)
-
-    Returns:
-        Geodesic distances (N,) or None if computation fails
-    """
-    n = n_vertices
-
-    # Ensure float64 for numerical stability and PSD convention
-    L = ensure_psd(L.astype(np.float64))
-    M = M.astype(np.float64)
-
-    # Time step: t = h^2 where h is mean point spacing
-    if t is None:
-        if scipy.sparse.issparse(M):
-            areas = np.array(M.diagonal()).flatten()
-        else:
-            areas = np.diag(M)
-        h = np.sqrt(areas.mean())
-        t = h ** 2
-
-    try:
-
-        # Step I: Heat diffusion
-        # Solve (M + t*L) u = delta_source
-        delta = np.zeros(n)
-        delta[source_idx] = 1.0
-
-        A = M + t * L
-        u = sparse_solve(A, delta, device, spd=True)
-
-        if not np.all(np.isfinite(u)):
-            print(f"  [!] Heat Method (pointcloud): heat diffusion produced non-finite values, skipping")
-            return None
-
-        # Step II: Compute and normalize gradient (2D in tangent plane)
-        grad_u = grad_op @ u  # (2N,) - interleaved [x1, y1, x2, y2, ...]
-        grad_u_2d = grad_u.reshape(-1, 2)  # (N, 2)
-
-        # Normalize to unit vectors pointing toward source
-        norms = np.linalg.norm(grad_u_2d, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-10)
-        X = -grad_u_2d / norms  # Negative: point toward source
-
-        X_flat = X.flatten()
-
-        # Step III: Divergence and Poisson
-        # Try both signs and pick the one where source has minimum distance
-        div_X = div_op @ X_flat
-
-        eps = _HEAT_EPS
-        L_reg = L + eps * scipy.sparse.eye(n)
-
-        # Factorize once, solve twice (±rhs) — SPD after regularization
-        poisson_factor = sparse_factorize(L_reg, spd=True)
-        phi_pos = poisson_factor.solve(div_X)
-        phi_neg = poisson_factor.solve(-div_X)
-
-        # The correct sign should have the source at or near the minimum
-        phi_pos_shifted = phi_pos - phi_pos.min()
-        phi_neg_shifted = phi_neg - phi_neg.min()
-
-        # Check which one has source closer to minimum
-        source_rank_pos = (phi_pos_shifted < phi_pos_shifted[source_idx]).sum()
-        source_rank_neg = (phi_neg_shifted < phi_neg_shifted[source_idx]).sum()
-
-        if source_rank_pos < source_rank_neg:
-            phi = phi_pos_shifted
-        else:
-            phi = phi_neg_shifted
-
-        # Warn if distances are unreasonably large (but still return them)
-        if phi.max() > 1e3:
-            print(f"  [!] Heat Method (pointcloud): WARNING — unreasonable max distance {phi.max():.1f}")
-
-        return phi
-
-    except Exception as e:
-        print(f"Heat Method (pointcloud) failed: {e}")
-        return None
-
-
-def compute_heat_geodesic_mesh(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    grad_op: scipy.sparse.spmatrix,
-    face_areas: np.ndarray,
-    source_idx: int,
-    n_vertices: int,
-    t: Optional[float] = None,
-    device: Optional[torch.device] = None
-) -> Optional[np.ndarray]:
-    """
-    Compute geodesic distances using Heat Method with mesh-based gradient.
-
-    Uses igl.grad() which produces per-face 3D gradients.
-
-    Args:
-        L: Laplacian matrix (N, N) - should be positive semi-definite
-        M: Mass matrix (N, N) - diagonal
-        grad_op: Gradient operator (3*nF, N) from igl.grad()
-        face_areas: Face areas (nF,)
-        source_idx: Index of source vertex
-        n_vertices: Number of vertices
-        t: Time step (default: auto-computed from face areas)
-
-    Returns:
-        Geodesic distances (N,) or None if computation fails
-    """
-    n = n_vertices
-    nF = len(face_areas)
-
-    # Ensure float64 for numerical stability and PSD convention
-    L = ensure_psd(L.astype(np.float64))
-    M = M.astype(np.float64)
-
-    # Time step: t = h^2 where h is mean edge length
-    # For equilateral triangle: area = sqrt(3)/4 * h^2, so h Ã¢â€°Ë† 1.52 * sqrt(area)
-    if t is None:
-        h = 1.52 * np.sqrt(face_areas.mean())
-        t = h ** 2
-
-    try:
-
-        # Step I: Heat diffusion
-        delta = np.zeros(n)
-        delta[source_idx] = 1.0
-
-        A = M + t * L
-        u = sparse_solve(A, delta, device, spd=True)
-
-        if not np.all(np.isfinite(u)):
-            print(f"  [!] Heat Method (mesh): heat diffusion produced non-finite values, skipping")
-            return None
-
-        # Step II: Compute per-face gradient and normalize
-        # grad_op @ u gives (3*nF,) vector: [gx_f0, gy_f0, gz_f0, gx_f1, ...]
-        grad_u = grad_op @ u  # (3*nF,)
-        grad_u_3d = grad_u.reshape(nF, 3)  # (nF, 3) - 3D gradient per face
-
-        # Normalize each face's gradient to unit vector
-        norms = np.linalg.norm(grad_u_3d, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-10)
-        X = -grad_u_3d / norms  # Negative: point toward source
-
-        # Step III: Compute integrated divergence
-        # For igl.grad(), the discrete divergence is:
-        # div(X) = -G^T @ (A Ã¢Å â€” I_3) @ X
-        # But we need to solve: ÃŽâ€Ãâ€  = Ã¢Ë†â€¡Ã‚Â·X, and since L = -ÃŽâ€, we have LÃâ€  = -Ã¢Ë†â€¡Ã‚Â·X
-        # So: LÃâ€  = -div(X) = G^T @ (A Ã¢Å â€” I_3) @ X
-
-        # Create area-weighted X
-        X_weighted = X * face_areas[:, np.newaxis]  # (nF, 3)
-        X_weighted_flat = X_weighted.flatten()  # (3*nF,)
-
-        # RHS for Poisson (the negatives cancel)
-        rhs = grad_op.T @ X_weighted_flat  # (nV,)
-
-        # Step IV: Solve Poisson — try both signs to handle sign ambiguity
-        eps = _HEAT_EPS
-        L_reg = L + eps * scipy.sparse.eye(n)
-
-        # Factorize once, solve twice (±rhs) — SPD after regularization
-        poisson_factor = sparse_factorize(L_reg, spd=True)
-        phi_pos = poisson_factor.solve(rhs)
-        phi_neg = poisson_factor.solve(-rhs)
-
-        if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
-            print(f"  [!] Heat Method (mesh): Poisson solve produced non-finite values, skipping")
-            return None
-
-        # Pick the sign where source is closest to the minimum
-        phi_pos_shifted = phi_pos - phi_pos.min() if np.all(np.isfinite(phi_pos)) else np.full(n, np.inf)
-        phi_neg_shifted = phi_neg - phi_neg.min() if np.all(np.isfinite(phi_neg)) else np.full(n, np.inf)
-
-        source_rank_pos = (phi_pos_shifted < phi_pos_shifted[source_idx]).sum()
-        source_rank_neg = (phi_neg_shifted < phi_neg_shifted[source_idx]).sum()
-
-        phi = phi_pos_shifted if source_rank_pos < source_rank_neg else phi_neg_shifted
-
-        # Warn if distances are unreasonably large (but still return them)
-        if phi.max() > 1e3:
-            print(f"  [!] Heat Method (mesh): WARNING — unreasonable max distance {phi.max():.1f}")
-
-        return phi
-
-    except Exception as e:
-        print(f"Heat Method (mesh) failed: {e}")
-        return None
-
-
-def compute_heat_geodesic_learned(
+def compute_heat_geodesics_batch(
     S: scipy.sparse.spmatrix,
     M: scipy.sparse.spmatrix,
-    G: scipy.sparse.spmatrix,
-    source_idx: int,
-    n_vertices: int,
-    t: Optional[float] = None,
-    device: Optional[torch.device] = None
-) -> Optional[np.ndarray]:
-    """
-    Compute geodesic distances using Heat Method with fully learned operators.
-
-    All operators (S, M, G) come from the same learned gradient coefficients g_ij
-    and vertex areas A_i. No external dependencies (no pcdiff).
-
-    The gradient operator G is (3N, N) and maps vertex scalars to 3D vertex vectors:
-        (âˆ‡f)_i = Î£_j g_ij (f_j - f_i)
-
-    The divergence is the adjoint of G w.r.t. the M-weighted inner product:
-        div(X) = -M^{-1} G^T M_3 X_flat
-    where M_3 repeats vertex areas 3x (once per spatial component).
-
-    Heat Method steps:
-        1. Solve (M + tS) u = Î´_source  â€” heat diffusion
-        2. X = -âˆ‡u / |âˆ‡u|               â€” normalized gradient (using G)
-        3. Solve S Ï† = G^T M_3 X_flat    â€” Poisson (RHS = -M Â· div(X))
-
-    Note on Step 3 sign: We solve S Ï† = -M div(X).
-        -M div(X) = -M Â· (-M^{-1} G^T M_3 X) = G^T M_3 X
-    So the RHS is simply G^T M_3 X_flat â€” no sign ambiguity.
-
-    Args:
-        S: One-ring stiffness matrix (N, N) â€” assembled from â€–g_ijâ€–Â²
-        M: Diagonal vertex mass matrix (N, N) â€” assembled from A_i
-        G: Gradient operator (3N, N) â€” assembled from g_ij vectors
-        source_idx: Source vertex index for geodesic computation
-        n_vertices: Number of vertices
-        t: Diffusion time step (auto-computed from M if None)
-
-    Returns:
-        Geodesic distances (N,) or None if computation fails
-    """
-    n = n_vertices
-
-    # Ensure float64 for numerical stability
-    S = ensure_psd(S.astype(np.float64))
-    M = M.astype(np.float64)
-    G = G.astype(np.float64)
-
-    # Auto time step: t = h^2 where h = sqrt(mean vertex area)
-    if t is None:
-        if scipy.sparse.issparse(M):
-            areas = np.array(M.diagonal()).flatten()
-        else:
-            areas = np.diag(M)
-        h = np.sqrt(areas.mean())
-        t = h ** 2
-
-    try:
-
-        # Step 1: Heat diffusion â€” solve (M + tS) u = Î´_source
-        delta = np.zeros(n)
-        delta[source_idx] = 1.0
-
-        A = M + t * S
-        u = sparse_solve(A, delta, device, spd=True)
-
-        if not np.all(np.isfinite(u)):
-            print(f"  [!] Heat Method (learned): heat diffusion produced non-finite values, skipping")
-            return None
-
-        # Step 2: Compute gradient and normalize to unit vectors
-        # G maps scalars to 3D vectors (unlike pcdiff which uses 2D tangent frames)
-        grad_u_flat = G @ u             # (3N,)
-        grad_u = grad_u_flat.reshape(-1, 3)  # (N, 3)
-
-        norms = np.linalg.norm(grad_u, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-10)
-        X = -grad_u / norms  # Negative: point toward source
-
-        # Step 3: Poisson solve â€” S Ï† = G^T M_3 X_flat
-        # Build area-weighted X: multiply each vertex's vector by its area
-        areas_diag = np.array(M.diagonal()).flatten()
-        M_3 = np.repeat(areas_diag, 3)  # (3N,) â€” area_i repeated for x,y,z
-        rhs = G.T @ (M_3 * X.flatten())  # (N,) â€” this is -M Â· div(X)
-
-        eps = _HEAT_EPS
-        S_reg = S + eps * scipy.sparse.eye(n)
-
-        # Factorize once, solve twice (±rhs) — SPD after regularization
-        poisson_factor = sparse_factorize(S_reg, spd=True)
-        phi_pos = poisson_factor.solve(rhs)
-        phi_neg = poisson_factor.solve(-rhs)
-
-        if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
-            print(f"  [!] Heat Method (learned): Poisson solve produced non-finite values, skipping")
-            return None
-
-        # Pick the sign where source is closest to the minimum
-        phi_pos_shifted = phi_pos - phi_pos.min() if np.all(np.isfinite(phi_pos)) else np.full(n, np.inf)
-        phi_neg_shifted = phi_neg - phi_neg.min() if np.all(np.isfinite(phi_neg)) else np.full(n, np.inf)
-
-        source_rank_pos = (phi_pos_shifted < phi_pos_shifted[source_idx]).sum()
-        source_rank_neg = (phi_neg_shifted < phi_neg_shifted[source_idx]).sum()
-
-        phi = phi_pos_shifted if source_rank_pos < source_rank_neg else phi_neg_shifted
-
-        # Warn if distances are unreasonably large (but still return them)
-        if phi.max() > 1e3:
-            print(f"  [!] Heat Method (learned): WARNING — unreasonable max distance {phi.max():.1f}")
-
-        return phi
-
-    except Exception as e:
-        print(f"Heat Method (learned) failed: {e}")
-        return None
-
-
-def compute_heat_geodesic_learned_batch(
-    S: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    G: scipy.sparse.spmatrix,
     source_indices: List[int],
     n_vertices: int,
-    device: Optional[torch.device] = None,
+    grad_and_div_fn,
     t: Optional[float] = None,
 ) -> List[Optional[np.ndarray]]:
     """
-    Compute geodesic distances from multiple sources using learned operators.
+    Compute geodesic distances from multiple sources using the Heat Method.
 
-    Factorizes (M + tS + eps*I) and (S + eps*I) ONCE each, solving all sources
-    in two passes to avoid re-factorization with shared solvers (pypardiso).
+    Unified implementation for all Laplacian types (GT mesh, learned, pointcloud).
+    Factorizes each matrix ONCE, then solves all sources -- avoiding re-factorization.
 
-    Pass 1: Factorize heat matrix, solve all sources → get gradient fields
-    Pass 2: Factorize Poisson matrix, solve all sources → get distances
+    Heat Method (Crane et al. 2013):
+        1. Solve (M + tS + eI) u = d_source    -- heat diffusion
+        2. X = -grad(u) / |grad(u)|            -- normalized gradient
+        3. Solve (S + eI) phi = -div(X)         -- Poisson equation
+
+    Steps 2-3 differ per method and are encapsulated in grad_and_div_fn.
 
     Args:
-        S: One-ring stiffness matrix (N, N)
-        M: Diagonal vertex mass matrix (N, N)
-        G: Gradient operator (3N, N)
+        S: Stiffness/Laplacian matrix (N, N)
+        M: Mass matrix (N, N) -- diagonal
         source_indices: List of source vertex indices
         n_vertices: Number of vertices
-        device: Unused (kept for API compatibility)
+        grad_and_div_fn: Callable(u) -> rhs.
+            Takes heat solution u (N,), returns Poisson RHS (N,).
+            Encapsulates gradient computation, normalization, and divergence.
         t: Diffusion time step (auto-computed from M if None)
 
     Returns:
-        List of geodesic distances (N,) per source, or None for failed sources
+        List of geodesic distances (N,) per source, or None for failed sources.
     """
     n = n_vertices
     num_sources = len(source_indices)
 
-    # Ensure float64 for numerical stability
     S = ensure_psd(S.astype(np.float64))
     M = M.astype(np.float64)
-    G = G.astype(np.float64)
 
-    # Auto time step
+    # Auto time step: t = h^2 where h = sqrt(mean vertex area)
     if t is None:
-        if scipy.sparse.issparse(M):
-            areas = np.array(M.diagonal()).flatten()
-        else:
-            areas = np.diag(M)
+        areas = np.array(M.diagonal()).flatten() if scipy.sparse.issparse(M) else np.diag(M)
         h = np.sqrt(areas.mean())
         t = h ** 2
 
     eps = _HEAT_EPS
-
-    # Pre-compute shared quantities
-    areas_diag = np.array(M.diagonal()).flatten()
-    M_3 = np.repeat(areas_diag, 3)  # (3N,)
 
     A = M + t * S + eps * scipy.sparse.eye(n)
     S_reg = S + eps * scipy.sparse.eye(n)
 
     # ---- Pass 1: Heat diffusion (one factorization, N solves) ----
     try:
-        heat_factor = sparse_factorize(A, spd=True)
+        heat_factor = sparse_factorize(A)
     except Exception as e:
-        print(f"Heat Method (learned batch): heat factorization failed: {e}")
+        print(f"Heat Method batch: heat factorization failed: {e}")
         return [None] * num_sources
 
-    # Solve heat for all sources, compute normalized gradient fields
-    rhs_list = []  # Poisson RHS per source
+    rhs_list = []
     failed = [False] * num_sources
 
     for i, source_idx in enumerate(source_indices):
@@ -825,24 +486,17 @@ def compute_heat_geodesic_learned_batch(
                 rhs_list.append(None)
                 continue
 
-            # Gradient + normalize
-            grad_u = (G @ u).reshape(-1, 3)
-            norms = np.maximum(np.linalg.norm(grad_u, axis=1, keepdims=True), 1e-10)
-            X = -grad_u / norms
+            rhs_list.append(grad_and_div_fn(u))
 
-            # Compute Poisson RHS (store for pass 2)
-            rhs_list.append(G.T @ (M_3 * X.flatten()))
-
-        except Exception as e:
-            print(f"Heat Method (learned batch) heat solve source {source_idx} failed: {e}")
+        except Exception:
             failed[i] = True
             rhs_list.append(None)
 
     # ---- Pass 2: Poisson solve (one factorization, N solves) ----
     try:
-        poisson_factor = sparse_factorize(S_reg, spd=True)
+        poisson_factor = sparse_factorize(S_reg)
     except Exception as e:
-        print(f"Heat Method (learned batch): Poisson factorization failed: {e}")
+        print(f"Heat Method batch: Poisson factorization failed: {e}")
         return [None] * num_sources
 
     results = []
@@ -869,11 +523,88 @@ def compute_heat_geodesic_learned_batch(
             phi = phi_pos_shifted if source_rank_pos < source_rank_neg else phi_neg_shifted
             results.append(phi)
 
-        except Exception as e:
-            print(f"Heat Method (learned batch) Poisson source {source_idx} failed: {e}")
+        except Exception:
             results.append(None)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# grad_and_div factories -- one per Laplacian type
+# ---------------------------------------------------------------------------
+
+def make_grad_div_mesh(grad_op: scipy.sparse.spmatrix, face_areas: np.ndarray):
+    """Create grad_and_div_fn for mesh-based GT Laplacian (igl.grad)."""
+    nF = len(face_areas)
+    def grad_and_div(u):
+        grad_u = (grad_op @ u).reshape(nF, 3)
+        norms = np.maximum(np.linalg.norm(grad_u, axis=1, keepdims=True), 1e-10)
+        X = -grad_u / norms
+        return grad_op.T @ (X * face_areas[:, np.newaxis]).flatten()
+    return grad_and_div
+
+
+def make_grad_div_learned(G: scipy.sparse.spmatrix, M: scipy.sparse.spmatrix):
+    """Create grad_and_div_fn for learned gradient operator (3N x N)."""
+    G_f64 = G.astype(np.float64)
+    areas = np.array(M.diagonal()).flatten() if scipy.sparse.issparse(M) else np.diag(M)
+    M_3 = np.repeat(areas.astype(np.float64), 3)  # (3N,)
+    def grad_and_div(u):
+        grad_u = (G_f64 @ u).reshape(-1, 3)
+        norms = np.maximum(np.linalg.norm(grad_u, axis=1, keepdims=True), 1e-10)
+        X = -grad_u / norms
+        return G_f64.T @ (M_3 * X.flatten())
+    return grad_and_div
+
+
+def make_grad_div_pointcloud(grad_op: scipy.sparse.spmatrix, div_op: scipy.sparse.spmatrix):
+    """Create grad_and_div_fn for pointcloud operators (pcdiff)."""
+    def grad_and_div(u):
+        grad_u = (grad_op @ u).reshape(-1, 2)
+        norms = np.maximum(np.linalg.norm(grad_u, axis=1, keepdims=True), 1e-10)
+        X = -grad_u / norms
+        return div_op @ X.flatten()
+    return grad_and_div
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrappers -- backward-compatible single/multi source APIs
+# ---------------------------------------------------------------------------
+
+def compute_heat_geodesic_pointcloud(
+    L, M, grad_op, div_op, source_idx, n_vertices, t=None, device=None
+) -> Optional[np.ndarray]:
+    """Single-source geodesic with pointcloud operators."""
+    fn = make_grad_div_pointcloud(grad_op, div_op)
+    return compute_heat_geodesics_batch(L, M, [source_idx], n_vertices, fn, t=t)[0]
+
+
+def compute_heat_geodesic_mesh(
+    L, M, grad_op, face_areas, source_idx, n_vertices, t=None, device=None
+) -> Optional[np.ndarray]:
+    """Single-source geodesic with mesh operators."""
+    if t is None:
+        h = 1.52 * np.sqrt(face_areas.mean())
+        t = h ** 2
+    fn = make_grad_div_mesh(grad_op, face_areas)
+    return compute_heat_geodesics_batch(L, M, [source_idx], n_vertices, fn, t=t)[0]
+
+
+def compute_heat_geodesic_learned(
+    S, M, G, source_idx, n_vertices, t=None, device=None
+) -> Optional[np.ndarray]:
+    """Single-source geodesic with learned operators."""
+    fn = make_grad_div_learned(G, M)
+    return compute_heat_geodesics_batch(S, M, [source_idx], n_vertices, fn, t=t)[0]
+
+
+def compute_heat_geodesic_learned_batch(
+    S, M, G, source_indices, n_vertices, device=None, t=None
+) -> List[Optional[np.ndarray]]:
+    """Multi-source geodesic with learned operators."""
+    fn = make_grad_div_learned(G, M)
+    return compute_heat_geodesics_batch(S, M, source_indices, n_vertices, fn, t=t)
+
 
 
 def _check_mesh_topology_safe(vertices: np.ndarray, faces: np.ndarray) -> Tuple[bool, str]:

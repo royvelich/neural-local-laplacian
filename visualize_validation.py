@@ -78,10 +78,14 @@ from neural_local_laplacian.utils.utils import (
     cuda_warmup,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
+    compute_heat_geodesics_batch,
     compute_heat_geodesic_pointcloud,
     compute_heat_geodesic_learned,
     compute_heat_geodesic_learned_batch,
     compute_heat_geodesic_mesh,
+    make_grad_div_mesh,
+    make_grad_div_learned,
+    make_grad_div_pointcloud,
     compute_geodesic_metrics,
     compute_exact_geodesics,
     ensure_psd,
@@ -5149,6 +5153,84 @@ class RealTimeEigenanalysisVisualizer:
             traceback.print_exc()
             return None
 
+    def compute_greens_function_batch(
+            self,
+            laplacian_matrix: scipy.sparse.csr_matrix,
+            mass_matrix: Optional[scipy.sparse.csr_matrix],
+            source_indices: List[int],
+            regularization: float = 1e-6,
+    ) -> Dict[int, Optional[Tuple[np.ndarray, float]]]:
+        """
+        Compute Green's function for multiple sources with one factorization.
+
+        Factorizes (L + εM) ONCE, then solves for each source.
+
+        Args:
+            laplacian_matrix: Sparse Laplacian matrix L (n x n)
+            mass_matrix: Sparse diagonal mass matrix M (n x n), or None for identity
+            source_indices: List of source vertex indices
+            regularization: Regularization parameter ε (default 1e-6)
+
+        Returns:
+            Dict mapping source_idx -> (normalized_greens, residual_norm), or None for failed sources.
+        """
+        from neural_local_laplacian.utils.geodesic_utils import sparse_factorize
+
+        n = laplacian_matrix.shape[0]
+        L = ensure_psd(laplacian_matrix.astype(np.float64))
+
+        if mass_matrix is None:
+            M = scipy.sparse.eye(n, format='csr', dtype=np.float64)
+        else:
+            M = mass_matrix.astype(np.float64)
+
+        # Adaptive regularization based on Laplacian scale
+        diag = np.array(L.diagonal()).flatten()
+        L_scale = np.abs(diag).mean() if len(diag) > 0 else 1.0
+        adaptive_reg = regularization * max(L_scale, 1e-4)
+
+        A = L + adaptive_reg * M
+
+        # Factorize ONCE
+        try:
+            factor = sparse_factorize(A)
+        except Exception as e:
+            print(f"  [!] Green's function batch factorization failed: {e}")
+            return {src: None for src in source_indices}
+
+        M_diag = np.array(M.diagonal()).flatten()
+        total_mass = M_diag.sum()
+
+        results = {}
+        for source_idx in source_indices:
+            try:
+                delta = np.zeros(n, dtype=np.float64)
+                delta[source_idx] = 1.0
+                g_raw = factor.solve(delta)
+
+                if not np.isfinite(g_raw).all():
+                    results[source_idx] = None
+                    continue
+
+                # Residual before normalization
+                Lg = L @ g_raw
+                residual_norm = float(np.linalg.norm(Lg - delta) / np.linalg.norm(delta))
+
+                # Normalize: remove mean, shift min=0, scale max=1
+                if total_mass > 0:
+                    g = g_raw - (g_raw * M_diag).sum() / total_mass
+                else:
+                    g = g_raw - g_raw.mean()
+                g = g - g.min()
+                if g.max() > 0:
+                    g = g / g.max()
+
+                results[source_idx] = (g, residual_norm)
+            except Exception:
+                results[source_idx] = None
+
+        return results
+
     def validate_maximum_principle(
             self,
             greens_function: np.ndarray,
@@ -6764,220 +6846,243 @@ class RealTimeEigenanalysisVisualizer:
             src_pos = gt_data['vertices'][first_src:first_src + 1]
             ps.register_point_cloud("Source Vertex", src_pos, radius=0.025, color=(0.6, 0.0, 0.8))
 
-        # STEP 8: Green's function maximum principle validation
-        # (Uses first source for full Polyscope visualization)
+        # =====================================================================
+        # STEP 8: Green's function validation (all sources, batched)
+        # =====================================================================
         _mark_step("step8_greens")
-        print(f"\nSTEP 8: Green's function maximum principle validation")
-        L_gt = None
-        M_gt = None
-        L_pred = None
-        M_pred = None
-        L_robust = None
-        M_robust = None
+        print(f"\nSTEP 8: Green's function validation ({len(self._source_indices)} sources)")
+
         try:
-            greens_results = self.compute_and_visualize_greens_functions(
-                mesh_structure, gt_data, inference_result,
-                source_vertex_idx=self._source_indices[0]  # First source for viz
-            )
-            # Store results in both old (display) and new (multi-source) structures
-            self.current_greens_results = greens_results
-            first_src = self._source_indices[0]
-            self._all_greens_results[first_src] = dict(greens_results) if greens_results else {}
+            all_sources = self._source_indices
+            vertices_for_greens = gt_data['vertices']
+            faces_for_greens = gt_data['faces']
+
+            # Get L,M for each method
+            method_LM = {}
+            for mk in ['GT', 'PRED', 'Robust', 'NeLo']:
+                method_LM[mk] = self._get_method_L_M(mk)
+
+            # Batch Green's function: factorize once per method, solve all sources
+            for method_key in ['GT', 'PRED', 'Robust', 'NeLo']:
+                Lm, Mm = method_LM[method_key]
+                if Lm is None:
+                    continue
+
+                _t = time.perf_counter()
+                batch_results = self.compute_greens_function_batch(Lm, Mm, all_sources)
+                elapsed = time.perf_counter() - _t
+
+                # Store timing
+                time_field = {'GT': 'gt_greens_solve_time', 'PRED': 'pred_greens_solve_time',
+                              'Robust': 'robust_greens_solve_time', 'NeLo': 'nelo_greens_solve_time'}
+                if method_key in time_field:
+                    setattr(self.timing_results, time_field[method_key], elapsed)
+
+                # Process results for each source
+                for src_idx in all_sources:
+                    result = batch_results.get(src_idx)
+                    if result is None:
+                        continue
+                    greens_values, residual = result
+
+                    # Store GT Green's for correlation comparison
+                    if method_key == 'GT':
+                        self._greens_gt_values[src_idx] = greens_values
+
+                    # Validate maximum principle
+                    gt_greens = self._greens_gt_values.get(src_idx)
+                    validation = self.validate_maximum_principle(
+                        greens_values, src_idx, method_key,
+                        vertices=vertices_for_greens, faces=faces_for_greens,
+                        laplacian_residual_norm=residual,
+                        gt_greens_function=gt_greens
+                    )
+                    if src_idx not in self._all_greens_results:
+                        self._all_greens_results[src_idx] = {}
+                    self._all_greens_results[src_idx][method_key] = validation
+                    if src_idx not in self._all_greens_values:
+                        self._all_greens_values[src_idx] = {}
+                    self._all_greens_values[src_idx][method_key] = greens_values
+
+                n_ok = sum(1 for s in all_sources if batch_results.get(s) is not None)
+                print(f"  {method_key}: {n_ok}/{len(all_sources)} sources in {elapsed*1000:.1f} ms")
+
+            # Set current display results (first source)
+            first_src = all_sources[0]
+            if first_src in self._all_greens_results:
+                self.current_greens_results = self._all_greens_results[first_src]
+
+            # Aggregate
+            self._aggregate_greens_metrics()
+
+            # Visualization for first source (visual mode only)
+            if not self._quantitative_mode and mesh_structure is not None:
+                for method_key in ['GT', 'PRED', 'Robust', 'NeLo']:
+                    greens_vals = (self._all_greens_values.get(first_src) or {}).get(method_key)
+                    if greens_vals is not None:
+                        mesh_structure.add_scalar_quantity(
+                            name=f"J1 Green's Function - {method_key}",
+                            values=greens_vals, enabled=False, cmap='viridis'
+                        )
+
         except Exception as e:
             print(f"  [!] Green's function validation failed: {e}")
             import traceback
             traceback.print_exc()
 
-        # STEP 9: Heat Method Geodesic Distance Validation
+        # =====================================================================
+        # STEP 9: Heat Method Geodesic Distance Validation (all sources, batched)
+        # =====================================================================
         _mark_step("step9_geodesic")
-        print(f"\nSTEP 9: Heat Method geodesic distance validation")
+        print(f"\nSTEP 9: Heat Method geodesic distance validation ({len(self._source_indices)} sources)")
+
         try:
             vertices = gt_data['vertices']
             faces = gt_data['faces']
+            n = len(vertices)
+            all_sources = self._source_indices
 
-            # Build Laplacians for Step 9
-            # GT Laplacian
+            operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
+
+            # ---- Build gradient operators once ----
+            gt_grad_div_fn = None
+            gt_t = None
+            L_gt_geo, M_gt_geo = None, None
             if HAS_IGL:
                 V = vertices.astype(np.float64)
                 F = faces.astype(np.int32)
-                L_gt = -igl.cotmatrix(V, F)  # Negate for positive semi-definite
-                M_gt = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+                L_gt_geo = -igl.cotmatrix(V, F)
+                M_gt_geo = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+                mesh_grad_op = igl.grad(V, F)
+                mesh_face_areas = igl.doublearea(V, F).flatten() / 2.0
+                gt_grad_div_fn = make_grad_div_mesh(mesh_grad_op, mesh_face_areas)
+                gt_t = (1.52 * np.sqrt(mesh_face_areas.mean())) ** 2
 
-            # PRED Laplacian
-            if inference_result.get('stiffness_matrix') is not None:
-                L_pred = inference_result['stiffness_matrix']
-                M_pred = inference_result.get('mass_matrix')
+            pred_grad_div_fn = None
+            L_pred_geo = inference_result.get('stiffness_matrix')
+            M_pred_geo = inference_result.get('mass_matrix')
+            if L_pred_geo is not None and M_pred_geo is not None:
+                if operator_mode == 'gradient' and self.current_learned_gradient_op is not None:
+                    pred_grad_div_fn = make_grad_div_learned(self.current_learned_gradient_op, M_pred_geo)
+                elif self._pc_grad_op is not None and self._pc_div_op is not None:
+                    pred_grad_div_fn = make_grad_div_pointcloud(self._pc_grad_op, self._pc_div_op)
 
-            # Robust Laplacian
+            nelo_grad_div_fn = None
+            L_nelo_geo = self.current_nelo_L
+            M_nelo_geo = self.current_nelo_M
+            if L_nelo_geo is not None and M_nelo_geo is not None and self._pc_grad_op is not None:
+                nelo_grad_div_fn = make_grad_div_pointcloud(self._pc_grad_op, self._pc_div_op)
+
+            # ---- Batch geodesics for GT, PRED, NeLo ----
+            geodesic_times = {}
+
+            for method_key, S, M_mat, fn, t_override in [
+                ('GT',   L_gt_geo,   M_gt_geo,   gt_grad_div_fn,   gt_t),
+                ('PRED', L_pred_geo, M_pred_geo, pred_grad_div_fn, None),
+                ('NeLo', L_nelo_geo, M_nelo_geo, nelo_grad_div_fn, None),
+            ]:
+                if S is None or M_mat is None or fn is None:
+                    continue
+                _t = time.perf_counter()
+                results = compute_heat_geodesics_batch(S, M_mat, all_sources, n, fn, t=t_override)
+                elapsed = time.perf_counter() - _t
+                geodesic_times[method_key] = elapsed
+                for i, src_idx in enumerate(all_sources):
+                    if results[i] is not None:
+                        if src_idx not in self._all_geodesic_distances:
+                            self._all_geodesic_distances[src_idx] = {}
+                        self._all_geodesic_distances[src_idx][method_key] = results[i]
+                print(f"  {method_key}: {len(all_sources)} sources in {elapsed*1000:.1f} ms "
+                      f"({elapsed/len(all_sources)*1000:.1f} ms/source)")
+
+            # ---- Robust: pp3d per-source (has its own internal C++ solver) ----
             if not self._skip_robust:
-                k = self.reconstruction_settings.current_robust_k
-                L_robust, M_robust = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=k)
+                import potpourri3d as pp3d
+                _t = time.perf_counter()
+                pc_solver = pp3d.PointCloudHeatSolver(vertices)
+                for src_idx in all_sources:
+                    try:
+                        d = pc_solver.compute_distance(src_idx)
+                        if src_idx not in self._all_geodesic_distances:
+                            self._all_geodesic_distances[src_idx] = {}
+                        self._all_geodesic_distances[src_idx]['Robust (pp3d)'] = d
+                    except Exception:
+                        pass
+                elapsed = time.perf_counter() - _t
+                geodesic_times['Robust'] = elapsed
+                print(f"  Robust (pp3d): {len(all_sources)} sources in {elapsed*1000:.1f} ms "
+                      f"({elapsed/len(all_sources)*1000:.1f} ms/source)")
 
-            # Run Heat Method geodesic validation (first source for full viz)
-            heat_geodesic_results = self.validate_heat_method_geodesics_step9(
-                vertices=vertices,
-                faces=faces,
-                L_gt=L_gt,
-                M_gt=M_gt,
-                L_pred=L_pred,
-                M_pred=M_pred,
-                L_robust=L_robust,
-                M_robust=M_robust,
-                source_vertex_idx=self._source_indices[0],
-                mesh_structure=mesh_structure,
-                k_neighbors=self.reconstruction_settings.current_pred_k
-            )
-            self.current_heat_geodesic_results = heat_geodesic_results
+            # ---- Store timing ----
+            if 'GT' in geodesic_times:
+                self.timing_results.gt_geodesic_solve_time = geodesic_times['GT']
+            if 'PRED' in geodesic_times:
+                self.timing_results.pred_geodesic_solve_time = geodesic_times['PRED']
+            if 'Robust' in geodesic_times:
+                self.timing_results.robust_geodesic_solve_time = geodesic_times['Robust']
+            if 'NeLo' in geodesic_times:
+                self.timing_results.nelo_geodesic_solve_time = geodesic_times['NeLo']
 
-            # Store first source results in multi-source structure
+            # ---- Compute metrics for all sources ----
+            for src_idx in all_sources:
+                exact_distances = self._exact_geodesics.get(src_idx)
+                if exact_distances is None:
+                    continue
+                src_dists = self._all_geodesic_distances.get(src_idx, {})
+                for method_key, distances in src_dists.items():
+                    metrics = compute_geodesic_metrics(distances, exact_distances)
+                    result = HeatMethodGeodesicResult(
+                        method_name=method_key,
+                        source_vertex_idx=src_idx,
+                        num_vertices=n,
+                        min_distance=float(distances.min()),
+                        max_distance=float(distances.max()),
+                        mean_distance=float(distances.mean()),
+                        distance_at_source=float(distances[src_idx]),
+                        correlation_with_reference=float(metrics.correlation),
+                        mean_absolute_error=float(metrics.mae_normalized),
+                        max_absolute_error=float(metrics.max_error_normalized),
+                        relative_error_percent=float(metrics.mae_normalized * 100),
+                        monotonicity_score=float(metrics.monotonicity),
+                    )
+                    if src_idx not in self._all_geodesic_results:
+                        self._all_geodesic_results[src_idx] = {}
+                    self._all_geodesic_results[src_idx][method_key] = result
+
+            # ---- Aggregate and display ----
+            self._aggregate_geodesic_metrics()
+            self._aggregate_greens_metrics()
             first_src = self._source_indices[0]
-            if heat_geodesic_results:
-                self._all_geodesic_results[first_src] = dict(heat_geodesic_results)
+            if first_src in self._all_geodesic_results:
+                self.current_heat_geodesic_results = self._all_geodesic_results[first_src]
+
+            self._print_multisource_summary()
+
+            # Visualization for first source (visual mode only)
+            if not self._quantitative_mode and mesh_structure is not None:
+                for method_key in list((self._all_geodesic_distances.get(first_src) or {}).keys()):
+                    distances = self._all_geodesic_distances[first_src][method_key]
+                    exact_distances = self._exact_geodesics.get(first_src)
+                    if distances is not None and exact_distances is not None:
+                        d_norm = normalize_distances(distances)
+                        is_bad = distances.max() > 1e3
+                        label_suffix = " [!]" if is_bad else ""
+                        cmap = 'hot' if is_bad else 'viridis'
+                        mesh_structure.add_scalar_quantity(
+                            name=f"K1 Geodesic (norm) - {method_key}{label_suffix}",
+                            values=d_norm, enabled=False, cmap=cmap
+                        )
+                        exact_norm = normalize_distances(exact_distances)
+                        error = np.abs(d_norm - exact_norm)
+                        mesh_structure.add_scalar_quantity(
+                            name=f"K2 Geodesic Error - {method_key}",
+                            values=error, enabled=False, cmap='hot'
+                        )
 
         except Exception as e:
             print(f"  [!] Heat Method geodesic validation failed: {e}")
             import traceback
             traceback.print_exc()
-
-        # STEP 9.5: Multi-source validation (remaining sources, metrics only)
-        _mark_step("step9_5_multisource")
-        if len(self._source_indices) > 1 and len(self._exact_geodesics) > 0:
-            print(f"\nSTEP 9.5: Multi-source validation ({len(self._source_indices) - 1} additional sources)")
-            try:
-                remaining_sources = self._source_indices[1:]
-
-                # Cache L/M per method once (avoid recomputing Robust Laplacian per source)
-                method_LM = {}
-                for mk in ['GT', 'PRED', 'Robust', 'NeLo']:
-                    method_LM[mk] = self._get_method_L_M(mk)
-
-                # Cache GT grad ops once
-                mesh_grad_op_ms = None
-                mesh_face_areas_ms = None
-                if HAS_IGL:
-                    V_ms = gt_data['vertices'].astype(np.float64)
-                    F_ms = gt_data['faces'].astype(np.int32)
-                    mesh_grad_op_ms = igl.grad(V_ms, F_ms)
-                    mesh_face_areas_ms = igl.doublearea(V_ms, F_ms).flatten() / 2.0
-
-                # Timing accumulators for additional sources
-                greens_time_accum = {}  # method -> total seconds
-                geodesic_time_accum = {}  # method -> total seconds
-
-                for src_idx in remaining_sources:
-                    exact_distances = self._exact_geodesics.get(src_idx)
-                    if exact_distances is None:
-                        continue
-
-                    # Green's function for all methods
-                    for method_key in ['GT', 'PRED', 'Robust', 'NeLo']:
-                        Lm, Mm = method_LM[method_key]
-                        if Lm is None:
-                            continue
-                        try:
-                            device = self.current_device if method_key in ('PRED', 'NeLo') else None
-                            _t = time.perf_counter()
-                            result = self.compute_greens_function(Lm, Mm, src_idx, device=device)
-                            elapsed = time.perf_counter() - _t
-                            greens_time_accum[method_key] = greens_time_accum.get(method_key, 0.0) + elapsed
-                            if result is not None:
-                                greens_values, residual = result
-                                gt_greens = self._greens_gt_values.get(src_idx)
-                                validation = self.validate_maximum_principle(
-                                    greens_values, src_idx, method_key,
-                                    vertices=gt_data['vertices'], faces=gt_data['faces'],
-                                    laplacian_residual_norm=residual,
-                                    gt_greens_function=gt_greens
-                                )
-                                if src_idx not in self._all_greens_results:
-                                    self._all_greens_results[src_idx] = {}
-                                self._all_greens_results[src_idx][method_key] = validation
-
-                                # Cache raw values for slider refresh
-                                if src_idx not in self._all_greens_values:
-                                    self._all_greens_values[src_idx] = {}
-                                self._all_greens_values[src_idx][method_key] = greens_values
-
-                                if method_key == 'GT':
-                                    self._greens_gt_values[src_idx] = greens_values
-                        except Exception:
-                            pass  # Silent failure for additional sources
-
-                    # Geodesics for all methods
-                    for method_key in ['GT', 'PRED', 'NeLo', 'Robust']:
-                        try:
-                            Lm, Mm = method_LM[method_key]
-                            if Lm is None and method_key != 'Robust':
-                                continue
-
-                            _t = time.perf_counter()
-                            distances = self._compute_geodesic_single_source(
-                                method_key, src_idx,
-                                gt_data['vertices'].astype(np.float64), Lm, Mm,
-                                mesh_grad_op=mesh_grad_op_ms if method_key == 'GT' else None,
-                                mesh_face_areas=mesh_face_areas_ms if method_key == 'GT' else None
-                            )
-                            elapsed = time.perf_counter() - _t
-                            geodesic_time_accum[method_key] = geodesic_time_accum.get(method_key, 0.0) + elapsed
-                            if distances is not None:
-                                result_key = method_key
-                                if method_key == "Robust" and not self._robust_geodesic_heat:
-                                    result_key = "Robust (pp3d)"
-                                metrics = compute_geodesic_metrics(distances, exact_distances)
-                                n_verts = len(gt_data['vertices'])
-                                result = HeatMethodGeodesicResult(
-                                    method_name=result_key,
-                                    source_vertex_idx=src_idx,
-                                    num_vertices=n_verts,
-                                    min_distance=float(distances.min()),
-                                    max_distance=float(distances.max()),
-                                    mean_distance=float(distances.mean()),
-                                    distance_at_source=float(distances[src_idx]),
-                                    correlation_with_reference=float(metrics.correlation),
-                                    mean_absolute_error=float(metrics.mae_normalized),
-                                    max_absolute_error=float(metrics.max_error_normalized),
-                                    relative_error_percent=float(metrics.mae_normalized * 100),
-                                    monotonicity_score=float(metrics.monotonicity),
-                                )
-                                if src_idx not in self._all_geodesic_results:
-                                    self._all_geodesic_results[src_idx] = {}
-                                self._all_geodesic_results[src_idx][result_key] = result
-
-                                # Cache raw distances for slider refresh
-                                if src_idx not in self._all_geodesic_distances:
-                                    self._all_geodesic_distances[src_idx] = {}
-                                self._all_geodesic_distances[src_idx][result_key] = distances
-                        except Exception:
-                            pass  # Silent failure for additional sources
-
-                    print(f"  Source {src_idx}: done")
-
-                # Accumulate timing from additional sources into timing fields
-                greens_field_map = {'GT': 'gt_greens_solve_time', 'PRED': 'pred_greens_solve_time',
-                                    'Robust': 'robust_greens_solve_time', 'NeLo': 'nelo_greens_solve_time'}
-                for mk, field in greens_field_map.items():
-                    if mk in greens_time_accum:
-                        current = getattr(self.timing_results, field, 0.0)
-                        setattr(self.timing_results, field, current + greens_time_accum[mk])
-
-                geodesic_field_map = {'GT': 'gt_geodesic_solve_time', 'PRED': 'pred_geodesic_solve_time',
-                                      'Robust': 'robust_geodesic_solve_time', 'NeLo': 'nelo_geodesic_solve_time'}
-                for mk, field in geodesic_field_map.items():
-                    if mk in geodesic_time_accum:
-                        current = getattr(self.timing_results, field, 0.0)
-                        setattr(self.timing_results, field, current + geodesic_time_accum[mk])
-
-                # Aggregate all sources
-                self._aggregate_greens_metrics()
-                self._aggregate_geodesic_metrics()
-
-                # Print aggregated summary
-                self._print_multisource_summary()
-
-            except Exception as e:
-                print(f"  [!] Multi-source validation failed: {e}")
-                import traceback
-                traceback.print_exc()
 
         # STEP 9.6: Probe function MSE (Lf error, NeLo paper Table 1 metric)
         _mark_step("step9_6_probe")
