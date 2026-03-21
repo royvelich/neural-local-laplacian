@@ -803,8 +803,11 @@ def compute_heat_geodesic_learned_batch(
     """
     Compute geodesic distances from multiple sources using learned operators.
 
-    Factorizes (M + tS + eps*I) and (S + eps*I) ONCE, then solves for each source.
-    ~Nx faster than calling compute_heat_geodesic_learned N times.
+    Factorizes (M + tS + eps*I) and (S + eps*I) ONCE each, solving all sources
+    in two passes to avoid re-factorization with shared solvers (pypardiso).
+
+    Pass 1: Factorize heat matrix, solve all sources → get gradient fields
+    Pass 2: Factorize Poisson matrix, solve all sources → get distances
 
     Args:
         S: One-ring stiffness matrix (N, N)
@@ -819,6 +822,7 @@ def compute_heat_geodesic_learned_batch(
         List of geodesic distances (N,) per source, or None for failed sources
     """
     n = n_vertices
+    num_sources = len(source_indices)
 
     # Ensure float64 for numerical stability
     S = ensure_psd(S.astype(np.float64))
@@ -840,42 +844,59 @@ def compute_heat_geodesic_learned_batch(
     areas_diag = np.array(M.diagonal()).flatten()
     M_3 = np.repeat(areas_diag, 3)  # (3N,)
 
-    # Factorize ONCE — these are the expensive operations
     A = M + t * S + eps * scipy.sparse.eye(n)
     S_reg = S + eps * scipy.sparse.eye(n)
 
+    # ---- Pass 1: Heat diffusion (one factorization, N solves) ----
     try:
         heat_factor = sparse_factorize(A, spd=True)
     except Exception as e:
         print(f"Heat Method (learned batch): heat factorization failed: {e}")
-        return [None] * len(source_indices)
+        return [None] * num_sources
 
-    try:
-        poisson_factor = sparse_factorize(S_reg, spd=True)
-    except Exception as e:
-        print(f"Heat Method (learned batch): Poisson factorization failed: {e}")
-        return [None] * len(source_indices)
+    # Solve heat for all sources, compute normalized gradient fields
+    rhs_list = []  # Poisson RHS per source
+    failed = [False] * num_sources
 
-    # Solve for each source (cheap — just forward/back substitution)
-    results = []
-    for source_idx in source_indices:
+    for i, source_idx in enumerate(source_indices):
         try:
-            # Step 1: Heat diffusion (reuses factorization)
             delta = np.zeros(n)
             delta[source_idx] = 1.0
             u = heat_factor.solve(delta)
 
             if not np.all(np.isfinite(u)):
-                results.append(None)
+                failed[i] = True
+                rhs_list.append(None)
                 continue
 
-            # Step 2: Gradient + normalize
+            # Gradient + normalize
             grad_u = (G @ u).reshape(-1, 3)
             norms = np.maximum(np.linalg.norm(grad_u, axis=1, keepdims=True), 1e-10)
             X = -grad_u / norms
 
-            # Step 3: Poisson solve (reuses factorization, ±rhs)
-            rhs = G.T @ (M_3 * X.flatten())
+            # Compute Poisson RHS (store for pass 2)
+            rhs_list.append(G.T @ (M_3 * X.flatten()))
+
+        except Exception as e:
+            print(f"Heat Method (learned batch) heat solve source {source_idx} failed: {e}")
+            failed[i] = True
+            rhs_list.append(None)
+
+    # ---- Pass 2: Poisson solve (one factorization, N solves) ----
+    try:
+        poisson_factor = sparse_factorize(S_reg, spd=True)
+    except Exception as e:
+        print(f"Heat Method (learned batch): Poisson factorization failed: {e}")
+        return [None] * num_sources
+
+    results = []
+    for i, source_idx in enumerate(source_indices):
+        if failed[i] or rhs_list[i] is None:
+            results.append(None)
+            continue
+
+        try:
+            rhs = rhs_list[i]
             phi_pos = poisson_factor.solve(rhs)
             phi_neg = poisson_factor.solve(-rhs)
 
@@ -883,7 +904,6 @@ def compute_heat_geodesic_learned_batch(
                 results.append(None)
                 continue
 
-            # Pick the sign where source is closest to the minimum
             phi_pos_shifted = phi_pos - phi_pos.min() if np.all(np.isfinite(phi_pos)) else np.full(n, np.inf)
             phi_neg_shifted = phi_neg - phi_neg.min() if np.all(np.isfinite(phi_neg)) else np.full(n, np.inf)
 
@@ -894,7 +914,7 @@ def compute_heat_geodesic_learned_batch(
             results.append(phi)
 
         except Exception as e:
-            print(f"Heat Method (learned batch) source {source_idx} failed: {e}")
+            print(f"Heat Method (learned batch) Poisson source {source_idx} failed: {e}")
             results.append(None)
 
     return results
