@@ -6450,6 +6450,18 @@ class RealTimeEigenanalysisVisualizer:
         print(f"PROCESSING BATCH {batch_idx + 1}")
         print('=' * 80)
 
+        # Step-level timing tracker
+        _step_times = {}
+        _step_t0 = time.perf_counter()
+        _current_step = "init"
+
+        def _mark_step(name):
+            nonlocal _step_t0, _current_step
+            elapsed = time.perf_counter() - _step_t0
+            _step_times[_current_step] = elapsed
+            _current_step = name
+            _step_t0 = time.perf_counter()
+
         # Clear previous visualization and tracking (only if polyscope is active)
         if not self._quantitative_mode:
             ps.remove_all_structures()
@@ -6473,6 +6485,7 @@ class RealTimeEigenanalysisVisualizer:
         self._clear_stored_references()
 
         # STEP 1: Extract mesh data from batch
+        _mark_step("step1_extract")
         print("STEP 1: Extracting mesh data from batch")
 
         # Handle case where batch_data is a list (from MeshDataset)
@@ -6501,6 +6514,7 @@ class RealTimeEigenanalysisVisualizer:
         print(f"Dataset k: {original_k}")
 
         # STEP 2: Load original mesh for GT computation
+        _mark_step("step2_gt_load")
         print(f"\nSTEP 2: Loading original mesh for GT computation")
         gt_data = self.load_original_mesh_for_gt(mesh_file_path)
 
@@ -6512,6 +6526,7 @@ class RealTimeEigenanalysisVisualizer:
 
         # STEP 2.5: Build patches with PRED k using GPU kNN
         pred_k = self._initial_k_pred
+        _mark_step("step2_5_patches")
         print(f"\nSTEP 2.5: Extracting patches with k={pred_k} (for timing comparison)...")
 
         # Cache vertices tensor on GPU (reused for k-change updates)
@@ -6538,6 +6553,7 @@ class RealTimeEigenanalysisVisualizer:
         self.current_batch_indices = patch_data.patch_idx.to(device)
 
         # STEP 3: Model inference (use our extracted patches for consistent timing)
+        _mark_step("step3_inference")
         print(f"\nSTEP 3: Model inference")
         inference_result = self.perform_model_inference(model, patch_data, device)
 
@@ -6553,10 +6569,12 @@ class RealTimeEigenanalysisVisualizer:
         )
 
         # Compute GT matrix assembly timing (for fair comparison, time only matrix construction)
+        _mark_step("step3_5_gt_timing")
         print(f"\nSTEP 3.5: Computing GT matrix assembly timing...")
         self._compute_gt_matrices_timed(gt_data['vertices'], gt_data['faces'])
 
         # STEP 4: Compute predicted quantities
+        _mark_step("step4_predicted")
         print(f"\nSTEP 4: Computing predicted quantities")
         predicted_data = self.compute_predicted_quantities_from_laplacian(
             inference_result['stiffness_matrix'], gt_data['vertices'],
@@ -6618,6 +6636,7 @@ class RealTimeEigenanalysisVisualizer:
 
         # STEP 5.5: Compute robust-laplacian with point_cloud_laplacian using robust k
         robust_k = self._initial_k_robust
+        _mark_step("step5_5_robust")
         print(f"\nSTEP 5.5: Computing robust-laplacian with k={robust_k}...")
         robust_eigenvalues, robust_eigenvectors, robust_vertex_areas = self._compute_robust_laplacian_with_k(
             gt_data['vertices'], robust_k
@@ -6627,8 +6646,10 @@ class RealTimeEigenanalysisVisualizer:
         gt_data['robust_vertex_areas'] = robust_vertex_areas
 
         # STEP 5.6: Compute Laplacian sparsity comparison
+        _mark_step("step5_6_sparsity")
         print(f"\nSTEP 5.6: Computing Laplacian sparsity comparison...")
 
+        _mark_step("step5_7_nelo")
         # STEP 5.7: NeLo inference
         self.current_nelo_L = None
         self.current_nelo_M = None
@@ -6655,6 +6676,7 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print("\nSTEP 5.7: NeLo skipped (pipeline not loaded)")
         self._compute_and_store_all_sparsity_stats()
+        _mark_step("step6_eigen_viz")
         if not self._quantitative_mode:
             print(f"\nSTEP 6: Creating comprehensive visualization")
             mesh_structure = self.visualize_mesh(gt_data['vertices'], gt_data['gt_vertex_normals'], gt_data['faces'])
@@ -6734,6 +6756,7 @@ class RealTimeEigenanalysisVisualizer:
         self._all_greens_values = {}
         self._all_geodesic_distances = {}
         self._current_source_display_idx = 0
+        _mark_step("step7_5_sources")
         print(f"\nSelected {len(self._source_indices)} source vertices (FPS): {self._source_indices}")
 
         # Precompute exact geodesics for all sources
@@ -6752,6 +6775,7 @@ class RealTimeEigenanalysisVisualizer:
 
         # STEP 8: Green's function maximum principle validation
         # (Uses first source for full Polyscope visualization)
+        _mark_step("step8_greens")
         print(f"\nSTEP 8: Green's function maximum principle validation")
         L_gt = None
         M_gt = None
@@ -6774,6 +6798,7 @@ class RealTimeEigenanalysisVisualizer:
             traceback.print_exc()
 
         # STEP 9: Heat Method Geodesic Distance Validation
+        _mark_step("step9_geodesic")
         print(f"\nSTEP 9: Heat Method geodesic distance validation")
         try:
             vertices = gt_data['vertices']
@@ -6824,6 +6849,7 @@ class RealTimeEigenanalysisVisualizer:
             traceback.print_exc()
 
         # STEP 9.5: Multi-source validation (remaining sources, metrics only)
+        _mark_step("step9_5_multisource")
         if len(self._source_indices) > 1 and len(self._exact_geodesics) > 0:
             print(f"\nSTEP 9.5: Multi-source validation ({len(self._source_indices) - 1} additional sources)")
             try:
@@ -6963,6 +6989,7 @@ class RealTimeEigenanalysisVisualizer:
                 traceback.print_exc()
 
         # STEP 9.6: Probe function MSE (Lf error, NeLo paper Table 1 metric)
+        _mark_step("step9_6_probe")
         print(f"\nSTEP 9.6: Probe function MSE (Lf error)")
         try:
             self._compute_probe_function_mse()
@@ -6978,6 +7005,7 @@ class RealTimeEigenanalysisVisualizer:
         except Exception as e:
             print(f"  [!] Weyl calibration failed: {e}")
 
+        _mark_step("step9_7_descriptors")
         print(f"\nSTEP 9.7: Shape descriptor comparison (HKS / WKS)")
         try:
             self._compute_descriptor_comparison()
@@ -6987,6 +7015,7 @@ class RealTimeEigenanalysisVisualizer:
             traceback.print_exc()
 
         # STEP 9.8: Spectral mesh compression error
+        _mark_step("step9_8_compression")
         print(f"\nSTEP 9.8: Spectral compression error")
         try:
             self._compute_spectral_compression_error()
@@ -6997,6 +7026,20 @@ class RealTimeEigenanalysisVisualizer:
 
         # Print timing summary to console
         self._print_timing_summary()
+
+        # Print step-level timing breakdown
+        _mark_step("done")
+        print(f"\n{'=' * 60}")
+        print(f"STEP TIMING BREAKDOWN")
+        print(f"{'=' * 60}")
+        total = sum(_step_times.values())
+        for step_name, elapsed in _step_times.items():
+            if step_name == "init":
+                continue
+            pct = (elapsed / total * 100) if total > 0 else 0
+            print(f"  {step_name:<30s} {elapsed:>8.1f}s  ({pct:>5.1f}%)")
+        print(f"  {'TOTAL':<30s} {total:>8.1f}s")
+        print(f"{'=' * 60}")
 
         print(f"\n[OK] Comprehensive visualization completed for {Path(mesh_file_path).name}")
         return True
