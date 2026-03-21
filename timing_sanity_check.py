@@ -240,7 +240,7 @@ def main(cfg: DictConfig) -> None:
             t_pred_prefactor = time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            _ = heat_method_solve(prefactored, source_indices)
+            _ = heat_method_solve(prefactored, source_indices, verbose=True)
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             t_pred_solve = time.perf_counter() - t0

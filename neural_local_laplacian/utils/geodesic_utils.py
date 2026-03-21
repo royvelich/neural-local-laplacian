@@ -470,6 +470,7 @@ def heat_method_prefactorize(
 def heat_method_solve(
     prefactored: HeatMethodPrefactored,
     source_indices: List[int],
+    verbose: bool = False,
 ) -> List[Optional[np.ndarray]]:
     """
     Solve for geodesic distances from multiple sources using prefactored systems.
@@ -479,15 +480,22 @@ def heat_method_solve(
     Args:
         prefactored: HeatMethodPrefactored from heat_method_prefactorize()
         source_indices: List of source vertex indices
+        verbose: If True, print internal timing breakdown
 
     Returns:
         List of geodesic distances (N,) per source, or None for failed sources.
     """
+    import time as _time
+
     n = prefactored.n
     heat_factor = prefactored.heat_factor
     poisson_factor = prefactored.poisson_factor
     grad_and_div_fn = prefactored.grad_and_div_fn
     num_sources = len(source_indices)
+
+    _t_heat = 0.0
+    _t_grad = 0.0
+    _t_poisson = 0.0
 
     # ---- Pass 1: Heat diffusion ----
     rhs_list = []
@@ -497,14 +505,19 @@ def heat_method_solve(
         try:
             delta = np.zeros(n)
             delta[source_idx] = 1.0
+
+            _t0 = _time.perf_counter()
             u = heat_factor.solve(delta)
+            _t_heat += _time.perf_counter() - _t0
 
             if not np.all(np.isfinite(u)):
                 failed[i] = True
                 rhs_list.append(None)
                 continue
 
+            _t0 = _time.perf_counter()
             rhs_list.append(grad_and_div_fn(u))
+            _t_grad += _time.perf_counter() - _t0
 
         except Exception:
             failed[i] = True
@@ -519,8 +532,11 @@ def heat_method_solve(
 
         try:
             rhs = rhs_list[i]
+
+            _t0 = _time.perf_counter()
             phi_pos = poisson_factor.solve(rhs)
             phi_neg = poisson_factor.solve(-rhs)
+            _t_poisson += _time.perf_counter() - _t0
 
             if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
                 results.append(None)
@@ -537,6 +553,12 @@ def heat_method_solve(
 
         except Exception:
             results.append(None)
+
+    if verbose:
+        total = _t_heat + _t_grad + _t_poisson
+        print(f"    [heat_method_solve] {num_sources} sources: "
+              f"heat={_t_heat*1000:.1f}ms, grad_div={_t_grad*1000:.1f}ms, "
+              f"poisson={_t_poisson*1000:.1f}ms, total={total*1000:.1f}ms")
 
     return results
 
