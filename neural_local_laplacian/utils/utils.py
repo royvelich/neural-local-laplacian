@@ -773,3 +773,61 @@ def compute_laplacian_eigendecomposition(
     eigenvectors = eigenvectors[:, sort_idx]
 
     return eigenvalues, eigenvectors
+
+
+def cuda_warmup(model, device: torch.device, k: int):
+    """
+    CUDA warmup: single forward pass + assembly + gradient op.
+
+    Eliminates first-mesh cold start (~300ms) by warming up cuBLAS algorithm
+    selection and scatter op kernels. Call once after model loading.
+
+    Args:
+        model: LaplacianTransformerModule in eval mode on device
+        device: CUDA device
+        k: Number of neighbors (should match pred_k)
+    """
+    if device.type != 'cuda':
+        return
+
+    from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
+
+    num_patches = 10000
+    print(f"[INFO] Running CUDA warmup (N={num_patches}, k={k})...")
+
+    warmup_data = MeshPatchData(
+        pos=torch.randn(num_patches * k, 3, device=device),
+        x=torch.randn(num_patches * k, 3, device=device),
+        patch_idx=torch.arange(num_patches, device=device).repeat_interleave(k),
+        vertex_indices=torch.randint(0, num_patches, (num_patches * k,), device=device),
+        center_indices=torch.arange(num_patches, device=device),
+    )
+
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    with torch.no_grad():
+        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+            warmup_result = model._forward_pass(warmup_data)
+        torch.cuda.synchronize()
+
+    # Warmup assembly (scatter ops have their own cold start)
+    _ = assemble_stiffness_and_mass_matrices(
+        warmup_result['stiffness_weights'].float(),
+        warmup_result['areas'].float(),
+        warmup_result['attention_mask'],
+        warmup_data.vertex_indices,
+        warmup_data.center_indices,
+        warmup_data.patch_idx,
+    )
+    if warmup_result.get('grad_coeffs') is not None:
+        _ = assemble_gradient_operator(
+            grad_coeffs=warmup_result['grad_coeffs'],
+            attention_mask=warmup_result['attention_mask'],
+            vertex_indices=warmup_data.vertex_indices,
+            center_indices=warmup_data.center_indices,
+            batch_indices=warmup_data.patch_idx,
+        )
+    torch.cuda.synchronize()
+
+    del warmup_data, warmup_result
+    torch.cuda.empty_cache()
+    print("[OK] CUDA warmup complete")

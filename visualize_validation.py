@@ -72,11 +72,13 @@ from neural_local_laplacian.utils.utils import (
     assemble_gradient_operator,
     compute_laplacian_eigendecomposition,
     build_patches_from_vertices,
-    set_knn_backend
+    set_knn_backend,
+    cuda_warmup,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_pointcloud,
     compute_heat_geodesic_learned,
+    compute_heat_geodesic_learned_batch,
     compute_heat_geodesic_mesh,
     compute_geodesic_metrics,
     compute_exact_geodesics,
@@ -1669,42 +1671,80 @@ class RealTimeEigenanalysisVisualizer:
             n_sources = len(self._source_indices)
             print(f"\nRecomputing Heat Method geodesic for {method_key} ({n_sources} sources)...")
 
+            operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
+
             _t_solve = time.perf_counter()
-            for source_idx in self._source_indices:
-                exact_distances = self._exact_geodesics.get(source_idx)
-                if exact_distances is None:
-                    continue
 
-                distances = self._compute_geodesic_single_source(
-                    method_key, source_idx, vertices, L, M,
-                    mesh_grad_op=mesh_grad_op, mesh_face_areas=mesh_face_areas
+            # Use batch solve for PRED with gradient operator (factorize once, solve N times)
+            if (method_key == 'PRED' and operator_mode == 'gradient'
+                    and self.current_learned_gradient_op is not None and L is not None and M is not None):
+                all_distances = compute_heat_geodesic_learned_batch(
+                    S=L, M=M, G=self.current_learned_gradient_op,
+                    source_indices=self._source_indices, n_vertices=n,
+                    device=self.current_device,
                 )
+                for i, source_idx in enumerate(self._source_indices):
+                    distances = all_distances[i]
+                    exact_distances = self._exact_geodesics.get(source_idx)
+                    if distances is not None and exact_distances is not None:
+                        metrics = compute_geodesic_metrics(distances, exact_distances)
+                        result = HeatMethodGeodesicResult(
+                            method_name=result_key,
+                            source_vertex_idx=source_idx,
+                            num_vertices=n,
+                            min_distance=float(distances.min()),
+                            max_distance=float(distances.max()),
+                            mean_distance=float(distances.mean()),
+                            distance_at_source=float(distances[source_idx]),
+                            correlation_with_reference=float(metrics.correlation),
+                            mean_absolute_error=float(metrics.mae_normalized),
+                            max_absolute_error=float(metrics.max_error_normalized),
+                            relative_error_percent=float(metrics.mae_normalized * 100),
+                            monotonicity_score=float(metrics.monotonicity),
+                        )
+                        if source_idx not in self._all_geodesic_results:
+                            self._all_geodesic_results[source_idx] = {}
+                        self._all_geodesic_results[source_idx][result_key] = result
+                        if source_idx not in self._all_geodesic_distances:
+                            self._all_geodesic_distances[source_idx] = {}
+                        self._all_geodesic_distances[source_idx][result_key] = distances
+            else:
+                # Per-source loop for other methods (GT, Robust, NeLo, PRED stiffness mode)
+                for source_idx in self._source_indices:
+                    exact_distances = self._exact_geodesics.get(source_idx)
+                    if exact_distances is None:
+                        continue
 
-                if distances is not None:
-                    metrics = compute_geodesic_metrics(distances, exact_distances)
-                    result = HeatMethodGeodesicResult(
-                        method_name=result_key,
-                        source_vertex_idx=source_idx,
-                        num_vertices=n,
-                        min_distance=float(distances.min()),
-                        max_distance=float(distances.max()),
-                        mean_distance=float(distances.mean()),
-                        distance_at_source=float(distances[source_idx]),
-                        correlation_with_reference=float(metrics.correlation),
-                        mean_absolute_error=float(metrics.mae_normalized),
-                        max_absolute_error=float(metrics.max_error_normalized),
-                        relative_error_percent=float(metrics.mae_normalized * 100),
-                        monotonicity_score=float(metrics.monotonicity),
+                    distances = self._compute_geodesic_single_source(
+                        method_key, source_idx, vertices, L, M,
+                        mesh_grad_op=mesh_grad_op, mesh_face_areas=mesh_face_areas
                     )
 
-                    if source_idx not in self._all_geodesic_results:
-                        self._all_geodesic_results[source_idx] = {}
-                    self._all_geodesic_results[source_idx][result_key] = result
+                    if distances is not None:
+                        metrics = compute_geodesic_metrics(distances, exact_distances)
+                        result = HeatMethodGeodesicResult(
+                            method_name=result_key,
+                            source_vertex_idx=source_idx,
+                            num_vertices=n,
+                            min_distance=float(distances.min()),
+                            max_distance=float(distances.max()),
+                            mean_distance=float(distances.mean()),
+                            distance_at_source=float(distances[source_idx]),
+                            correlation_with_reference=float(metrics.correlation),
+                            mean_absolute_error=float(metrics.mae_normalized),
+                            max_absolute_error=float(metrics.max_error_normalized),
+                            relative_error_percent=float(metrics.mae_normalized * 100),
+                            monotonicity_score=float(metrics.monotonicity),
+                        )
 
-                    # Cache raw distances for slider refresh
-                    if source_idx not in self._all_geodesic_distances:
-                        self._all_geodesic_distances[source_idx] = {}
-                    self._all_geodesic_distances[source_idx][result_key] = distances
+                        if source_idx not in self._all_geodesic_results:
+                            self._all_geodesic_results[source_idx] = {}
+                        self._all_geodesic_results[source_idx][result_key] = result
+
+                        # Cache raw distances for slider refresh
+                        if source_idx not in self._all_geodesic_distances:
+                            self._all_geodesic_distances[source_idx] = {}
+                        self._all_geodesic_distances[source_idx][result_key] = distances
 
             solve_elapsed = time.perf_counter() - _t_solve
 
@@ -1866,8 +1906,9 @@ class RealTimeEigenanalysisVisualizer:
         import gc
         gc.collect()
 
-        # Clear CUDA cache again after gc
-        if torch.cuda.is_available():
+        # Clear CUDA cache after gc — only in visual mode.
+        # In quantitative mode, keep allocator warm for fast subsequent inferences.
+        if torch.cuda.is_available() and not self._quantitative_mode:
             torch.cuda.empty_cache()
 
     def _compute_predicted_vertex_areas(self, inference_result: Dict) -> Optional[np.ndarray]:
@@ -3314,7 +3355,7 @@ class RealTimeEigenanalysisVisualizer:
         except Exception as e:
             print(f"  Warning: Failed to remove some reconstruction structures: {e}")
 
-    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig, use_torch_compile: bool = True, diagnostic_mode: bool = False) -> LaplacianTransformerModule:
+    def load_trained_model(self, ckpt_path: Path, device: torch.device, cfg: DictConfig) -> LaplacianTransformerModule:
         """
         Load trained LaplacianTransformerModule from checkpoint.
 
@@ -3322,16 +3363,10 @@ class RealTimeEigenanalysisVisualizer:
             ckpt_path: Path to the checkpoint file
             device: Device to load the model on
             cfg: Hydra config containing model configuration
-            use_torch_compile: Whether to use torch.compile() for faster inference
-            diagnostic_mode: If True, disables optimizations for debugging timing issues
 
         Returns:
             Loaded model in evaluation mode
         """
-        if diagnostic_mode:
-            print("[DIAGNOSTIC MODE] Disabling torch.compile for debugging")
-            use_torch_compile = False
-
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
 
@@ -3357,19 +3392,6 @@ class RealTimeEigenanalysisVisualizer:
             # Disable gradient checkpointing for inference (if present)
             # This ensures we don't have unnecessary overhead from checkpointing logic
             self._disable_gradient_checkpointing(model)
-
-            # Apply torch.compile() for faster inference (PyTorch 2.0+)
-            # Use dynamic=True to handle varying mesh sizes without recompilation
-            # Use fullgraph=False to allow graph breaks for better compatibility
-            if use_torch_compile:
-                try:
-                    print("Applying torch.compile() for optimized inference...")
-                    # dynamic=True: Allows varying input shapes without recompilation
-                    # fullgraph=False: Allows graph breaks for better compatibility with varying shapes
-                    model = torch.compile(model, mode="default", dynamic=True, fullgraph=False)
-                    print("[OK] torch.compile() applied (dynamic shapes enabled)")
-                except Exception as e:
-                    print(f"[!] torch.compile() failed, using eager mode: {e}")
 
             print(f"[OK] Model loaded successfully on {device}")
             print(f"   Model type: {type(model).__name__}")
@@ -3427,67 +3449,9 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print("  No gradient checkpointing found (good for inference)")
 
-    def _warmup_model(self, model: LaplacianTransformerModule, device: torch.device, k: int = 30, num_warmup: int = 3):
-        """
-        Warmup the model to trigger torch.compile() compilation.
-
-        With dynamic=True, we warm up with multiple input sizes to ensure
-        the compiler generates efficient code for varying shapes.
-
-        Args:
-            model: The model to warm up
-            device: Device to run on
-            k: Number of neighbors (should match actual data!)
-            num_warmup: Number of warmup iterations per size
-        """
-        print(f"Warming up model (k={k}, dynamic shapes)...")
-
-        from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
-
-        # Warmup with different BATCH sizes but SAME k as actual data
-        # This ensures torch.compile sees the right sequence length
-        # Include sizes close to actual mesh sizes (e.g., 9999, 10002)
-        warmup_patch_counts = [1000, 5000, 9999, 10000, 10002]
-
-        # Determine mixed precision dtype (must match inference for torch.compile)
-        use_amp = device.type == 'cuda'
-        if use_amp:
-            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
-        try:
-            with torch.no_grad():
-                for num_patches in warmup_patch_counts:
-                    dummy_data = MeshPatchData(
-                        pos=torch.randn(num_patches * k, 3, device=device),
-                        x=torch.randn(num_patches * k, 3, device=device),
-                        patch_idx=torch.arange(num_patches, device=device).repeat_interleave(k),
-                        vertex_indices=torch.randint(0, num_patches, (num_patches * k,), device=device),
-                        center_indices=torch.arange(num_patches, device=device)
-                    )
-
-                    for i in range(num_warmup):
-                        if device.type == 'cuda':
-                            torch.cuda.synchronize()
-
-                        # Use same mixed precision as inference
-                        if use_amp:
-                            with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                                _ = model._forward_pass(dummy_data)
-                        else:
-                            _ = model._forward_pass(dummy_data)
-
-                        if device.type == 'cuda':
-                            torch.cuda.synchronize()
-
-                    print(f"  Warmed up with {num_patches} patches, k={k}")
-
-            # Clear cache after warmup
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-            print(f"[OK] Model warmup complete")
-        except Exception as e:
-            print(f"[!] Model warmup failed (this is OK if not using torch.compile): {e}")
+    def _warmup_cuda(self, model: LaplacianTransformerModule, device: torch.device, k: int):
+        """CUDA warmup — delegates to shared cuda_warmup() in utils."""
+        cuda_warmup(model, device, k)
 
     def compute_eigendecomposition(self, stiffness_matrix: scipy.sparse.csr_matrix,
                                    k: int = 50,
@@ -3924,12 +3888,11 @@ class RealTimeEigenanalysisVisualizer:
                 print("  Using mixed precision: FP16")
 
         with torch.no_grad():
-            # === Single inference for actual results ===
+            # === Single timed inference ===
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             t_inference_start = time.perf_counter()
 
-            # Use same precision as warmup/torch.compile for consistency
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=amp_dtype):
                     forward_result = model._forward_pass(batch_data)
@@ -3938,30 +3901,7 @@ class RealTimeEigenanalysisVisualizer:
 
             if device.type == 'cuda':
                 torch.cuda.synchronize()
-            t_inference_end = time.perf_counter()
-            pred_inference_time = t_inference_end - t_inference_start
-
-            # === Optional: additional timing runs (results discarded) ===
-            if not self._quantitative_mode:
-                inference_times = [pred_inference_time]
-                num_extra_runs = 2
-                for run_idx in range(num_extra_runs):
-                    if device.type == 'cuda':
-                        torch.cuda.synchronize()
-                    t_start = time.perf_counter()
-
-                    if use_amp:
-                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                            _ = model._forward_pass(batch_data)
-                    else:
-                        _ = model._forward_pass(batch_data)
-
-                    if device.type == 'cuda':
-                        torch.cuda.synchronize()
-                    inference_times.append(time.perf_counter() - t_start)
-
-                print(f"  [DIAGNOSTIC] Inference times: {[f'{t * 1000:.1f}ms' for t in inference_times]}")
-                pred_inference_time = min(inference_times)
+            pred_inference_time = time.perf_counter() - t_inference_start
 
             print(f"  [TIMING] Model inference: {pred_inference_time * 1000:.2f} ms")
 
@@ -6498,10 +6438,12 @@ class RealTimeEigenanalysisVisualizer:
             ps.remove_all_structures()
         self.reconstruction_structure_names.clear()  # Clear reconstruction tracking
 
-        # Clear CUDA cache to ensure consistent memory state across meshes
-        # This prevents memory fragmentation from affecting timing
+        # Clear CUDA cache — only in visual mode where Polyscope needs the VRAM.
+        # In quantitative mode, keep the caching allocator warm so subsequent meshes
+        # with similar sizes reuse memory blocks (~12ms vs ~300ms per inference).
         if device.type == 'cuda':
-            torch.cuda.empty_cache()
+            if not self._quantitative_mode:
+                torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
             # Log GPU memory status
@@ -7409,15 +7351,25 @@ class RealTimeEigenanalysisVisualizer:
                 print(f"  {key:<45} {stats['mean']:>10.4f} {stats['std']:>10.4f} "
                       f"{stats['min']:>10.4f} {stats['max']:>10.4f} {stats['median']:>10.4f} {stats['count']:>4}")
 
+        def print_section_filter(title: str, filter_fn):
+            """Print a section of the summary table for keys matching filter function."""
+            matching = [(k, v) for k, v in agg_stats.items() if filter_fn(k)]
+            if not matching:
+                return
+            print(f"\n  {title}:")
+            print(f"  {'Metric':<45} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Median':>10} {'N':>4}")
+            print(f"  {'-' * 99}")
+            for key, stats in matching:
+                print(f"  {key:<45} {stats['mean']:>10.4f} {stats['std']:>10.4f} "
+                      f"{stats['min']:>10.4f} {stats['max']:>10.4f} {stats['median']:>10.4f} {stats['count']:>4}")
+
         # Mesh info
         print_section("Mesh Info", "num_")
         print_section("Mesh Info", "k")
 
         # Timing
-        print_section("Timing (ms)", "pred_")
-        print_section("Timing (ms)", "robust_total")
-        print_section("Timing (ms)", "gt_")
-        print_section("Timing (ms)", "nelo_")
+        print_section_filter("Timing (ms)",
+            lambda k: k.endswith('_ms'))
 
         # Eigenvector alignment
         for method in ['pred', 'robust', 'nelo']:
@@ -7435,9 +7387,36 @@ class RealTimeEigenanalysisVisualizer:
         for method in ['gt', 'pred', 'robust', 'nelo']:
             print_section(f"Geodesics ({method.upper()})", f"{method}_geodesic")
 
-        # Sparsity
+        # Probe functions (Lf error)
         for method in ['gt', 'pred', 'robust', 'nelo']:
-            print_section(f"Sparsity ({method.upper()})", f"{method}_")
+            print_section(f"Probe Functions ({method.upper()})", f"{method}_probe")
+
+        # HKS / WKS Descriptors
+        for method in ['gt', 'pred', 'robust', 'nelo']:
+            print_section_filter(f"Shape Descriptors ({method.upper()})",
+                lambda k, m=method: k.startswith(f"{m}_hks") or k.startswith(f"{m}_wks"))
+
+        # Spectral Compression
+        for method in ['gt', 'pred', 'robust', 'nelo']:
+            print_section(f"Spectral Compression ({method.upper()})", f"{method}_compression")
+
+        # Sparsity
+        print_section_filter("Sparsity",
+            lambda k: k.endswith('_nnz') or k.endswith('_density_pct') or k.endswith('_avg_nnz_per_row'))
+
+        # Vertex Areas
+        print_section_filter("Vertex Areas",
+            lambda k: '_area_' in k or k.startswith('area_'))
+
+        # Curvature
+        print_section_filter("Curvature",
+            lambda k: '_curv_' in k or k.startswith('mean_curv_'))
+
+        # Weyl calibration
+        print_section("Weyl Calibration", "pred_weyl")
+
+        # Eigenvalue scale
+        print_section("Eigenvalue Scale", "eval_scale")
 
         print(f"\n{'=' * 100}")
 
@@ -7898,17 +7877,12 @@ class RealTimeEigenanalysisVisualizer:
         diagnostic_mode = getattr(cfg, 'diagnostic_mode', False)
         skip_robust = getattr(cfg, 'skip_robust', False)  # Debug: skip robust computation
         quantitative_mode = getattr(cfg, 'quantitative_mode', False)  # Headless metrics-only mode
-        use_compile = getattr(cfg, 'torch_compile', True)  # Enable/disable torch.compile
         robust_geodesic_heat = getattr(cfg, 'robust_geodesic_heat', False)  # Use heat method for Robust geodesics
-
-        if not use_compile:
-            print("[INFO] torch.compile disabled (torch_compile=false)")
 
         if diagnostic_mode:
             print("\n" + "!" * 80)
             print("DIAGNOSTIC MODE ENABLED - Optimizations disabled for debugging")
             print("!" * 80 + "\n")
-            use_compile = False
 
         if skip_robust:
             print("[DEBUG] skip_robust=True: Robust-laplacian computation will be skipped")
@@ -7927,10 +7901,15 @@ class RealTimeEigenanalysisVisualizer:
         self._quantitative_mode = quantitative_mode
         self._robust_geodesic_heat = robust_geodesic_heat
 
+        # Sparse solver backend (default: scipy)
+        solver_backend = str(getattr(cfg, 'solver', 'scipy'))
+        if solver_backend != 'scipy':
+            set_solver_backend(solver_backend)
+        import neural_local_laplacian.utils.geodesic_utils as _geo_utils
+        print(f"Sparse solver: {_geo_utils._SOLVER_BACKEND}")
+
         # Load trained model
-        model = self.load_trained_model(ckpt_path, device, cfg,
-                                         use_torch_compile=use_compile,
-                                         diagnostic_mode=diagnostic_mode)
+        model = self.load_trained_model(ckpt_path, device, cfg)
 
         # Load NeLo pipeline if checkpoint path provided
         nelo_ckpt = getattr(cfg, 'nelo_ckpt_path', None)
@@ -7972,11 +7951,8 @@ class RealTimeEigenanalysisVisualizer:
         actual_k = int(first_data.k_neighbors) if hasattr(first_data, 'k_neighbors') else 30
         print(f"Detected k={actual_k} from dataset")
 
-        # Warmup for torch.compile with ACTUAL k from dataset
-        if use_compile:
-            self._warmup_model(model, device, k=actual_k)
-        else:
-            print("[INFO] Skipping warmup (torch.compile disabled)")
+        # CUDA warmup: forward pass + assembly + gradient op (eliminates first-mesh cold start)
+        self._warmup_cuda(model, device, k=self._initial_k_pred)
 
         # Re-create dataloader since we consumed it (reset iterator)
         # Also reset seed to ensure same data order

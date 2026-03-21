@@ -32,12 +32,12 @@ import hydra
 from omegaconf import DictConfig
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
-from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
 from neural_local_laplacian.utils.utils import (
     normalize_mesh_vertices,
     assemble_stiffness_and_mass_matrices,
     assemble_gradient_operator,
     build_patches_from_vertices,
+    cuda_warmup,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_learned,
@@ -111,44 +111,7 @@ def main(cfg: DictConfig) -> None:
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
     # ---- CUDA warmup (forward + assembly + gradient op) ----
-    if device.type == 'cuda':
-        warmup_n = 10000
-        print(f"Running CUDA warmup (N={warmup_n}, k={pred_k})...")
-        warmup_data = MeshPatchData(
-            pos=torch.randn(warmup_n * pred_k, 3, device=device),
-            x=torch.randn(warmup_n * pred_k, 3, device=device),
-            patch_idx=torch.arange(warmup_n, device=device).repeat_interleave(pred_k),
-            vertex_indices=torch.randint(0, warmup_n, (warmup_n * pred_k,), device=device),
-            center_indices=torch.arange(warmup_n, device=device),
-        )
-        with torch.no_grad():
-            if use_amp:
-                with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                    warmup_result = model._forward_pass(warmup_data)
-            else:
-                warmup_result = model._forward_pass(warmup_data)
-            torch.cuda.synchronize()
-        # Warmup assembly + gradient op (scatter ops have their own cold start)
-        _ = assemble_stiffness_and_mass_matrices(
-            warmup_result['stiffness_weights'].float(),
-            warmup_result['areas'].float(),
-            warmup_result['attention_mask'],
-            warmup_data.vertex_indices,
-            warmup_data.center_indices,
-            warmup_data.patch_idx,
-        )
-        if has_grad and warmup_result.get('grad_coeffs') is not None:
-            _ = assemble_gradient_operator(
-                grad_coeffs=warmup_result['grad_coeffs'],
-                attention_mask=warmup_result['attention_mask'],
-                vertex_indices=warmup_data.vertex_indices,
-                center_indices=warmup_data.center_indices,
-                batch_indices=warmup_data.patch_idx,
-            )
-        torch.cuda.synchronize()
-        del warmup_data, warmup_result
-        torch.cuda.empty_cache()
-        print("[OK] CUDA warmup complete")
+    cuda_warmup(model, device, k=pred_k)
 
     # ---- Load dataset ----
     pl.seed_everything(cfg.globals.seed)

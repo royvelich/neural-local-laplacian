@@ -46,6 +46,8 @@ from visualize_validation import (
     VisualizationConfig,
     HAS_IGL,
 )
+from neural_local_laplacian.utils.utils import cuda_warmup
+from neural_local_laplacian.utils.geodesic_utils import set_solver_backend
 
 
 # ============================================================================
@@ -69,8 +71,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(rank)
 
-    tag = f"[GPU {rank}/{world_size}]"
-    print(f"\n{tag} Starting on {device}")
+    tag = f"[GPU {rank}] " if world_size > 1 else ""
+    print(f"\n{tag}Starting on {device}")
 
     # ---- Reconstruct config objects ----
     cfg = OmegaConf.create(cfg_dict)
@@ -87,18 +89,21 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     ckpt_path = Path(cfg.ckpt_path)
     model = visualizer.load_trained_model(
         ckpt_path, device, cfg,
-        use_torch_compile=False,  # compile per-worker is wasteful, skip for quantitative
-        diagnostic_mode=False
     )
+
+    # ---- Sparse solver backend ----
+    solver_backend = str(getattr(cfg, 'solver', 'scipy'))
+    if solver_backend != 'scipy':
+        set_solver_backend(solver_backend)
 
     # ---- Load NeLo (optional) ----
     nelo_ckpt = getattr(cfg, 'nelo_ckpt_path', None)
     if nelo_ckpt is not None:
         try:
             visualizer.load_nelo_pipeline(str(nelo_ckpt), device=str(device))
-            print(f"{tag} NeLo loaded")
+            print(f"{tag}NeLo loaded")
         except Exception as e:
-            print(f"{tag} NeLo load failed: {e} — skipping NeLo")
+            print(f"{tag}NeLo load failed: {e} — skipping NeLo")
 
     # ---- Configure k values ----
     default_k = getattr(cfg.globals, 'k', 30)
@@ -106,6 +111,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     visualizer._initial_k_robust = getattr(cfg.globals, 'k_robust', None) or default_k
     visualizer._initial_k_nelo = getattr(cfg.globals, 'k_nelo', None) or default_k
     visualizer.nelo_k = visualizer._initial_k_nelo
+
+    # ---- CUDA warmup ----
+    cuda_warmup(model, device, k=visualizer._initial_k_pred)
 
     # ---- Seed for reproducibility ----
     pl.seed_everything(cfg.globals.seed)
@@ -119,7 +127,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
 
     # ---- Compute this worker's mesh indices (interleaved for load balance) ----
     my_indices = list(range(rank, len(dataset), world_size))
-    print(f"{tag} Assigned {len(my_indices)}/{len(dataset)} meshes")
+    print(f"{tag}Assigned {len(my_indices)}/{len(dataset)} meshes")
 
     # ---- Process meshes ----
     metrics_list: List[Dict[str, Any]] = []
@@ -127,7 +135,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
 
     for local_idx, global_idx in enumerate(my_indices):
         mesh_num = f"{local_idx + 1}/{len(my_indices)}"
-        print(f"\n{tag} Mesh {mesh_num} (global #{global_idx})")
+        print(f"\n{tag}Mesh {mesh_num} (global #{global_idx})")
 
         try:
             # Load single mesh from dataset (returns a Data object)
@@ -140,23 +148,23 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
                 mesh_metrics = visualizer._collect_mesh_metrics()
                 if mesh_metrics is not None:
                     metrics_list.append(mesh_metrics)
-                    print(f"{tag} Mesh {mesh_num}: OK ({mesh_metrics.get('mesh_name', '?')})")
+                    print(f"{tag}Mesh {mesh_num}: OK ({mesh_metrics.get('mesh_name', '?')})")
             else:
-                print(f"{tag} Mesh {mesh_num}: skipped (process_batch returned False)")
+                print(f"{tag}Mesh {mesh_num}: skipped (process_batch returned False)")
 
         except Exception as e:
-            print(f"{tag} Mesh {mesh_num}: ERROR — {e}")
+            print(f"{tag}Mesh {mesh_num}: ERROR — {e}")
             import traceback
             traceback.print_exc()
 
     elapsed = time.time() - t_start
-    print(f"\n{tag} Done — {len(metrics_list)} meshes in {elapsed:.1f}s "
+    print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s "
           f"({elapsed / max(len(my_indices), 1):.1f}s/mesh)")
 
     # ---- Write per-rank CSV ----
     rank_csv = Path(output_dir) / f'metrics_rank{rank}.csv'
     _write_csv(metrics_list, rank_csv)
-    print(f"{tag} Saved {rank_csv}")
+    print(f"{tag}Saved {rank_csv}")
 
 
 # ============================================================================
