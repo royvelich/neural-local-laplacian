@@ -22,13 +22,21 @@ from dataclasses import dataclass
 # =============================================================================
 # Sparse solver backend: auto-detect best available, with manual override
 #
-# Priority: pypardiso (Intel MKL, multi-threaded) > scipy splu (single-threaded)
+# Priority: cholmod (Cholesky, SPD only, fastest) > pypardiso (Intel MKL) > scipy splu
 #
 # To override at runtime:
 #   from neural_local_laplacian.utils.geodesic_utils import set_solver_backend
-#   set_solver_backend('scipy')   # force scipy
-#   set_solver_backend('auto')    # re-detect best available
+#   set_solver_backend('scipy')      # force scipy
+#   set_solver_backend('pypardiso')  # force pypardiso
+#   set_solver_backend('auto')       # re-detect best available
 # =============================================================================
+
+_HAS_CHOLMOD = False
+try:
+    from sksparse.cholmod import cholesky as cholmod_cholesky
+    _HAS_CHOLMOD = True
+except ImportError:
+    pass
 
 _HAS_PARDISO = False
 try:
@@ -37,9 +45,10 @@ try:
 except ImportError:
     pass
 
-_SOLVER_BACKEND = 'pypardiso' if _HAS_PARDISO else 'scipy'
-print(f"[sparse solver] Backend: {_SOLVER_BACKEND}" +
-      (" (pypardiso available but not selected)" if _HAS_PARDISO and _SOLVER_BACKEND != 'pypardiso' else ""))
+_SOLVER_BACKEND = 'cholmod' if _HAS_CHOLMOD else ('pypardiso' if _HAS_PARDISO else 'scipy')
+print(f"[sparse solver] Backend: {_SOLVER_BACKEND}"
+      + (f" (also available: pypardiso)" if _HAS_PARDISO and _SOLVER_BACKEND != 'pypardiso' else "")
+      + (f" (also available: cholmod)" if _HAS_CHOLMOD and _SOLVER_BACKEND != 'cholmod' else ""))
 
 
 def set_solver_backend(backend: str):
@@ -47,19 +56,22 @@ def set_solver_backend(backend: str):
     Switch sparse solver backend at runtime.
 
     Args:
-        backend: 'pypardiso', 'scipy', or 'auto' (re-detect best available)
+        backend: 'cholmod', 'pypardiso', 'scipy', or 'auto' (re-detect best available)
     """
     global _SOLVER_BACKEND
     if backend == 'auto':
-        _SOLVER_BACKEND = 'pypardiso' if _HAS_PARDISO else 'scipy'
-    elif backend in ('pypardiso', 'scipy'):
-        if backend == 'pypardiso' and not _HAS_PARDISO:
+        _SOLVER_BACKEND = 'cholmod' if _HAS_CHOLMOD else ('pypardiso' if _HAS_PARDISO else 'scipy')
+    elif backend in ('cholmod', 'pypardiso', 'scipy'):
+        if backend == 'cholmod' and not _HAS_CHOLMOD:
+            print("[sparse solver] scikit-sparse (cholmod) not installed, falling back to auto")
+            _SOLVER_BACKEND = 'pypardiso' if _HAS_PARDISO else 'scipy'
+        elif backend == 'pypardiso' and not _HAS_PARDISO:
             print("[sparse solver] pypardiso not installed, falling back to scipy")
             _SOLVER_BACKEND = 'scipy'
         else:
             _SOLVER_BACKEND = backend
     else:
-        raise ValueError(f"Unknown solver backend: {backend}. Use 'pypardiso', 'scipy', or 'auto'.")
+        raise ValueError(f"Unknown solver backend: {backend}. Use 'cholmod', 'pypardiso', 'scipy', or 'auto'.")
     print(f"[sparse solver] Backend set to: {_SOLVER_BACKEND}")
 
 
@@ -67,11 +79,11 @@ class SparseFactorization:
     """
     Cached sparse matrix factorization for solving Ax=b with multiple right-hand sides.
 
-    Uses pypardiso (Intel MKL PARDISO, multi-threaded) when available,
-    otherwise scipy splu (single-threaded SuperLU).
+    For SPD matrices: uses CHOLMOD (Cholesky, ~2× faster than LU) when available.
+    Otherwise: pypardiso (Intel MKL PARDISO, multi-threaded) or scipy splu.
 
     Usage:
-        factor = SparseFactorization(A)
+        factor = SparseFactorization(A, spd=True)
         x1 = factor.solve(b1)
         x2 = factor.solve(b2)  # reuses factorization
     """
@@ -80,7 +92,16 @@ class SparseFactorization:
     _shared_solver = None
 
     def __init__(self, A: scipy.sparse.spmatrix, spd: bool = False):
-        if _SOLVER_BACKEND == 'pypardiso' and _HAS_PARDISO:
+        # CHOLMOD: best for SPD matrices (Cholesky = half the work of LU)
+        if spd and _SOLVER_BACKEND == 'cholmod' and _HAS_CHOLMOD:
+            try:
+                self._cholmod_factor = cholmod_cholesky(A.tocsc())
+                self._backend = 'cholmod'
+                return
+            except Exception:
+                pass  # fall through to pypardiso/scipy
+
+        if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
             if SparseFactorization._shared_solver is None:
                 SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
             self._solver = SparseFactorization._shared_solver
@@ -93,7 +114,9 @@ class SparseFactorization:
 
     def solve(self, b: np.ndarray) -> np.ndarray:
         """Solve Ax = b using the cached factorization."""
-        if self._backend == 'pypardiso':
+        if self._backend == 'cholmod':
+            return self._cholmod_factor.solve_A(b)
+        elif self._backend == 'pypardiso':
             return self._solver.solve(self._A_csr, b)
         else:
             return self._factor.solve(b)
@@ -105,9 +128,7 @@ def sparse_factorize(A: scipy.sparse.spmatrix, spd: bool = False) -> SparseFacto
 
     Args:
         A: Sparse matrix (N, N)
-        spd: Accepted for API compatibility but currently unused.
-            (mtype=2 Cholesky requires a single solver instance per type,
-            which conflicts with Windows PARDISO limitations.)
+        spd: If True and CHOLMOD is available, uses Cholesky factorization (~2× faster).
 
     Returns:
         SparseFactorization object whose .solve(b) method is fast.
@@ -130,7 +151,7 @@ def sparse_solve(
         b: Right-hand side (N,)
         device: Unused (kept for API compatibility)
         factor: Optional pre-computed SparseFactorization for reuse
-        spd: Accepted for API compatibility but currently unused.
+        spd: If True and CHOLMOD is available, uses Cholesky (~2× faster).
 
     Returns:
         Solution x as numpy array (N,)
@@ -138,7 +159,14 @@ def sparse_solve(
     if factor is not None:
         return factor.solve(b)
 
-    if _SOLVER_BACKEND == 'pypardiso' and _HAS_PARDISO:
+    # CHOLMOD direct solve for SPD systems
+    if spd and _SOLVER_BACKEND == 'cholmod' and _HAS_CHOLMOD:
+        try:
+            return cholmod_cholesky(A.tocsc()).solve_A(b)
+        except Exception:
+            pass  # fall through
+
+    if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
         return pypardiso.spsolve(A.tocsr(), b)
 
     import warnings

@@ -6,11 +6,17 @@ No polyscope, no eigendecomposition, no visualization — just raw timing.
 Single forward pass per mesh. CUDA warmup once at startup.
 
 Flags:
-    +use_amp=False         Disable autocast / BF16 (default: True)
+    +use_amp=False             Disable autocast / BF16 (default: True)
+    +solver=cholmod|pypardiso|scipy  Sparse solver backend (default: auto-detect best)
 
 Usage:
     python timing_sanity_check.py +ckpt_path=model.ckpt \
         +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation
+
+    # With explicit solver:
+    python timing_sanity_check.py +ckpt_path=model.ckpt \
+        +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation \
+        +solver=cholmod
 """
 
 import gc
@@ -92,6 +98,13 @@ def main(cfg: DictConfig) -> None:
     num_sources = getattr(cfg.globals, 'num_validation_sources', 5)
     print(f"Geodesic sources per mesh: {num_sources} (FPS)")
     print(f"AMP (autocast): {'ON' if use_amp else 'OFF'}")
+
+    # ---- Sparse solver backend ----
+    import neural_local_laplacian.utils.geodesic_utils as geo_utils
+    solver_backend = str(getattr(cfg, 'solver', 'auto'))
+    if solver_backend != 'auto':
+        geo_utils.set_solver_backend(solver_backend)
+    print(f"Sparse solver: {geo_utils._SOLVER_BACKEND}")
 
     # ---- AMP dtype ----
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
@@ -316,7 +329,7 @@ def main(cfg: DictConfig) -> None:
 
         W = 10
         print(f"\n{'=' * 75}")
-        print(f"SUMMARY ({n} meshes, AMP={'ON' if use_amp else 'OFF'})")
+        print(f"SUMMARY ({n} meshes, AMP={'ON' if use_amp else 'OFF'}, solver={geo_utils._SOLVER_BACKEND})")
         print(f"{'=' * 75}")
         print(f"{'':>20s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
         print(f"{'-' * 20} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
