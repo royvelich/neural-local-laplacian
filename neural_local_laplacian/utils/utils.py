@@ -799,16 +799,6 @@ def cuda_warmup(model, device: torch.device, k: int):
         )
     torch.cuda.synchronize()
 
-    # Warmup sparse solver (pypardiso MKL initialization takes ~700ms on first call)
-    try:
-        from neural_local_laplacian.utils.geodesic_utils import sparse_factorize
-        _warmup_mat = scipy.sparse.eye(100, format='csr', dtype=np.float64)
-        _warmup_factor = sparse_factorize(_warmup_mat)
-        _ = _warmup_factor.solve(np.ones(100))
-        del _warmup_mat, _warmup_factor
-    except Exception:
-        pass
-
     del warmup_data, warmup_result
     torch.cuda.empty_cache()
     print("[OK] CUDA warmup complete")

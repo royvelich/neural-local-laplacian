@@ -48,7 +48,7 @@ from visualize_validation import (
     HAS_IGL,
 )
 from neural_local_laplacian.utils.utils import cuda_warmup
-from neural_local_laplacian.utils.geodesic_utils import set_solver_backend
+
 
 
 # ============================================================================
@@ -103,11 +103,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
     model = visualizer.load_trained_model(
         ckpt_path, device, cfg,
     )
-
-    # ---- Sparse solver backend ----
-    solver_backend = str(getattr(cfg, 'solver', 'scipy'))
-    if solver_backend != 'scipy':
-        set_solver_backend(solver_backend)
 
     # ---- Load NeLo (optional) ----
     nelo_ckpt = getattr(cfg, 'nelo_ckpt_path', None)

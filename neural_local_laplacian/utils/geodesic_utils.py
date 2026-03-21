@@ -21,99 +21,24 @@ from dataclasses import dataclass
 
 # =============================================================================
 # Sparse solver backend: explicit selection, no fallback
-#
-# Default: scipy (always available). Override with set_solver_backend() or
-# +solver=pypardiso / +solver=cholmod from timing scripts.
-# =============================================================================
-
-_HAS_CHOLMOD = False
-try:
-    from sksparse.cholmod import cholesky as cholmod_cholesky
-    _HAS_CHOLMOD = True
-except ImportError:
-    pass
-
-_HAS_PARDISO = False
-try:
-    import pypardiso
-    _HAS_PARDISO = True
-except ImportError:
-    pass
-
-_SOLVER_BACKEND = 'scipy'
-print(f"[sparse solver] Backend: {_SOLVER_BACKEND}"
-      + (f" (available: pypardiso)" if _HAS_PARDISO else "")
-      + (f" (available: cholmod)" if _HAS_CHOLMOD else ""))
-
-# Regularization epsilon for heat method solves (ensures SPD for Cholesky, avoids singular matrices)
+# Regularization epsilon for heat method solves (ensures SPD, avoids singular matrices)
 _HEAT_EPS = 1e-8
 
 
-def set_solver_backend(backend: str):
-    """
-    Switch sparse solver backend at runtime.
-
-    Args:
-        backend: 'cholmod', 'pypardiso', or 'scipy'
-    """
-    global _SOLVER_BACKEND
-    if backend == 'cholmod':
-        if not _HAS_CHOLMOD:
-            raise RuntimeError("scikit-sparse (cholmod) not installed")
-        _SOLVER_BACKEND = 'cholmod'
-    elif backend == 'pypardiso':
-        if not _HAS_PARDISO:
-            raise RuntimeError("pypardiso not installed")
-        _SOLVER_BACKEND = 'pypardiso'
-    elif backend == 'scipy':
-        _SOLVER_BACKEND = 'scipy'
-    else:
-        raise ValueError(f"Unknown solver backend: {backend}. Use 'cholmod', 'pypardiso', or 'scipy'.")
-    print(f"[sparse solver] Backend set to: {_SOLVER_BACKEND}")
-
-
 class SparseFactorization:
-    """
-    Cached sparse matrix factorization for solving Ax=b with multiple right-hand sides.
+    """Cached sparse LU factorization for solving Ax=b with multiple right-hand sides."""
 
-    Uses exactly the backend specified by _SOLVER_BACKEND — no fallback.
-
-    NOTE: pypardiso uses a single shared solver instance. This means only ONE
-    factorization is active at a time. If you need two concurrent factorizations
-    (e.g. heat + Poisson), use sequential factorize-solve patterns instead.
-    """
-
-    # Single shared pypardiso solver (MKL init is expensive per-instance)
-    _shared_solver = None
-
-    def __init__(self, A: scipy.sparse.spmatrix, spd: bool = False):
-        if _SOLVER_BACKEND == 'cholmod':
-            self._cholmod_factor = cholmod_cholesky(A.tocsc())
-            self._backend = 'cholmod'
-        elif _SOLVER_BACKEND == 'pypardiso':
-            if SparseFactorization._shared_solver is None:
-                SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
-            self._solver = SparseFactorization._shared_solver
-            self._A_csr = A.tocsr()
-            self._solver.factorize(self._A_csr)
-            self._backend = 'pypardiso'
-        else:
-            self._factor = scipy.sparse.linalg.splu(A.tocsc())
-            self._backend = 'scipy'
+    def __init__(self, A: scipy.sparse.spmatrix):
+        self._factor = scipy.sparse.linalg.splu(A.tocsc())
 
     def solve(self, b: np.ndarray) -> np.ndarray:
         """Solve Ax = b using the cached factorization."""
-        if self._backend == 'cholmod':
-            return self._cholmod_factor.solve_A(b)
-        elif self._backend == 'pypardiso':
-            return self._solver.solve(self._A_csr, b)
-        else:
-            return self._factor.solve(b)
+        return self._factor.solve(b)
 
 
 def sparse_factorize(A: scipy.sparse.spmatrix, spd: bool = False) -> SparseFactorization:
     """Factorize a sparse matrix for repeated solves."""
-    return SparseFactorization(A, spd=spd)
+    return SparseFactorization(A)
 
 
 def sparse_solve(
@@ -123,16 +48,10 @@ def sparse_solve(
     factor: Optional[SparseFactorization] = None,
     spd: bool = False
 ) -> np.ndarray:
-    """Solve sparse linear system Ax = b using the selected backend."""
+    """Solve sparse linear system Ax = b."""
     if factor is not None:
         return factor.solve(b)
-
-    if _SOLVER_BACKEND == 'cholmod':
-        return cholmod_cholesky(A.tocsc()).solve_A(b)
-    elif _SOLVER_BACKEND == 'pypardiso':
-        return pypardiso.spsolve(A.tocsr(), b)
-    else:
-        return scipy.sparse.linalg.spsolve(A.tocsc(), b)
+    return scipy.sparse.linalg.spsolve(A.tocsc(), b)
 
 
 # Optional imports with graceful fallback

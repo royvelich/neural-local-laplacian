@@ -7,16 +7,10 @@ Single forward pass per mesh. CUDA warmup once at startup.
 
 Flags:
     +use_amp=False             Disable autocast / BF16 (default: True)
-    +solver=pypardiso|cholmod  Sparse solver backend (default: scipy)
 
 Usage:
     python timing_sanity_check.py +ckpt_path=model.ckpt \
         +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation
-
-    # With explicit solver:
-    python timing_sanity_check.py +ckpt_path=model.ckpt \
-        +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation \
-        +solver=cholmod
 """
 
 import gc
@@ -24,8 +18,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import scipy.sparse
-import scipy.sparse.linalg
 import torch
 import pytorch_lightning as pl
 import robust_laplacian
@@ -105,13 +97,6 @@ def main(cfg: DictConfig) -> None:
     num_sources = getattr(cfg.globals, 'num_validation_sources', 5)
     print(f"Geodesic sources per mesh: {num_sources} (FPS)")
     print(f"AMP (autocast): {'ON' if use_amp else 'OFF'}")
-
-    # ---- Sparse solver backend ----
-    import neural_local_laplacian.utils.geodesic_utils as geo_utils
-    solver_backend = str(getattr(cfg, 'solver', 'scipy'))
-    if solver_backend != 'scipy':
-        geo_utils.set_solver_backend(solver_backend)
-    print(f"Sparse solver: {geo_utils._SOLVER_BACKEND}")
 
     # ---- AMP dtype ----
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
@@ -267,41 +252,6 @@ def main(cfg: DictConfig) -> None:
         t_pred_solve = t_pred_heat_solve + t_pred_poisson_solve
 
         # ==============================================================
-        # Diagnostic: isolate forward-solve vs grad_div cost
-        # ==============================================================
-        if matrices is not None:
-            b_test = np.random.rand(N)
-
-            # scipy splu forward-solve
-            _hf = scipy.sparse.linalg.splu(matrices.A_heat.tocsc())
-            _times = []
-            for _ in range(20):
-                _t0 = time.perf_counter()
-                _hf.solve(b_test)
-                _times.append(time.perf_counter() - _t0)
-            t_scipy_solve = np.median(_times) * 1000
-
-            # pypardiso forward-solve (using the shared solver)
-            from neural_local_laplacian.utils.geodesic_utils import SparseFactorization
-            _pf = SparseFactorization(matrices.A_heat)
-            _times = []
-            for _ in range(20):
-                _t0 = time.perf_counter()
-                _pf.solve(b_test)
-                _times.append(time.perf_counter() - _t0)
-            t_pardiso_solve = np.median(_times) * 1000
-
-            # grad_div call
-            _times = []
-            for _ in range(20):
-                _t0 = time.perf_counter()
-                matrices.grad_and_div_fn(b_test)
-                _times.append(time.perf_counter() - _t0)
-            t_grad_div_call = np.median(_times) * 1000
-
-            print(f"    [diag] scipy_fwd={t_scipy_solve:.2f}ms, pardiso_fwd={t_pardiso_solve:.2f}ms, grad_div={t_grad_div_call:.2f}ms")
-
-        # ==============================================================
         # Robust: point_cloud_laplacian + pp3d geodesic
         # ==============================================================
 
@@ -392,7 +342,7 @@ def main(cfg: DictConfig) -> None:
         W = 10
         n_src = results[0]['n_src']
         print(f"\n{'=' * 80}")
-        print(f"SUMMARY ({n} meshes, {n_src} sources/mesh, AMP={'ON' if use_amp else 'OFF'}, solver={geo_utils._SOLVER_BACKEND})")
+        print(f"SUMMARY ({n} meshes, {n_src} sources/mesh, AMP={'ON' if use_amp else 'OFF'})")
         print(f"{'=' * 80}")
         print(f"{'':>22s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
         print(f"{'-' * 22} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")

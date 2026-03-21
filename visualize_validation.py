@@ -90,7 +90,6 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_exact_geodesics,
     ensure_psd,
     sparse_solve,
-    set_solver_backend,
     normalize_distances,
     build_pointcloud_grad_div_operators,
     edge_index_from_knn_indices,
@@ -8077,13 +8076,6 @@ class RealTimeEigenanalysisVisualizer:
         self._quantitative_mode = quantitative_mode
         self._robust_geodesic_heat = robust_geodesic_heat
         self._verbose = getattr(cfg, 'verbose', True)  # +verbose=False to suppress per-mesh output
-
-        # Sparse solver backend (default: scipy)
-        solver_backend = str(getattr(cfg, 'solver', 'scipy'))
-        if solver_backend != 'scipy':
-            set_solver_backend(solver_backend)
-        import neural_local_laplacian.utils.geodesic_utils as _geo_utils
-        print(f"Sparse solver: {_geo_utils._SOLVER_BACKEND}")
 
         # Load trained model
         model = self.load_trained_model(ckpt_path, device, cfg)
