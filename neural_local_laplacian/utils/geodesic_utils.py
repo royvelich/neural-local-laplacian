@@ -15,7 +15,7 @@ import numpy as np
 import scipy.sparse
 import scipy.sparse.linalg
 import torch
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
 from dataclasses import dataclass
 
 
@@ -789,6 +789,115 @@ def compute_heat_geodesic_learned(
     except Exception as e:
         print(f"Heat Method (learned) failed: {e}")
         return None
+
+
+def compute_heat_geodesic_learned_batch(
+    S: scipy.sparse.spmatrix,
+    M: scipy.sparse.spmatrix,
+    G: scipy.sparse.spmatrix,
+    source_indices: List[int],
+    n_vertices: int,
+    device: Optional[torch.device] = None,
+    t: Optional[float] = None,
+) -> List[Optional[np.ndarray]]:
+    """
+    Compute geodesic distances from multiple sources using learned operators.
+
+    Factorizes (M + tS + eps*I) and (S + eps*I) ONCE, then solves for each source.
+    ~Nx faster than calling compute_heat_geodesic_learned N times.
+
+    Args:
+        S: One-ring stiffness matrix (N, N)
+        M: Diagonal vertex mass matrix (N, N)
+        G: Gradient operator (3N, N)
+        source_indices: List of source vertex indices
+        n_vertices: Number of vertices
+        device: Unused (kept for API compatibility)
+        t: Diffusion time step (auto-computed from M if None)
+
+    Returns:
+        List of geodesic distances (N,) per source, or None for failed sources
+    """
+    n = n_vertices
+
+    # Ensure float64 for numerical stability
+    S = ensure_psd(S.astype(np.float64))
+    M = M.astype(np.float64)
+    G = G.astype(np.float64)
+
+    # Auto time step
+    if t is None:
+        if scipy.sparse.issparse(M):
+            areas = np.array(M.diagonal()).flatten()
+        else:
+            areas = np.diag(M)
+        h = np.sqrt(areas.mean())
+        t = h ** 2
+
+    eps = 1e-8
+
+    # Pre-compute shared quantities
+    areas_diag = np.array(M.diagonal()).flatten()
+    M_3 = np.repeat(areas_diag, 3)  # (3N,)
+
+    # Factorize ONCE — these are the expensive operations
+    A = M + t * S + eps * scipy.sparse.eye(n)
+    S_reg = S + eps * scipy.sparse.eye(n)
+
+    try:
+        heat_factor = sparse_factorize(A, spd=True)
+    except Exception as e:
+        print(f"Heat Method (learned batch): heat factorization failed: {e}")
+        return [None] * len(source_indices)
+
+    try:
+        poisson_factor = sparse_factorize(S_reg, spd=True)
+    except Exception as e:
+        print(f"Heat Method (learned batch): Poisson factorization failed: {e}")
+        return [None] * len(source_indices)
+
+    # Solve for each source (cheap — just forward/back substitution)
+    results = []
+    for source_idx in source_indices:
+        try:
+            # Step 1: Heat diffusion (reuses factorization)
+            delta = np.zeros(n)
+            delta[source_idx] = 1.0
+            u = heat_factor.solve(delta)
+
+            if not np.all(np.isfinite(u)):
+                results.append(None)
+                continue
+
+            # Step 2: Gradient + normalize
+            grad_u = (G @ u).reshape(-1, 3)
+            norms = np.maximum(np.linalg.norm(grad_u, axis=1, keepdims=True), 1e-10)
+            X = -grad_u / norms
+
+            # Step 3: Poisson solve (reuses factorization, ±rhs)
+            rhs = G.T @ (M_3 * X.flatten())
+            phi_pos = poisson_factor.solve(rhs)
+            phi_neg = poisson_factor.solve(-rhs)
+
+            if not np.all(np.isfinite(phi_pos)) and not np.all(np.isfinite(phi_neg)):
+                results.append(None)
+                continue
+
+            # Pick the sign where source is closest to the minimum
+            phi_pos_shifted = phi_pos - phi_pos.min() if np.all(np.isfinite(phi_pos)) else np.full(n, np.inf)
+            phi_neg_shifted = phi_neg - phi_neg.min() if np.all(np.isfinite(phi_neg)) else np.full(n, np.inf)
+
+            source_rank_pos = (phi_pos_shifted < phi_pos_shifted[source_idx]).sum()
+            source_rank_neg = (phi_neg_shifted < phi_neg_shifted[source_idx]).sum()
+
+            phi = phi_pos_shifted if source_rank_pos < source_rank_neg else phi_neg_shifted
+            results.append(phi)
+
+        except Exception as e:
+            print(f"Heat Method (learned batch) source {source_idx} failed: {e}")
+            results.append(None)
+
+    return results
 
 
 def _check_mesh_topology_safe(vertices: np.ndarray, faces: np.ndarray) -> Tuple[bool, str]:

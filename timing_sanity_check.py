@@ -41,6 +41,7 @@ from neural_local_laplacian.utils.utils import (
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesic_learned,
+    compute_heat_geodesic_learned_batch,
     select_multiple_geodesic_sources,
 )
 
@@ -256,15 +257,14 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.synchronize()
             t_grad_op = time.perf_counter() - t0
 
-        # PRED geodesic (heat method with learned operators, averaged over sources)
+        # PRED geodesic (heat method with learned operators, batch — factorize once)
         t_pred_geo = 0.0
         if G_pred is not None:
             t0 = time.perf_counter()
-            for src in source_indices:
-                _ = compute_heat_geodesic_learned(
-                    S=L_pred, M=M_pred, G=G_pred,
-                    source_idx=src, n_vertices=N, device=device,
-                )
+            _ = compute_heat_geodesic_learned_batch(
+                S=L_pred, M=M_pred, G=G_pred,
+                source_indices=source_indices, n_vertices=N, device=device,
+            )
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             t_pred_geo = (time.perf_counter() - t0) / len(source_indices)
