@@ -128,7 +128,7 @@ def main(cfg: DictConfig) -> None:
     header = (
         f"{'#':>4}  {'Mesh':<14}  {'N':>6}"
         f"  {'kNN':>8}  {'Fwd':>8}  {'Asm':>8}  {'GradOp':>8}  {'PRED LM':>9}"
-        f"  {'PRED Geo':>9}  {'PRED E2E':>9}  {'Rob LM':>9}  {'Rob Geo':>9}  {'Rob E2E':>9}"
+        f"  {'PRED Geo':>9}  {'PRED E2E':>9}  {'Rob LM':>9}  {'Rob pp3d':>9}  {'Rob E2E':>9}"
         f"  {'LM Rat':>7}  {'E2E Rat':>8}"
     )
     print(header)
@@ -248,7 +248,9 @@ def main(cfg: DictConfig) -> None:
 
         ratio_lm = pred_lm_total / t_robust_lm if t_robust_lm > 0 else float('inf')
         pred_e2e = pred_lm_total + t_grad_op + t_pred_geo
-        robust_e2e = t_robust_lm + t_robust_geo
+        # pp3d.PointCloudHeatSolver builds its own internal Laplacian in C++,
+        # so t_robust_geo already includes L,M assembly — don't add t_robust_lm.
+        robust_e2e = t_robust_geo
         ratio_e2e = pred_e2e / robust_e2e if robust_e2e > 0 else float('inf')
 
         results.append({
@@ -306,7 +308,7 @@ def main(cfg: DictConfig) -> None:
             ("PRED geodesic",  "pred_geo_ms"),
             ("PRED E2E",       "pred_e2e_ms"),
             ("Robust L,M",     "robust_lm_ms"),
-            ("Robust geodesic","robust_geo_ms"),
+            ("Robust pp3d",   "robust_geo_ms"),
             ("Robust E2E",     "robust_e2e_ms"),
         ]:
             m, s, mn, mx = stats(key)
