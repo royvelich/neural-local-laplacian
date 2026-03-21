@@ -282,7 +282,7 @@ def main(cfg: DictConfig) -> None:
     # ---- Build configs ----
     vis_config = VisualizationConfig(
         point_radius=0.005,
-        num_eigenvectors_to_show=60,
+        num_eigenvectors_to_show=getattr(cfg.globals, 'num_eigenvectors', 60),
         colormap='coolwarm',
         enable_eigenvalue_info=True,
         enable_correlation_analysis=True,
