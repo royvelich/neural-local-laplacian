@@ -91,36 +91,15 @@ class SparseFactorization:
     # Single shared pypardiso solver (Windows allows only one instance)
     _shared_solver = None
 
-    @staticmethod
-    def _try_cholmod(A_csc, test_rhs):
-        """Try CHOLMOD factorization, suppressing C-level warnings. Returns Factor or None."""
-        import os
-        # Redirect C stderr to suppress "not positive definite" warnings
-        stderr_fd = os.dup(2)
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, 2)
-        try:
-            factor = cholmod_cholesky(A_csc)
-            if hasattr(factor, 'solve_A'):
-                result = factor.solve_A(test_rhs)
-                if np.all(np.isfinite(result)):
-                    return factor
-        except Exception:
-            pass
-        finally:
-            os.dup2(stderr_fd, 2)
-            os.close(devnull)
-            os.close(stderr_fd)
-        return None
-
     def __init__(self, A: scipy.sparse.spmatrix, spd: bool = False):
         # CHOLMOD: best for SPD matrices (Cholesky = half the work of LU)
         if spd and _SOLVER_BACKEND == 'cholmod' and _HAS_CHOLMOD:
-            factor = self._try_cholmod(A.tocsc(), np.ones(A.shape[0]))
-            if factor is not None:
-                self._cholmod_factor = factor
+            try:
+                self._cholmod_factor = cholmod_cholesky(A.tocsc())
                 self._backend = 'cholmod'
                 return
+            except Exception:
+                pass  # fall through
 
         # pypardiso: Intel MKL PARDISO (multi-threaded LU)
         if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
@@ -188,22 +167,10 @@ def sparse_solve(
 
     # CHOLMOD direct solve for SPD systems
     if spd and _SOLVER_BACKEND == 'cholmod' and _HAS_CHOLMOD:
-        import os
-        stderr_fd = os.dup(2)
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull_fd, 2)
         try:
-            factor = cholmod_cholesky(A.tocsc())
-            if hasattr(factor, 'solve_A'):
-                result = factor.solve_A(b)
-                if np.all(np.isfinite(result)):
-                    return result
+            return cholmod_cholesky(A.tocsc()).solve_A(b)
         except Exception:
-            pass
-        finally:
-            os.dup2(stderr_fd, 2)
-            os.close(devnull_fd)
-            os.close(stderr_fd)
+            pass  # fall through
 
     # pypardiso
     if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
