@@ -99,18 +99,24 @@ class SparseFactorization:
                 self._backend = 'cholmod'
                 return
             except Exception:
-                pass  # fall through to pypardiso/scipy
+                pass  # fall through
 
+        # pypardiso: Intel MKL PARDISO (multi-threaded LU)
         if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
-            if SparseFactorization._shared_solver is None:
-                SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
-            self._solver = SparseFactorization._shared_solver
-            self._A_csr = A.tocsr()
-            self._solver.factorize(self._A_csr)
-            self._backend = 'pypardiso'
-        else:
-            self._factor = scipy.sparse.linalg.splu(A.tocsc())
-            self._backend = 'scipy'
+            try:
+                if SparseFactorization._shared_solver is None:
+                    SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
+                self._solver = SparseFactorization._shared_solver
+                self._A_csr = A.tocsr()
+                self._solver.factorize(self._A_csr)
+                self._backend = 'pypardiso'
+                return
+            except Exception:
+                pass  # fall through
+
+        # scipy splu: always works (single-threaded SuperLU)
+        self._factor = scipy.sparse.linalg.splu(A.tocsc())
+        self._backend = 'scipy'
 
     def solve(self, b: np.ndarray) -> np.ndarray:
         """Solve Ax = b using the cached factorization."""
@@ -166,12 +172,18 @@ def sparse_solve(
         except Exception:
             pass  # fall through
 
+    # pypardiso
     if _SOLVER_BACKEND in ('cholmod', 'pypardiso') and _HAS_PARDISO:
-        return pypardiso.spsolve(A.tocsr(), b)
+        try:
+            return pypardiso.spsolve(A.tocsr(), b)
+        except Exception:
+            pass  # fall through
 
+    # scipy (always works)
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", scipy.sparse.linalg.MatrixRankWarning)
+        return scipy.sparse.linalg.spsolve(A.tocsc(), b)
         return scipy.sparse.linalg.spsolve(A.tocsc(), b)
 
 
@@ -505,12 +517,14 @@ def compute_heat_geodesic_pointcloud(
 
     try:
 
+        eps = 1e-6
+
         # Step I: Heat diffusion
         # Solve (M + t*L) u = delta_source
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
-        A = M + t * L
+        A = M + t * L + eps * scipy.sparse.eye(n)
         u = sparse_solve(A, delta, device, spd=True)
 
         if not np.all(np.isfinite(u)):
@@ -532,7 +546,6 @@ def compute_heat_geodesic_pointcloud(
         # Try both signs and pick the one where source has minimum distance
         div_X = div_op @ X_flat
 
-        eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
         # Factorize once, solve twice (±rhs) — SPD after regularization
@@ -606,11 +619,13 @@ def compute_heat_geodesic_mesh(
 
     try:
 
+        eps = 1e-6
+
         # Step I: Heat diffusion
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
-        A = M + t * L
+        A = M + t * L + eps * scipy.sparse.eye(n)
         u = sparse_solve(A, delta, device, spd=True)
 
         if not np.all(np.isfinite(u)):
@@ -641,7 +656,6 @@ def compute_heat_geodesic_mesh(
         rhs = grad_op.T @ X_weighted_flat  # (nV,)
 
         # Step IV: Solve Poisson — try both signs to handle sign ambiguity
-        eps = 1e-8
         L_reg = L + eps * scipy.sparse.eye(n)
 
         # Factorize once, solve twice (±rhs) — SPD after regularization
@@ -733,13 +747,14 @@ def compute_heat_geodesic_learned(
 
     try:
 
-        # Step 1: Heat diffusion â€” solve (M + tS) u = Î´_source
+        eps = 1e-6
+
+        # Step 1: Heat diffusion — solve (M + tS) u = delta_source
         delta = np.zeros(n)
         delta[source_idx] = 1.0
 
-        A = M + t * S
+        A = M + t * S + eps * scipy.sparse.eye(n)
         u = sparse_solve(A, delta, device, spd=True)
-
         if not np.all(np.isfinite(u)):
             print(f"  [!] Heat Method (learned): heat diffusion produced non-finite values, skipping")
             return None
@@ -759,7 +774,6 @@ def compute_heat_geodesic_learned(
         M_3 = np.repeat(areas_diag, 3)  # (3N,) â€” area_i repeated for x,y,z
         rhs = G.T @ (M_3 * X.flatten())  # (N,) â€” this is -M Â· div(X)
 
-        eps = 1e-8
         S_reg = S + eps * scipy.sparse.eye(n)
 
         # Factorize once, solve twice (±rhs) — SPD after regularization
