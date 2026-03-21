@@ -79,17 +79,14 @@ class SparseFactorization:
     Uses exactly the backend specified by _SOLVER_BACKEND — no fallback.
     """
 
-    # Single shared pypardiso solver (Windows allows only one instance)
-    _shared_solver = None
-
     def __init__(self, A: scipy.sparse.spmatrix, spd: bool = False):
         if _SOLVER_BACKEND == 'cholmod':
             self._cholmod_factor = cholmod_cholesky(A.tocsc())
             self._backend = 'cholmod'
         elif _SOLVER_BACKEND == 'pypardiso':
-            if SparseFactorization._shared_solver is None:
-                SparseFactorization._shared_solver = pypardiso.PyPardisoSolver()
-            self._solver = SparseFactorization._shared_solver
+            # Each factorization gets its own solver so multiple prefactored
+            # systems can coexist (e.g. heat + Poisson in the heat method).
+            self._solver = pypardiso.PyPardisoSolver()
             self._A_csr = A.tocsr()
             self._solver.factorize(self._A_csr)
             self._backend = 'pypardiso'
