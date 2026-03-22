@@ -26,7 +26,7 @@ Usage:
     python quantitative_eval.py +ckpt_path=model.ckpt +num_gpus=4
 
     # Top-k weight pruning sweep (quality-sparsity tradeoff)
-    python quantitative_eval.py +ckpt_path=model.ckpt +top_k_values=3,4,5
+    python quantitative_eval.py +ckpt_path=model.ckpt '+top_k_values=[3,4,5]'
 """
 
 import csv
@@ -189,10 +189,16 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     use_amp = device.type == 'cuda'
 
     # ---- Top-k pruning sweep ----
-    top_k_str = getattr(cfg, 'top_k_values', '')
+    # Accepts: +top_k_values='[6,10,20]' or +top_k_values=[6,10,20]
+    top_k_raw = getattr(cfg, 'top_k_values', None)
     top_k_values: List[int] = []
-    if top_k_str and run_pred:
-        top_k_values = sorted([int(x.strip()) for x in str(top_k_str).split(',') if x.strip()])
+    if top_k_raw is not None and run_pred:
+        if isinstance(top_k_raw, (list, tuple)):
+            # Hydra list: +top_k_values=[6,10,20]
+            top_k_values = sorted([int(x) for x in top_k_raw])
+        else:
+            # String: +top_k_values='6,10,20'
+            top_k_values = sorted([int(x.strip()) for x in str(top_k_raw).split(',') if x.strip()])
         top_k_values = [k for k in top_k_values if 2 <= k < pred_k]
 
     # ---- Load PRED model ----
@@ -827,9 +833,12 @@ def main(cfg: DictConfig) -> None:
     print(f"GPUs:        {num_gpus} / {num_gpus_available} available")
     if 'pred' in methods:
         print(f"PRED k:      {pred_k}")
-        top_k_str = getattr(cfg, 'top_k_values', '')
-        if top_k_str:
-            print(f"Top-k sweep: {top_k_str}")
+        top_k_raw = getattr(cfg, 'top_k_values', None)
+        if top_k_raw is not None:
+            if isinstance(top_k_raw, (list, tuple)):
+                print(f"Top-k sweep: {','.join(str(x) for x in top_k_raw)}")
+            else:
+                print(f"Top-k sweep: {top_k_raw}")
     if 'robust' in methods:
         print(f"Robust k:    {robust_k}")
     if 'nelo' in methods:
