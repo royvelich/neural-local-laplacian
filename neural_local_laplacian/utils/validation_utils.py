@@ -557,13 +557,37 @@ class RobustGeodesicTiming:
         return self.constructor + self.solve
 
 
+def _pp3d_worker(vertices: np.ndarray, source_indices: List[int], result_queue):
+    """Run pp3d in a child process. Puts (distances, constructor_time, solve_time) into queue."""
+    import potpourri3d as pp3d
+
+    t0 = time.perf_counter()
+    solver = pp3d.PointCloudHeatSolver(vertices)
+    constructor_time = time.perf_counter() - t0
+
+    distances = []
+    t0 = time.perf_counter()
+    for src in source_indices:
+        try:
+            distances.append(solver.compute_distance(src))
+        except Exception:
+            distances.append(None)
+    solve_time = time.perf_counter() - t0
+
+    result_queue.put((distances, constructor_time, solve_time))
+
+
 def step_robust_geodesic(
     vertices: np.ndarray,
     source_indices: List[int],
     robust_k: int = 30,
+    timeout: float = 120.0,
 ) -> Tuple[List[Optional[np.ndarray]], RobustGeodesicTiming]:
     """
     Compute geodesics using pp3d PointCloudHeatSolver.
+
+    pp3d runs in a subprocess to survive C++ segfaults on degenerate meshes.
+    If the subprocess crashes or times out, returns None distances.
 
     Also times robust_laplacian assembly (needed for non-geodesic tasks like
     eigendecomposition, Green's function) but NOT included in geodesic E2E.
@@ -571,8 +595,8 @@ def step_robust_geodesic(
     Returns:
         (distances_list, timing)
     """
+    import multiprocessing as _mp
     import robust_laplacian
-    import potpourri3d as pp3d
 
     timing = RobustGeodesicTiming()
 
@@ -581,20 +605,32 @@ def step_robust_geodesic(
     L_rob, M_rob = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=robust_k)
     timing.lm_assembly = time.perf_counter() - t0
 
-    # pp3d constructor (one-time — builds its own internal L,M + prefactors)
-    t0 = time.perf_counter()
-    solver = pp3d.PointCloudHeatSolver(vertices)
-    timing.constructor = time.perf_counter() - t0
+    # Run pp3d in subprocess (survives C++ segfaults)
+    ctx = _mp.get_context('fork')
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_pp3d_worker, args=(vertices, source_indices, result_queue))
+    proc.start()
+    proc.join(timeout=timeout)
 
-    # Forward-solves (per-source)
-    distances = []
-    t0 = time.perf_counter()
-    for src in source_indices:
-        try:
-            distances.append(solver.compute_distance(src))
-        except Exception:
-            distances.append(None)
-    timing.solve = time.perf_counter() - t0
+    if proc.is_alive():
+        # Timeout — kill subprocess
+        proc.kill()
+        proc.join()
+        print(f"  [!] pp3d timed out after {timeout:.0f}s (N={len(vertices)})")
+        return [None] * len(source_indices), timing
+
+    if proc.exitcode != 0:
+        # Segfault or other crash
+        print(f"  [!] pp3d crashed (exit code {proc.exitcode}, N={len(vertices)})")
+        return [None] * len(source_indices), timing
+
+    # Success — retrieve results
+    try:
+        distances, constructor_time, solve_time = result_queue.get_nowait()
+        timing.constructor = constructor_time
+        timing.solve = solve_time
+    except Exception:
+        return [None] * len(source_indices), timing
 
     return distances, timing
 
