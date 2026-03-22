@@ -802,3 +802,340 @@ def cuda_warmup(model, device: torch.device, k: int):
     del warmup_data, warmup_result
     torch.cuda.empty_cache()
     print("[OK] CUDA warmup complete")
+
+
+# =============================================================================
+# Mesh folder scanning and lookup table
+# =============================================================================
+
+import json
+import random as _random
+from pathlib import Path
+
+SUPPORTED_MESH_FORMATS = {'.obj', '.ply', '.off', '.stl'}
+MESH_PROPERTIES_CACHE_FILENAME = '.mesh_properties_cache.json'
+
+
+def load_mesh_lookup_table(
+    folder_paths: List[Path],
+) -> dict:
+    """
+    Load mesh properties lookup tables from all folder paths and merge.
+
+    Each folder may contain a .mesh_properties_cache.json with entries:
+        { "relative/path.obj": { "size_bytes": ..., "num_vertices": ...,
+          "num_faces": ..., "num_components": ... } }
+
+    Returns:
+        Dict mapping absolute file path (str) -> properties dict.
+    """
+    merged = {}
+    for folder_path in folder_paths:
+        cache_path = folder_path / MESH_PROPERTIES_CACHE_FILENAME
+        if cache_path.exists():
+            try:
+                with open(cache_path, 'r') as f:
+                    folder_cache = json.load(f)
+                for rel_path, props in folder_cache.items():
+                    abs_path = str(folder_path / rel_path)
+                    merged[abs_path] = props
+                print(f"  Loaded {len(folder_cache)} entries from {cache_path}")
+            except Exception as e:
+                print(f"  Warning: Failed to load lookup cache {cache_path}: {e}")
+    return merged
+
+
+def save_mesh_lookup_table(
+    lookup: dict,
+    folder_paths: List[Path],
+) -> None:
+    """
+    Save mesh properties lookup table back to each folder's cache file.
+
+    Only entries belonging to each folder are saved to that folder's cache.
+    """
+    for folder_path in folder_paths:
+        folder_entries = {}
+        for abs_path_str, props in lookup.items():
+            abs_path = Path(abs_path_str)
+            try:
+                rel_path = str(abs_path.relative_to(folder_path))
+                folder_entries[rel_path] = props
+            except ValueError:
+                pass
+
+        if not folder_entries:
+            continue
+
+        cache_path = folder_path / MESH_PROPERTIES_CACHE_FILENAME
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump(folder_entries, f, indent=2)
+            print(f"  Saved {len(folder_entries)} entries to {cache_path}")
+        except Exception as e:
+            print(f"  Warning: Failed to save lookup cache {cache_path}: {e}")
+
+
+def get_mesh_geometry_info(
+    file_path: Path,
+) -> Optional[Tuple[int, int, int]]:
+    """
+    Load a mesh and return (num_vertices, num_faces, num_components).
+
+    Returns None if the mesh could not be loaded.
+    """
+    import trimesh
+    try:
+        loaded = trimesh.load(str(file_path))
+    except Exception as e:
+        print(f"  Warning: could not load {file_path.name}: {e}")
+        return None
+
+    if isinstance(loaded, trimesh.Scene):
+        num_components = len(loaded.geometry)
+        num_vertices = sum(
+            len(g.vertices) for g in loaded.geometry.values()
+            if hasattr(g, 'vertices')
+        )
+        num_faces = sum(
+            len(g.faces) for g in loaded.geometry.values()
+            if hasattr(g, 'faces')
+        )
+    elif isinstance(loaded, trimesh.Trimesh):
+        num_vertices = len(loaded.vertices)
+        num_faces = len(loaded.faces)
+        num_components = len(loaded.split())
+    else:
+        print(f"  Warning: unsupported mesh type {type(loaded).__name__} "
+              f"for {file_path.name}")
+        return None
+
+    return num_vertices, num_faces, num_components
+
+
+def scan_mesh_folders(
+    folder_paths: List[Path],
+    file_size_range_mb: Optional[Tuple[float, float]] = None,
+    vertices_count_range: Optional[Tuple[int, int]] = None,
+    faces_count_range: Optional[Tuple[int, int]] = None,
+    num_components_range: Optional[Tuple[int, int]] = None,
+    max_meshes: Optional[int] = None,
+    shuffle: bool = False,
+    seed: Optional[int] = None,
+) -> List[Path]:
+    """
+    Scan mesh folders, apply filters, build/update lookup table.
+
+    Filter order: file size (cheap) → geometry (uses lookup, loads on miss) →
+    shuffle → cap.
+
+    This function is called by preprocess_mesh_folder.py to discover meshes.
+    MeshDataset does NOT call this — it reads from the existing lookup table.
+
+    Args:
+        folder_paths: List of folder paths to scan
+        file_size_range_mb: (min_mb, max_mb) or None
+        vertices_count_range: (min_verts, max_verts) or None
+        faces_count_range: (min_faces, max_faces) or None
+        num_components_range: (min_comp, max_comp) or None
+        max_meshes: Cap on number of meshes (applied after shuffle)
+        shuffle: Shuffle before capping
+        seed: Random seed for shuffle
+
+    Returns:
+        List of mesh file Path objects
+    """
+    # Discover all mesh files
+    mesh_files = []
+    for folder_path in folder_paths:
+        for file_path in folder_path.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_MESH_FORMATS:
+                mesh_files.append(file_path)
+    mesh_files.sort()
+
+    # File size filter (cheap, no I/O)
+    if file_size_range_mb is not None:
+        min_bytes = file_size_range_mb[0] * 1024 * 1024
+        max_bytes = file_size_range_mb[1] * 1024 * 1024
+        before = len(mesh_files)
+        mesh_files = [f for f in mesh_files if min_bytes <= f.stat().st_size <= max_bytes]
+        skipped = before - len(mesh_files)
+        if skipped > 0:
+            print(f"File size filter ({file_size_range_mb[0]:.2f}-"
+                  f"{file_size_range_mb[1]:.2f} MB): kept {len(mesh_files)}, skipped {skipped}")
+
+    # Geometry filter (uses lookup table, loads mesh on cache miss)
+    has_geo_filters = (vertices_count_range is not None
+                       or faces_count_range is not None
+                       or num_components_range is not None)
+
+    if has_geo_filters and mesh_files:
+        lookup = load_mesh_lookup_table(folder_paths)
+        cache_hits, cache_misses = 0, 0
+        kept = []
+        skipped = 0
+
+        filter_parts = []
+        if vertices_count_range is not None:
+            filter_parts.append(f"vertices in [{vertices_count_range[0]}, {vertices_count_range[1]}]")
+        if faces_count_range is not None:
+            filter_parts.append(f"faces in [{faces_count_range[0]}, {faces_count_range[1]}]")
+        if num_components_range is not None:
+            filter_parts.append(f"components in [{num_components_range[0]}, {num_components_range[1]}]")
+        print(f"Geometry filter ({', '.join(filter_parts)}): checking {len(mesh_files)} meshes "
+              f"({len(lookup)} cached entries) ...")
+
+        for file_path in mesh_files:
+            key = str(file_path)
+            info = None
+
+            # Try cache
+            if key in lookup:
+                props = lookup[key]
+                try:
+                    current_size = file_path.stat().st_size
+                    if current_size == props.get('size_bytes'):
+                        info = (props['num_vertices'], props['num_faces'], props['num_components'])
+                        cache_hits += 1
+                except (OSError, KeyError):
+                    pass
+
+            # Cache miss — load mesh
+            if info is None:
+                cache_misses += 1
+                info = get_mesh_geometry_info(file_path)
+                if info is not None:
+                    num_v, num_f, num_c = info
+                    try:
+                        size_bytes = file_path.stat().st_size
+                    except OSError:
+                        size_bytes = 0
+                    lookup[key] = {
+                        'size_bytes': size_bytes,
+                        'num_vertices': num_v,
+                        'num_faces': num_f,
+                        'num_components': num_c,
+                    }
+
+            if info is None:
+                skipped += 1
+                continue
+
+            num_v, num_f, num_c = info
+            if vertices_count_range is not None:
+                if not (vertices_count_range[0] <= num_v <= vertices_count_range[1]):
+                    skipped += 1
+                    continue
+            if faces_count_range is not None:
+                if not (faces_count_range[0] <= num_f <= faces_count_range[1]):
+                    skipped += 1
+                    continue
+            if num_components_range is not None:
+                if not (num_components_range[0] <= num_c <= num_components_range[1]):
+                    skipped += 1
+                    continue
+
+            kept.append(file_path)
+
+        print(f"Geometry filter: kept {len(kept)}, skipped {skipped} "
+              f"(cache: {cache_hits} hits, {cache_misses} misses)")
+
+        if cache_misses > 0:
+            save_mesh_lookup_table(lookup, folder_paths)
+
+        mesh_files = kept
+
+    # Shuffle
+    if shuffle:
+        if seed is not None:
+            _random.seed(seed)
+        _random.shuffle(mesh_files)
+
+    # Cap
+    if max_meshes is not None and len(mesh_files) > max_meshes:
+        print(f"Capping mesh list from {len(mesh_files)} to {max_meshes}"
+              f"{' (shuffled)' if shuffle else ''}")
+        mesh_files = mesh_files[:max_meshes]
+
+    return mesh_files
+
+
+def load_mesh_list_from_lookup(
+    folder_paths: List[Path],
+    file_size_range_mb: Optional[Tuple[float, float]] = None,
+    vertices_count_range: Optional[Tuple[int, int]] = None,
+    faces_count_range: Optional[Tuple[int, int]] = None,
+    num_components_range: Optional[Tuple[int, int]] = None,
+    max_meshes: Optional[int] = None,
+    shuffle: bool = False,
+    seed: Optional[int] = None,
+) -> List[Path]:
+    """
+    Load mesh file list from existing lookup table. No scanning, no trimesh.
+
+    Raises RuntimeError if no lookup table found.
+
+    Args:
+        folder_paths: List of dataset folder paths
+        (remaining args same as scan_mesh_folders)
+
+    Returns:
+        Filtered list of mesh file Path objects
+    """
+    lookup = load_mesh_lookup_table(folder_paths)
+    if not lookup:
+        folders_str = ", ".join(str(p) for p in folder_paths)
+        raise RuntimeError(
+            f"No mesh lookup table found in: {folders_str}\n"
+            f"Run preprocess_mesh_folder.py first to build the lookup table."
+        )
+
+    # Filter from lookup entries
+    mesh_files = []
+    for abs_path_str, props in lookup.items():
+        path = Path(abs_path_str)
+
+        # Must exist
+        if not path.exists():
+            continue
+
+        # File size filter
+        if file_size_range_mb is not None:
+            min_bytes = file_size_range_mb[0] * 1024 * 1024
+            max_bytes = file_size_range_mb[1] * 1024 * 1024
+            size = props.get('size_bytes', 0)
+            if not (min_bytes <= size <= max_bytes):
+                continue
+
+        # Geometry filters
+        num_v = props.get('num_vertices', 0)
+        num_f = props.get('num_faces', 0)
+        num_c = props.get('num_components', 0)
+
+        if vertices_count_range is not None:
+            if not (vertices_count_range[0] <= num_v <= vertices_count_range[1]):
+                continue
+        if faces_count_range is not None:
+            if not (faces_count_range[0] <= num_f <= faces_count_range[1]):
+                continue
+        if num_components_range is not None:
+            if not (num_components_range[0] <= num_c <= num_components_range[1]):
+                continue
+
+        mesh_files.append(path)
+
+    mesh_files.sort()
+
+    # Shuffle
+    if shuffle:
+        if seed is not None:
+            _random.seed(seed)
+        _random.shuffle(mesh_files)
+
+    # Cap
+    if max_meshes is not None and len(mesh_files) > max_meshes:
+        print(f"Capping mesh list from {len(mesh_files)} to {max_meshes}"
+              f"{' (shuffled)' if shuffle else ''}")
+        mesh_files = mesh_files[:max_meshes]
+
+    return mesh_files

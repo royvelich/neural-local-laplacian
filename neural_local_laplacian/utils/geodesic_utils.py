@@ -880,3 +880,101 @@ def compute_multisource_geodesic_metrics(
         num_sources=len(valid_sources),
         source_indices=np.array(valid_sources)
     )
+
+# =============================================================================
+# Geodesic cache (shared by precompute_geodesics.py, mesh_datasets.py,
+#                 quantitative_eval.py)
+# =============================================================================
+
+from pathlib import Path
+
+GEODESICS_CACHE_DIR = '.geodesics_cache'
+
+
+def get_geodesic_cache_path(mesh_file_path: str) -> Path:
+    """Get the .npz cache path for a mesh file.
+
+    Cache lives in a .geodesics_cache/ subfolder next to the mesh file:
+        /data/meshes/T1121.off  ->  /data/meshes/.geodesics_cache/T1121.npz
+    """
+    mesh_path = Path(mesh_file_path)
+    cache_dir = mesh_path.parent / GEODESICS_CACHE_DIR
+    return cache_dir / f"{mesh_path.stem}.npz"
+
+
+def load_cached_geodesics(
+    mesh_file_path: str,
+    num_vertices: int,
+    source_indices: np.ndarray,
+) -> Optional[Dict[int, np.ndarray]]:
+    """
+    Load precomputed geodesics from cache if available and valid.
+
+    Validates that:
+    - Cache file exists
+    - num_vertices matches (mesh hasn't changed)
+    - source_indices match exactly (same FPS seed + num_sources)
+
+    Args:
+        mesh_file_path: Path to the mesh file
+        num_vertices: Expected vertex count (after process=True + normalize)
+        source_indices: Expected FPS source indices
+
+    Returns:
+        Dict mapping source_idx -> distances (N,), or None if cache miss.
+    """
+    cache_path = get_geodesic_cache_path(mesh_file_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        data = np.load(str(cache_path))
+        cached_n = int(data['num_vertices'])
+        cached_sources = data['source_indices']
+
+        if cached_n != num_vertices:
+            return None
+        if not np.array_equal(cached_sources, source_indices):
+            return None
+
+        result = {}
+        for src_idx in source_indices:
+            key = f'distances_{src_idx}'
+            if key in data:
+                result[int(src_idx)] = data[key]
+            else:
+                return None  # Incomplete cache
+
+        return result
+    except Exception:
+        return None
+
+
+def save_geodesics_to_cache(
+    mesh_file_path: str,
+    num_vertices: int,
+    source_indices: np.ndarray,
+    geodesics: Dict[int, Optional[np.ndarray]],
+) -> None:
+    """
+    Save computed geodesics to cache.
+
+    Args:
+        mesh_file_path: Path to the mesh file
+        num_vertices: Vertex count (for validation on load)
+        source_indices: FPS source indices
+        geodesics: Dict mapping source_idx -> distances (N,), may contain None
+    """
+    cache_path = get_geodesic_cache_path(mesh_file_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    save_dict = {
+        'num_vertices': np.array(num_vertices),
+        'source_indices': np.array(source_indices),
+    }
+
+    for src_idx, dists in geodesics.items():
+        if dists is not None:
+            save_dict[f'distances_{src_idx}'] = dists.astype(np.float64)
+
+    np.savez_compressed(str(cache_path), **save_dict)

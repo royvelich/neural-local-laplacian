@@ -1,8 +1,6 @@
 # Standard library
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
-import random
-import json
 
 # Third-party libraries
 import numpy as np
@@ -19,9 +17,11 @@ import trimesh
 from neural_local_laplacian.datasets.base_datasets import PoseType
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 from neural_local_laplacian.utils import utils
+from neural_local_laplacian.utils.utils import load_mesh_list_from_lookup
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_exact_geodesics,
     select_multiple_geodesic_sources,
+    load_cached_geodesics,
 )
 
 
@@ -50,15 +50,9 @@ class MeshDataset(Dataset):
     """
     Dataset for loading real 3D meshes and extracting local surface patches.
 
-    For each vertex in a mesh, extracts k nearest neighbors (excluding the center vertex),
-    translates the patch so the center would be at origin, and applies feature extraction.
+    Requires a pre-built lookup table (.mesh_properties_cache.json) in each
+    mesh folder. Run preprocess_mesh_folder.py to create it.
     """
-
-    # Supported mesh file formats
-    SUPPORTED_FORMATS = {'.obj', '.ply', '.off', '.stl'}
-
-    # Filename for the mesh properties lookup cache (stored per folder)
-    _LOOKUP_CACHE_FILENAME = '.mesh_properties_cache.json'
 
     def __init__(
             self,
@@ -140,8 +134,16 @@ class MeshDataset(Dataset):
         # Validate inputs
         self._validate_inputs()
 
-        # Scan all folders for mesh files
-        self._mesh_file_paths = self._scan_mesh_folders()
+        # Load mesh list from existing lookup table (no scanning)
+        self._mesh_file_paths = load_mesh_list_from_lookup(
+            folder_paths=self._mesh_folder_paths,
+            file_size_range_mb=self._file_size_range_mb,
+            vertices_count_range=self._vertices_count_range,
+            faces_count_range=self._faces_count_range,
+            num_components_range=self._num_components_range,
+            max_meshes=self._max_meshes,
+            shuffle=self._shuffle,
+        )
 
         if len(self._mesh_file_paths) == 0:
             folders_str = ", ".join(str(p) for p in self._mesh_folder_paths)
@@ -194,288 +196,6 @@ class MeshDataset(Dataset):
                 raise ValueError(f"num_components_range min must be >= 1, got {min_c}")
             if max_c < min_c:
                 raise ValueError(f"num_components_range max ({max_c}) must be >= min ({min_c})")
-
-    def _scan_mesh_folders(self) -> List[Path]:
-        """
-        Scan all mesh folders for supported mesh files, applying size filtering,
-        geometry filtering (vertices/faces/components), optional shuffling, and
-        max mesh cap.
-
-        Filter order: file size (cheap, no I/O) → geometry (requires mesh loading) →
-        shuffle → cap.
-
-        Returns:
-            List of Path objects for found mesh files
-        """
-        mesh_files = []
-
-        for folder_path in self._mesh_folder_paths:
-            for file_path in folder_path.rglob('*'):
-                if file_path.is_file() and file_path.suffix.lower() in self.SUPPORTED_FORMATS:
-                    mesh_files.append(file_path)
-
-        # Sort for consistent base ordering (before optional shuffle)
-        mesh_files.sort()
-
-        # Filter by file size if specified (cheap — no mesh loading)
-        if self._file_size_range_mb is not None:
-            min_bytes = self._file_size_range_mb[0] * 1024 * 1024
-            max_bytes = self._file_size_range_mb[1] * 1024 * 1024
-            before_count = len(mesh_files)
-            mesh_files = [
-                f for f in mesh_files
-                if min_bytes <= f.stat().st_size <= max_bytes
-            ]
-            filtered_count = before_count - len(mesh_files)
-            if filtered_count > 0:
-                print(f"File size filter ({self._file_size_range_mb[0]:.2f}-"
-                      f"{self._file_size_range_mb[1]:.2f} MB): "
-                      f"kept {len(mesh_files)}, skipped {filtered_count}")
-
-        # Filter by geometry properties if any geometry filter is specified
-        # (requires loading each mesh — applied after cheap file-size filter)
-        has_geometry_filters = (
-            self._vertices_count_range is not None
-            or self._faces_count_range is not None
-            or self._num_components_range is not None
-        )
-        if has_geometry_filters and len(mesh_files) > 0:
-            mesh_files = self._apply_geometry_filters(mesh_files)
-
-        # Shuffle before capping if requested
-        if self._shuffle:
-            random.shuffle(mesh_files)
-
-        # Cap to max_meshes
-        if self._max_meshes is not None and len(mesh_files) > self._max_meshes:
-            print(f"Capping mesh list from {len(mesh_files)} to {self._max_meshes}"
-                  f"{' (shuffled)' if self._shuffle else ''}")
-            mesh_files = mesh_files[:self._max_meshes]
-
-        return mesh_files
-
-    def _load_lookup_table(self) -> dict:
-        """
-        Load mesh properties lookup tables from all configured folder paths and merge.
-
-        Each folder may contain a `.mesh_properties_cache.json` file with entries:
-            { "relative/path.obj": { "size_bytes": 12345, "num_vertices": 100, "num_faces": 200, "num_components": 1 } }
-
-        Returns:
-            Merged lookup dict mapping absolute file path (str) -> properties dict.
-        """
-        merged = {}
-        for folder_path in self._mesh_folder_paths:
-            cache_path = folder_path / self._LOOKUP_CACHE_FILENAME
-            if cache_path.exists():
-                try:
-                    with open(cache_path, 'r') as f:
-                        folder_cache = json.load(f)
-                    # Convert relative keys to absolute paths
-                    for rel_path, props in folder_cache.items():
-                        abs_path = str(folder_path / rel_path)
-                        merged[abs_path] = props
-                    print(f"  Loaded {len(folder_cache)} entries from {cache_path}")
-                except Exception as e:
-                    print(f"  Warning: Failed to load lookup cache {cache_path}: {e}")
-        return merged
-
-    def _save_lookup_table(self, lookup: dict):
-        """
-        Save mesh properties lookup table back to each folder's cache file.
-
-        Only entries belonging to each folder are saved to that folder's cache file.
-
-        Args:
-            lookup: Dict mapping absolute file path (str) -> properties dict.
-        """
-        for folder_path in self._mesh_folder_paths:
-            # Extract entries belonging to this folder, convert to relative paths
-            folder_entries = {}
-            for abs_path_str, props in lookup.items():
-                abs_path = Path(abs_path_str)
-                try:
-                    rel_path = str(abs_path.relative_to(folder_path))
-                    folder_entries[rel_path] = props
-                except ValueError:
-                    # abs_path is not under folder_path — skip
-                    pass
-
-            if not folder_entries:
-                continue
-
-            cache_path = folder_path / self._LOOKUP_CACHE_FILENAME
-            try:
-                with open(cache_path, 'w') as f:
-                    json.dump(folder_entries, f, indent=2)
-                print(f"  Saved {len(folder_entries)} entries to {cache_path}")
-            except Exception as e:
-                print(f"  Warning: Failed to save lookup cache {cache_path}: {e}")
-
-    def _get_cached_geometry_info(self, file_path: Path, lookup: dict) -> Optional[Tuple[int, int, int]]:
-        """
-        Get mesh geometry info from cache if available and valid (file size matches).
-
-        Args:
-            file_path: Path to the mesh file.
-            lookup: The loaded lookup table.
-
-        Returns:
-            Tuple of (num_vertices, num_faces, num_components) from cache, or None if
-            not cached or cache entry is stale (file size changed).
-        """
-        key = str(file_path)
-        if key not in lookup:
-            return None
-
-        props = lookup[key]
-        # Validate by file size — if size changed, cache is stale
-        try:
-            current_size = file_path.stat().st_size
-            if current_size != props.get('size_bytes'):
-                return None
-        except OSError:
-            return None
-
-        try:
-            return props['num_vertices'], props['num_faces'], props['num_components']
-        except KeyError:
-            return None
-
-    def _get_mesh_geometry_info(self, file_path: Path) -> Optional[Tuple[int, int, int]]:
-        """
-        Load a mesh and return its vertex count, face count, and number of
-        connected components.
-
-        Args:
-            file_path: Path to the mesh file
-
-        Returns:
-            Tuple of (num_vertices, num_faces, num_components), or None if the
-            mesh could not be loaded.
-        """
-        try:
-            loaded = trimesh.load(str(file_path))
-        except Exception as e:
-            print(f"  Warning: could not load {file_path.name} for filtering: {e}")
-            return None
-
-        if isinstance(loaded, trimesh.Scene):
-            # Scene: each entry in .geometry is a separate object
-            num_components = len(loaded.geometry)
-            # Aggregate vertex/face counts across all geometries
-            num_vertices = sum(
-                len(g.vertices) for g in loaded.geometry.values()
-                if hasattr(g, 'vertices')
-            )
-            num_faces = sum(
-                len(g.faces) for g in loaded.geometry.values()
-                if hasattr(g, 'faces')
-            )
-        elif isinstance(loaded, trimesh.Trimesh):
-            num_vertices = len(loaded.vertices)
-            num_faces = len(loaded.faces)
-            num_components = len(loaded.split())
-        else:
-            print(f"  Warning: unsupported mesh type {type(loaded).__name__} "
-                  f"for {file_path.name}, skipping")
-            return None
-
-        return num_vertices, num_faces, num_components
-
-    def _apply_geometry_filters(self, mesh_files: List[Path]) -> List[Path]:
-        """
-        Filter mesh files by vertex count, face count, and/or number of connected
-        components.  Uses a lookup cache to avoid reloading meshes that have already
-        been inspected.
-
-        Args:
-            mesh_files: List of mesh file paths that passed earlier (cheap) filters
-
-        Returns:
-            Filtered list of mesh file paths
-        """
-        # Build human-readable description of active filters for logging
-        filter_parts = []
-        if self._vertices_count_range is not None:
-            lo, hi = self._vertices_count_range
-            filter_parts.append(f"vertices in [{lo}, {hi}]")
-        if self._faces_count_range is not None:
-            lo, hi = self._faces_count_range
-            filter_parts.append(f"faces in [{lo}, {hi}]")
-        if self._num_components_range is not None:
-            lo, hi = self._num_components_range
-            filter_parts.append(f"components in [{lo}, {hi}]")
-        filter_desc = ", ".join(filter_parts)
-
-        # Load existing lookup cache
-        lookup = self._load_lookup_table()
-        cache_hits = 0
-        cache_misses = 0
-
-        print(f"Geometry filter ({filter_desc}): checking {len(mesh_files)} meshes "
-              f"({len(lookup)} cached entries) ...")
-
-        kept: List[Path] = []
-        skipped = 0
-
-        for file_path in mesh_files:
-            # Try cache first
-            info = self._get_cached_geometry_info(file_path, lookup)
-            if info is not None:
-                cache_hits += 1
-            else:
-                # Cache miss — load mesh and compute properties
-                cache_misses += 1
-                info = self._get_mesh_geometry_info(file_path)
-                if info is not None:
-                    # Store in lookup for saving later
-                    num_vertices, num_faces, num_components = info
-                    try:
-                        size_bytes = file_path.stat().st_size
-                    except OSError:
-                        size_bytes = 0
-                    lookup[str(file_path)] = {
-                        'size_bytes': size_bytes,
-                        'num_vertices': num_vertices,
-                        'num_faces': num_faces,
-                        'num_components': num_components,
-                    }
-
-            if info is None:
-                skipped += 1
-                continue
-
-            num_vertices, num_faces, num_components = info
-
-            if self._vertices_count_range is not None:
-                lo, hi = self._vertices_count_range
-                if not (lo <= num_vertices <= hi):
-                    skipped += 1
-                    continue
-
-            if self._faces_count_range is not None:
-                lo, hi = self._faces_count_range
-                if not (lo <= num_faces <= hi):
-                    skipped += 1
-                    continue
-
-            if self._num_components_range is not None:
-                lo, hi = self._num_components_range
-                if not (lo <= num_components <= hi):
-                    skipped += 1
-                    continue
-
-            kept.append(file_path)
-
-        print(f"Geometry filter: kept {len(kept)}, skipped {skipped} "
-              f"(cache: {cache_hits} hits, {cache_misses} misses)")
-
-        # Save updated lookup cache (includes any newly computed entries)
-        if cache_misses > 0:
-            self._save_lookup_table(lookup)
-
-        return kept
 
     def len(self) -> int:
         """Return the number of mesh files in the dataset."""
@@ -559,7 +279,9 @@ class MeshDataset(Dataset):
 
         # Compute geodesic validation data (source selection + exact geodesics, no pcdiff operators)
         if _v: print(f"    [diag] geodesic_validation_data ...", flush=True)
-        geodesic_data = self._compute_geodesic_validation_data(vertices, faces)
+        geodesic_data = self._compute_geodesic_validation_data(
+            vertices, faces, mesh_file_path=str(mesh_file_path),
+        )
 
         # Build Data object with raw mesh information
         data = Data()
@@ -614,18 +336,20 @@ class MeshDataset(Dataset):
     def _compute_geodesic_validation_data(
             self,
             vertices: np.ndarray,
-            faces: np.ndarray
+            faces: np.ndarray,
+            mesh_file_path: str = None,
     ) -> dict:
         """
-        Compute geodesic validation data: source vertices and exact geodesics.
+        Load geodesic validation data from cache, or compute on the fly.
 
-        Point cloud grad/div operators (pcdiff) are NOT built here — they depend
-        on k and should be built at inference time by the consumer, matching the
-        actual k used for the PRED Laplacian.
+        Tries to load from .geodesics_cache/ first (built by
+        preprocess_mesh_folder.py). Falls back to on-the-fly computation
+        if cache is missing.
 
         Args:
             vertices: Mesh vertices of shape (N, 3)
             faces: Mesh faces of shape (F, 3)
+            mesh_file_path: Path to mesh file (for cache lookup)
 
         Returns:
             Dictionary with:
@@ -639,19 +363,30 @@ class MeshDataset(Dataset):
             'has_geodesic_data': False
         }
 
-        # Select multiple source vertices using configured method
+        # Select sources (deterministic — same seed/method as preprocess script)
         source_indices = select_multiple_geodesic_sources(
             vertices,
             num_sources=self._num_geodesic_sources,
             method=self._geodesic_source_method,
-            seed=42  # For reproducibility
+            seed=42
         )
         result['source_indices'] = source_indices
 
-        # Compute exact geodesics for each source
+        # Try cache first
+        if mesh_file_path is not None:
+            cached = load_cached_geodesics(mesh_file_path, len(vertices), source_indices)
+            if cached is not None:
+                result['exact_geodesics'] = cached
+                result['has_geodesic_data'] = True
+                if self._verbose:
+                    print(f"    [diag] Loaded geodesics from cache ({len(cached)} sources)")
+                return result
+
+        # Cache miss — compute on the fly
         exact_geodesics = {}
         for source_idx in source_indices:
-            if self._verbose: print(f"    [diag] compute_exact_geodesics (source={source_idx}) ...", flush=True)
+            if self._verbose:
+                print(f"    [diag] compute_exact_geodesics (source={source_idx}) ...", flush=True)
             geodesics = compute_exact_geodesics(vertices, faces, int(source_idx))
             if geodesics is not None:
                 exact_geodesics[int(source_idx)] = geodesics
