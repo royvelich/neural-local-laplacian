@@ -55,8 +55,10 @@ def main(cfg: DictConfig) -> None:
     print(f"Loading model from: {ckpt_path}")
     model = LaplacianTransformerModule.load_from_checkpoint(ckpt_path, map_location=device, strict=False)
     model = model.to(device).eval()
-    print(f"  d_model={model.model_params.d_model}, layers={model.model_params.num_layers}, "
-          f"params={sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    d_model = getattr(model, '_d_model', '?')
+    n_layers = getattr(model, '_num_layers', '?')
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"  d_model={d_model}, layers={n_layers}, params={n_params:.1f}M")
 
     has_grad = getattr(model, '_operator_mode', 'stiffness') == 'gradient'
     print(f"Operator mode: {getattr(model, '_operator_mode', 'stiffness')}"
