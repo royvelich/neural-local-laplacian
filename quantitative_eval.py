@@ -189,16 +189,17 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     use_amp = device.type == 'cuda'
 
     # ---- Top-k pruning sweep ----
-    # Accepts: +top_k_values='[6,10,20]' or +top_k_values=[6,10,20]
+    # Accepts: +top_k_values=[6,10,20] or +'top_k_values=[6,10,20]'
     top_k_raw = getattr(cfg, 'top_k_values', None)
     top_k_values: List[int] = []
     if top_k_raw is not None and run_pred:
         if isinstance(top_k_raw, (list, tuple)):
-            # Hydra list: +top_k_values=[6,10,20]
             top_k_values = sorted([int(x) for x in top_k_raw])
         else:
-            # String: +top_k_values='6,10,20'
-            top_k_values = sorted([int(x.strip()) for x in str(top_k_raw).split(',') if x.strip()])
+            # Strip brackets and whitespace, then split
+            cleaned = str(top_k_raw).strip().strip('[]()').strip()
+            if cleaned:
+                top_k_values = sorted([int(x.strip()) for x in cleaned.split(',') if x.strip()])
         top_k_values = [k for k in top_k_values if 2 <= k < pred_k]
 
     # ---- Load PRED model ----
