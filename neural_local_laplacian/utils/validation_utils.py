@@ -1389,13 +1389,13 @@ def step_spectral_compression(
         eigenvectors: (N, K) eigenvectors
         M: Mass matrix (N, N) for computing spectral coefficients
         vertices: (N, 3) original mesh vertices
-        k_values: List of eigenvector counts to test (default [5, 10, 20, 50])
+        k_values: List of eigenvector counts to test. Required.
 
     Returns:
         CompressionResult with per-k errors.
     """
     if k_values is None:
-        k_values = [5, 10, 20, 50]
+        raise ValueError("k_values must be provided")
 
     result = CompressionResult()
     evecs = np.asarray(eigenvectors, dtype=np.float64)

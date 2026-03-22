@@ -570,7 +570,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics[f'{prefix}_density_pct'] = sp.density_percent
 
             # ---- Spectral compression ----
-            compression_k_values = [5, 10, 20, 50]
+            compression_k_values = list(range(5, num_eigenvalues + 1, 5))
             for prefix, m_evecs, m_M in [
                 ('gt', gt_evecs, gt_M),
                 ('pred', pred_evecs, pred_M),
@@ -888,12 +888,12 @@ def main(cfg: DictConfig) -> None:
     print(f"Saved summary: {summary_path}")
 
     # ---- Print summary table ----
-    _print_summary(all_metrics, methods, num_sources, elapsed, num_gpus)
+    _print_summary(all_metrics, methods, num_sources, num_eigenvalues, elapsed, num_gpus)
 
     # ---- Generate plots ----
     figures_dir = output_dir / 'figures'
     figures_dir.mkdir(parents=True, exist_ok=True)
-    _generate_plots(all_metrics, methods, figures_dir)
+    _generate_plots(all_metrics, methods, figures_dir, num_eigenvalues)
 
     # ---- Cleanup ----
     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -903,6 +903,7 @@ def _print_summary(
     all_metrics: List[Dict[str, Any]],
     methods: Set[str],
     num_sources: int,
+    num_eigenvalues: int,
     elapsed: float,
     num_gpus: int,
 ):
@@ -1053,7 +1054,7 @@ def _print_summary(
     print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
     print(f"  {'-' * 28} {'-' * W} {'-' * W}")
 
-    for k in [5, 10, 20, 50]:
+    for k in range(5, num_eigenvalues + 1, 5):
         _print_quality_row(f"GT k={k}", f"gt_compress_k{k}_mean_l2")
         for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
             if prefix not in methods:
@@ -1179,6 +1180,7 @@ def _generate_plots(
     all_metrics: List[Dict[str, Any]],
     methods: Set[str],
     output_dir: Path,
+    num_eigenvalues: int = 50,
 ):
     """Generate all plots from collected metrics."""
     _setup_plot_style()
@@ -1192,7 +1194,7 @@ def _generate_plots(
     _plot_descriptor_quality(all_metrics, active, output_dir)
     _plot_probe_quality(all_metrics, active, output_dir)
     _plot_sparsity(all_metrics, active, output_dir)
-    _plot_spectral_compression(all_metrics, active, output_dir)
+    _plot_spectral_compression(all_metrics, active, output_dir, num_eigenvalues)
 
     # Top-k sweep (if present)
     tk_values = _detect_top_k_values(all_metrics)
@@ -1579,11 +1581,12 @@ def _plot_sparsity(all_metrics: List[Dict], methods: List[str], output_dir: Path
     print(f"  Saved: sparsity.pdf/png")
 
 
-def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], output_dir: Path,
+                               num_eigenvalues: int = 50):
     """Line plot: mean L2 reconstruction error vs number of eigenvectors (k)."""
 
     all_prefixes = ['gt'] + methods
-    k_values = [5, 10, 20, 50]
+    k_values = list(range(5, num_eigenvalues + 1, 5))
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
 
@@ -1617,7 +1620,8 @@ def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], outp
     ax.set_xlabel('Number of Eigenvectors (k)')
     ax.set_ylabel('Mean L2 Reconstruction Error')
     ax.set_title('Spectral Compression Quality')
-    ax.set_xticks(k_values)
+    ax.set_xticks(list(range(5, num_eigenvalues + 1, 10)))
+    ax.set_xticks(k_values, minor=True)
     ax.set_xlim(k_values[0] - 1, k_values[-1] + 1)
     ax.set_ylim(bottom=0)
     ax.legend(loc='upper right', framealpha=0.9)
