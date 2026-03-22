@@ -240,28 +240,21 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
             # ==============================================================
             # Phase 1: TIMING-SENSITIVE (GC disabled)
-            # Grouped by type: assemblies → geodesics → Green's
-            # GPU mini-warmup before each GPU method.
+            # GPU assemblies run FIRST (before any heavy CPU work cools GPU).
+            # Then CPU-only: GT/Robust assembly → all geodesics → all Green's.
             # ==============================================================
 
             n_src = len(source_indices)
 
-            # ---- Assemblies ----
-            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
-            metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
-
-            rob_L, rob_M, t_rob_lm = None, None, None
-            if run_robust:
-                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
-                metrics['robust_k'] = robust_k
-                metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
+            # ---- GPU assemblies (run first while GPU is warm) ----
+            # Mini warmup: wake GPU from idle after Phase 2's heavy CPU work.
+            if device.type == 'cuda' and (run_pred or run_nelo):
+                _w = torch.randn(512, 512, device=device) @ torch.randn(512, 512, device=device)
+                torch.cuda.synchronize()
+                del _w
 
             pred_L, pred_M, pred_G, t_pred = None, None, None, None
             if run_pred:
-                if device.type == 'cuda':
-                    _w = torch.randn(256, 256, device=device) @ torch.randn(256, 256, device=device)
-                    torch.cuda.synchronize()
-                    del _w
                 pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
                     model, verts_tensor, pred_k, device, use_amp=use_amp,
                 )
@@ -274,10 +267,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
             nelo_L, nelo_M, t_nelo = None, None, None
             if run_nelo:
-                if device.type == 'cuda':
-                    _w = torch.randn(256, 256, device=device) @ torch.randn(256, 256, device=device)
-                    torch.cuda.synchronize()
-                    del _w
                 nelo_L, nelo_M, t_nelo = step_nelo_laplacian(
                     nelo_pipeline, vertices, nelo_k, device,
                 )
@@ -287,7 +276,17 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['nelo_assembly_ms'] = t_nelo.assembly * 1000
                 metrics['nelo_lm_total_ms'] = t_nelo.total * 1000
 
-            # ---- Geodesics ----
+            # ---- CPU assemblies ----
+            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
+            metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
+
+            rob_L, rob_M, t_rob_lm = None, None, None
+            if run_robust:
+                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+                metrics['robust_k'] = robust_k
+                metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
+
+            # ---- Geodesics (all CPU) ----
             # GT geodesic (mesh-based heat method)
             if gt_L is not None:
                 _, gt_geo_timing = step_gt_geodesic(
