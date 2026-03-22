@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import gc
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
@@ -6616,6 +6617,10 @@ class RealTimeEigenanalysisVisualizer:
         _mark_step("step2_5_patches")
         print(f"\nSTEP 2.5: Extracting patches with k={pred_k} (for timing comparison)...")
 
+        # Disable GC during timing-sensitive sections to avoid random stalls
+        gc.collect()
+        gc.disable()
+
         # Cache vertices tensor on GPU (reused for k-change updates)
         self._current_vertices_tensor = torch.from_numpy(gt_data['vertices']).float().to(device)
 
@@ -7191,6 +7196,11 @@ class RealTimeEigenanalysisVisualizer:
 
         # Print step-level timing breakdown
         _mark_step("done")
+
+        # Re-enable GC after timing-sensitive sections
+        gc.enable()
+        gc.collect()
+
         print(f"\n{'=' * 60}")
         print(f"STEP TIMING BREAKDOWN")
         print(f"{'=' * 60}")
