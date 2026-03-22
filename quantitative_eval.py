@@ -37,6 +37,10 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 import hydra
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
@@ -133,6 +137,9 @@ def _add_eigen_metrics(
             if c <= len(sims):
                 metrics[f'{prefix}_eigvec_cos_top{c}'] = float(sims[:c].mean())
         metrics[f'{prefix}_eigvec_cos_all'] = float(sims.mean())
+        # Per-eigenvector cosines (for decay curve plots)
+        for j, val in enumerate(sims):
+            metrics[f'{prefix}_eigvec_cos_{j}'] = float(val)
 
     return evals, evecs
 
@@ -684,6 +691,11 @@ def main(cfg: DictConfig) -> None:
     # ---- Print summary table ----
     _print_summary(all_metrics, methods, num_sources, elapsed, num_gpus)
 
+    # ---- Generate plots ----
+    figures_dir = output_dir / 'figures'
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    _generate_plots(all_metrics, methods, figures_dir)
+
     # ---- Cleanup ----
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -808,6 +820,279 @@ def _print_summary(
 
     print(f"\n  Total time: {elapsed:.1f}s ({n_meshes} meshes, {num_gpus} GPUs)")
     print(f"{'=' * 80}")
+
+
+# ============================================================================
+# Plotting
+# ============================================================================
+
+METHOD_COLORS = {
+    'pred':   '#2563EB',
+    'robust': '#DC2626',
+    'nelo':   '#16A34A',
+    'gt':     '#6B7280',
+}
+
+METHOD_LABELS = {
+    'pred':   'PRED (Ours)',
+    'robust': 'Robust',
+    'nelo':   'NeLo',
+    'gt':     'GT',
+}
+
+
+def _setup_plot_style():
+    """Set up matplotlib style for publication-quality figures."""
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'font.size': 11,
+        'axes.titlesize': 13,
+        'axes.labelsize': 12,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'legend.fontsize': 10,
+        'figure.dpi': 150,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+        'savefig.pad_inches': 0.1,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+        'grid.linewidth': 0.5,
+    })
+
+
+def _get_vals(all_metrics: List[Dict], key: str) -> Optional[np.ndarray]:
+    """Extract numeric values for a key across all meshes."""
+    vals = [float(m[key]) for m in all_metrics if m.get(key) is not None]
+    return np.array(vals) if vals else None
+
+
+def _generate_plots(
+    all_metrics: List[Dict[str, Any]],
+    methods: Set[str],
+    output_dir: Path,
+):
+    """Generate all plots from collected metrics."""
+    _setup_plot_style()
+    active = [m for m in ['pred', 'robust', 'nelo'] if m in methods]
+    print(f"\nGenerating plots to {output_dir}...")
+
+    _plot_timing(all_metrics, active, output_dir)
+    _plot_quality(all_metrics, active, output_dir)
+    _plot_eigvec_decay(all_metrics, active, output_dir)
+
+    print(f"All plots saved to: {output_dir}")
+
+
+def _plot_timing(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """Grouped bar chart: L,M assembly, geodesic E2E, Green's E2E."""
+
+    groups = [
+        ('L,M Assembly', {
+            'pred':   'pred_lm_total_ms',
+            'robust': 'robust_lm_assembly_ms',
+            'nelo':   'nelo_lm_total_ms',
+        }),
+        ('Geodesic E2E', {
+            'pred':   'pred_e2e_geodesic_ms',
+            'robust': 'robust_e2e_geodesic_ms',
+            'nelo':   'nelo_e2e_geodesic_ms',
+        }),
+        ("Green's E2E", {
+            'pred':   'pred_greens_e2e_ms',
+            'robust': 'robust_greens_e2e_ms',
+            'nelo':   'nelo_greens_e2e_ms',
+        }),
+    ]
+
+    n_groups = len(groups)
+    n_methods = len(methods)
+    bar_width = 0.22
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    x = np.arange(n_groups)
+
+    for j, method in enumerate(methods):
+        means, stds = [], []
+        for _, col_map in groups:
+            vals = _get_vals(all_metrics, col_map.get(method, ''))
+            means.append(vals.mean() if vals is not None else 0)
+            stds.append(vals.std() if vals is not None else 0)
+
+        offset = (j - (n_methods - 1) / 2) * bar_width
+        bars = ax.bar(x + offset, means, bar_width,
+                      yerr=stds, capsize=3,
+                      label=METHOD_LABELS[method],
+                      color=METHOD_COLORS[method],
+                      edgecolor='white', linewidth=0.5,
+                      alpha=0.9, zorder=3)
+        for bar, mean in zip(bars, means):
+            if mean > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
+                        f'{mean:.0f}', ha='center', va='bottom', fontsize=8,
+                        color=METHOD_COLORS[method], fontweight='bold')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([g[0] for g in groups])
+    ax.set_ylabel('Time (ms)')
+    ax.set_title('Timing Comparison')
+    ax.legend(loc='upper left', framealpha=0.9)
+    ax.set_ylim(bottom=0)
+    fig.tight_layout()
+
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'timing_bars.{ext}')
+    plt.close(fig)
+    print(f"  Saved: timing_bars.pdf/png")
+
+
+def _plot_quality(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """4-panel: Green's GT corr, max principle, eigenvalue error, eigvec cosine."""
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+    # (a) Green's GT correlation
+    ax = axes[0]
+    for j, method in enumerate(methods):
+        vals = _get_vals(all_metrics, f'{method}_greens_gt_corr_mean')
+        if vals is not None:
+            ax.bar(j, vals.mean(), yerr=vals.std(), capsize=4,
+                   color=METHOD_COLORS[method], edgecolor='white',
+                   linewidth=0.5, alpha=0.9, zorder=3)
+            ax.text(j, vals.mean() + vals.std() + 0.005,
+                    f'{vals.mean():.3f}', ha='center', va='bottom',
+                    fontsize=9, fontweight='bold', color=METHOD_COLORS[method])
+    ax.set_xticks(range(len(methods)))
+    ax.set_xticklabels([METHOD_LABELS[m] for m in methods], fontsize=9)
+    ax.set_ylabel('Correlation')
+    ax.set_title("Green's GT Correlation")
+    ax.set_ylim(0.9, 1.01)
+
+    # (b) Max principle
+    ax = axes[1]
+    for j, method in enumerate(methods):
+        vals = _get_vals(all_metrics, f'{method}_greens_max_principle')
+        if vals is not None:
+            ax.bar(j, vals.mean() * 100, capsize=4,
+                   color=METHOD_COLORS[method], edgecolor='white',
+                   linewidth=0.5, alpha=0.9, zorder=3)
+            ax.text(j, vals.mean() * 100 + 0.5,
+                    f'{vals.mean() * 100:.0f}%', ha='center', va='bottom',
+                    fontsize=9, fontweight='bold', color=METHOD_COLORS[method])
+    ax.set_xticks(range(len(methods)))
+    ax.set_xticklabels([METHOD_LABELS[m] for m in methods], fontsize=9)
+    ax.set_ylabel('Pass Rate (%)')
+    ax.set_title("Max Principle")
+    ax.set_ylim(0, 110)
+
+    # (c) Eigenvalue relative error
+    ax = axes[2]
+    for j, method in enumerate(methods):
+        vals = _get_vals(all_metrics, f'{method}_eval_spectrum_rel_err_mean')
+        if vals is not None:
+            ax.bar(j, vals.mean(), yerr=vals.std(), capsize=4,
+                   color=METHOD_COLORS[method], edgecolor='white',
+                   linewidth=0.5, alpha=0.9, zorder=3)
+            ax.text(j, vals.mean() + vals.std() + 0.002,
+                    f'{vals.mean():.3f}', ha='center', va='bottom',
+                    fontsize=9, fontweight='bold', color=METHOD_COLORS[method])
+    ax.set_xticks(range(len(methods)))
+    ax.set_xticklabels([METHOD_LABELS[m] for m in methods], fontsize=9)
+    ax.set_ylabel('Relative Error')
+    ax.set_title('Eigenvalue Error')
+    ax.set_ylim(bottom=0)
+
+    # (d) Eigenvector cosine at top-k
+    ax = axes[3]
+    k_values = [5, 10, 20, 50]
+    n_k = len(k_values)
+    bar_width = 0.8 / max(len(methods), 1)
+    for j, method in enumerate(methods):
+        means, stds = [], []
+        for k in k_values:
+            vals = _get_vals(all_metrics, f'{method}_eigvec_cos_top{k}')
+            means.append(vals.mean() if vals is not None else 0)
+            stds.append(vals.std() if vals is not None else 0)
+        offset = (j - (len(methods) - 1) / 2) * bar_width
+        ax.bar(np.arange(n_k) + offset, means, bar_width,
+               yerr=stds, capsize=2,
+               label=METHOD_LABELS[method],
+               color=METHOD_COLORS[method], edgecolor='white',
+               linewidth=0.5, alpha=0.9, zorder=3)
+    ax.set_xticks(range(n_k))
+    ax.set_xticklabels([f'top-{k}' for k in k_values])
+    ax.set_ylabel('Cosine Similarity')
+    ax.set_title('Eigenvector Quality')
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc='lower left', fontsize=8, framealpha=0.9)
+
+    fig.suptitle('Quality Metrics', fontsize=14, fontweight='bold', y=1.02)
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'quality_bars.{ext}')
+    plt.close(fig)
+    print(f"  Saved: quality_bars.pdf/png")
+
+
+def _plot_eigvec_decay(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """Eigenvector cosine similarity vs eigenvector index."""
+
+    # Find max eigenvector index
+    max_idx = 0
+    for m in all_metrics:
+        for key in m.keys():
+            for method in methods:
+                prefix = f'{method}_eigvec_cos_'
+                if key.startswith(prefix):
+                    suffix = key[len(prefix):]
+                    if suffix.isdigit():
+                        max_idx = max(max_idx, int(suffix))
+
+    if max_idx == 0:
+        print("  [!] No per-eigenvector cosine data — skipping decay curve")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    for method in methods:
+        indices, means, stds = [], [], []
+        for idx in range(max_idx + 1):
+            vals = _get_vals(all_metrics, f'{method}_eigvec_cos_{idx}')
+            if vals is not None:
+                indices.append(idx)
+                means.append(vals.mean())
+                stds.append(vals.std())
+
+        if not indices:
+            continue
+
+        indices = np.array(indices)
+        means = np.array(means)
+        stds = np.array(stds)
+
+        ax.plot(indices, means, '-',
+                color=METHOD_COLORS[method],
+                label=METHOD_LABELS[method],
+                linewidth=2, zorder=3)
+        ax.fill_between(indices, means - stds, np.minimum(means + stds, 1.0),
+                         color=METHOD_COLORS[method], alpha=0.15, zorder=2)
+
+    ax.set_xlabel('Eigenvector Index')
+    ax.set_ylabel('Cosine Similarity with GT')
+    ax.set_title('Eigenvector Quality Decay')
+    ax.set_xlim(0, max_idx)
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc='upper right', framealpha=0.9)
+    ax.axhline(y=1.0, color='gray', linewidth=0.5, linestyle='--', alpha=0.5)
+    ax.axhline(y=0.5, color='gray', linewidth=0.5, linestyle='--', alpha=0.3)
+
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'eigvec_decay.{ext}')
+    plt.close(fig)
+    print(f"  Saved: eigvec_decay.pdf/png")
 
 
 if __name__ == '__main__':
