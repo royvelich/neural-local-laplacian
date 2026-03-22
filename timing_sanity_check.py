@@ -83,7 +83,8 @@ def main(cfg: DictConfig) -> None:
     data_loader = data_module.val_dataloader()
     if isinstance(data_loader, list):
         data_loader = data_loader[0]
-    num_meshes = len(data_loader.dataset)
+    dataset = data_loader.dataset
+    num_meshes = len(dataset)
     print(f"Dataset: {num_meshes} meshes (processing up to {max_meshes})\n")
 
     # ---- Table header ----
@@ -103,9 +104,8 @@ def main(cfg: DictConfig) -> None:
     # ---- Timing loop ----
     results = []
 
-    for batch_idx, batch_data in enumerate(data_loader):
-        if batch_idx >= max_meshes:
-            break
+    for batch_idx in range(min(max_meshes, num_meshes)):
+        batch_data = dataset[batch_idx]
 
         data = batch_data[0] if isinstance(batch_data, list) else batch_data
         mesh_file_path = data.mesh_file_path
