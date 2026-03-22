@@ -11,8 +11,10 @@ Timing convention:
     - GPU synchronization is handled inside each step.
 """
 
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -41,6 +43,65 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_exact_geodesics,
     normalize_distances,
 )
+
+
+# =============================================================================
+# Optional NeLo imports (SIGGRAPH Asia 2024)
+# =============================================================================
+
+HAS_NELO = False
+_NeLo_Pipeline = None
+_nelo_construct_graph_tree = None
+_nelo_global_config = None
+
+try:
+    # Add NeLo's root folder to sys.path so its internal imports resolve
+    _nelo_root = str(Path(__file__).resolve().parent.parent.parent / 'nelo')
+    if _nelo_root not in sys.path:
+        sys.path.insert(0, _nelo_root)
+
+    from nelo.src.pipeline import MyPipeline as _NeLo_MyPipeline
+    from nelo.src.graphtree.graph_tree import (
+        construct_graph_tree_from_point_cloud as _nelo_construct_graph_tree_orig,
+    )
+    from config.global_config import global_config as _nelo_global_config
+
+    import torch_geometric
+
+    def _nelo_construct_graph_tree(vertices, k: int = 8):
+        """Configure global_config for point-cloud mode then build graph tree."""
+        _nelo_global_config.point_cloud_knn_k = k
+        _nelo_global_config.use_ref_mesh = False
+        return _nelo_construct_graph_tree_orig(vertices, ref_mesh=None)
+
+    class _NeLo_Pipeline(_NeLo_MyPipeline):
+        """Thin subclass adding forward_inference() for clean inference."""
+
+        def forward_inference(self, graph_tree):
+            """Run inference. Returns (edge_weight, vert_mass, edge_index)."""
+            graph = graph_tree.treedict[0]
+            feat = torch.ones(graph.x.shape[0], 3, device=graph.x.device)
+            degrees = torch_geometric.utils.degree(
+                graph.edge_index[0],
+                num_nodes=graph.x.shape[0],
+                dtype=torch.float32,
+            )
+            feat = torch.cat([feat, degrees.view(-1, 1)], dim=1)
+            vert_feat = self.eigen_network(feat, graph_tree, graph_tree.depth)
+            if graph.x.is_cuda:
+                torch.cuda.synchronize()
+            va_idx = graph.edge_index[0]
+            vb_idx = graph.edge_index[1]
+            edge_w = self.edge_decoder((vert_feat[va_idx] - vert_feat[vb_idx]).pow(2))
+            edge_w = -torch.nn.functional.relu(-edge_w)
+            mass = self.mass_decoder(vert_feat)
+            if graph.x.is_cuda:
+                torch.cuda.synchronize()
+            return edge_w, mass, graph.edge_index
+
+    HAS_NELO = True
+except ImportError:
+    pass
 
 
 # =============================================================================
@@ -444,6 +505,128 @@ def step_robust_laplacian(
     elapsed = time.perf_counter() - t0
 
     return L, M, {'assembly': elapsed}
+
+
+# =============================================================================
+# Step: NeLo Laplacian (SIGGRAPH Asia 2024)
+# =============================================================================
+
+@dataclass
+class NeloLaplacianTiming:
+    """Timing breakdown for the NeLo Laplacian pipeline."""
+    graph_tree: float = 0.0   # GraphTree / kNN construction
+    forward: float = 0.0      # Network forward pass
+    assembly: float = 0.0     # Sparse L, M assembly
+
+    @property
+    def total(self) -> float:
+        return self.graph_tree + self.forward + self.assembly
+
+
+def load_nelo_model(
+    ckpt_path: str,
+    device: torch.device,
+) -> Any:
+    """
+    Load a NeLo pipeline from checkpoint.
+
+    Args:
+        ckpt_path: Path to NeLo checkpoint
+        device: Target device
+
+    Returns:
+        NeLo pipeline in eval mode.
+
+    Raises:
+        ImportError: If NeLo dependencies are not installed.
+    """
+    if not HAS_NELO:
+        raise ImportError(
+            "NeLo dependencies not available. Ensure the nelo/ repo is present "
+            "and its dependencies are installed."
+        )
+
+    pipeline = _NeLo_Pipeline.load_from_checkpoint(str(ckpt_path), map_location=device)
+    pipeline.eval()
+    pipeline.to(device)
+
+    # Verify assumptions hardcoded in forward_inference
+    assert _nelo_global_config.gnn_input_signal == "all_one", \
+        f"NeLo checkpoint uses gnn_input_signal={_nelo_global_config.gnn_input_signal!r}, expected all_one"
+    assert _nelo_global_config.use_vertex_mass == True, \
+        f"NeLo checkpoint has use_vertex_mass=False, expected True"
+
+    return pipeline
+
+
+def step_nelo_laplacian(
+    pipeline,
+    vertices: np.ndarray,
+    k: int,
+    device: torch.device,
+) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix, NeloLaplacianTiming]:
+    """
+    Full NeLo Laplacian pipeline: GraphTree → inference → L, M assembly.
+
+    Output L is guaranteed PSD.
+
+    Args:
+        pipeline: NeLo pipeline from load_nelo_model()
+        vertices: (N, 3) vertex positions (numpy, float32/64)
+        k: Number of neighbors for NeLo's graph tree
+        device: torch device
+
+    Returns:
+        (L, M, timing) where:
+        - L: PSD sparse Laplacian (N, N)
+        - M: Sparse diagonal mass matrix (N, N)
+        - timing: NeloLaplacianTiming with per-stage breakdown
+    """
+    if not HAS_NELO:
+        raise ImportError("NeLo dependencies not available")
+
+    timing = NeloLaplacianTiming()
+    device_str = str(device)
+    N = vertices.shape[0]
+
+    # 1. GraphTree construction
+    t0 = time.perf_counter()
+    graph_tree = _nelo_construct_graph_tree(vertices, k=k)
+    graph_tree = graph_tree.to(device_str)
+    if 'cuda' in device_str:
+        torch.cuda.synchronize()
+    timing.graph_tree = time.perf_counter() - t0
+
+    # 2. Network forward pass
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        edge_w, mass, edge_index = pipeline.forward_inference(graph_tree)
+    if 'cuda' in device_str:
+        torch.cuda.synchronize()
+    timing.forward = time.perf_counter() - t0
+
+    # 3. Sparse (L, M) assembly
+    t0 = time.perf_counter()
+    rows = edge_index[0].cpu().numpy()
+    cols = edge_index[1].cpu().numpy()
+    # NeLo outputs non-positive weights (clamped with -relu(-x)).
+    # Negate so w > 0, giving standard PSD L = D - W.
+    w = -edge_w.squeeze().detach().cpu().numpy()
+    mass_np = mass.squeeze().detach().cpu().numpy()
+
+    diag_vals = np.zeros(N)
+    np.add.at(diag_vals, rows, w)
+    L = (scipy.sparse.coo_matrix((-w, (rows, cols)), shape=(N, N))
+         + scipy.sparse.diags(diag_vals)).tocsr()
+    L = ensure_psd(L)
+
+    mass_mean = mass_np.mean()
+    mass_rel = np.maximum(mass_np / mass_mean, 0.01) if mass_mean > 0 else np.ones(N)
+    M = scipy.sparse.diags(mass_rel).tocsr()
+
+    timing.assembly = time.perf_counter() - t0
+
+    return L, M, timing
 
 
 # =============================================================================

@@ -4,29 +4,34 @@ Quantitative Evaluation for Neural Local Laplacian.
 
 Uses shared step functions from validation_utils.py so timing numbers are
 identical across scripts.  Outputs per-mesh CSV with timing breakdown AND
-quality metrics (eigenvalues, eigenvectors, Green's, geodesics, probes,
-descriptors, spectral compression).
+quality metrics.
 
 Supports multi-GPU via mp.spawn.
 
+Methods:
+    GT is always computed (cotangent Laplacian from mesh faces, requires igl).
+    Additional methods are selected via +methods=pred,robust,nelo (comma-separated).
+
 Usage:
-    python quantitative_eval.py +ckpt_path=model.ckpt \
-        +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation
+    python quantitative_eval.py +ckpt_path=model.ckpt
+
+    # Choose which methods to evaluate (default: pred,robust)
+    python quantitative_eval.py +ckpt_path=model.ckpt +methods=pred,robust,nelo
+
+    # NeLo requires its own checkpoint and k
+    python quantitative_eval.py +ckpt_path=model.ckpt +methods=pred,nelo \
+        +nelo_ckpt_path=nelo_model.ckpt +nelo_k=8
 
     # Multi-GPU
     python quantitative_eval.py +ckpt_path=model.ckpt +num_gpus=4
-
-    # Custom output directory
-    python quantitative_eval.py +ckpt_path=model.ckpt +output_dir=results/
 """
 
 import csv
 import gc
 import shutil
-import sys
 import time
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 
 import numpy as np
 import torch
@@ -51,7 +56,79 @@ from neural_local_laplacian.utils.validation_utils import (
     step_eigenvalue_errors,
     step_eigenvector_cosine_similarity,
     GeodesicTimingBreakdown,
+    HAS_NELO,
 )
+
+if HAS_NELO:
+    from neural_local_laplacian.utils.validation_utils import (
+        load_nelo_model,
+        step_nelo_laplacian,
+    )
+
+
+VALID_METHODS = {'pred', 'robust', 'nelo'}
+
+
+def _parse_methods(methods_str: str) -> Set[str]:
+    """Parse comma-separated methods string, validate."""
+    methods = {m.strip().lower() for m in methods_str.split(',')}
+    invalid = methods - VALID_METHODS
+    if invalid:
+        raise ValueError(f"Unknown methods: {invalid}. Valid: {VALID_METHODS}")
+    return methods
+
+
+# ============================================================================
+# Helper: add metrics for a method's Green's / eigen / etc.
+# ============================================================================
+
+def _add_method_metrics(
+    metrics: Dict[str, Any],
+    prefix: str,
+    L, M,
+    source_indices: List[int],
+    gt_greens_values,
+    gt_evals, gt_evecs,
+    num_eigenvalues: int,
+    lm_timing_total: float,
+):
+    """Run Green's + eigen for one method and add to metrics dict."""
+
+    # Green's function
+    greens, t_greens = step_greens_function(
+        L, M, source_indices, gt_greens_values=gt_greens_values,
+    )
+    greens_e2e = lm_timing_total + t_greens.total
+    metrics[f'{prefix}_greens_fact_ms'] = t_greens.factorize * 1000
+    metrics[f'{prefix}_greens_solve_ms'] = t_greens.solve * 1000
+    metrics[f'{prefix}_greens_total_ms'] = t_greens.total * 1000
+    metrics[f'{prefix}_greens_e2e_ms'] = greens_e2e * 1000
+    metrics[f'{prefix}_greens_max_principle'] = greens.max_principle_pass_rate
+    metrics[f'{prefix}_greens_gt_corr_mean'] = greens.mean_corr_with_gt
+    metrics[f'{prefix}_greens_gt_corr_std'] = greens.std_corr_with_gt
+    metrics[f'{prefix}_greens_residual_norm'] = greens.mean_residual_norm
+
+    # Eigendecomposition
+    evals, evecs, t_eig = step_eigendecomposition(L, M, num_eigenvalues)
+    metrics[f'{prefix}_eigen_ms'] = t_eig['eigen'] * 1000
+
+    # Eigenvalue errors (vs GT)
+    if gt_evals is not None and evals is not None:
+        ev_err = step_eigenvalue_errors(evals, gt_evals)
+        metrics[f'{prefix}_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
+        metrics[f'{prefix}_eval_spectrum_rel_err_max'] = ev_err.spectrum_rel_err_max
+        metrics[f'{prefix}_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
+        metrics[f'{prefix}_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
+
+    # Eigenvector cosine similarity (vs GT)
+    if gt_evecs is not None and evecs is not None:
+        sims = step_eigenvector_cosine_similarity(gt_evecs, evecs)
+        for c in [5, 10, 20, 50]:
+            if c <= len(sims):
+                metrics[f'{prefix}_eigvec_cos_top{c}'] = float(sims[:c].mean())
+        metrics[f'{prefix}_eigvec_cos_all'] = float(sims.mean())
+
+    return greens, evals, evecs
 
 
 # ============================================================================
@@ -71,25 +148,40 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     tag = f"[GPU {rank}] " if world_size > 1 else ""
     cfg = OmegaConf.create(cfg_dict)
 
-    # ---- Load model ----
-    ckpt_path = Path(cfg.ckpt_path)
-    model = LaplacianTransformerModule.load_from_checkpoint(
-        str(ckpt_path), map_location=device, strict=False
-    )
-    model = model.to(device).eval()
-
-    has_grad = getattr(model, '_operator_mode', 'stiffness') == 'gradient'
+    # ---- Parse methods ----
+    methods = _parse_methods(getattr(cfg, 'methods', 'pred,robust'))
+    run_pred = 'pred' in methods
+    run_robust = 'robust' in methods
+    run_nelo = 'nelo' in methods
 
     # ---- Config ----
     pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
     robust_k = getattr(cfg.globals, 'k_robust', None) or 30
+    nelo_k = getattr(cfg, 'nelo_k', 8)
     num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
     num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
     use_amp = device.type == 'cuda'
 
-    # ---- CUDA warmup ----
-    if device.type == 'cuda':
-        cuda_warmup(model, device, k=pred_k)
+    # ---- Load PRED model ----
+    model = None
+    if run_pred:
+        ckpt_path = Path(cfg.ckpt_path)
+        model = LaplacianTransformerModule.load_from_checkpoint(
+            str(ckpt_path), map_location=device, strict=False
+        )
+        model = model.to(device).eval()
+        if device.type == 'cuda':
+            cuda_warmup(model, device, k=pred_k)
+
+    # ---- Load NeLo model ----
+    nelo_pipeline = None
+    if run_nelo:
+        nelo_ckpt = getattr(cfg, 'nelo_ckpt_path', None)
+        if nelo_ckpt is None:
+            raise ValueError("nelo_ckpt_path is required when methods includes 'nelo'")
+        if not HAS_NELO:
+            raise ImportError("NeLo dependencies not available")
+        nelo_pipeline = load_nelo_model(str(nelo_ckpt), device)
 
     # ---- Dataset ----
     pl.seed_everything(cfg.globals.seed)
@@ -102,7 +194,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     # ---- Compute this worker's mesh indices ----
     my_indices = list(range(rank, len(dataset), world_size))
     n_total = len(my_indices)
-    print(f"{tag}Ready — {n_total} meshes on {device}, PRED k={pred_k}, Robust k={robust_k}")
+    methods_str = ','.join(sorted(methods))
+    print(f"{tag}Ready — {n_total} meshes on {device}, methods=[{methods_str}], "
+          f"PRED k={pred_k}, Robust k={robust_k}")
 
     # ---- Process meshes ----
     metrics_list: List[Dict[str, Any]] = []
@@ -129,184 +223,135 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             ).tolist()
             verts_tensor = torch.from_numpy(vertices).float().to(device)
 
+            metrics['mesh_name'] = mesh_name
+            metrics['num_vertices'] = N
+            metrics['num_faces'] = len(faces)
+            metrics['num_sources'] = len(source_indices)
+
             # ---- Disable GC during timing ----
             gc.collect()
             gc.disable()
 
-            # ---- PRED pipeline ----
-            pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
-                model, verts_tensor, pred_k, device, use_amp=use_amp,
-            )
+            # ==============================================================
+            # Assembly: GT (always) + selected methods
+            # ==============================================================
 
-            if pred_G is not None:
-                _, pred_geo_timing = step_pred_geodesic(
-                    pred_L, pred_M, pred_G,
-                    source_indices, N,
-                )
-            else:
-                pred_geo_timing = GeodesicTimingBreakdown()
-
-            # ---- Robust pipeline ----
-            _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
-
-            # ---- GT Laplacian (for Green's function reference) ----
+            # GT Laplacian
             gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
+            metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
 
-            # ---- Robust Laplacian (for Green's function) ----
-            rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
-
-            # ---- Green's function (GT → PRED → Robust) ----
+            # GT Green's (reference for correlation)
             gt_greens = None
-            t_greens_gt = None
+            gt_gvals = None
             if gt_L is not None:
                 gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
+                metrics['gt_greens_total_ms'] = t_greens_gt.total * 1000
+                metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
+                gt_gvals = gt_greens.values
 
-            gt_gvals = gt_greens.values if gt_greens is not None else None
-
-            pred_greens, t_greens_pred = step_greens_function(
-                pred_L, pred_M, source_indices,
-                gt_greens_values=gt_gvals,
-            )
-
-            rob_greens, t_greens_rob = step_greens_function(
-                rob_L, rob_M, source_indices,
-                gt_greens_values=gt_gvals,
-            )
-
-            # ---- Eigendecomposition (all methods) ----
+            # GT eigendecomposition
             gt_evals, gt_evecs = None, None
             if gt_L is not None:
                 gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
                     gt_L, gt_M, num_eigenvalues,
                 )
+                metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
 
-            pred_evals, pred_evecs, t_eig_pred = step_eigendecomposition(
-                pred_L, pred_M, num_eigenvalues,
-            )
+            # ---- PRED ----
+            if run_pred:
+                pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
+                    model, verts_tensor, pred_k, device, use_amp=use_amp,
+                )
+                metrics['pred_k'] = pred_k
+                metrics['pred_knn_ms'] = t_pred.knn * 1000
+                metrics['pred_forward_ms'] = t_pred.forward * 1000
+                metrics['pred_assembly_ms'] = t_pred.assembly * 1000
+                metrics['pred_grad_op_ms'] = t_pred.grad_op * 1000
+                metrics['pred_lm_total_ms'] = t_pred.lm_total * 1000
 
-            rob_evals, rob_evecs, t_eig_rob = step_eigendecomposition(
-                rob_L, rob_M, num_eigenvalues,
-            )
+                # PRED geodesic (requires gradient operator)
+                if pred_G is not None:
+                    _, pred_geo_timing = step_pred_geodesic(
+                        pred_L, pred_M, pred_G, source_indices, N,
+                    )
+                    pred_onetime = (t_pred.total
+                                    + pred_geo_timing.build
+                                    + pred_geo_timing.heat_factorize
+                                    + pred_geo_timing.poisson_factorize)
+                    pred_e2e = pred_onetime + pred_geo_timing.solve
+                    metrics['pred_geo_build_ms'] = pred_geo_timing.build * 1000
+                    metrics['pred_geo_heat_fact_ms'] = pred_geo_timing.heat_factorize * 1000
+                    metrics['pred_geo_poisson_fact_ms'] = pred_geo_timing.poisson_factorize * 1000
+                    metrics['pred_geo_solve_ms'] = pred_geo_timing.solve * 1000
+                    metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
+                    metrics['pred_per_src_ms'] = pred_e2e / len(source_indices) * 1000
+
+                # PRED Green's + eigen
+                _add_method_metrics(
+                    metrics, 'pred', pred_L, pred_M,
+                    source_indices, gt_gvals, gt_evals, gt_evecs,
+                    num_eigenvalues, t_pred.lm_total,
+                )
+
+            # ---- Robust ----
+            if run_robust:
+                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+                metrics['robust_k'] = robust_k
+                metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
+
+                # Robust geodesic (pp3d)
+                _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
+                robust_e2e = robust_timing.total
+                metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
+                metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
+                metrics['robust_e2e_geodesic_ms'] = robust_e2e * 1000
+                metrics['robust_per_src_ms'] = robust_e2e / len(source_indices) * 1000
+
+                # Robust Green's + eigen
+                _add_method_metrics(
+                    metrics, 'robust', rob_L, rob_M,
+                    source_indices, gt_gvals, gt_evals, gt_evecs,
+                    num_eigenvalues, t_rob_lm['assembly'],
+                )
+
+            # ---- NeLo ----
+            if run_nelo:
+                nelo_L, nelo_M, t_nelo = step_nelo_laplacian(
+                    nelo_pipeline, vertices, nelo_k, device,
+                )
+                metrics['nelo_k'] = nelo_k
+                metrics['nelo_graph_tree_ms'] = t_nelo.graph_tree * 1000
+                metrics['nelo_forward_ms'] = t_nelo.forward * 1000
+                metrics['nelo_assembly_ms'] = t_nelo.assembly * 1000
+                metrics['nelo_lm_total_ms'] = t_nelo.total * 1000
+
+                # NeLo Green's + eigen
+                _add_method_metrics(
+                    metrics, 'nelo', nelo_L, nelo_M,
+                    source_indices, gt_gvals, gt_evals, gt_evecs,
+                    num_eigenvalues, t_nelo.total,
+                )
+
+            # ==============================================================
+            # Timing ratios
+            # ==============================================================
+            if run_pred and run_robust:
+                if robust_timing.lm_assembly > 0:
+                    metrics['ratio_lm'] = t_pred.lm_total / robust_timing.lm_assembly
+                if metrics.get('pred_e2e_geodesic_ms') and metrics.get('robust_e2e_geodesic_ms'):
+                    metrics['ratio_e2e_geodesic'] = (
+                        metrics['pred_e2e_geodesic_ms'] / metrics['robust_e2e_geodesic_ms']
+                    )
+                if metrics.get('pred_greens_e2e_ms') and metrics.get('robust_greens_e2e_ms'):
+                    metrics['ratio_greens_e2e'] = (
+                        metrics['pred_greens_e2e_ms'] / metrics['robust_greens_e2e_ms']
+                    )
 
             # ---- Re-enable GC ----
             gc.enable()
 
-            # ---- Compute E2E ----
-            n_src = len(source_indices)
-
-            pred_onetime = (t_pred.total
-                            + pred_geo_timing.build
-                            + pred_geo_timing.heat_factorize
-                            + pred_geo_timing.poisson_factorize)
-            pred_e2e = pred_onetime + pred_geo_timing.solve
-            robust_e2e = robust_timing.total
-
-            # Green's E2E: L,M assembly + factorize + solve
-            pred_greens_e2e = t_pred.lm_total + t_greens_pred.total
-            robust_greens_e2e = t_rob_lm['assembly'] + t_greens_rob.total
-
-            metrics = {
-                'mesh_name': mesh_name,
-                'num_vertices': N,
-                'num_faces': len(faces),
-                'k': pred_k,
-                'num_sources': n_src,
-                # PRED L,M breakdown (ms)
-                'pred_knn_ms': t_pred.knn * 1000,
-                'pred_forward_ms': t_pred.forward * 1000,
-                'pred_assembly_ms': t_pred.assembly * 1000,
-                'pred_grad_op_ms': t_pred.grad_op * 1000,
-                'pred_lm_total_ms': t_pred.lm_total * 1000,
-                # PRED geodesic breakdown (ms)
-                'pred_geo_build_ms': pred_geo_timing.build * 1000,
-                'pred_geo_heat_fact_ms': pred_geo_timing.heat_factorize * 1000,
-                'pred_geo_poisson_fact_ms': pred_geo_timing.poisson_factorize * 1000,
-                'pred_geo_heat_solve_ms': pred_geo_timing.heat_solve * 1000,
-                'pred_geo_poisson_solve_ms': pred_geo_timing.poisson_solve * 1000,
-                'pred_geo_onetime_ms': pred_onetime * 1000,
-                'pred_geo_solve_ms': pred_geo_timing.solve * 1000,
-                'pred_e2e_geodesic_ms': pred_e2e * 1000,
-                'pred_per_src_ms': pred_e2e / n_src * 1000,
-                # Robust breakdown (ms)
-                'robust_lm_ms': robust_timing.lm_assembly * 1000,
-                'robust_constructor_ms': robust_timing.constructor * 1000,
-                'robust_solve_ms': robust_timing.solve * 1000,
-                'robust_e2e_geodesic_ms': robust_e2e * 1000,
-                'robust_per_src_ms': robust_e2e / n_src * 1000,
-                # Ratios (geodesic)
-                'ratio_lm': t_pred.lm_total / robust_timing.lm_assembly if robust_timing.lm_assembly > 0 else None,
-                'ratio_e2e': pred_e2e / robust_e2e if robust_e2e > 0 else None,
-                # GT assembly (ms)
-                'gt_assembly_ms': t_gt['assembly'] * 1000,
-                'robust_lm_assembly_ms': t_rob_lm['assembly'] * 1000,
-                # Green's function — PRED
-                'pred_greens_fact_ms': t_greens_pred.factorize * 1000,
-                'pred_greens_solve_ms': t_greens_pred.solve * 1000,
-                'pred_greens_total_ms': t_greens_pred.total * 1000,
-                'pred_greens_e2e_ms': pred_greens_e2e * 1000,
-                'pred_greens_max_principle': pred_greens.max_principle_pass_rate,
-                'pred_greens_gt_corr_mean': pred_greens.mean_corr_with_gt,
-                'pred_greens_gt_corr_std': pred_greens.std_corr_with_gt,
-                'pred_greens_residual_norm': pred_greens.mean_residual_norm,
-                # Green's function — Robust
-                'robust_greens_fact_ms': t_greens_rob.factorize * 1000,
-                'robust_greens_solve_ms': t_greens_rob.solve * 1000,
-                'robust_greens_total_ms': t_greens_rob.total * 1000,
-                'robust_greens_e2e_ms': robust_greens_e2e * 1000,
-                'robust_greens_max_principle': rob_greens.max_principle_pass_rate,
-                'robust_greens_gt_corr_mean': rob_greens.mean_corr_with_gt,
-                'robust_greens_gt_corr_std': rob_greens.std_corr_with_gt,
-                'robust_greens_residual_norm': rob_greens.mean_residual_norm,
-            }
-            # Green's function — GT (optional, may be None if igl unavailable)
-            if t_greens_gt is not None:
-                metrics['gt_greens_total_ms'] = t_greens_gt.total * 1000
-                metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
-            # Green's E2E ratio
-            if robust_greens_e2e > 0:
-                metrics['ratio_greens_e2e'] = pred_greens_e2e / robust_greens_e2e
-
-            # ---- Eigendecomposition timing ----
-            metrics['pred_eigen_ms'] = t_eig_pred['eigen'] * 1000
-            metrics['robust_eigen_ms'] = t_eig_rob['eigen'] * 1000
-            if gt_evals is not None:
-                metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
-
-            # ---- Eigenvalue errors (vs GT) ----
-            if gt_evals is not None:
-                if pred_evals is not None:
-                    ev_err = step_eigenvalue_errors(pred_evals, gt_evals)
-                    metrics['pred_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
-                    metrics['pred_eval_spectrum_rel_err_max'] = ev_err.spectrum_rel_err_max
-                    metrics['pred_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
-                    metrics['pred_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
-
-                if rob_evals is not None:
-                    ev_err = step_eigenvalue_errors(rob_evals, gt_evals)
-                    metrics['robust_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
-                    metrics['robust_eval_spectrum_rel_err_max'] = ev_err.spectrum_rel_err_max
-                    metrics['robust_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
-                    metrics['robust_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
-
-            # ---- Eigenvector cosine similarity (vs GT) ----
-            if gt_evecs is not None:
-                if pred_evecs is not None:
-                    sims = step_eigenvector_cosine_similarity(gt_evecs, pred_evecs)
-                    for c in [5, 10, 20, 50]:
-                        if c <= len(sims):
-                            metrics[f'pred_eigvec_cos_top{c}'] = float(sims[:c].mean())
-                    metrics['pred_eigvec_cos_all'] = float(sims.mean())
-
-                if rob_evecs is not None:
-                    sims = step_eigenvector_cosine_similarity(gt_evecs, rob_evecs)
-                    for c in [5, 10, 20, 50]:
-                        if c <= len(sims):
-                            metrics[f'robust_eigvec_cos_top{c}'] = float(sims[:c].mean())
-                    metrics['robust_eigvec_cos_all'] = float(sims.mean())
-
             metrics_list.append(metrics)
             status = "OK"
-
             del verts_tensor
 
         except Exception as e:
@@ -320,16 +365,20 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         done = local_idx + 1
         eta = (elapsed / done) * (n_total - done) if done > 0 else 0
 
-        ratio_str = f"{metrics.get('ratio_e2e', 0):.2f}x" if metrics.get('ratio_e2e') else "?"
-        greens_corr = f"{metrics.get('pred_greens_gt_corr_mean', 0):.3f}"
-        greens_mp = f"{metrics.get('pred_greens_max_principle', 0):.0%}"
-        evec_cos = f"{metrics.get('pred_eigvec_cos_all', 0):.3f}"
-        print(f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<10s} "
-              f"PRED={metrics.get('pred_e2e_geodesic_ms', 0):.0f}ms "
-              f"Rob={metrics.get('robust_e2e_geodesic_ms', 0):.0f}ms "
-              f"({ratio_str}) "
-              f"G_corr={greens_corr} mp={greens_mp} evec={evec_cos} "
-              f"[{t_mesh:.1f}s, ETA {eta:.0f}s]")
+        # Per-mesh summary line
+        parts = [f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<6s} N={N:>6d}"]
+        if metrics.get('pred_e2e_geodesic_ms'):
+            parts.append(f"PRED={metrics['pred_e2e_geodesic_ms']:.0f}ms")
+        if metrics.get('robust_e2e_geodesic_ms'):
+            parts.append(f"Rob={metrics['robust_e2e_geodesic_ms']:.0f}ms")
+        if metrics.get('nelo_lm_total_ms'):
+            parts.append(f"NeLo={metrics['nelo_lm_total_ms']:.0f}ms")
+        if metrics.get('pred_greens_gt_corr_mean'):
+            parts.append(f"G_corr={metrics['pred_greens_gt_corr_mean']:.3f}")
+        if metrics.get('pred_eigvec_cos_all'):
+            parts.append(f"evec={metrics['pred_eigvec_cos_all']:.3f}")
+        parts.append(f"[{t_mesh:.1f}s, ETA {eta:.0f}s]")
+        print(' '.join(parts))
 
     elapsed = time.time() - t_start
     print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s")
@@ -443,6 +492,8 @@ def main(cfg: DictConfig) -> None:
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
+    methods = _parse_methods(getattr(cfg, 'methods', 'pred,robust'))
+
     # ---- GPU setup ----
     num_gpus_available = torch.cuda.device_count()
     num_gpus = getattr(cfg, 'num_gpus', None)
@@ -470,6 +521,7 @@ def main(cfg: DictConfig) -> None:
 
     pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
     robust_k = getattr(cfg.globals, 'k_robust', None) or 30
+    nelo_k = getattr(cfg, 'nelo_k', 8)
     num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
     num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
 
@@ -477,10 +529,16 @@ def main(cfg: DictConfig) -> None:
     print(f"QUANTITATIVE EVALUATION")
     print(f"{'=' * 80}")
     print(f"Checkpoint:  {ckpt_path}")
+    print(f"Methods:     GT + {', '.join(sorted(methods))}")
     print(f"Meshes:      {total_meshes}")
     print(f"GPUs:        {num_gpus} / {num_gpus_available} available")
-    print(f"PRED k:      {pred_k}")
-    print(f"Robust k:    {robust_k}")
+    if 'pred' in methods:
+        print(f"PRED k:      {pred_k}")
+    if 'robust' in methods:
+        print(f"Robust k:    {robust_k}")
+    if 'nelo' in methods:
+        print(f"NeLo k:      {nelo_k}")
+        print(f"NeLo ckpt:   {getattr(cfg, 'nelo_ckpt_path', 'N/A')}")
     print(f"Sources:     {num_sources}")
     print(f"Eigenvalues: {num_eigenvalues}")
     print(f"Output:      {output_dir}")
@@ -524,9 +582,20 @@ def main(cfg: DictConfig) -> None:
     print(f"Saved summary: {summary_path}")
 
     # ---- Print summary table ----
-    print(f"\n{'=' * 80}")
-    print(f"SUMMARY ({len(all_metrics)} meshes, {num_sources} sources/mesh)")
-    print(f"{'=' * 80}")
+    _print_summary(all_metrics, methods, num_sources, elapsed, num_gpus)
+
+    # ---- Cleanup ----
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _print_summary(
+    all_metrics: List[Dict[str, Any]],
+    methods: Set[str],
+    num_sources: int,
+    elapsed: float,
+    num_gpus: int,
+):
+    """Print human-readable summary table."""
 
     def _stats(key):
         vals = [float(m[key]) for m in all_metrics if m.get(key) is not None]
@@ -534,103 +603,110 @@ def main(cfg: DictConfig) -> None:
             return None, None, None, None
         return np.mean(vals), np.std(vals), np.min(vals), np.max(vals)
 
-    W = 10
-
-    print(f"{'':>28s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
-    print(f"{'-' * 28} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
-
-    for label, key in [
-        ("PRED L,M total",         "pred_lm_total_ms"),
-        ("Robust L,M",             "robust_lm_ms"),
-        ("PRED E2E geodesic",      "pred_e2e_geodesic_ms"),
-        ("Robust E2E geodesic",    "robust_e2e_geodesic_ms"),
-        ("PRED per-source",        "pred_per_src_ms"),
-        ("Robust per-source",      "robust_per_src_ms"),
-        ("",                       ""),
-        ("PRED Green's E2E",       "pred_greens_e2e_ms"),
-        ("Robust Green's E2E",     "robust_greens_e2e_ms"),
-        ("PRED Green's solve",     "pred_greens_solve_ms"),
-        ("Robust Green's solve",   "robust_greens_solve_ms"),
-        ("",                       ""),
-        ("PRED eigendecomp",       "pred_eigen_ms"),
-        ("Robust eigendecomp",     "robust_eigen_ms"),
-        ("GT eigendecomp",         "gt_eigen_ms"),
-    ]:
-        if not key:
-            print()
-            continue
+    def _print_timing_row(label, key, W=10):
         m, s, mn, mx = _stats(key)
         if m is not None:
-            print(f"  {label:<26s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+            print(f"  {label:<28s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
 
-    # --- Green's function quality ---
+    def _print_quality_row(label, key, W=10):
+        m, s, _, _ = _stats(key)
+        if m is not None:
+            print(f"  {label:<28s} {m:>{W}.4f} {s:>{W}.4f}")
+
+    W = 10
+    n_meshes = len(all_metrics)
+
+    print(f"\n{'=' * 80}")
+    print(f"SUMMARY ({n_meshes} meshes, {num_sources} sources/mesh)")
+    print(f"{'=' * 80}")
+
+    # --- Timing ---
+    print(f"\n  TIMING (ms)")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
+
+    # L,M assembly
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
+            continue
+        _print_timing_row(f"{label} L,M total", f"{prefix}_lm_total_ms" if prefix != 'robust' else "robust_lm_assembly_ms")
+
+    _print_timing_row("GT assembly", "gt_assembly_ms")
+    print()
+
+    # Geodesic E2E
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust')]:
+        if prefix not in methods:
+            continue
+        _print_timing_row(f"{label} E2E geodesic", f"{prefix}_e2e_geodesic_ms")
+
+    print()
+
+    # Green's E2E
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
+            continue
+        _print_timing_row(f"{label} Green's E2E", f"{prefix}_greens_e2e_ms")
+
+    print()
+
+    # Eigendecomposition
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo'), ('gt', 'GT')]:
+        if prefix != 'gt' and prefix not in methods:
+            continue
+        _print_timing_row(f"{label} eigendecomp", f"{prefix}_eigen_ms")
+
+    # --- Green's quality ---
     print(f"\n  GREEN'S FUNCTION QUALITY")
     print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
     print(f"  {'-' * 28} {'-' * W} {'-' * W}")
-    for label, key in [
-        ("PRED max principle",     "pred_greens_max_principle"),
-        ("Robust max principle",   "robust_greens_max_principle"),
-        ("GT max principle",       "gt_greens_max_principle"),
-        ("PRED GT correlation",    "pred_greens_gt_corr_mean"),
-        ("Robust GT correlation",  "robust_greens_gt_corr_mean"),
-        ("PRED residual norm",     "pred_greens_residual_norm"),
-        ("Robust residual norm",   "robust_greens_residual_norm"),
-    ]:
-        m, s, _, _ = _stats(key)
-        if m is not None:
-            print(f"  {label:<26s} {m:>{W}.4f} {s:>{W}.4f}")
 
-    # --- Eigenvalue / eigenvector quality ---
+    _print_quality_row("GT max principle", "gt_greens_max_principle")
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
+            continue
+        _print_quality_row(f"{label} max principle", f"{prefix}_greens_max_principle")
+        _print_quality_row(f"{label} GT correlation", f"{prefix}_greens_gt_corr_mean")
+        _print_quality_row(f"{label} residual norm", f"{prefix}_greens_residual_norm")
+
+    # --- Spectral quality ---
     print(f"\n  SPECTRAL QUALITY")
     print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
     print(f"  {'-' * 28} {'-' * W} {'-' * W}")
-    for label, key in [
-        ("PRED eval rel err mean", "pred_eval_spectrum_rel_err_mean"),
-        ("PRED eval rel err max",  "pred_eval_spectrum_rel_err_max"),
-        ("Robust eval rel err mean", "robust_eval_spectrum_rel_err_mean"),
-        ("Robust eval rel err max",  "robust_eval_spectrum_rel_err_max"),
-        ("",                       ""),
-        ("PRED eigvec cos top5",   "pred_eigvec_cos_top5"),
-        ("PRED eigvec cos top10",  "pred_eigvec_cos_top10"),
-        ("PRED eigvec cos top20",  "pred_eigvec_cos_top20"),
-        ("PRED eigvec cos all",    "pred_eigvec_cos_all"),
-        ("Robust eigvec cos top5", "robust_eigvec_cos_top5"),
-        ("Robust eigvec cos top10","robust_eigvec_cos_top10"),
-        ("Robust eigvec cos top20","robust_eigvec_cos_top20"),
-        ("Robust eigvec cos all",  "robust_eigvec_cos_all"),
-    ]:
-        if not key:
-            print()
+
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
             continue
-        m, s, _, _ = _stats(key)
-        if m is not None:
-            print(f"  {label:<26s} {m:>{W}.4f} {s:>{W}.4f}")
+        _print_quality_row(f"{label} eval rel err mean", f"{prefix}_eval_spectrum_rel_err_mean")
+        _print_quality_row(f"{label} eigvec cos top5", f"{prefix}_eigvec_cos_top5")
+        _print_quality_row(f"{label} eigvec cos top20", f"{prefix}_eigvec_cos_top20")
+        _print_quality_row(f"{label} eigvec cos all", f"{prefix}_eigvec_cos_all")
+        if prefix != list(methods)[-1]:  # separator between methods
+            print()
 
-    pred_e2e_vals = [float(m['pred_e2e_geodesic_ms']) for m in all_metrics
-                     if m.get('pred_e2e_geodesic_ms')]
-    robust_e2e_vals = [float(m['robust_e2e_geodesic_ms']) for m in all_metrics
-                       if m.get('robust_e2e_geodesic_ms')]
-    if pred_e2e_vals and robust_e2e_vals:
-        ratio = np.mean(pred_e2e_vals) / np.mean(robust_e2e_vals)
-        wins = sum(1 for p, r in zip(pred_e2e_vals, robust_e2e_vals) if p < r)
-        print(f"\n  PRED/Robust E2E geodesic ratio: {ratio:.2f}x  "
-              f"(PRED wins {wins}/{len(pred_e2e_vals)})")
+    # --- Ratios ---
+    if 'pred' in methods and 'robust' in methods:
+        print()
+        pred_e2e = [float(m['pred_e2e_geodesic_ms']) for m in all_metrics
+                    if m.get('pred_e2e_geodesic_ms')]
+        rob_e2e = [float(m['robust_e2e_geodesic_ms']) for m in all_metrics
+                   if m.get('robust_e2e_geodesic_ms')]
+        if pred_e2e and rob_e2e:
+            ratio = np.mean(pred_e2e) / np.mean(rob_e2e)
+            wins = sum(1 for p, r in zip(pred_e2e, rob_e2e) if p < r)
+            print(f"  PRED/Robust E2E geodesic: {ratio:.2f}x  (PRED wins {wins}/{len(pred_e2e)})")
 
-    pred_greens_vals = [float(m['pred_greens_e2e_ms']) for m in all_metrics
-                        if m.get('pred_greens_e2e_ms')]
-    robust_greens_vals = [float(m['robust_greens_e2e_ms']) for m in all_metrics
-                          if m.get('robust_greens_e2e_ms')]
-    if pred_greens_vals and robust_greens_vals:
-        ratio = np.mean(pred_greens_vals) / np.mean(robust_greens_vals)
-        wins = sum(1 for p, r in zip(pred_greens_vals, robust_greens_vals) if p < r)
-        print(f"  PRED/Robust E2E Green's ratio:  {ratio:.2f}x  "
-              f"(PRED wins {wins}/{len(pred_greens_vals)})")
+        pred_g = [float(m['pred_greens_e2e_ms']) for m in all_metrics
+                  if m.get('pred_greens_e2e_ms')]
+        rob_g = [float(m['robust_greens_e2e_ms']) for m in all_metrics
+                 if m.get('robust_greens_e2e_ms')]
+        if pred_g and rob_g:
+            ratio = np.mean(pred_g) / np.mean(rob_g)
+            wins = sum(1 for p, r in zip(pred_g, rob_g) if p < r)
+            print(f"  PRED/Robust E2E Green's:  {ratio:.2f}x  (PRED wins {wins}/{len(pred_g)})")
 
-    print(f"\n  Total time: {elapsed:.1f}s ({len(all_metrics)} meshes, {num_gpus} GPUs)")
+    print(f"\n  Total time: {elapsed:.1f}s ({n_meshes} meshes, {num_gpus} GPUs)")
     print(f"{'=' * 80}")
-
-    # ---- Cleanup ----
-    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == '__main__':
