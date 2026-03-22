@@ -557,37 +557,13 @@ class RobustGeodesicTiming:
         return self.constructor + self.solve
 
 
-def _pp3d_worker(vertices: np.ndarray, source_indices: List[int], result_queue):
-    """Run pp3d in a child process. Puts (distances, constructor_time, solve_time) into queue."""
-    import potpourri3d as pp3d
-
-    t0 = time.perf_counter()
-    solver = pp3d.PointCloudHeatSolver(vertices)
-    constructor_time = time.perf_counter() - t0
-
-    distances = []
-    t0 = time.perf_counter()
-    for src in source_indices:
-        try:
-            distances.append(solver.compute_distance(src))
-        except Exception:
-            distances.append(None)
-    solve_time = time.perf_counter() - t0
-
-    result_queue.put((distances, constructor_time, solve_time))
-
-
 def step_robust_geodesic(
     vertices: np.ndarray,
     source_indices: List[int],
     robust_k: int = 30,
-    verbose: bool = True,
 ) -> Tuple[List[Optional[np.ndarray]], RobustGeodesicTiming]:
     """
     Compute geodesics using pp3d PointCloudHeatSolver.
-
-    pp3d runs in a subprocess to survive C++ segfaults on degenerate meshes.
-    If the subprocess crashes, returns None distances.
 
     Also times robust_laplacian assembly (needed for non-geodesic tasks like
     eigendecomposition, Green's function) but NOT included in geodesic E2E.
@@ -595,8 +571,8 @@ def step_robust_geodesic(
     Returns:
         (distances_list, timing)
     """
-    import multiprocessing as _mp
     import robust_laplacian
+    import potpourri3d as pp3d
 
     timing = RobustGeodesicTiming()
 
@@ -605,25 +581,20 @@ def step_robust_geodesic(
     L_rob, M_rob = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=robust_k)
     timing.lm_assembly = time.perf_counter() - t0
 
-    # Run pp3d in subprocess (survives C++ segfaults)
-    ctx = _mp.get_context('fork')
-    result_queue = ctx.Queue()
-    proc = ctx.Process(target=_pp3d_worker, args=(vertices, source_indices, result_queue))
-    proc.start()
-    proc.join()
+    # pp3d constructor (one-time — builds its own internal L,M + prefactors)
+    t0 = time.perf_counter()
+    solver = pp3d.PointCloudHeatSolver(vertices)
+    timing.constructor = time.perf_counter() - t0
 
-    if proc.exitcode != 0:
-        if verbose:
-            print(f"  [!] pp3d crashed (exit code {proc.exitcode}, N={len(vertices)})")
-        return [None] * len(source_indices), timing
-
-    # Success — retrieve results
-    try:
-        distances, constructor_time, solve_time = result_queue.get_nowait()
-        timing.constructor = constructor_time
-        timing.solve = solve_time
-    except Exception:
-        return [None] * len(source_indices), timing
+    # Forward-solves (per-source)
+    distances = []
+    t0 = time.perf_counter()
+    for src in source_indices:
+        try:
+            distances.append(solver.compute_distance(src))
+        except Exception:
+            distances.append(None)
+    timing.solve = time.perf_counter() - t0
 
     return distances, timing
 
@@ -633,21 +604,17 @@ def step_robust_geodesic(
 # =============================================================================
 
 def load_mesh_with_faces(mesh_file_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load mesh, merge duplicate vertices, normalize, return (vertices_f32, faces_i32).
+    """Load mesh, normalize vertices, return (vertices_f32, faces_i32).
 
-    Uses trimesh process=True to merge duplicate vertices and remove
-    degenerate faces. This is essential for STL triangle soups where
-    every triangle stores its own vertex copies.
-
-    Raises RuntimeError if mesh has no faces after processing.
+    Raises RuntimeError if mesh has no faces.
     """
     import trimesh
-    mesh = trimesh.load(mesh_file_path, process=True, force='mesh')
+    mesh = trimesh.load(mesh_file_path, process=False, force='mesh')
     vertices = np.array(mesh.vertices, dtype=np.float64)
     vertices = normalize_mesh_vertices(vertices).astype(np.float32)
     faces = np.array(mesh.faces, dtype=np.int32)
     if len(faces) == 0:
-        raise RuntimeError(f"Mesh has no faces after processing: {mesh_file_path}")
+        raise RuntimeError(f"Mesh has no faces: {mesh_file_path}")
     return vertices, faces
 
 
@@ -1106,35 +1073,13 @@ class GeodesicQuality:
     num_sources_ok: int = 0
 
 
-def _exact_geodesics_worker(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-    source_indices: List[int],
-    result_queue,
-):
-    """Run exact geodesics in a child process. Puts dict of results into queue."""
-    verts_f64 = vertices.astype(np.float64)
-    faces_i32 = faces.astype(np.int32)
-    exact = {}
-    for src_idx in source_indices:
-        try:
-            exact[src_idx] = compute_exact_geodesics(verts_f64, faces_i32, int(src_idx))
-        except Exception:
-            exact[src_idx] = None
-    result_queue.put(exact)
-
-
 def step_exact_geodesics(
     vertices: np.ndarray,
     faces: np.ndarray,
     source_indices: List[int],
-    verbose: bool = True,
 ) -> Dict[int, Optional[np.ndarray]]:
     """
     Precompute exact geodesic distances for all source vertices.
-
-    Runs in a subprocess to survive C++ segfaults (pygeodesic can crash
-    on meshes with degenerate topology or int32 overflow).
 
     Call once per mesh, then pass the result to step_geodesic_quality
     for each method to avoid redundant computation.
@@ -1142,29 +1087,12 @@ def step_exact_geodesics(
     Returns:
         Dict mapping source_idx -> exact distances (N,), or None if failed.
     """
-    import multiprocessing as _mp
-
-    empty = {src: None for src in source_indices}
-
-    ctx = _mp.get_context('fork')
-    result_queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_exact_geodesics_worker,
-        args=(vertices, faces, source_indices, result_queue),
-    )
-    proc.start()
-    proc.join()
-
-    if proc.exitcode != 0:
-        if verbose:
-            print(f"  [!] Exact geodesics crashed (exit code {proc.exitcode}, "
-                  f"N={len(vertices)}, F={len(faces)})")
-        return empty
-
-    try:
-        return result_queue.get_nowait()
-    except Exception:
-        return empty
+    exact = {}
+    verts_f64 = vertices.astype(np.float64)
+    faces_i32 = faces.astype(np.int32)
+    for src_idx in source_indices:
+        exact[src_idx] = compute_exact_geodesics(verts_f64, faces_i32, int(src_idx))
+    return exact
 
 
 def step_geodesic_quality(

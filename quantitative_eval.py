@@ -31,30 +31,14 @@ Usage:
 
 import csv
 import gc
-import os
 import shutil
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-
-
-@contextmanager
-def _suppress_c_stderr():
-    """Suppress C-level stderr (e.g. 'skipping degenerate neighborhood' from robust_laplacian)."""
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    old_stderr = os.dup(2)
-    os.dup2(devnull, 2)
-    try:
-        yield
-    finally:
-        os.dup2(old_stderr, 2)
-        os.close(devnull)
-        os.close(old_stderr)
 
 import matplotlib
 matplotlib.use('Agg')
@@ -203,14 +187,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
     num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
     use_amp = device.type == 'cuda'
-    verbose = getattr(cfg, 'verbose', True)
-    if isinstance(verbose, str):
-        verbose = verbose.lower() not in ('false', '0', 'no')
-
-    def vprint(*args, **kwargs):
-        """Print only when verbose is True."""
-        if verbose:
-            print(*args, **kwargs)
 
     # ---- Top-k pruning sweep ----
     # Accepts: +top_k_values=[6,10,20] or +'top_k_values=[6,10,20]'
@@ -270,7 +246,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     # ==================================================================
     # Pre-load all meshes (shared across passes)
     # ==================================================================
-    vprint(f"{tag}Loading {n_total} meshes...")
+    print(f"{tag}Loading {n_total} meshes...")
     mesh_data_list: List[Optional[Dict[str, Any]]] = []
     for local_idx, global_idx in enumerate(my_indices):
         try:
@@ -294,7 +270,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 'source_indices': source_indices,
             })
         except Exception as e:
-            vprint(f"{tag}  Failed to load mesh {global_idx}: {e}")
+            print(f"{tag}  Failed to load mesh {global_idx}: {e}")
             mesh_data_list.append(None)
 
         metrics_list.append({})
@@ -354,8 +330,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
                 del verts_tensor, patch_data
             except Exception as e:
-                vprint(f"{tag}  PRED assembly failed for {md['mesh_name']} "
-                      f"(N={md['N']}): {e}")
+                print(f"{tag}  PRED assembly failed for {md['mesh_name']}: {e}")
         gc.enable()
         print(f"{tag}Pass 1 done: {time.time() - t_start:.1f}s")
 
@@ -382,8 +357,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics_list[i]['nelo_assembly_ms'] = t_nelo.assembly * 1000
                 metrics_list[i]['nelo_lm_total_ms'] = t_nelo.total * 1000
             except Exception as e:
-                vprint(f"{tag}  NeLo assembly failed for {md['mesh_name']} "
-                      f"(N={md['N']}): {e}")
+                print(f"{tag}  NeLo assembly failed for {md['mesh_name']}: {e}")
         gc.enable()
         print(f"{tag}Pass 2 done: {time.time() - t_start:.1f}s")
 
@@ -423,47 +397,29 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
             rob_L, rob_M, t_rob_lm = None, None, None
             if run_robust:
-                if verbose:
-                    rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
-                else:
-                    with _suppress_c_stderr():
-                        rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
                 metrics['robust_k'] = robust_k
                 metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
                 cache['rob_L'] = rob_L
                 cache['rob_M'] = rob_M
 
-            # ---- Geodesics (each wrapped — pp3d/igl can crash on bad meshes) ----
+            # ---- Geodesics ----
             gt_distances = None
             if gt_L is not None:
-                try:
-                    gt_distances, gt_geo_timing = step_gt_geodesic(
-                        gt_L, gt_M, vertices, faces, source_indices, N,
-                    )
-                    metrics['gt_geo_total_ms'] = gt_geo_timing.total * 1000
-                    metrics['gt_e2e_geodesic_ms'] = (t_gt['assembly'] + gt_geo_timing.total) * 1000
-                    metrics['gt_geodesic_failed'] = 0
-                except Exception as e:
-                    vprint(f"{tag}  GT geodesic failed for {mesh_name} (N={N}): {e}")
-                    metrics['gt_geodesic_failed'] = 1
+                gt_distances, gt_geo_timing = step_gt_geodesic(
+                    gt_L, gt_M, vertices, faces, source_indices, N,
+                )
+                metrics['gt_geo_total_ms'] = gt_geo_timing.total * 1000
+                metrics['gt_e2e_geodesic_ms'] = (t_gt['assembly'] + gt_geo_timing.total) * 1000
 
             robust_distances = None
             robust_timing = None
             if run_robust:
-                try:
-                    if verbose:
-                        robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k, verbose=True)
-                    else:
-                        with _suppress_c_stderr():
-                            robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k, verbose=False)
-                    metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
-                    metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
-                    metrics['robust_e2e_geodesic_ms'] = robust_timing.total * 1000
-                    metrics['robust_per_src_ms'] = robust_timing.total / n_src * 1000
-                    metrics['robust_geodesic_failed'] = 0
-                except Exception as e:
-                    vprint(f"{tag}  Robust geodesic failed for {mesh_name} (N={N}): {e}")
-                    metrics['robust_geodesic_failed'] = 1
+                robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
+                metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
+                metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
+                metrics['robust_e2e_geodesic_ms'] = robust_timing.total * 1000
+                metrics['robust_per_src_ms'] = robust_timing.total / n_src * 1000
 
             pred_distances = None
             pred_L = cache.get('pred_L')
@@ -471,54 +427,36 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             pred_G = cache.get('pred_G')
             t_pred = cache.get('t_pred')
             if run_pred and pred_G is not None:
-                try:
-                    pred_distances, pred_geo_timing = step_pred_geodesic(
-                        pred_L, pred_M, pred_G, source_indices, N,
-                    )
-                    pred_onetime = (t_pred.total
-                                    + pred_geo_timing.build
-                                    + pred_geo_timing.heat_factorize
-                                    + pred_geo_timing.poisson_factorize)
-                    pred_e2e = pred_onetime + pred_geo_timing.solve
-                    metrics['pred_geo_build_ms'] = pred_geo_timing.build * 1000
-                    metrics['pred_geo_heat_fact_ms'] = pred_geo_timing.heat_factorize * 1000
-                    metrics['pred_geo_poisson_fact_ms'] = pred_geo_timing.poisson_factorize * 1000
-                    metrics['pred_geo_solve_ms'] = pred_geo_timing.solve * 1000
-                    metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
-                    metrics['pred_per_src_ms'] = pred_e2e / n_src * 1000
-                    metrics['pred_geodesic_failed'] = 0
-                except Exception as e:
-                    vprint(f"{tag}  PRED geodesic failed for {mesh_name} (N={N}): {e}")
-                    metrics['pred_geodesic_failed'] = 1
+                pred_distances, pred_geo_timing = step_pred_geodesic(
+                    pred_L, pred_M, pred_G, source_indices, N,
+                )
+                pred_onetime = (t_pred.total
+                                + pred_geo_timing.build
+                                + pred_geo_timing.heat_factorize
+                                + pred_geo_timing.poisson_factorize)
+                pred_e2e = pred_onetime + pred_geo_timing.solve
+                metrics['pred_geo_build_ms'] = pred_geo_timing.build * 1000
+                metrics['pred_geo_heat_fact_ms'] = pred_geo_timing.heat_factorize * 1000
+                metrics['pred_geo_poisson_fact_ms'] = pred_geo_timing.poisson_factorize * 1000
+                metrics['pred_geo_solve_ms'] = pred_geo_timing.solve * 1000
+                metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
+                metrics['pred_per_src_ms'] = pred_e2e / n_src * 1000
 
             nelo_distances = None
             nelo_L = cache.get('nelo_L')
             nelo_M = cache.get('nelo_M')
             t_nelo = cache.get('t_nelo')
             if run_nelo and nelo_L is not None:
-                try:
-                    nelo_distances, nelo_geo_timing = step_pcdiff_geodesic(
-                        nelo_L, nelo_M, vertices, nelo_k, source_indices, N,
-                    )
-                    nelo_geo_e2e = t_nelo.total + nelo_geo_timing.total
-                    metrics['nelo_geo_total_ms'] = nelo_geo_timing.total * 1000
-                    metrics['nelo_e2e_geodesic_ms'] = nelo_geo_e2e * 1000
-                    metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
-                    metrics['nelo_geodesic_failed'] = 0
-                except Exception as e:
-                    vprint(f"{tag}  NeLo geodesic failed for {mesh_name} (N={N}): {e}")
-                    metrics['nelo_geodesic_failed'] = 1
+                nelo_distances, nelo_geo_timing = step_pcdiff_geodesic(
+                    nelo_L, nelo_M, vertices, nelo_k, source_indices, N,
+                )
+                nelo_geo_e2e = t_nelo.total + nelo_geo_timing.total
+                metrics['nelo_geo_total_ms'] = nelo_geo_timing.total * 1000
+                metrics['nelo_e2e_geodesic_ms'] = nelo_geo_e2e * 1000
+                metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
 
             # ---- Geodesic quality vs exact (precompute exact once) ----
-            exact_geo = {}
-            try:
-                vprint(f"{tag}  Computing exact geodesics for {mesh_name} (N={N}, F={len(faces)})...",
-                      flush=True)
-                exact_geo = step_exact_geodesics(vertices, faces, source_indices, verbose=verbose)
-                metrics['exact_geodesic_failed'] = 0
-            except Exception as e:
-                vprint(f"{tag}  Exact geodesics failed for {mesh_name} (N={N}): {e}")
-                metrics['exact_geodesic_failed'] = 1
+            exact_geo = step_exact_geodesics(vertices, faces, source_indices)
             n_exact = sum(1 for v in exact_geo.values() if v is not None)
             metrics['num_exact_geodesics'] = n_exact
 
@@ -1175,26 +1113,6 @@ def _print_summary(
                     parts.append(f'{"N/A":>{W}s}')
             print(''.join(parts))
 
-    # --- Failure counts ---
-    failure_keys = [
-        ('GT geodesic',     'gt_geodesic_failed'),
-        ('Exact geodesic',  'exact_geodesic_failed'),
-    ]
-    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
-        if prefix not in methods:
-            continue
-        failure_keys.append((f'{label} geodesic', f'{prefix}_geodesic_failed'))
-
-    any_failures = False
-    for label, key in failure_keys:
-        vals = [int(m[key]) for m in all_metrics if m.get(key) is not None]
-        n_fail = sum(vals)
-        if n_fail > 0:
-            if not any_failures:
-                print(f"\n  FAILURES")
-                any_failures = True
-            print(f"  {label:<28s} {n_fail}/{len(vals)} meshes")
-
     print(f"\n  Total time: {elapsed:.1f}s ({n_meshes} meshes, {num_gpus} GPUs)")
     print(f"{'=' * 80}")
 
@@ -1277,7 +1195,6 @@ def _generate_plots(
     _plot_probe_quality(all_metrics, active, output_dir)
     _plot_sparsity(all_metrics, active, output_dir)
     _plot_spectral_compression(all_metrics, active, output_dir, num_eigenvalues)
-    _plot_failure_rates(all_metrics, active, output_dir)
 
     # Top-k sweep (if present)
     tk_values = _detect_top_k_values(all_metrics)
@@ -1714,61 +1631,6 @@ def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], outp
         fig.savefig(output_dir / f'spectral_compression.{ext}')
     plt.close(fig)
     print(f"  Saved: spectral_compression.pdf/png")
-
-
-def _plot_failure_rates(all_metrics: List[Dict], methods: List[str], output_dir: Path):
-    """Bar chart: geodesic failure count per method."""
-
-    all_prefixes = ['gt', 'exact'] + methods
-    labels_map = {
-        'gt': 'GT',
-        'exact': 'Exact',
-        'pred': 'PRED (Ours)',
-        'robust': 'Robust',
-        'nelo': 'NeLo',
-    }
-    colors_map = {
-        'gt': '#6B7280',
-        'exact': '#9CA3AF',
-        'pred': '#2563EB',
-        'robust': '#DC2626',
-        'nelo': '#16A34A',
-    }
-
-    present = []
-    for pfx in all_prefixes:
-        key = f'{pfx}_geodesic_failed'
-        vals = [int(m[key]) for m in all_metrics if m.get(key) is not None]
-        if vals:
-            present.append((pfx, sum(vals), len(vals)))
-
-    if not present or all(n_fail == 0 for _, n_fail, _ in present):
-        # No failures at all — skip plot
-        return
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-
-    for j, (pfx, n_fail, n_total) in enumerate(present):
-        color = colors_map.get(pfx, '#6B7280')
-        label = labels_map.get(pfx, pfx)
-        ax.bar(j, n_fail, color=color, edgecolor='white',
-               linewidth=0.5, alpha=0.9, zorder=3)
-        ax.text(j, n_fail + 0.2, f'{n_fail}/{n_total}',
-                ha='center', va='bottom', fontsize=9,
-                fontweight='bold', color=color)
-
-    ax.set_xticks(range(len(present)))
-    ax.set_xticklabels([labels_map.get(p, p) for p, _, _ in present], fontsize=10)
-    ax.set_ylabel('Failed Meshes')
-    ax.set_title('Geodesic Computation Failures')
-    ax.set_ylim(bottom=0)
-    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-    fig.tight_layout()
-    for ext in ['pdf', 'png']:
-        fig.savefig(output_dir / f'failure_rates.{ext}')
-    plt.close(fig)
-    print(f"  Saved: failure_rates.pdf/png")
 
 
 def _plot_topk_sweep(all_metrics: List[Dict], tk_values: List[int], output_dir: Path):
