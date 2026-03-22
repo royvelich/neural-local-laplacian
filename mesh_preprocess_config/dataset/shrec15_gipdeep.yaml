@@ -1,3 +1,6 @@
 folder: "/home/royve/datasets/neural-laplacian/shrec15"
 file_size_range_mb: [0.2, 2.0]
 num_components_range: [1, 1]
+num_sources: 10
+seed: 42
+num_workers: 8

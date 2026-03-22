@@ -101,15 +101,15 @@ def _compute_one_mesh(args) -> Tuple[str, str, bool, int, int, str]:
         return mesh_file_path, mesh_name, False, 0, num_sources, str(e)
 
 
-@hydra.main(version_base="1.2", config_path='./mesh_preprocess_config')
+@hydra.main(version_base="1.2", config_path='./mesh_preprocess_config', config_name='config')
 def main(cfg: DictConfig) -> None:
     """Preprocess mesh folder: build lookup table + precompute geodesics."""
 
     ds = cfg.dataset
     folder_paths = [Path(ds.folder)]
-    num_sources = cfg.num_sources
-    seed = cfg.seed
-    num_workers = cfg.num_workers
+    num_sources = getattr(ds, 'num_sources', 10)
+    seed = getattr(ds, 'seed', 42)
+    num_workers = getattr(ds, 'num_workers', 8)
 
     # Parse filter ranges from dataset config (None if not set)
     file_size_range = tuple(ds.file_size_range_mb) if getattr(ds, 'file_size_range_mb', None) is not None else None
