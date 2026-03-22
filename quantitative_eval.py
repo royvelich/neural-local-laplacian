@@ -66,6 +66,7 @@ from neural_local_laplacian.utils.validation_utils import (
     step_descriptor_comparison,
     step_probe_function_mse,
     step_sparsity,
+    step_spectral_compression,
     GeodesicTimingBreakdown,
     HAS_NELO,
     HAS_PCDIFF,
@@ -520,6 +521,21 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics[f'{prefix}_avg_nnz_per_row'] = sp.avg_nnz_per_row
                 metrics[f'{prefix}_density_pct'] = sp.density_percent
 
+            # ---- Spectral compression ----
+            compression_k_values = [5, 10, 20, 50]
+            for prefix, m_evecs, m_M in [
+                ('gt', gt_evecs, gt_M),
+                ('pred', pred_evecs, pred_M),
+                ('robust', rob_evecs, rob_M),
+                ('nelo', nelo_evecs, nelo_M),
+            ]:
+                if m_evecs is None or m_M is None:
+                    continue
+                comp = step_spectral_compression(m_evecs, m_M, vertices, compression_k_values)
+                for k, errs in comp.errors.items():
+                    metrics[f'{prefix}_compress_k{k}_mean_l2'] = errs['mean_l2']
+                    metrics[f'{prefix}_compress_k{k}_max_l2'] = errs['max_l2']
+
             # ---- Timing ratios ----
             if run_pred and run_robust and robust_timing is not None and t_pred is not None:
                 if robust_timing.lm_assembly > 0:
@@ -924,6 +940,19 @@ def _print_summary(
         _print_quality_row(f"{label} avg NNZ/row", f"{prefix}_avg_nnz_per_row")
         _print_quality_row(f"{label} density %", f"{prefix}_density_pct")
 
+    # --- Spectral compression ---
+    print(f"\n  SPECTRAL COMPRESSION (mean L2 recon error)")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+
+    for k in [5, 10, 20, 50]:
+        _print_quality_row(f"GT k={k}", f"gt_compress_k{k}_mean_l2")
+        for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+            if prefix not in methods:
+                continue
+            _print_quality_row(f"{label} k={k}", f"{prefix}_compress_k{k}_mean_l2")
+        print()
+
     # --- Ratios ---
     if 'pred' in methods and 'robust' in methods:
         print()
@@ -1013,6 +1042,7 @@ def _generate_plots(
     _plot_descriptor_quality(all_metrics, active, output_dir)
     _plot_probe_quality(all_metrics, active, output_dir)
     _plot_sparsity(all_metrics, active, output_dir)
+    _plot_spectral_compression(all_metrics, active, output_dir)
 
     print(f"All plots saved to: {output_dir}")
 
@@ -1392,6 +1422,56 @@ def _plot_sparsity(all_metrics: List[Dict], methods: List[str], output_dir: Path
         fig.savefig(output_dir / f'sparsity.{ext}')
     plt.close(fig)
     print(f"  Saved: sparsity.pdf/png")
+
+
+def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """Line plot: mean L2 reconstruction error vs number of eigenvectors (k)."""
+
+    all_prefixes = ['gt'] + methods
+    k_values = [5, 10, 20, 50]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    for prefix in all_prefixes:
+        if prefix != 'gt' and prefix not in methods:
+            continue
+
+        ks, means, stds = [], [], []
+        for k in k_values:
+            vals = _get_vals(all_metrics, f'{prefix}_compress_k{k}_mean_l2')
+            if vals is not None:
+                ks.append(k)
+                means.append(vals.mean())
+                stds.append(vals.std())
+
+        if not ks:
+            continue
+
+        color = METHOD_COLORS.get(prefix, '#6B7280')
+        label = METHOD_LABELS.get(prefix, prefix)
+        ks = np.array(ks)
+        means = np.array(means)
+        stds = np.array(stds)
+
+        ax.plot(ks, means, 'o-',
+                color=color, label=label,
+                linewidth=2, markersize=6, zorder=3)
+        ax.fill_between(ks, means - stds, means + stds,
+                         color=color, alpha=0.15, zorder=2)
+
+    ax.set_xlabel('Number of Eigenvectors (k)')
+    ax.set_ylabel('Mean L2 Reconstruction Error')
+    ax.set_title('Spectral Compression Quality')
+    ax.set_xticks(k_values)
+    ax.set_xlim(k_values[0] - 1, k_values[-1] + 1)
+    ax.set_ylim(bottom=0)
+    ax.legend(loc='upper right', framealpha=0.9)
+
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'spectral_compression.{ext}')
+    plt.close(fig)
+    print(f"  Saved: spectral_compression.pdf/png")
 
 
 if __name__ == '__main__':
