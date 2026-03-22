@@ -206,13 +206,15 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
     # ---- Process meshes ----
     metrics_list: List[Dict[str, Any]] = []
+    mesh_cache: List[Dict[str, Any]] = []
     t_start = time.time()
 
+    # ==================================================================
+    # Pre-load all meshes (shared across passes)
+    # ==================================================================
+    print(f"{tag}Loading {n_total} meshes...")
+    mesh_data_list: List[Optional[Dict[str, Any]]] = []
     for local_idx, global_idx in enumerate(my_indices):
-        t_mesh_start = time.time()
-        mesh_name = "?"
-        metrics: Dict[str, Any] = {}
-
         try:
             batch_data = dataset[global_idx]
             data = batch_data[0] if isinstance(batch_data, list) else batch_data
@@ -220,93 +222,146 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             if isinstance(mesh_file_path, list):
                 mesh_file_path = mesh_file_path[0]
             mesh_name = Path(mesh_file_path).name
-
             vertices, faces = load_mesh_with_faces(mesh_file_path)
             N = len(vertices)
             source_indices = select_multiple_geodesic_sources(
                 vertices.astype(np.float64), num_sources=num_sources,
                 method="farthest_point_sampling", seed=42
             ).tolist()
-            verts_tensor = torch.from_numpy(vertices).float().to(device)
+            mesh_data_list.append({
+                'mesh_name': mesh_name,
+                'vertices': vertices,
+                'faces': faces,
+                'N': N,
+                'source_indices': source_indices,
+            })
+        except Exception as e:
+            print(f"{tag}  Failed to load mesh {global_idx}: {e}")
+            mesh_data_list.append(None)
 
-            metrics['mesh_name'] = mesh_name
-            metrics['num_vertices'] = N
-            metrics['num_faces'] = len(faces)
-            metrics['num_sources'] = len(source_indices)
+        metrics_list.append({})
+        mesh_cache.append({})
 
-            # ---- Disable GC during timing-sensitive section ----
-            gc.collect()
-            gc.disable()
-
-            # ==============================================================
-            # Phase 1: TIMING-SENSITIVE (GC disabled)
-            # GPU assemblies run FIRST (before any heavy CPU work cools GPU).
-            # Then CPU-only: GT/Robust assembly → all geodesics → all Green's.
-            # ==============================================================
-
-            n_src = len(source_indices)
-
-            # ---- GPU assemblies (run first while GPU is warm) ----
-            # Mini warmup: wake GPU from idle after Phase 2's heavy CPU work.
-            if device.type == 'cuda' and (run_pred or run_nelo):
-                _w = torch.randn(512, 512, device=device) @ torch.randn(512, 512, device=device)
-                torch.cuda.synchronize()
-                del _w
-
-            pred_L, pred_M, pred_G, t_pred = None, None, None, None
-            if run_pred:
+    # ==================================================================
+    # PASS 1: PRED assembly (GPU, back-to-back, hottest possible)
+    # ==================================================================
+    if run_pred:
+        print(f"{tag}Pass 1: PRED assembly (k={pred_k})...")
+        gc.collect()
+        gc.disable()
+        for i, md in enumerate(mesh_data_list):
+            if md is None:
+                continue
+            try:
+                verts_tensor = torch.from_numpy(md['vertices']).float().to(device)
                 pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
                     model, verts_tensor, pred_k, device, use_amp=use_amp,
                 )
-                metrics['pred_k'] = pred_k
-                metrics['pred_knn_ms'] = t_pred.knn * 1000
-                metrics['pred_forward_ms'] = t_pred.forward * 1000
-                metrics['pred_assembly_ms'] = t_pred.assembly * 1000
-                metrics['pred_grad_op_ms'] = t_pred.grad_op * 1000
-                metrics['pred_lm_total_ms'] = t_pred.lm_total * 1000
+                mesh_cache[i]['pred_L'] = pred_L
+                mesh_cache[i]['pred_M'] = pred_M
+                mesh_cache[i]['pred_G'] = pred_G
+                mesh_cache[i]['t_pred'] = t_pred
+                metrics_list[i]['pred_k'] = pred_k
+                metrics_list[i]['pred_knn_ms'] = t_pred.knn * 1000
+                metrics_list[i]['pred_forward_ms'] = t_pred.forward * 1000
+                metrics_list[i]['pred_assembly_ms'] = t_pred.assembly * 1000
+                metrics_list[i]['pred_grad_op_ms'] = t_pred.grad_op * 1000
+                metrics_list[i]['pred_lm_total_ms'] = t_pred.lm_total * 1000
+                del verts_tensor
+            except Exception as e:
+                print(f"{tag}  PRED assembly failed for {md['mesh_name']}: {e}")
+        gc.enable()
+        print(f"{tag}Pass 1 done: {time.time() - t_start:.1f}s")
 
-            nelo_L, nelo_M, t_nelo = None, None, None
-            if run_nelo:
+    # ==================================================================
+    # PASS 2: NeLo assembly (GPU, back-to-back)
+    # ==================================================================
+    if run_nelo:
+        print(f"{tag}Pass 2: NeLo assembly (k={nelo_k})...")
+        gc.collect()
+        gc.disable()
+        for i, md in enumerate(mesh_data_list):
+            if md is None:
+                continue
+            try:
                 nelo_L, nelo_M, t_nelo = step_nelo_laplacian(
-                    nelo_pipeline, vertices, nelo_k, device,
+                    nelo_pipeline, md['vertices'], nelo_k, device,
                 )
-                metrics['nelo_k'] = nelo_k
-                metrics['nelo_graph_tree_ms'] = t_nelo.graph_tree * 1000
-                metrics['nelo_forward_ms'] = t_nelo.forward * 1000
-                metrics['nelo_assembly_ms'] = t_nelo.assembly * 1000
-                metrics['nelo_lm_total_ms'] = t_nelo.total * 1000
+                mesh_cache[i]['nelo_L'] = nelo_L
+                mesh_cache[i]['nelo_M'] = nelo_M
+                mesh_cache[i]['t_nelo'] = t_nelo
+                metrics_list[i]['nelo_k'] = nelo_k
+                metrics_list[i]['nelo_graph_tree_ms'] = t_nelo.graph_tree * 1000
+                metrics_list[i]['nelo_forward_ms'] = t_nelo.forward * 1000
+                metrics_list[i]['nelo_assembly_ms'] = t_nelo.assembly * 1000
+                metrics_list[i]['nelo_lm_total_ms'] = t_nelo.total * 1000
+            except Exception as e:
+                print(f"{tag}  NeLo assembly failed for {md['mesh_name']}: {e}")
+        gc.enable()
+        print(f"{tag}Pass 2 done: {time.time() - t_start:.1f}s")
+
+    # ==================================================================
+    # PASS 3: Everything else (CPU — GT/Robust assembly, geodesics,
+    #         Green's, eigendecomposition, spectral comparisons)
+    # ==================================================================
+    print(f"{tag}Pass 3: GT/Robust assembly + geodesics + Green's + eigen...")
+
+    for i, md in enumerate(mesh_data_list):
+        if md is None:
+            continue
+        t_mesh_start = time.time()
+        metrics = metrics_list[i]
+        cache = mesh_cache[i]
+        mesh_name = md['mesh_name']
+        vertices = md['vertices']
+        faces = md['faces']
+        N = md['N']
+        source_indices = md['source_indices']
+        n_src = len(source_indices)
+
+        metrics['mesh_name'] = mesh_name
+        metrics['num_vertices'] = N
+        metrics['num_faces'] = len(faces)
+        metrics['num_sources'] = n_src
+
+        try:
+            gc.collect()
+            gc.disable()
 
             # ---- CPU assemblies ----
             gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
             metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
+            cache['gt_L'] = gt_L
+            cache['gt_M'] = gt_M
 
             rob_L, rob_M, t_rob_lm = None, None, None
             if run_robust:
                 rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
                 metrics['robust_k'] = robust_k
                 metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
+                cache['rob_L'] = rob_L
+                cache['rob_M'] = rob_M
 
-            # ---- Geodesics (all CPU) ----
-            # GT geodesic (mesh-based heat method)
+            # ---- Geodesics ----
             if gt_L is not None:
                 _, gt_geo_timing = step_gt_geodesic(
                     gt_L, gt_M, vertices, faces, source_indices, N,
                 )
-                gt_geo_e2e = t_gt['assembly'] + gt_geo_timing.total
                 metrics['gt_geo_total_ms'] = gt_geo_timing.total * 1000
-                metrics['gt_e2e_geodesic_ms'] = gt_geo_e2e * 1000
+                metrics['gt_e2e_geodesic_ms'] = (t_gt['assembly'] + gt_geo_timing.total) * 1000
 
-            # Robust geodesic (pp3d)
             robust_timing = None
             if run_robust:
                 _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
-                robust_e2e = robust_timing.total
                 metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
                 metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
-                metrics['robust_e2e_geodesic_ms'] = robust_e2e * 1000
-                metrics['robust_per_src_ms'] = robust_e2e / n_src * 1000
+                metrics['robust_e2e_geodesic_ms'] = robust_timing.total * 1000
+                metrics['robust_per_src_ms'] = robust_timing.total / n_src * 1000
 
-            # PRED geodesic (learned G)
+            pred_L = cache.get('pred_L')
+            pred_M = cache.get('pred_M')
+            pred_G = cache.get('pred_G')
+            t_pred = cache.get('t_pred')
             if run_pred and pred_G is not None:
                 _, pred_geo_timing = step_pred_geodesic(
                     pred_L, pred_M, pred_G, source_indices, N,
@@ -323,7 +378,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
                 metrics['pred_per_src_ms'] = pred_e2e / n_src * 1000
 
-            # NeLo geodesic (pcdiff operators)
+            nelo_L = cache.get('nelo_L')
+            nelo_M = cache.get('nelo_M')
+            t_nelo = cache.get('t_nelo')
             if run_nelo and nelo_L is not None:
                 _, nelo_geo_timing = step_pcdiff_geodesic(
                     nelo_L, nelo_M, vertices, nelo_k, source_indices, N,
@@ -334,7 +391,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
 
             # ---- Green's function ----
-            # GT first (provides reference values)
             gt_gvals = None
             if gt_L is not None:
                 gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
@@ -358,14 +414,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     source_indices, gt_gvals, t_nelo.total,
                 )
 
-            # ---- Re-enable GC (timing-sensitive section done) ----
             gc.enable()
 
-            # ==============================================================
-            # Phase 2: QUALITY (not timing-sensitive)
-            # Eigendecomposition + spectral comparisons.
-            # ==============================================================
-
+            # ---- Eigendecomposition (not timing-sensitive) ----
             gt_evals, gt_evecs = None, None
             if gt_L is not None:
                 gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
@@ -389,11 +440,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     gt_evals, gt_evecs, num_eigenvalues,
                 )
 
-            # ==============================================================
-            # Timing ratios
-            # ==============================================================
-            if run_pred and run_robust and robust_timing is not None:
-                if robust_timing.lm_assembly > 0 and t_pred is not None:
+            # ---- Timing ratios ----
+            if run_pred and run_robust and robust_timing is not None and t_pred is not None:
+                if robust_timing.lm_assembly > 0:
                     metrics['ratio_lm'] = t_pred.lm_total / robust_timing.lm_assembly
                 if metrics.get('pred_e2e_geodesic_ms') and metrics.get('robust_e2e_geodesic_ms'):
                     metrics['ratio_e2e_geodesic'] = (
@@ -404,9 +453,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                         metrics['pred_greens_e2e_ms'] / metrics['robust_greens_e2e_ms']
                     )
 
-            metrics_list.append(metrics)
             status = "OK"
-            del verts_tensor
 
         except Exception as e:
             gc.enable()
@@ -416,17 +463,16 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
         t_mesh = time.time() - t_mesh_start
         elapsed = time.time() - t_start
-        done = local_idx + 1
-        eta = (elapsed / done) * (n_total - done) if done > 0 else 0
+        done = i + 1
+        eta = (elapsed / max(done, 1)) * (n_total - done)
 
-        # Per-mesh summary line
         parts = [f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<6s} N={N:>6d}"]
         if metrics.get('pred_e2e_geodesic_ms'):
             parts.append(f"PRED={metrics['pred_e2e_geodesic_ms']:.0f}ms")
         if metrics.get('robust_e2e_geodesic_ms'):
             parts.append(f"Rob={metrics['robust_e2e_geodesic_ms']:.0f}ms")
-        if metrics.get('nelo_lm_total_ms'):
-            parts.append(f"NeLo={metrics['nelo_lm_total_ms']:.0f}ms")
+        if metrics.get('nelo_e2e_geodesic_ms'):
+            parts.append(f"NeLo={metrics['nelo_e2e_geodesic_ms']:.0f}ms")
         if metrics.get('pred_greens_gt_corr_mean'):
             parts.append(f"G_corr={metrics['pred_greens_gt_corr_mean']:.3f}")
         if metrics.get('pred_eigvec_cos_all'):
