@@ -633,17 +633,21 @@ def step_robust_geodesic(
 # =============================================================================
 
 def load_mesh_with_faces(mesh_file_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load mesh, normalize vertices, return (vertices_f32, faces_i32).
+    """Load mesh, merge duplicate vertices, normalize, return (vertices_f32, faces_i32).
 
-    Raises RuntimeError if mesh has no faces.
+    Uses trimesh process=True to merge duplicate vertices and remove
+    degenerate faces. This is essential for STL triangle soups where
+    every triangle stores its own vertex copies.
+
+    Raises RuntimeError if mesh has no faces after processing.
     """
     import trimesh
-    mesh = trimesh.load(mesh_file_path, process=False, force='mesh')
+    mesh = trimesh.load(mesh_file_path, process=True, force='mesh')
     vertices = np.array(mesh.vertices, dtype=np.float64)
     vertices = normalize_mesh_vertices(vertices).astype(np.float32)
     faces = np.array(mesh.faces, dtype=np.int32)
     if len(faces) == 0:
-        raise RuntimeError(f"Mesh has no faces: {mesh_file_path}")
+        raise RuntimeError(f"Mesh has no faces after processing: {mesh_file_path}")
     return vertices, faces
 
 
