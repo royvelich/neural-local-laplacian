@@ -383,7 +383,7 @@ def step_eigendecomposition(
     L: scipy.sparse.spmatrix,
     M: scipy.sparse.spmatrix,
     num_eigenvalues: int = 50,
-    method: str = "lobpcg",
+    method: str = "eigsh_sm",
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, float]]:
     """
     Compute generalized eigendecomposition L v = λ M v.
@@ -394,7 +394,10 @@ def step_eigendecomposition(
         L: Sparse Laplacian (N, N)
         M: Sparse mass matrix (N, N)
         num_eigenvalues: Number of smallest eigenpairs to compute
-        method: "lobpcg" (fast, no factorization) or "eigsh" (shift-invert, robust)
+        method:
+            "eigsh_sm"  — standard Lanczos with which='SM' (default, fast, no factorization)
+            "lobpcg"    — LOBPCG with diagonal preconditioner (fast, no factorization)
+            "eigsh"     — shift-invert eigsh with sigma=-0.01 (slow, most robust)
 
     Returns:
         (eigenvalues, eigenvectors, timing) where timing has key 'eigen'.
@@ -405,7 +408,9 @@ def step_eigendecomposition(
         L_psd = ensure_psd(L).astype(np.float64)
         M_f64 = M.astype(np.float64)
 
-        if method == "lobpcg":
+        if method == "eigsh_sm":
+            eigenvalues, eigenvectors = _eigen_eigsh_sm(L_psd, M_f64, num_eigenvalues)
+        elif method == "lobpcg":
             eigenvalues, eigenvectors = _eigen_lobpcg(L_psd, M_f64, num_eigenvalues)
         else:
             eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
@@ -416,6 +421,45 @@ def step_eigendecomposition(
     elapsed = time.perf_counter() - t0
 
     return eigenvalues, eigenvectors, {'eigen': elapsed}
+
+
+def _eigen_eigsh_sm(
+    L: scipy.sparse.spmatrix,
+    M: scipy.sparse.spmatrix,
+    k: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute k smallest eigenpairs using eigsh with which='SM'.
+
+    Standard Lanczos — no LU factorization, just matrix-vector products.
+    Much faster than shift-invert for well-conditioned problems.
+    Falls back to shift-invert eigsh if convergence fails.
+
+    Args:
+        L: PSD sparse Laplacian (N, N), float64
+        M: SPD sparse mass matrix (N, N), float64
+        k: Number of eigenpairs
+
+    Returns:
+        (eigenvalues, eigenvectors) sorted ascending, shapes (k,) and (N, k).
+    """
+    try:
+        eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
+            L, k=k, M=M, which='SM',
+        )
+    except Exception:
+        # Fallback to shift-invert
+        eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
+            L, k, mass_matrix=M,
+        )
+        return eigenvalues, eigenvectors
+
+    # Sort ascending
+    sort_idx = np.argsort(eigenvalues)
+    eigenvalues = eigenvalues[sort_idx]
+    eigenvectors = eigenvectors[:, sort_idx]
+
+    return eigenvalues, eigenvectors
 
 
 def _eigen_lobpcg(
