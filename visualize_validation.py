@@ -86,6 +86,11 @@ from neural_local_laplacian.utils.geodesic_utils import (
     make_grad_div_mesh,
     make_grad_div_learned,
     make_grad_div_pointcloud,
+    heat_method_build,
+    heat_factorize,
+    heat_solve_all,
+    poisson_factorize,
+    poisson_solve_all,
     compute_geodesic_metrics,
     compute_exact_geodesics,
     ensure_psd,
@@ -286,9 +291,15 @@ class LaplacianTimingResults:
     nelo_grad_op_time: float = 0.0     # build_pointcloud_grad_div_operators
 
     # Pure geodesic solve times (seconds) — excludes operator construction
+    # factorize = one-time matrix factorization (heat + Poisson)
+    # solve = per-source forward-solves only
+    gt_geodesic_factorize_time: float = 0.0
     gt_geodesic_solve_time: float = 0.0
+    pred_geodesic_factorize_time: float = 0.0
     pred_geodesic_solve_time: float = 0.0
-    robust_geodesic_solve_time: float = 0.0  # pp3d: self-contained (includes everything)
+    robust_geodesic_solve_time: float = 0.0  # pp3d: constructor is one-time, solve is per-source
+    robust_geodesic_constructor_time: float = 0.0  # pp3d constructor (one-time)
+    nelo_geodesic_factorize_time: float = 0.0
     nelo_geodesic_solve_time: float = 0.0
 
     # Mesh info
@@ -6993,7 +7004,8 @@ class RealTimeEigenanalysisVisualizer:
                     print(f"  [!] NeLo grad/div operators failed: {e}")
 
             # ---- Batch geodesics for GT, PRED, NeLo ----
-            geodesic_times = {}
+            geodesic_factorize_times = {}
+            geodesic_solve_times = {}
 
             for method_key, S, M_mat, fn, t_override in [
                 ('GT',   L_gt_geo,   M_gt_geo,   gt_grad_div_fn,   gt_t),
@@ -7002,23 +7014,53 @@ class RealTimeEigenanalysisVisualizer:
             ]:
                 if S is None or M_mat is None or fn is None:
                     continue
+
+                # Build matrices
+                matrices = heat_method_build(S, M_mat, n, fn, t=t_override)
+
+                # Factorize heat (one-time)
                 _t = time.perf_counter()
-                results = compute_heat_geodesics_batch(S, M_mat, all_sources, n, fn, t=t_override)
-                elapsed = time.perf_counter() - _t
-                geodesic_times[method_key] = elapsed
+                hf = heat_factorize(matrices)
+                _t_hf = time.perf_counter() - _t
+
+                # Heat forward-solve + grad/div (per-source)
+                _t = time.perf_counter()
+                rhs_list = heat_solve_all(hf, all_sources, matrices)
+                _t_hs = time.perf_counter() - _t
+
+                # Factorize Poisson (one-time)
+                _t = time.perf_counter()
+                pf = poisson_factorize(matrices)
+                _t_pf = time.perf_counter() - _t
+
+                # Poisson forward-solve (per-source)
+                _t = time.perf_counter()
+                results = poisson_solve_all(pf, all_sources, rhs_list, n)
+                _t_ps = time.perf_counter() - _t
+
+                geodesic_factorize_times[method_key] = _t_hf + _t_pf
+                geodesic_solve_times[method_key] = _t_hs + _t_ps
+
                 for i, src_idx in enumerate(all_sources):
                     if results[i] is not None:
                         if src_idx not in self._all_geodesic_distances:
                             self._all_geodesic_distances[src_idx] = {}
                         self._all_geodesic_distances[src_idx][method_key] = results[i]
-                print(f"  {method_key}: {len(all_sources)} sources in {elapsed*1000:.1f} ms "
-                      f"({elapsed/len(all_sources)*1000:.1f} ms/source)")
+
+                total_ms = (geodesic_factorize_times[method_key] + geodesic_solve_times[method_key]) * 1000
+                solve_per_src = geodesic_solve_times[method_key] / len(all_sources) * 1000
+                print(f"  {method_key}: {len(all_sources)} sources in {total_ms:.1f} ms "
+                      f"(factorize={geodesic_factorize_times[method_key]*1000:.1f}ms, "
+                      f"solve={solve_per_src:.1f}ms/source)")
 
             # ---- Robust: pp3d per-source (has its own internal C++ solver) ----
             if not self._skip_robust:
                 import potpourri3d as pp3d
                 _t = time.perf_counter()
                 pc_solver = pp3d.PointCloudHeatSolver(vertices)
+                _t_robust_constructor = time.perf_counter() - _t
+
+                _t = time.perf_counter()
                 for src_idx in all_sources:
                     try:
                         d = pc_solver.compute_distance(src_idx)
@@ -7027,20 +7069,25 @@ class RealTimeEigenanalysisVisualizer:
                         self._all_geodesic_distances[src_idx]['Robust (pp3d)'] = d
                     except Exception:
                         pass
-                elapsed = time.perf_counter() - _t
-                geodesic_times['Robust'] = elapsed
-                print(f"  Robust (pp3d): {len(all_sources)} sources in {elapsed*1000:.1f} ms "
-                      f"({elapsed/len(all_sources)*1000:.1f} ms/source)")
+                _t_robust_solve = time.perf_counter() - _t
+
+                total_ms = (_t_robust_constructor + _t_robust_solve) * 1000
+                solve_per_src = _t_robust_solve / len(all_sources) * 1000
+                print(f"  Robust (pp3d): {len(all_sources)} sources in {total_ms:.1f} ms "
+                      f"(constructor={_t_robust_constructor*1000:.1f}ms, "
+                      f"solve={solve_per_src:.1f}ms/source)")
 
             # ---- Store timing ----
-            if 'GT' in geodesic_times:
-                self.timing_results.gt_geodesic_solve_time = geodesic_times['GT']
-            if 'PRED' in geodesic_times:
-                self.timing_results.pred_geodesic_solve_time = geodesic_times['PRED']
-            if 'Robust' in geodesic_times:
-                self.timing_results.robust_geodesic_solve_time = geodesic_times['Robust']
-            if 'NeLo' in geodesic_times:
-                self.timing_results.nelo_geodesic_solve_time = geodesic_times['NeLo']
+            for mk in ['GT', 'PRED', 'NeLo']:
+                if mk in geodesic_factorize_times:
+                    setattr(self.timing_results, f'{mk.lower()}_geodesic_factorize_time',
+                            geodesic_factorize_times[mk])
+                if mk in geodesic_solve_times:
+                    setattr(self.timing_results, f'{mk.lower()}_geodesic_solve_time',
+                            geodesic_solve_times[mk])
+            if not self._skip_robust:
+                self.timing_results.robust_geodesic_constructor_time = _t_robust_constructor
+                self.timing_results.robust_geodesic_solve_time = _t_robust_solve
 
             # ---- Compute metrics for all sources ----
             for src_idx in all_sources:
@@ -7197,7 +7244,7 @@ class RealTimeEigenanalysisVisualizer:
             metrics['nelo_assembly_ms'] = t.nelo_matrix_assembly_time * 1000
             metrics['nelo_total_ms'] = t.nelo_total_time * 1000
 
-        # --- Downstream solve timings (per-source average) ---
+        # --- Downstream solve timings (per-source average, excludes factorize) ---
         n_src = len(self._source_indices) if self._source_indices else 1
         if t.gt_geodesic_solve_time > 0:
             metrics['gt_geodesic_solve_avg_ms'] = t.gt_geodesic_solve_time / n_src * 1000
@@ -7217,27 +7264,28 @@ class RealTimeEigenanalysisVisualizer:
         if t.nelo_greens_solve_time > 0:
             metrics['nelo_greens_solve_avg_ms'] = t.nelo_greens_solve_time / n_src * 1000
 
-        # --- E2E timing: assembly + per-source avg downstream solve ---
+        # --- E2E timing: one-time (assembly + factorize) + per-source avg solve ---
+        # PRED: L,M + factorize (one-time) + solve/n_src (per-source)
         if t.pred_geodesic_solve_time > 0:
-            metrics['pred_e2e_geodesic_ms'] = t.pred_total_time * 1000 + t.pred_geodesic_solve_time / n_src * 1000
+            metrics['pred_e2e_geodesic_ms'] = (t.pred_total_time + t.pred_geodesic_factorize_time) * 1000 + t.pred_geodesic_solve_time / n_src * 1000
         if t.pred_greens_solve_time > 0:
             metrics['pred_e2e_greens_ms'] = t.pred_total_time * 1000 + t.pred_greens_solve_time / n_src * 1000
 
+        # Robust: constructor (one-time) + solve/n_src (per-source)
         if t.robust_geodesic_solve_time > 0:
-            if self._robust_geodesic_heat:
-                metrics['robust_e2e_geodesic_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_geodesic_solve_time / n_src * 1000
-            else:
-                metrics['robust_e2e_geodesic_ms'] = t.robust_geodesic_solve_time / n_src * 1000
+            metrics['robust_e2e_geodesic_ms'] = t.robust_geodesic_constructor_time * 1000 + t.robust_geodesic_solve_time / n_src * 1000
         if t.robust_greens_solve_time > 0:
             metrics['robust_e2e_greens_ms'] = t.robust_matrix_assembly_time * 1000 + t.robust_greens_solve_time / n_src * 1000
 
+        # NeLo: L,M + factorize (one-time) + solve/n_src (per-source)
         if t.nelo_total_time > 0 and t.nelo_geodesic_solve_time > 0:
-            metrics['nelo_e2e_geodesic_ms'] = t.nelo_total_time * 1000 + t.nelo_geodesic_solve_time / n_src * 1000
+            metrics['nelo_e2e_geodesic_ms'] = (t.nelo_total_time + t.nelo_geodesic_factorize_time) * 1000 + t.nelo_geodesic_solve_time / n_src * 1000
         if t.nelo_total_time > 0 and t.nelo_greens_solve_time > 0:
             metrics['nelo_e2e_greens_ms'] = t.nelo_total_time * 1000 + t.nelo_greens_solve_time / n_src * 1000
 
+        # GT: assembly + factorize (one-time) + solve/n_src (per-source)
         if t.gt_geodesic_solve_time > 0:
-            metrics['gt_e2e_geodesic_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_geodesic_solve_time / n_src * 1000
+            metrics['gt_e2e_geodesic_ms'] = (t.gt_matrix_assembly_time + t.gt_geodesic_factorize_time) * 1000 + t.gt_geodesic_solve_time / n_src * 1000
         if t.gt_greens_solve_time > 0:
             metrics['gt_e2e_greens_ms'] = t.gt_matrix_assembly_time * 1000 + t.gt_greens_solve_time / n_src * 1000
 
