@@ -383,21 +383,12 @@ def step_eigendecomposition(
     L: scipy.sparse.spmatrix,
     M: scipy.sparse.spmatrix,
     num_eigenvalues: int = 50,
-    method: str = "eigsh_sm",
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, float]]:
     """
     Compute generalized eigendecomposition L v = λ M v.
 
-    Ensures PSD convention before solving (handles igl NSD cotangent matrices).
-
-    Args:
-        L: Sparse Laplacian (N, N)
-        M: Sparse mass matrix (N, N)
-        num_eigenvalues: Number of smallest eigenpairs to compute
-        method:
-            "eigsh_sm"  — standard Lanczos with which='SM' (default, fast, no factorization)
-            "lobpcg"    — LOBPCG with diagonal preconditioner (fast, no factorization)
-            "eigsh"     — shift-invert eigsh with sigma=-0.01 (slow, most robust)
+    Uses shift-invert eigsh (sigma=-0.01). Ensures PSD convention before
+    solving (handles igl NSD cotangent matrices).
 
     Returns:
         (eigenvalues, eigenvectors, timing) where timing has key 'eigen'.
@@ -405,124 +396,15 @@ def step_eigendecomposition(
     """
     t0 = time.perf_counter()
     try:
-        L_psd = ensure_psd(L).astype(np.float64)
-        M_f64 = M.astype(np.float64)
-
-        if method == "eigsh_sm":
-            eigenvalues, eigenvectors = _eigen_eigsh_sm(L_psd, M_f64, num_eigenvalues)
-        elif method == "lobpcg":
-            eigenvalues, eigenvectors = _eigen_lobpcg(L_psd, M_f64, num_eigenvalues)
-        else:
-            eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
-                L_psd, num_eigenvalues, mass_matrix=M_f64,
-            )
+        L_psd = ensure_psd(L)
+        eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
+            L_psd, num_eigenvalues, mass_matrix=M,
+        )
     except Exception:
         return None, None, {'eigen': time.perf_counter() - t0}
     elapsed = time.perf_counter() - t0
 
     return eigenvalues, eigenvectors, {'eigen': elapsed}
-
-
-def _eigen_eigsh_sm(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    k: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute k smallest eigenpairs using eigsh with which='SM'.
-
-    Standard Lanczos — no LU factorization, just matrix-vector products.
-    Much faster than shift-invert for well-conditioned problems.
-    Falls back to shift-invert eigsh if convergence fails.
-
-    Args:
-        L: PSD sparse Laplacian (N, N), float64
-        M: SPD sparse mass matrix (N, N), float64
-        k: Number of eigenpairs
-
-    Returns:
-        (eigenvalues, eigenvectors) sorted ascending, shapes (k,) and (N, k).
-    """
-    try:
-        eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
-            L, k=k, M=M, which='SM',
-        )
-    except Exception:
-        # Fallback to shift-invert
-        eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
-            L, k, mass_matrix=M,
-        )
-        return eigenvalues, eigenvectors
-
-    # Sort ascending
-    sort_idx = np.argsort(eigenvalues)
-    eigenvalues = eigenvalues[sort_idx]
-    eigenvectors = eigenvectors[:, sort_idx]
-
-    return eigenvalues, eigenvectors
-
-
-def _eigen_lobpcg(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    k: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute k smallest eigenpairs of L v = λ M v using LOBPCG.
-
-    LOBPCG is matrix-free (no LU factorization), so it's much faster than
-    shift-invert eigsh for large sparse systems. Uses a diagonal preconditioner
-    from L for faster convergence.
-
-    Since L is PSD (null space = constant vector), we add a tiny regularization
-    ε·I to make it SPD, then solve. The first eigenvalue will be ≈ ε ≈ 0.
-
-    Falls back to shift-invert eigsh if LOBPCG fails to converge.
-
-    Args:
-        L: PSD sparse Laplacian (N, N), float64
-        M: SPD sparse mass matrix (N, N), float64
-        k: Number of eigenpairs
-
-    Returns:
-        (eigenvalues, eigenvectors) sorted ascending, shapes (k,) and (N, k).
-    """
-    n = L.shape[0]
-    eps = 1e-10
-
-    # Regularize: L + εI makes it SPD (removes zero eigenvalue singularity)
-    L_reg = L + eps * scipy.sparse.eye(n, dtype=np.float64)
-
-    # Random initial guess — must be (N, k)
-    rng = np.random.RandomState(42)
-    X0 = rng.randn(n, k).astype(np.float64)
-
-    # Diagonal preconditioner: inv(diag(L_reg)) — cheap but effective
-    diag_L = np.array(L_reg.diagonal()).flatten()
-    diag_L = np.where(diag_L > 1e-12, diag_L, 1e-12)
-    precond = scipy.sparse.diags(1.0 / diag_L)
-
-    try:
-        eigenvalues, eigenvectors = scipy.sparse.linalg.lobpcg(
-            L_reg, X0, B=M, M=precond,
-            tol=1e-8, maxiter=500, largest=False,
-        )
-    except Exception:
-        # Fallback to shift-invert eigsh
-        eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
-            L, k, mass_matrix=M,
-        )
-        return eigenvalues, eigenvectors
-
-    # Sort ascending
-    sort_idx = np.argsort(eigenvalues)
-    eigenvalues = eigenvalues[sort_idx]
-    eigenvectors = eigenvectors[:, sort_idx]
-
-    # Correct for regularization: λ_true ≈ λ_lobpcg - ε (negligible but clean)
-    eigenvalues = np.maximum(eigenvalues - eps, 0.0)
-
-    return eigenvalues, eigenvectors
 
 
 # =============================================================================
