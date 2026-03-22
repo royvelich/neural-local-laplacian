@@ -228,36 +228,18 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             metrics['num_faces'] = len(faces)
             metrics['num_sources'] = len(source_indices)
 
-            # ---- Disable GC during timing ----
+            # ---- Disable GC during timing-sensitive section ----
             gc.collect()
             gc.disable()
 
             # ==============================================================
-            # Assembly: GT (always) + selected methods
+            # Phase 1: TIMING-SENSITIVE (GPU hot, GC disabled)
+            # Runs all assembly + geodesic steps while GPU caches are warm.
             # ==============================================================
 
-            # GT Laplacian
-            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
-            metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
-
-            # GT Green's (reference for correlation)
-            gt_greens = None
-            gt_gvals = None
-            if gt_L is not None:
-                gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
-                metrics['gt_greens_total_ms'] = t_greens_gt.total * 1000
-                metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
-                gt_gvals = gt_greens.values
-
-            # GT eigendecomposition
-            gt_evals, gt_evecs = None, None
-            if gt_L is not None:
-                gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
-                    gt_L, gt_M, num_eigenvalues,
-                )
-                metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
-
-            # ---- PRED ----
+            # ---- PRED assembly + geodesic ----
+            pred_L, pred_M, pred_G, t_pred = None, None, None, None
+            pred_geo_timing = GeodesicTimingBreakdown()
             if run_pred:
                 pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
                     model, verts_tensor, pred_k, device, use_amp=use_amp,
@@ -269,7 +251,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['pred_grad_op_ms'] = t_pred.grad_op * 1000
                 metrics['pred_lm_total_ms'] = t_pred.lm_total * 1000
 
-                # PRED geodesic (requires gradient operator)
                 if pred_G is not None:
                     _, pred_geo_timing = step_pred_geodesic(
                         pred_L, pred_M, pred_G, source_indices, N,
@@ -286,20 +267,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
                     metrics['pred_per_src_ms'] = pred_e2e / len(source_indices) * 1000
 
-                # PRED Green's + eigen
-                _add_method_metrics(
-                    metrics, 'pred', pred_L, pred_M,
-                    source_indices, gt_gvals, gt_evals, gt_evecs,
-                    num_eigenvalues, t_pred.lm_total,
-                )
-
-            # ---- Robust ----
+            # ---- Robust geodesic (pp3d, self-contained timing) ----
+            robust_timing = None
             if run_robust:
-                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
-                metrics['robust_k'] = robust_k
-                metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
-
-                # Robust geodesic (pp3d)
                 _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
                 robust_e2e = robust_timing.total
                 metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
@@ -307,14 +277,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['robust_e2e_geodesic_ms'] = robust_e2e * 1000
                 metrics['robust_per_src_ms'] = robust_e2e / len(source_indices) * 1000
 
-                # Robust Green's + eigen
-                _add_method_metrics(
-                    metrics, 'robust', rob_L, rob_M,
-                    source_indices, gt_gvals, gt_evals, gt_evecs,
-                    num_eigenvalues, t_rob_lm['assembly'],
-                )
-
-            # ---- NeLo ----
+            # ---- NeLo assembly (timing-sensitive) ----
+            nelo_L, nelo_M, t_nelo = None, None, None
             if run_nelo:
                 nelo_L, nelo_M, t_nelo = step_nelo_laplacian(
                     nelo_pipeline, vertices, nelo_k, device,
@@ -325,7 +289,60 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['nelo_assembly_ms'] = t_nelo.assembly * 1000
                 metrics['nelo_lm_total_ms'] = t_nelo.total * 1000
 
-                # NeLo Green's + eigen
+            # ---- Re-enable GC (timing-sensitive section done) ----
+            gc.enable()
+
+            # ==============================================================
+            # Phase 2: QUALITY (not timing-sensitive)
+            # GT assembly, Green's, eigendecomposition, comparisons.
+            # ==============================================================
+
+            # ---- GT Laplacian ----
+            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
+            metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
+
+            # ---- Robust Laplacian (for Green's / eigen, separate from pp3d) ----
+            rob_L, rob_M = None, None
+            if run_robust:
+                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+                metrics['robust_k'] = robust_k
+                metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
+
+            # ---- GT Green's (reference for correlation) ----
+            gt_greens = None
+            gt_gvals = None
+            if gt_L is not None:
+                gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
+                metrics['gt_greens_total_ms'] = t_greens_gt.total * 1000
+                metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
+                gt_gvals = gt_greens.values
+
+            # ---- GT eigendecomposition ----
+            gt_evals, gt_evecs = None, None
+            if gt_L is not None:
+                gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
+                    gt_L, gt_M, num_eigenvalues,
+                )
+                metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
+
+            # ---- PRED quality (Green's + eigen) ----
+            if run_pred and pred_L is not None:
+                _add_method_metrics(
+                    metrics, 'pred', pred_L, pred_M,
+                    source_indices, gt_gvals, gt_evals, gt_evecs,
+                    num_eigenvalues, t_pred.lm_total,
+                )
+
+            # ---- Robust quality (Green's + eigen) ----
+            if run_robust and rob_L is not None:
+                _add_method_metrics(
+                    metrics, 'robust', rob_L, rob_M,
+                    source_indices, gt_gvals, gt_evals, gt_evecs,
+                    num_eigenvalues, t_rob_lm['assembly'],
+                )
+
+            # ---- NeLo quality (Green's + eigen) ----
+            if run_nelo and nelo_L is not None:
                 _add_method_metrics(
                     metrics, 'nelo', nelo_L, nelo_M,
                     source_indices, gt_gvals, gt_evals, gt_evecs,
@@ -335,7 +352,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             # ==============================================================
             # Timing ratios
             # ==============================================================
-            if run_pred and run_robust:
+            if run_pred and run_robust and robust_timing is not None:
                 if robust_timing.lm_assembly > 0:
                     metrics['ratio_lm'] = t_pred.lm_total / robust_timing.lm_assembly
                 if metrics.get('pred_e2e_geodesic_ms') and metrics.get('robust_e2e_geodesic_ms'):
@@ -346,9 +363,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     metrics['ratio_greens_e2e'] = (
                         metrics['pred_greens_e2e_ms'] / metrics['robust_greens_e2e_ms']
                     )
-
-            # ---- Re-enable GC ----
-            gc.enable()
 
             metrics_list.append(metrics)
             status = "OK"
