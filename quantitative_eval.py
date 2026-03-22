@@ -61,6 +61,8 @@ from neural_local_laplacian.utils.validation_utils import (
     step_eigendecomposition,
     step_eigenvalue_errors,
     step_eigenvector_cosine_similarity,
+    step_exact_geodesics,
+    step_geodesic_quality,
     GeodesicTimingBreakdown,
     HAS_NELO,
     HAS_PCDIFF,
@@ -350,27 +352,30 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 cache['rob_M'] = rob_M
 
             # ---- Geodesics ----
+            gt_distances = None
             if gt_L is not None:
-                _, gt_geo_timing = step_gt_geodesic(
+                gt_distances, gt_geo_timing = step_gt_geodesic(
                     gt_L, gt_M, vertices, faces, source_indices, N,
                 )
                 metrics['gt_geo_total_ms'] = gt_geo_timing.total * 1000
                 metrics['gt_e2e_geodesic_ms'] = (t_gt['assembly'] + gt_geo_timing.total) * 1000
 
+            robust_distances = None
             robust_timing = None
             if run_robust:
-                _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
+                robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
                 metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
                 metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
                 metrics['robust_e2e_geodesic_ms'] = robust_timing.total * 1000
                 metrics['robust_per_src_ms'] = robust_timing.total / n_src * 1000
 
+            pred_distances = None
             pred_L = cache.get('pred_L')
             pred_M = cache.get('pred_M')
             pred_G = cache.get('pred_G')
             t_pred = cache.get('t_pred')
             if run_pred and pred_G is not None:
-                _, pred_geo_timing = step_pred_geodesic(
+                pred_distances, pred_geo_timing = step_pred_geodesic(
                     pred_L, pred_M, pred_G, source_indices, N,
                 )
                 pred_onetime = (t_pred.total
@@ -385,17 +390,34 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
                 metrics['pred_per_src_ms'] = pred_e2e / n_src * 1000
 
+            nelo_distances = None
             nelo_L = cache.get('nelo_L')
             nelo_M = cache.get('nelo_M')
             t_nelo = cache.get('t_nelo')
             if run_nelo and nelo_L is not None:
-                _, nelo_geo_timing = step_pcdiff_geodesic(
+                nelo_distances, nelo_geo_timing = step_pcdiff_geodesic(
                     nelo_L, nelo_M, vertices, nelo_k, source_indices, N,
                 )
                 nelo_geo_e2e = t_nelo.total + nelo_geo_timing.total
                 metrics['nelo_geo_total_ms'] = nelo_geo_timing.total * 1000
                 metrics['nelo_e2e_geodesic_ms'] = nelo_geo_e2e * 1000
                 metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
+
+            # ---- Geodesic quality vs exact (precompute exact once) ----
+            exact_geo = step_exact_geodesics(vertices, faces, source_indices)
+            n_exact = sum(1 for v in exact_geo.values() if v is not None)
+            metrics['num_exact_geodesics'] = n_exact
+
+            for prefix, dists in [('gt', gt_distances), ('pred', pred_distances),
+                                   ('robust', robust_distances), ('nelo', nelo_distances)]:
+                if dists is None:
+                    continue
+                qual = step_geodesic_quality(dists, source_indices, exact_geo)
+                metrics[f'{prefix}_geodesic_corr_mean'] = qual.corr_mean
+                metrics[f'{prefix}_geodesic_corr_std'] = qual.corr_std
+                metrics[f'{prefix}_geodesic_mae_mean'] = qual.mae_mean
+                metrics[f'{prefix}_geodesic_max_err_mean'] = qual.max_err_mean
+                metrics[f'{prefix}_geodesic_mono_mean'] = qual.mono_mean
 
             # ---- Green's function ----
             gt_gvals = None
@@ -484,6 +506,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             parts.append(f"G_corr={metrics['pred_greens_gt_corr_mean']:.3f}")
         if metrics.get('pred_eigvec_cos_all'):
             parts.append(f"evec={metrics['pred_eigvec_cos_all']:.3f}")
+        if metrics.get('pred_geodesic_corr_mean'):
+            parts.append(f"geo={metrics['pred_geodesic_corr_mean']:.3f}")
         parts.append(f"[{t_mesh:.1f}s, ETA {eta:.0f}s]")
         print(' '.join(parts))
 
@@ -797,6 +821,19 @@ def _print_summary(
         if prefix != list(methods)[-1]:  # separator between methods
             print()
 
+    # --- Geodesic quality vs exact ---
+    print(f"\n  GEODESIC QUALITY (vs exact)")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+
+    _print_quality_row("GT geodesic corr", "gt_geodesic_corr_mean")
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
+            continue
+        _print_quality_row(f"{label} geodesic corr", f"{prefix}_geodesic_corr_mean")
+        _print_quality_row(f"{label} geodesic MAE", f"{prefix}_geodesic_mae_mean")
+        _print_quality_row(f"{label} geodesic mono", f"{prefix}_geodesic_mono_mean")
+
     # --- Ratios ---
     if 'pred' in methods and 'robust' in methods:
         print()
@@ -882,6 +919,7 @@ def _generate_plots(
     _plot_timing(all_metrics, active, output_dir)
     _plot_quality(all_metrics, active, output_dir)
     _plot_eigvec_decay(all_metrics, active, output_dir)
+    _plot_geodesic_quality(all_metrics, active, output_dir)
 
     print(f"All plots saved to: {output_dir}")
 
@@ -1093,6 +1131,53 @@ def _plot_eigvec_decay(all_metrics: List[Dict], methods: List[str], output_dir: 
         fig.savefig(output_dir / f'eigvec_decay.{ext}')
     plt.close(fig)
     print(f"  Saved: eigvec_decay.pdf/png")
+
+
+def _plot_geodesic_quality(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """3-panel: geodesic correlation, MAE, monotonicity vs exact."""
+
+    # Include GT as reference
+    all_prefixes = ['gt'] + methods
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    panels = [
+        ('Correlation with Exact', '_geodesic_corr_mean', True),   # higher is better
+        ('MAE (normalized)', '_geodesic_mae_mean', False),          # lower is better
+        ('Monotonicity', '_geodesic_mono_mean', True),             # higher is better
+    ]
+
+    for ax, (title, suffix, higher_better) in zip(axes, panels):
+        present = []
+        for prefix in all_prefixes:
+            vals = _get_vals(all_metrics, f'{prefix}{suffix}')
+            if vals is not None:
+                present.append((prefix, vals))
+
+        for j, (prefix, vals) in enumerate(present):
+            color = METHOD_COLORS.get(prefix, '#6B7280')
+            label = METHOD_LABELS.get(prefix, prefix)
+            ax.bar(j, vals.mean(), yerr=vals.std(), capsize=4,
+                   color=color, edgecolor='white',
+                   linewidth=0.5, alpha=0.9, zorder=3)
+            ax.text(j, vals.mean() + vals.std() + 0.005,
+                    f'{vals.mean():.3f}', ha='center', va='bottom',
+                    fontsize=9, fontweight='bold', color=color)
+
+        ax.set_xticks(range(len(present)))
+        ax.set_xticklabels([METHOD_LABELS.get(p, p) for p, _ in present], fontsize=9)
+        ax.set_title(title)
+        if higher_better:
+            ax.set_ylim(bottom=max(0, ax.get_ylim()[0]), top=1.05)
+        else:
+            ax.set_ylim(bottom=0)
+
+    fig.suptitle('Geodesic Quality vs Exact', fontsize=14, fontweight='bold', y=1.02)
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'geodesic_quality.{ext}')
+    plt.close(fig)
+    print(f"  Saved: geodesic_quality.pdf/png")
 
 
 if __name__ == '__main__':

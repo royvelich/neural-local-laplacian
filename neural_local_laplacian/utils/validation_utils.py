@@ -1031,23 +1031,40 @@ class GeodesicQuality:
     num_sources_ok: int = 0
 
 
+def step_exact_geodesics(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    source_indices: List[int],
+) -> Dict[int, Optional[np.ndarray]]:
+    """
+    Precompute exact geodesic distances for all source vertices.
+
+    Call once per mesh, then pass the result to step_geodesic_quality
+    for each method to avoid redundant computation.
+
+    Returns:
+        Dict mapping source_idx -> exact distances (N,), or None if failed.
+    """
+    exact = {}
+    verts_f64 = vertices.astype(np.float64)
+    faces_i32 = faces.astype(np.int32)
+    for src_idx in source_indices:
+        exact[src_idx] = compute_exact_geodesics(verts_f64, faces_i32, int(src_idx))
+    return exact
+
+
 def step_geodesic_quality(
     computed_distances: List[Optional[np.ndarray]],
     source_indices: List[int],
-    vertices: np.ndarray,
-    faces: np.ndarray,
+    exact_geodesics: Dict[int, Optional[np.ndarray]],
 ) -> GeodesicQuality:
     """
-    Compare computed geodesic distances against exact geodesics.
-
-    Computes exact geodesics on-the-fly for each source, then aggregates
-    correlation, MAE, max error, and monotonicity across sources.
+    Compare computed geodesic distances against precomputed exact geodesics.
 
     Args:
         computed_distances: List of distance arrays (one per source), may contain None
         source_indices: Source vertex indices
-        vertices: (N, 3) mesh vertices (float64)
-        faces: (F, 3) mesh faces (int32)
+        exact_geodesics: Dict from step_exact_geodesics()
 
     Returns:
         GeodesicQuality dataclass with aggregated metrics.
@@ -1060,9 +1077,7 @@ def step_geodesic_quality(
         if computed is None:
             continue
 
-        exact = compute_exact_geodesics(
-            vertices.astype(np.float64), faces.astype(np.int32), int(src_idx),
-        )
+        exact = exact_geodesics.get(src_idx)
         if exact is None:
             continue
 
