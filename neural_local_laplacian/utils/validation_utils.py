@@ -581,14 +581,13 @@ def step_robust_geodesic(
     vertices: np.ndarray,
     source_indices: List[int],
     robust_k: int = 30,
-    timeout: float = 120.0,
     verbose: bool = True,
 ) -> Tuple[List[Optional[np.ndarray]], RobustGeodesicTiming]:
     """
     Compute geodesics using pp3d PointCloudHeatSolver.
 
     pp3d runs in a subprocess to survive C++ segfaults on degenerate meshes.
-    If the subprocess crashes or times out, returns None distances.
+    If the subprocess crashes, returns None distances.
 
     Also times robust_laplacian assembly (needed for non-geodesic tasks like
     eigendecomposition, Green's function) but NOT included in geodesic E2E.
@@ -611,18 +610,9 @@ def step_robust_geodesic(
     result_queue = ctx.Queue()
     proc = ctx.Process(target=_pp3d_worker, args=(vertices, source_indices, result_queue))
     proc.start()
-    proc.join(timeout=timeout)
-
-    if proc.is_alive():
-        # Timeout — kill subprocess
-        proc.kill()
-        proc.join()
-        if verbose:
-            print(f"  [!] pp3d timed out after {timeout:.0f}s (N={len(vertices)})")
-        return [None] * len(source_indices), timing
+    proc.join()
 
     if proc.exitcode != 0:
-        # Segfault or other crash
         if verbose:
             print(f"  [!] pp3d crashed (exit code {proc.exitcode}, N={len(vertices)})")
         return [None] * len(source_indices), timing
@@ -1134,7 +1124,6 @@ def step_exact_geodesics(
     vertices: np.ndarray,
     faces: np.ndarray,
     source_indices: List[int],
-    timeout: float = 300.0,
     verbose: bool = True,
 ) -> Dict[int, Optional[np.ndarray]]:
     """
@@ -1160,14 +1149,7 @@ def step_exact_geodesics(
         args=(vertices, faces, source_indices, result_queue),
     )
     proc.start()
-    proc.join(timeout=timeout)
-
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
-        if verbose:
-            print(f"  [!] Exact geodesics timed out after {timeout:.0f}s (N={len(vertices)})")
-        return empty
+    proc.join()
 
     if proc.exitcode != 0:
         if verbose:
