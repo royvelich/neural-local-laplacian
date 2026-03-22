@@ -480,6 +480,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             # ---- Geodesic quality vs exact (precompute exact once) ----
             exact_geo = {}
             try:
+                print(f"{tag}  Computing exact geodesics for {mesh_name} (N={N}, F={len(faces)})...",
+                      flush=True)
                 exact_geo = step_exact_geodesics(vertices, faces, source_indices)
                 metrics['exact_geodesic_failed'] = 0
             except Exception as e:
