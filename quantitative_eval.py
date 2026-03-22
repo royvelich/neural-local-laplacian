@@ -63,6 +63,9 @@ from neural_local_laplacian.utils.validation_utils import (
     step_eigenvector_cosine_similarity,
     step_exact_geodesics,
     step_geodesic_quality,
+    step_descriptor_comparison,
+    step_probe_function_mse,
+    step_sparsity,
     GeodesicTimingBreakdown,
     HAS_NELO,
     HAS_PCDIFF,
@@ -453,21 +456,69 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 )
                 metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
 
+            pred_evals, pred_evecs = None, None
             if run_pred and pred_L is not None:
-                _add_eigen_metrics(
+                pred_evals, pred_evecs = _add_eigen_metrics(
                     metrics, 'pred', pred_L, pred_M,
                     gt_evals, gt_evecs, num_eigenvalues,
                 )
+            rob_evals, rob_evecs = None, None
             if run_robust and rob_L is not None:
-                _add_eigen_metrics(
+                rob_evals, rob_evecs = _add_eigen_metrics(
                     metrics, 'robust', rob_L, rob_M,
                     gt_evals, gt_evecs, num_eigenvalues,
                 )
+            nelo_evals, nelo_evecs = None, None
             if run_nelo and nelo_L is not None:
-                _add_eigen_metrics(
+                nelo_evals, nelo_evecs = _add_eigen_metrics(
                     metrics, 'nelo', nelo_L, nelo_M,
                     gt_evals, gt_evecs, num_eigenvalues,
                 )
+
+            # ---- HKS / WKS descriptor comparison ----
+            if gt_evals is not None and gt_evecs is not None:
+                for prefix, m_evals, m_evecs in [
+                    ('pred', pred_evals, pred_evecs),
+                    ('robust', rob_evals, rob_evecs),
+                    ('nelo', nelo_evals, nelo_evecs),
+                ]:
+                    if m_evals is None or m_evecs is None:
+                        continue
+                    desc = step_descriptor_comparison(m_evals, m_evecs, gt_evals, gt_evecs)
+                    metrics[f'{prefix}_hks_corr'] = desc.hks_correlation
+                    metrics[f'{prefix}_hks_l2_err'] = desc.hks_l2_error
+                    metrics[f'{prefix}_wks_corr'] = desc.wks_correlation
+                    metrics[f'{prefix}_wks_l2_err'] = desc.wks_l2_error
+
+            # ---- Probe function MSE ----
+            if gt_L is not None and gt_evals is not None and gt_evecs is not None:
+                for prefix, m_L, m_M in [
+                    ('pred', pred_L, pred_M),
+                    ('robust', rob_L, rob_M),
+                    ('nelo', nelo_L, nelo_M),
+                ]:
+                    if m_L is None:
+                        continue
+                    probe = step_probe_function_mse(
+                        m_L, m_M, gt_L, gt_M, vertices, gt_evals, gt_evecs,
+                    )
+                    metrics[f'{prefix}_probe_mse'] = probe.mse
+                    metrics[f'{prefix}_probe_cosine'] = probe.cosine_similarity
+                    metrics[f'{prefix}_probe_failure_rate'] = probe.failure_rate
+
+            # ---- Sparsity ----
+            if gt_L is not None:
+                sp_gt = step_sparsity(gt_L)
+                metrics['gt_nnz'] = sp_gt.nnz
+                metrics['gt_avg_nnz_per_row'] = sp_gt.avg_nnz_per_row
+                metrics['gt_density_pct'] = sp_gt.density_percent
+            for prefix, m_L in [('pred', pred_L), ('robust', rob_L), ('nelo', nelo_L)]:
+                if m_L is None:
+                    continue
+                sp = step_sparsity(m_L)
+                metrics[f'{prefix}_nnz'] = sp.nnz
+                metrics[f'{prefix}_avg_nnz_per_row'] = sp.avg_nnz_per_row
+                metrics[f'{prefix}_density_pct'] = sp.density_percent
 
             # ---- Timing ratios ----
             if run_pred and run_robust and robust_timing is not None and t_pred is not None:
@@ -834,6 +885,45 @@ def _print_summary(
         _print_quality_row(f"{label} geodesic MAE", f"{prefix}_geodesic_mae_mean")
         _print_quality_row(f"{label} geodesic mono", f"{prefix}_geodesic_mono_mean")
 
+    # --- Descriptor quality (HKS / WKS) ---
+    print(f"\n  DESCRIPTOR QUALITY (HKS / WKS)")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
+            continue
+        _print_quality_row(f"{label} HKS correlation", f"{prefix}_hks_corr")
+        _print_quality_row(f"{label} HKS L2 error", f"{prefix}_hks_l2_err")
+        _print_quality_row(f"{label} WKS correlation", f"{prefix}_wks_corr")
+        _print_quality_row(f"{label} WKS L2 error", f"{prefix}_wks_l2_err")
+        if prefix != list(methods)[-1]:
+            print()
+
+    # --- Probe function MSE ---
+    print(f"\n  PROBE FUNCTION QUALITY")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
+            continue
+        _print_quality_row(f"{label} probe MSE", f"{prefix}_probe_mse")
+        _print_quality_row(f"{label} probe cosine", f"{prefix}_probe_cosine")
+        _print_quality_row(f"{label} probe failure", f"{prefix}_probe_failure_rate")
+
+    # --- Sparsity ---
+    print(f"\n  SPARSITY")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+
+    _print_quality_row("GT avg NNZ/row", "gt_avg_nnz_per_row")
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
+        if prefix not in methods:
+            continue
+        _print_quality_row(f"{label} avg NNZ/row", f"{prefix}_avg_nnz_per_row")
+        _print_quality_row(f"{label} density %", f"{prefix}_density_pct")
+
     # --- Ratios ---
     if 'pred' in methods and 'robust' in methods:
         print()
@@ -920,6 +1010,9 @@ def _generate_plots(
     _plot_quality(all_metrics, active, output_dir)
     _plot_eigvec_decay(all_metrics, active, output_dir)
     _plot_geodesic_quality(all_metrics, active, output_dir)
+    _plot_descriptor_quality(all_metrics, active, output_dir)
+    _plot_probe_quality(all_metrics, active, output_dir)
+    _plot_sparsity(all_metrics, active, output_dir)
 
     print(f"All plots saved to: {output_dir}")
 
@@ -1178,6 +1271,127 @@ def _plot_geodesic_quality(all_metrics: List[Dict], methods: List[str], output_d
         fig.savefig(output_dir / f'geodesic_quality.{ext}')
     plt.close(fig)
     print(f"  Saved: geodesic_quality.pdf/png")
+
+
+def _plot_descriptor_quality(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """4-panel: HKS correlation, HKS L2, WKS correlation, WKS L2."""
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+    panels = [
+        ('HKS Correlation', '_hks_corr', True),
+        ('HKS L2 Error', '_hks_l2_err', False),
+        ('WKS Correlation', '_wks_corr', True),
+        ('WKS L2 Error', '_wks_l2_err', False),
+    ]
+
+    for ax, (title, suffix, higher_better) in zip(axes, panels):
+        for j, method in enumerate(methods):
+            vals = _get_vals(all_metrics, f'{method}{suffix}')
+            if vals is None:
+                continue
+            # Filter out -1 (N/A) for L2 errors
+            if not higher_better:
+                vals = vals[vals >= 0]
+                if len(vals) == 0:
+                    continue
+            ax.bar(j, vals.mean(), yerr=vals.std(), capsize=4,
+                   color=METHOD_COLORS[method], edgecolor='white',
+                   linewidth=0.5, alpha=0.9, zorder=3)
+            ax.text(j, vals.mean() + vals.std() + 0.005,
+                    f'{vals.mean():.3f}', ha='center', va='bottom',
+                    fontsize=9, fontweight='bold', color=METHOD_COLORS[method])
+        ax.set_xticks(range(len(methods)))
+        ax.set_xticklabels([METHOD_LABELS[m] for m in methods], fontsize=9)
+        ax.set_title(title)
+        if higher_better:
+            ax.set_ylim(bottom=max(0, ax.get_ylim()[0]))
+        else:
+            ax.set_ylim(bottom=0)
+
+    fig.suptitle('Descriptor Quality (HKS / WKS)', fontsize=14, fontweight='bold', y=1.02)
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'descriptor_quality.{ext}')
+    plt.close(fig)
+    print(f"  Saved: descriptor_quality.pdf/png")
+
+
+def _plot_probe_quality(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """3-panel: probe MSE, probe cosine, probe failure rate."""
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    panels = [
+        ('Probe MSE', '_probe_mse', False),
+        ('Probe Cosine Similarity', '_probe_cosine', True),
+        ('Probe Failure Rate', '_probe_failure_rate', False),
+    ]
+
+    for ax, (title, suffix, higher_better) in zip(axes, panels):
+        for j, method in enumerate(methods):
+            vals = _get_vals(all_metrics, f'{method}{suffix}')
+            if vals is None:
+                continue
+            ax.bar(j, vals.mean(), yerr=vals.std(), capsize=4,
+                   color=METHOD_COLORS[method], edgecolor='white',
+                   linewidth=0.5, alpha=0.9, zorder=3)
+            fmt = f'{vals.mean():.3f}' if vals.mean() < 1 else f'{vals.mean():.1f}'
+            ax.text(j, vals.mean() + vals.std() + 0.005,
+                    fmt, ha='center', va='bottom',
+                    fontsize=9, fontweight='bold', color=METHOD_COLORS[method])
+        ax.set_xticks(range(len(methods)))
+        ax.set_xticklabels([METHOD_LABELS[m] for m in methods], fontsize=9)
+        ax.set_title(title)
+        ax.set_ylim(bottom=0)
+
+    fig.suptitle('Probe Function Quality', fontsize=14, fontweight='bold', y=1.02)
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'probe_quality.{ext}')
+    plt.close(fig)
+    print(f"  Saved: probe_quality.pdf/png")
+
+
+def _plot_sparsity(all_metrics: List[Dict], methods: List[str], output_dir: Path):
+    """2-panel: avg NNZ per row, density %."""
+
+    all_prefixes = ['gt'] + methods
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    panels = [
+        ('Avg NNZ per Row', '_avg_nnz_per_row'),
+        ('Density (%)', '_density_pct'),
+    ]
+
+    for ax, (title, suffix) in zip(axes, panels):
+        present = []
+        for prefix in all_prefixes:
+            vals = _get_vals(all_metrics, f'{prefix}{suffix}')
+            if vals is not None:
+                present.append((prefix, vals))
+
+        for j, (prefix, vals) in enumerate(present):
+            color = METHOD_COLORS.get(prefix, '#6B7280')
+            ax.bar(j, vals.mean(), yerr=vals.std(), capsize=4,
+                   color=color, edgecolor='white',
+                   linewidth=0.5, alpha=0.9, zorder=3)
+            fmt = f'{vals.mean():.1f}' if vals.mean() >= 1 else f'{vals.mean():.4f}'
+            ax.text(j, vals.mean() + vals.std() + 0.1,
+                    fmt, ha='center', va='bottom',
+                    fontsize=9, fontweight='bold', color=color)
+        ax.set_xticks(range(len(present)))
+        ax.set_xticklabels([METHOD_LABELS.get(p, p) for p, _ in present], fontsize=9)
+        ax.set_title(title)
+        ax.set_ylim(bottom=0)
+
+    fig.suptitle('Laplacian Sparsity', fontsize=14, fontweight='bold', y=1.02)
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'sparsity.{ext}')
+    plt.close(fig)
+    print(f"  Saved: sparsity.pdf/png")
 
 
 if __name__ == '__main__':

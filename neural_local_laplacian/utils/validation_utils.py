@@ -1381,3 +1381,43 @@ def step_spectral_compression(
         }
 
     return result
+
+# =============================================================================
+# Step: Laplacian sparsity statistics
+# =============================================================================
+
+@dataclass
+class SparsityStats:
+    """Sparsity statistics for a Laplacian matrix."""
+    nnz: int = 0
+    num_vertices: int = 0
+    density_percent: float = 0.0
+    avg_nnz_per_row: float = 0.0
+    max_nnz_per_row: int = 0
+    min_nnz_per_row: int = 0
+
+
+def step_sparsity(L: scipy.sparse.spmatrix) -> SparsityStats:
+    """
+    Compute sparsity statistics for a Laplacian matrix.
+
+    Args:
+        L: Sparse Laplacian (N, N)
+
+    Returns:
+        SparsityStats dataclass.
+    """
+    n = L.shape[0]
+    csr = L.tocsr()
+    nnz = csr.nnz
+    total = n * n
+    nnz_per_row = np.diff(csr.indptr)
+
+    return SparsityStats(
+        nnz=nnz,
+        num_vertices=n,
+        density_percent=(nnz / total * 100) if total > 0 else 0.0,
+        avg_nnz_per_row=nnz / n if n > 0 else 0.0,
+        max_nnz_per_row=int(nnz_per_row.max()) if len(nnz_per_row) > 0 else 0,
+        min_nnz_per_row=int(nnz_per_row.min()) if len(nnz_per_row) > 0 else 0,
+    )
