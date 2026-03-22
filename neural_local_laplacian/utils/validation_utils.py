@@ -158,13 +158,14 @@ def step_pred_inference(
     patch_data: Any,
     device: torch.device,
     use_amp: bool = True,
+    top_k: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, float]]:
     """
     Run model forward pass, assemble L,M matrices and gradient operator.
 
     Returns:
         (result_dict, timing) where:
-        - result_dict has 'L', 'M', 'G' (gradient op, may be None)
+        - result_dict has 'L', 'M', 'G' (gradient op, may be None), 'fwd_result'
         - timing has keys 'forward', 'assembly', 'grad_op'
     """
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
@@ -196,6 +197,7 @@ def step_pred_inference(
     t0 = time.perf_counter()
     L, M = assemble_stiffness_and_mass_matrices(
         stiffness_w, areas, attention_mask, vi, ci, bi,
+        top_k=top_k,
     )
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -221,6 +223,46 @@ def step_pred_inference(
     result = {'L': ensure_psd(L), 'M': M, 'G': G, 'fwd_result': fwd_result}
     timing = {'forward': t_forward, 'assembly': t_assembly, 'grad_op': t_grad_op}
     return result, timing
+
+
+def step_pred_reassemble(
+    fwd_result: Dict[str, Any],
+    patch_data: Any,
+    device: torch.device,
+    top_k: int,
+) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix, float]:
+    """
+    Re-assemble L, M from cached forward pass result with a different top_k.
+
+    Skips kNN and forward pass — only runs sparse assembly with top_k pruning.
+    Does NOT rebuild the gradient operator G.
+
+    Args:
+        fwd_result: The 'fwd_result' dict from step_pred_inference
+        patch_data: The patch_data from step_pred_knn
+        device: torch device
+        top_k: Number of highest weights to keep per patch
+
+    Returns:
+        (L, M, assembly_time_seconds)
+    """
+    stiffness_w = fwd_result['stiffness_weights'].float()
+    areas = fwd_result['areas'].float()
+    attention_mask = fwd_result['attention_mask']
+    vi = patch_data.vertex_indices.to(device)
+    ci = patch_data.center_indices.to(device)
+    bi = patch_data.patch_idx.to(device)
+
+    t0 = time.perf_counter()
+    L, M = assemble_stiffness_and_mass_matrices(
+        stiffness_w, areas, attention_mask, vi, ci, bi,
+        top_k=top_k,
+    )
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_assembly = time.perf_counter() - t0
+
+    return ensure_psd(L), M, t_assembly
 
 
 # =============================================================================

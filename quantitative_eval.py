@@ -24,6 +24,9 @@ Usage:
 
     # Multi-GPU
     python quantitative_eval.py +ckpt_path=model.ckpt +num_gpus=4
+
+    # Top-k weight pruning sweep (quality-sparsity tradeoff)
+    python quantitative_eval.py +ckpt_path=model.ckpt +top_k_values=3,4,5
 """
 
 import csv
@@ -50,6 +53,9 @@ from neural_local_laplacian.utils.utils import cuda_warmup
 from neural_local_laplacian.utils.geodesic_utils import select_multiple_geodesic_sources
 from neural_local_laplacian.utils.validation_utils import (
     load_mesh_with_faces,
+    step_pred_knn,
+    step_pred_inference,
+    step_pred_reassemble,
     step_pred_laplacian,
     step_pred_geodesic,
     step_gt_laplacian,
@@ -68,6 +74,7 @@ from neural_local_laplacian.utils.validation_utils import (
     step_sparsity,
     step_spectral_compression,
     GeodesicTimingBreakdown,
+    PredLaplacianTiming,
     HAS_NELO,
     HAS_PCDIFF,
 )
@@ -181,6 +188,13 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
     use_amp = device.type == 'cuda'
 
+    # ---- Top-k pruning sweep ----
+    top_k_str = getattr(cfg, 'top_k_values', '')
+    top_k_values: List[int] = []
+    if top_k_str and run_pred:
+        top_k_values = sorted([int(x.strip()) for x in str(top_k_str).split(',') if x.strip()])
+        top_k_values = [k for k in top_k_values if 2 <= k < pred_k]
+
     # ---- Load PRED model ----
     model = None
     if run_pred:
@@ -257,9 +271,11 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
     # ==================================================================
     # PASS 1: PRED assembly (GPU, back-to-back, hottest possible)
+    #         + top-k reassembly variants (still GPU-warm, assembly only)
     # ==================================================================
     if run_pred:
-        print(f"{tag}Pass 1: PRED assembly (k={pred_k})...")
+        tk_str = f" + top_k={top_k_values}" if top_k_values else ""
+        print(f"{tag}Pass 1: PRED assembly (k={pred_k}{tk_str})...")
         gc.collect()
         gc.disable()
         for i, md in enumerate(mesh_data_list):
@@ -267,12 +283,22 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 continue
             try:
                 verts_tensor = torch.from_numpy(md['vertices']).float().to(device)
-                pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
-                    model, verts_tensor, pred_k, device, use_amp=use_amp,
+
+                # kNN + forward pass + assembly (no pruning)
+                patch_data, t_knn = step_pred_knn(verts_tensor, pred_k, device)
+                pred_result, t_infer = step_pred_inference(
+                    model, patch_data, device, use_amp=use_amp,
                 )
-                mesh_cache[i]['pred_L'] = pred_L
-                mesh_cache[i]['pred_M'] = pred_M
-                mesh_cache[i]['pred_G'] = pred_G
+
+                t_pred = PredLaplacianTiming(
+                    knn=t_knn['knn'],
+                    forward=t_infer['forward'],
+                    assembly=t_infer['assembly'],
+                    grad_op=t_infer['grad_op'],
+                )
+                mesh_cache[i]['pred_L'] = pred_result['L']
+                mesh_cache[i]['pred_M'] = pred_result['M']
+                mesh_cache[i]['pred_G'] = pred_result['G']
                 mesh_cache[i]['t_pred'] = t_pred
                 metrics_list[i]['pred_k'] = pred_k
                 metrics_list[i]['pred_knn_ms'] = t_pred.knn * 1000
@@ -280,7 +306,22 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics_list[i]['pred_assembly_ms'] = t_pred.assembly * 1000
                 metrics_list[i]['pred_grad_op_ms'] = t_pred.grad_op * 1000
                 metrics_list[i]['pred_lm_total_ms'] = t_pred.lm_total * 1000
-                del verts_tensor
+
+                # Top-k reassembly variants (reuse cached forward pass)
+                for tk in top_k_values:
+                    tk_L, tk_M, tk_asm_time = step_pred_reassemble(
+                        pred_result['fwd_result'], patch_data, device, top_k=tk,
+                    )
+                    pfx = f'pred_tk{tk}'
+                    mesh_cache[i][f'{pfx}_L'] = tk_L
+                    mesh_cache[i][f'{pfx}_M'] = tk_M
+                    # Timing: same knn + forward, different assembly
+                    metrics_list[i][f'{pfx}_assembly_ms'] = tk_asm_time * 1000
+                    metrics_list[i][f'{pfx}_lm_total_ms'] = (
+                        t_pred.knn + t_pred.forward + tk_asm_time
+                    ) * 1000
+
+                del verts_tensor, patch_data
             except Exception as e:
                 print(f"{tag}  PRED assembly failed for {md['mesh_name']}: {e}")
         gc.enable()
@@ -536,6 +577,60 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     metrics[f'{prefix}_compress_k{k}_mean_l2'] = errs['mean_l2']
                     metrics[f'{prefix}_compress_k{k}_max_l2'] = errs['max_l2']
 
+            # ---- Top-k pruning variants (full quality sweep) ----
+            for tk in top_k_values:
+                pfx = f'pred_tk{tk}'
+                tk_L = cache.get(f'{pfx}_L')
+                tk_M = cache.get(f'{pfx}_M')
+                if tk_L is None:
+                    continue
+
+                # Green's
+                if gt_gvals is not None:
+                    tk_lm_total = metrics.get(f'{pfx}_lm_total_ms', 0) / 1000
+                    _add_greens_metrics(
+                        metrics, pfx, tk_L, tk_M,
+                        source_indices, gt_gvals, tk_lm_total,
+                    )
+
+                # Eigen
+                tk_evals, tk_evecs = None, None
+                if gt_evals is not None:
+                    tk_evals, tk_evecs = _add_eigen_metrics(
+                        metrics, pfx, tk_L, tk_M,
+                        gt_evals, gt_evecs, num_eigenvalues,
+                    )
+
+                # Descriptors
+                if gt_evals is not None and tk_evals is not None and tk_evecs is not None:
+                    desc = step_descriptor_comparison(tk_evals, tk_evecs, gt_evals, gt_evecs)
+                    metrics[f'{pfx}_hks_corr'] = desc.hks_correlation
+                    metrics[f'{pfx}_hks_l2_err'] = desc.hks_l2_error
+                    metrics[f'{pfx}_wks_corr'] = desc.wks_correlation
+                    metrics[f'{pfx}_wks_l2_err'] = desc.wks_l2_error
+
+                # Probe
+                if gt_L is not None and gt_evals is not None and gt_evecs is not None:
+                    probe = step_probe_function_mse(
+                        tk_L, tk_M, gt_L, gt_M, vertices, gt_evals, gt_evecs,
+                    )
+                    metrics[f'{pfx}_probe_mse'] = probe.mse
+                    metrics[f'{pfx}_probe_cosine'] = probe.cosine_similarity
+                    metrics[f'{pfx}_probe_failure_rate'] = probe.failure_rate
+
+                # Sparsity
+                sp = step_sparsity(tk_L)
+                metrics[f'{pfx}_nnz'] = sp.nnz
+                metrics[f'{pfx}_avg_nnz_per_row'] = sp.avg_nnz_per_row
+                metrics[f'{pfx}_density_pct'] = sp.density_percent
+
+                # Spectral compression
+                if tk_evecs is not None and tk_M is not None:
+                    comp = step_spectral_compression(tk_evecs, tk_M, vertices, compression_k_values)
+                    for kc, errs in comp.errors.items():
+                        metrics[f'{pfx}_compress_k{kc}_mean_l2'] = errs['mean_l2']
+                        metrics[f'{pfx}_compress_k{kc}_max_l2'] = errs['max_l2']
+
             # ---- Timing ratios ----
             if run_pred and run_robust and robust_timing is not None and t_pred is not None:
                 if robust_timing.lm_assembly > 0:
@@ -732,6 +827,9 @@ def main(cfg: DictConfig) -> None:
     print(f"GPUs:        {num_gpus} / {num_gpus_available} available")
     if 'pred' in methods:
         print(f"PRED k:      {pred_k}")
+        top_k_str = getattr(cfg, 'top_k_values', '')
+        if top_k_str:
+            print(f"Top-k sweep: {top_k_str}")
     if 'robust' in methods:
         print(f"Robust k:    {robust_k}")
     if 'nelo' in methods:
@@ -974,6 +1072,36 @@ def _print_summary(
             wins = sum(1 for p, r in zip(pred_g, rob_g) if p < r)
             print(f"  PRED/Robust E2E Green's:  {ratio:.2f}x  (PRED wins {wins}/{len(pred_g)})")
 
+    # --- Top-k sweep ---
+    tk_values = _detect_top_k_values(all_metrics)
+    if tk_values:
+        print(f"\n  TOP-K WEIGHT PRUNING SWEEP")
+        prefixes = [f'pred_tk{tk}' for tk in tk_values] + ['pred']
+        labels = [f'tk={tk}' for tk in tk_values] + ['full']
+        header_row = f"  {'Metric':<24s}" + ''.join(f'{l:>{W}s}' for l in labels)
+        print(header_row)
+        print(f"  {'-' * 24}" + f" {'-' * W}" * len(labels))
+
+        sweep_metrics = [
+            ('eigvec cos top5',   '_eigvec_cos_top5'),
+            ('eigvec cos all',    '_eigvec_cos_all'),
+            ("Green's GT corr",   '_greens_gt_corr_mean'),
+            ('probe cosine',      '_probe_cosine'),
+            ('HKS correlation',   '_hks_corr'),
+            ('WKS correlation',   '_wks_corr'),
+            ('avg NNZ/row',       '_avg_nnz_per_row'),
+            ('density %',         '_density_pct'),
+        ]
+        for label, suffix in sweep_metrics:
+            parts = [f"  {label:<24s}"]
+            for pfx in prefixes:
+                m, s, _, _ = _stats(f'{pfx}{suffix}')
+                if m is not None:
+                    parts.append(f'{m:>{W}.4f}')
+                else:
+                    parts.append(f'{"N/A":>{W}s}')
+            print(''.join(parts))
+
     print(f"\n  Total time: {elapsed:.1f}s ({n_meshes} meshes, {num_gpus} GPUs)")
     print(f"{'=' * 80}")
 
@@ -1025,6 +1153,18 @@ def _get_vals(all_metrics: List[Dict], key: str) -> Optional[np.ndarray]:
     return np.array(vals) if vals else None
 
 
+def _detect_top_k_values(all_metrics: List[Dict]) -> List[int]:
+    """Detect top_k values from metric column names like pred_tk3_*."""
+    import re
+    tk_set = set()
+    for m in all_metrics:
+        for key in m.keys():
+            match = re.match(r'pred_tk(\d+)_', key)
+            if match:
+                tk_set.add(int(match.group(1)))
+    return sorted(tk_set)
+
+
 def _generate_plots(
     all_metrics: List[Dict[str, Any]],
     methods: Set[str],
@@ -1043,6 +1183,11 @@ def _generate_plots(
     _plot_probe_quality(all_metrics, active, output_dir)
     _plot_sparsity(all_metrics, active, output_dir)
     _plot_spectral_compression(all_metrics, active, output_dir)
+
+    # Top-k sweep (if present)
+    tk_values = _detect_top_k_values(all_metrics)
+    if tk_values:
+        _plot_topk_sweep(all_metrics, tk_values, output_dir)
 
     print(f"All plots saved to: {output_dir}")
 
@@ -1472,6 +1617,63 @@ def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], outp
         fig.savefig(output_dir / f'spectral_compression.{ext}')
     plt.close(fig)
     print(f"  Saved: spectral_compression.pdf/png")
+
+
+def _plot_topk_sweep(all_metrics: List[Dict], tk_values: List[int], output_dir: Path):
+    """Quality vs top_k pruning level: shows quality-sparsity tradeoff."""
+
+    # Build x-axis: top_k values + "full" (no pruning)
+    # Prefixes: pred_tk3, pred_tk4, ... and pred (full)
+    prefixes = [f'pred_tk{tk}' for tk in tk_values] + ['pred']
+    x_labels = [f'tk={tk}' for tk in tk_values] + ['full']
+    x = np.arange(len(prefixes))
+
+    panels = [
+        ('Eigvec Cos (top-5)', '_eigvec_cos_top5', True),
+        ('Eigvec Cos (all)', '_eigvec_cos_all', True),
+        ("Green's GT Corr", '_greens_gt_corr_mean', True),
+        ('Probe Cosine', '_probe_cosine', True),
+        ('HKS Correlation', '_hks_corr', True),
+        ('Avg NNZ/row', '_avg_nnz_per_row', None),  # None = no direction preference, just show
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    axes = axes.flatten()
+
+    for ax, (title, suffix, higher_better) in zip(axes, panels):
+        means, stds = [], []
+        for pfx in prefixes:
+            vals = _get_vals(all_metrics, f'{pfx}{suffix}')
+            means.append(vals.mean() if vals is not None else 0)
+            stds.append(vals.std() if vals is not None else 0)
+
+        colors = ['#93C5FD'] * len(tk_values) + ['#2563EB']  # light blue for pruned, full blue for full
+        ax.bar(x, means, yerr=stds, capsize=3,
+               color=colors, edgecolor='white', linewidth=0.5,
+               alpha=0.9, zorder=3)
+
+        for xi, mean in zip(x, means):
+            if mean > 0:
+                fmt = f'{mean:.3f}' if mean < 10 else f'{mean:.1f}'
+                ax.text(xi, mean + stds[xi] + 0.005, fmt,
+                        ha='center', va='bottom', fontsize=8, fontweight='bold',
+                        color='#1E40AF')
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, fontsize=9)
+        ax.set_title(title)
+        if higher_better is not None:
+            if higher_better:
+                ax.set_ylim(bottom=max(0, min(means) - 0.1) if means else 0)
+            else:
+                ax.set_ylim(bottom=0)
+
+    fig.suptitle('Top-k Weight Pruning Sweep', fontsize=14, fontweight='bold', y=1.02)
+    fig.tight_layout()
+    for ext in ['pdf', 'png']:
+        fig.savefig(output_dir / f'topk_sweep.{ext}')
+    plt.close(fig)
+    print(f"  Saved: topk_sweep.pdf/png")
 
 
 if __name__ == '__main__':
