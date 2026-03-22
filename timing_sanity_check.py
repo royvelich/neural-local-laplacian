@@ -78,8 +78,7 @@ def main(cfg: DictConfig) -> None:
 
     # ---- Dataset ----
     pl.seed_everything(cfg.globals.seed)
-    data_module = hydra.utils.instantiate(cfg.data_module, _recursive_=False)
-    data_module.setup('validate')
+    data_module = hydra.utils.instantiate(cfg.data_module)
     data_loader = data_module.val_dataloader()
     if isinstance(data_loader, list):
         data_loader = data_loader[0]
