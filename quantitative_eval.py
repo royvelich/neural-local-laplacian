@@ -41,8 +41,7 @@ from neural_local_laplacian.utils.utils import cuda_warmup
 from neural_local_laplacian.utils.geodesic_utils import select_multiple_geodesic_sources
 from neural_local_laplacian.utils.validation_utils import (
     load_mesh_with_faces,
-    step_pred_knn,
-    step_pred_inference,
+    step_pred_laplacian,
     step_pred_geodesic,
     step_robust_geodesic,
     step_gt_laplacian,
@@ -135,14 +134,13 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             gc.disable()
 
             # ---- PRED pipeline ----
-            patch_data, t_knn = step_pred_knn(verts_tensor, pred_k, device)
-            pred_result, t_infer = step_pred_inference(model, patch_data, device, use_amp=use_amp)
+            pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
+                model, verts_tensor, pred_k, device, use_amp=use_amp,
+            )
 
-            pred_lm_total = t_knn['knn'] + t_infer['forward'] + t_infer['assembly']
-
-            if pred_result['G'] is not None:
+            if pred_G is not None:
                 _, pred_geo_timing = step_pred_geodesic(
-                    pred_result['L'], pred_result['M'], pred_result['G'],
+                    pred_L, pred_M, pred_G,
                     source_indices, N,
                 )
             else:
@@ -166,7 +164,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             gt_gvals = gt_greens.values if gt_greens is not None else None
 
             pred_greens, t_greens_pred = step_greens_function(
-                pred_result['L'], pred_result['M'], source_indices,
+                pred_L, pred_M, source_indices,
                 gt_greens_values=gt_gvals,
             )
 
@@ -183,7 +181,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 )
 
             pred_evals, pred_evecs, t_eig_pred = step_eigendecomposition(
-                pred_result['L'], pred_result['M'], num_eigenvalues,
+                pred_L, pred_M, num_eigenvalues,
             )
 
             rob_evals, rob_evecs, t_eig_rob = step_eigendecomposition(
@@ -196,7 +194,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             # ---- Compute E2E ----
             n_src = len(source_indices)
 
-            pred_onetime = (pred_lm_total + t_infer['grad_op']
+            pred_onetime = (t_pred.total
                             + pred_geo_timing.build
                             + pred_geo_timing.heat_factorize
                             + pred_geo_timing.poisson_factorize)
@@ -204,7 +202,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             robust_e2e = robust_timing.total
 
             # Green's E2E: L,M assembly + factorize + solve
-            pred_greens_e2e = pred_lm_total + t_greens_pred.total
+            pred_greens_e2e = t_pred.lm_total + t_greens_pred.total
             robust_greens_e2e = t_rob_lm['assembly'] + t_greens_rob.total
 
             metrics = {
@@ -214,11 +212,11 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 'k': pred_k,
                 'num_sources': n_src,
                 # PRED L,M breakdown (ms)
-                'pred_knn_ms': t_knn['knn'] * 1000,
-                'pred_forward_ms': t_infer['forward'] * 1000,
-                'pred_assembly_ms': t_infer['assembly'] * 1000,
-                'pred_grad_op_ms': t_infer['grad_op'] * 1000,
-                'pred_lm_total_ms': pred_lm_total * 1000,
+                'pred_knn_ms': t_pred.knn * 1000,
+                'pred_forward_ms': t_pred.forward * 1000,
+                'pred_assembly_ms': t_pred.assembly * 1000,
+                'pred_grad_op_ms': t_pred.grad_op * 1000,
+                'pred_lm_total_ms': t_pred.lm_total * 1000,
                 # PRED geodesic breakdown (ms)
                 'pred_geo_build_ms': pred_geo_timing.build * 1000,
                 'pred_geo_heat_fact_ms': pred_geo_timing.heat_factorize * 1000,
@@ -236,7 +234,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 'robust_e2e_geodesic_ms': robust_e2e * 1000,
                 'robust_per_src_ms': robust_e2e / n_src * 1000,
                 # Ratios (geodesic)
-                'ratio_lm': pred_lm_total / robust_timing.lm_assembly if robust_timing.lm_assembly > 0 else None,
+                'ratio_lm': t_pred.lm_total / robust_timing.lm_assembly if robust_timing.lm_assembly > 0 else None,
                 'ratio_e2e': pred_e2e / robust_e2e if robust_e2e > 0 else None,
                 # GT assembly (ms)
                 'gt_assembly_ms': t_gt['assembly'] * 1000,
@@ -309,7 +307,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             metrics_list.append(metrics)
             status = "OK"
 
-            del patch_data, pred_result, verts_tensor
+            del verts_tensor
 
         except Exception as e:
             gc.enable()

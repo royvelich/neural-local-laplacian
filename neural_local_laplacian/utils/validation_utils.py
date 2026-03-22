@@ -153,9 +153,74 @@ def step_pred_inference(
             torch.cuda.synchronize()
         t_grad_op = time.perf_counter() - t0
 
-    result = {'L': L, 'M': M, 'G': G, 'fwd_result': fwd_result}
+    result = {'L': ensure_psd(L), 'M': M, 'G': G, 'fwd_result': fwd_result}
     timing = {'forward': t_forward, 'assembly': t_assembly, 'grad_op': t_grad_op}
     return result, timing
+
+
+# =============================================================================
+# Step: PRED Laplacian (unified: kNN + inference + assembly)
+# =============================================================================
+
+@dataclass
+class PredLaplacianTiming:
+    """Timing breakdown for the full PRED Laplacian pipeline."""
+    knn: float = 0.0        # k-NN patch extraction
+    forward: float = 0.0    # Transformer forward pass
+    assembly: float = 0.0   # Sparse L, M assembly
+    grad_op: float = 0.0    # Gradient operator assembly (gradient mode only)
+
+    @property
+    def lm_total(self) -> float:
+        """Total L,M assembly time (kNN + forward + assembly)."""
+        return self.knn + self.forward + self.assembly
+
+    @property
+    def total(self) -> float:
+        """Total time including gradient operator."""
+        return self.lm_total + self.grad_op
+
+
+def step_pred_laplacian(
+    model,
+    vertices: torch.Tensor,
+    k: int,
+    device: torch.device,
+    use_amp: bool = True,
+) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix,
+           Optional[scipy.sparse.spmatrix], PredLaplacianTiming]:
+    """
+    Full PRED Laplacian pipeline: kNN → inference → L, M, G assembly.
+
+    Output L is guaranteed PSD. Single call replaces step_pred_knn + step_pred_inference.
+
+    Args:
+        model: LaplacianTransformerModule in eval mode
+        vertices: (N, 3) vertex positions on device
+        k: Number of nearest neighbors
+        device: torch device
+        use_amp: Whether to use automatic mixed precision
+
+    Returns:
+        (L, M, G, timing) where:
+        - L: PSD sparse Laplacian (N, N)
+        - M: Sparse diagonal mass matrix (N, N)
+        - G: Sparse gradient operator (3N, N), or None in stiffness mode
+        - timing: PredLaplacianTiming with per-stage breakdown
+    """
+    timing = PredLaplacianTiming()
+
+    # kNN
+    patch_data, t_knn = step_pred_knn(vertices, k, device)
+    timing.knn = t_knn['knn']
+
+    # Inference + assembly
+    pred_result, t_infer = step_pred_inference(model, patch_data, device, use_amp=use_amp)
+    timing.forward = t_infer['forward']
+    timing.assembly = t_infer['assembly']
+    timing.grad_op = t_infer['grad_op']
+
+    return pred_result['L'], pred_result['M'], pred_result['G'], timing
 
 
 # =============================================================================
@@ -328,9 +393,11 @@ def step_gt_laplacian(
     """
     Compute GT cotangent Laplacian and mass matrix using igl.
 
+    Output L is guaranteed PSD (handles igl NSD convention).
+
     Args:
-        vertices: (N, 3) float64 mesh vertices
-        faces: (F, 3) int32 face indices
+        vertices: (N, 3) mesh vertices
+        faces: (F, 3) face indices
 
     Returns:
         (L, M, timing) where timing has key 'assembly'.
@@ -347,6 +414,7 @@ def step_gt_laplacian(
     t0 = time.perf_counter()
     L = igl.cotmatrix(V, F)
     M = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+    L = ensure_psd(L)
     elapsed = time.perf_counter() - t0
 
     return L, M, {'assembly': elapsed}
@@ -363,6 +431,8 @@ def step_robust_laplacian(
     """
     Compute robust Laplacian from point cloud.
 
+    Output L is guaranteed PSD.
+
     Returns:
         (L, M, timing) where timing has key 'assembly'.
     """
@@ -370,6 +440,7 @@ def step_robust_laplacian(
 
     t0 = time.perf_counter()
     L, M = rl.point_cloud_laplacian(vertices, n_neighbors=k)
+    L = ensure_psd(L)
     elapsed = time.perf_counter() - t0
 
     return L, M, {'assembly': elapsed}
@@ -387,8 +458,8 @@ def step_eigendecomposition(
     """
     Compute generalized eigendecomposition L v = λ M v.
 
-    Uses shift-invert eigsh (sigma=-0.01). Ensures PSD convention before
-    solving (handles igl NSD cotangent matrices).
+    Uses shift-invert eigsh (sigma=-0.01). Assumes L is already PSD
+    (assembly steps guarantee this).
 
     Returns:
         (eigenvalues, eigenvectors, timing) where timing has key 'eigen'.
@@ -396,9 +467,8 @@ def step_eigendecomposition(
     """
     t0 = time.perf_counter()
     try:
-        L_psd = ensure_psd(L)
         eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
-            L_psd, num_eigenvalues, mass_matrix=M,
+            L, num_eigenvalues, mass_matrix=M,
         )
     except Exception:
         return None, None, {'eigen': time.perf_counter() - t0}
