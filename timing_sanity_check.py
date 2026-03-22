@@ -79,8 +79,10 @@ def main(cfg: DictConfig) -> None:
     # ---- Dataset ----
     pl.seed_everything(cfg.globals.seed)
     data_module = hydra.utils.instantiate(cfg.data_module, _recursive_=False)
-    data_module.setup('predict')
-    data_loader = data_module.predict_dataloader()
+    data_module.setup('validate')
+    data_loader = data_module.val_dataloader()
+    if isinstance(data_loader, list):
+        data_loader = data_loader[0]
     num_meshes = len(data_loader.dataset)
     print(f"Dataset: {num_meshes} meshes (processing up to {max_meshes})\n")
 
