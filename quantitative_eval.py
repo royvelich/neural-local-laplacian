@@ -48,6 +48,9 @@ from neural_local_laplacian.utils.validation_utils import (
     step_gt_laplacian,
     step_robust_laplacian,
     step_greens_function,
+    step_eigendecomposition,
+    step_eigenvalue_errors,
+    step_eigenvector_cosine_similarity,
     GeodesicTimingBreakdown,
 )
 
@@ -82,6 +85,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
     robust_k = getattr(cfg.globals, 'k_robust', None) or 30
     num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
+    num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
     use_amp = device.type == 'cuda'
 
     # ---- CUDA warmup ----
@@ -171,6 +175,21 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 gt_greens_values=gt_gvals,
             )
 
+            # ---- Eigendecomposition (all methods) ----
+            gt_evals, gt_evecs = None, None
+            if gt_L is not None:
+                gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
+                    gt_L, gt_M, num_eigenvalues,
+                )
+
+            pred_evals, pred_evecs, t_eig_pred = step_eigendecomposition(
+                pred_result['L'], pred_result['M'], num_eigenvalues,
+            )
+
+            rob_evals, rob_evecs, t_eig_rob = step_eigendecomposition(
+                rob_L, rob_M, num_eigenvalues,
+            )
+
             # ---- Re-enable GC ----
             gc.enable()
 
@@ -249,6 +268,44 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             if robust_greens_e2e > 0:
                 metrics['ratio_greens_e2e'] = pred_greens_e2e / robust_greens_e2e
 
+            # ---- Eigendecomposition timing ----
+            metrics['pred_eigen_ms'] = t_eig_pred['eigen'] * 1000
+            metrics['robust_eigen_ms'] = t_eig_rob['eigen'] * 1000
+            if gt_evals is not None:
+                metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
+
+            # ---- Eigenvalue errors (vs GT) ----
+            if gt_evals is not None:
+                if pred_evals is not None:
+                    ev_err = step_eigenvalue_errors(pred_evals, gt_evals)
+                    metrics['pred_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
+                    metrics['pred_eval_spectrum_rel_err_max'] = ev_err.spectrum_rel_err_max
+                    metrics['pred_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
+                    metrics['pred_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
+
+                if rob_evals is not None:
+                    ev_err = step_eigenvalue_errors(rob_evals, gt_evals)
+                    metrics['robust_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
+                    metrics['robust_eval_spectrum_rel_err_max'] = ev_err.spectrum_rel_err_max
+                    metrics['robust_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
+                    metrics['robust_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
+
+            # ---- Eigenvector cosine similarity (vs GT) ----
+            if gt_evecs is not None:
+                if pred_evecs is not None:
+                    sims = step_eigenvector_cosine_similarity(gt_evecs, pred_evecs)
+                    for c in [5, 10, 20, 50]:
+                        if c <= len(sims):
+                            metrics[f'pred_eigvec_cos_top{c}'] = float(sims[:c].mean())
+                    metrics['pred_eigvec_cos_all'] = float(sims.mean())
+
+                if rob_evecs is not None:
+                    sims = step_eigenvector_cosine_similarity(gt_evecs, rob_evecs)
+                    for c in [5, 10, 20, 50]:
+                        if c <= len(sims):
+                            metrics[f'robust_eigvec_cos_top{c}'] = float(sims[:c].mean())
+                    metrics['robust_eigvec_cos_all'] = float(sims.mean())
+
             metrics_list.append(metrics)
             status = "OK"
 
@@ -268,11 +325,12 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         ratio_str = f"{metrics.get('ratio_e2e', 0):.2f}x" if metrics.get('ratio_e2e') else "?"
         greens_corr = f"{metrics.get('pred_greens_gt_corr_mean', 0):.3f}"
         greens_mp = f"{metrics.get('pred_greens_max_principle', 0):.0%}"
+        evec_cos = f"{metrics.get('pred_eigvec_cos_all', 0):.3f}"
         print(f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<10s} "
               f"PRED={metrics.get('pred_e2e_geodesic_ms', 0):.0f}ms "
               f"Rob={metrics.get('robust_e2e_geodesic_ms', 0):.0f}ms "
               f"({ratio_str}) "
-              f"Green's corr={greens_corr} mp={greens_mp} "
+              f"G_corr={greens_corr} mp={greens_mp} evec={evec_cos} "
               f"[{t_mesh:.1f}s, ETA {eta:.0f}s]")
 
     elapsed = time.time() - t_start
@@ -415,6 +473,7 @@ def main(cfg: DictConfig) -> None:
     pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
     robust_k = getattr(cfg.globals, 'k_robust', None) or 30
     num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
+    num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
 
     print(f"\n{'=' * 80}")
     print(f"QUANTITATIVE EVALUATION")
@@ -425,6 +484,7 @@ def main(cfg: DictConfig) -> None:
     print(f"PRED k:      {pred_k}")
     print(f"Robust k:    {robust_k}")
     print(f"Sources:     {num_sources}")
+    print(f"Eigenvalues: {num_eigenvalues}")
     print(f"Output:      {output_dir}")
     print(f"{'=' * 80}\n")
 
@@ -493,6 +553,10 @@ def main(cfg: DictConfig) -> None:
         ("Robust Green's E2E",     "robust_greens_e2e_ms"),
         ("PRED Green's solve",     "pred_greens_solve_ms"),
         ("Robust Green's solve",   "robust_greens_solve_ms"),
+        ("",                       ""),
+        ("PRED eigendecomp",       "pred_eigen_ms"),
+        ("Robust eigendecomp",     "robust_eigen_ms"),
+        ("GT eigendecomp",         "gt_eigen_ms"),
     ]:
         if not key:
             print()
@@ -514,6 +578,32 @@ def main(cfg: DictConfig) -> None:
         ("PRED residual norm",     "pred_greens_residual_norm"),
         ("Robust residual norm",   "robust_greens_residual_norm"),
     ]:
+        m, s, _, _ = _stats(key)
+        if m is not None:
+            print(f"  {label:<26s} {m:>{W}.4f} {s:>{W}.4f}")
+
+    # --- Eigenvalue / eigenvector quality ---
+    print(f"\n  SPECTRAL QUALITY")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+    for label, key in [
+        ("PRED eval rel err mean", "pred_eval_spectrum_rel_err_mean"),
+        ("PRED eval rel err max",  "pred_eval_spectrum_rel_err_max"),
+        ("Robust eval rel err mean", "robust_eval_spectrum_rel_err_mean"),
+        ("Robust eval rel err max",  "robust_eval_spectrum_rel_err_max"),
+        ("",                       ""),
+        ("PRED eigvec cos top5",   "pred_eigvec_cos_top5"),
+        ("PRED eigvec cos top10",  "pred_eigvec_cos_top10"),
+        ("PRED eigvec cos top20",  "pred_eigvec_cos_top20"),
+        ("PRED eigvec cos all",    "pred_eigvec_cos_all"),
+        ("Robust eigvec cos top5", "robust_eigvec_cos_top5"),
+        ("Robust eigvec cos top10","robust_eigvec_cos_top10"),
+        ("Robust eigvec cos top20","robust_eigvec_cos_top20"),
+        ("Robust eigvec cos all",  "robust_eigvec_cos_all"),
+    ]:
+        if not key:
+            print()
+            continue
         m, s, _, _ = _stats(key)
         if m is not None:
             print(f"  {label:<26s} {m:>{W}.4f} {s:>{W}.4f}")
