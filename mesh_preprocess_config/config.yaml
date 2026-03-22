@@ -1,0 +1,3 @@
+num_sources: 10    # ← default, override with: num_sources=20
+seed: 42
+num_workers: 8     # ← default, override with: num_workers=16
