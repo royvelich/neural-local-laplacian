@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
 """
-Multi-GPU Quantitative Evaluation for Neural Local Laplacian.
+Quantitative Evaluation for Neural Local Laplacian.
 
-Runs the same quantitative evaluation as `visualize_validation.py +quantitative_mode=true`
-but distributes meshes across all available GPUs for near-linear speedup.
+Uses the same shared step functions as timing_sanity_check.py (from validation_utils.py)
+so timing numbers are always identical between scripts.
 
-Each GPU gets its own model + NeLo copy and processes an interleaved subset of meshes.
-Per-rank CSVs are merged into a single output at the end.
+Outputs per-mesh CSV with timing breakdown and quality metrics.
+Supports multi-GPU via mp.spawn.
 
 Usage:
-    # Use all available GPUs (auto-detected)
-    python quantitative_eval.py +ckpt_path=model.ckpt +data_module=... +globals=...
+    python quantitative_eval.py +ckpt_path=model.ckpt \
+        +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation
 
-    # Specify number of GPUs
+    # Multi-GPU
     python quantitative_eval.py +ckpt_path=model.ckpt +num_gpus=4
-
-    # With NeLo comparison
-    python quantitative_eval.py +ckpt_path=model.ckpt +nelo_ckpt_path=nelo.ckpt ...
 
     # Custom output directory
     python quantitative_eval.py +ckpt_path=model.ckpt +output_dir=results/
-
-Single-GPU mode works identically — it just skips mp.spawn overhead.
-Compatible with Windows (uses 'spawn' start method).
 """
 
 import csv
+import gc
 import shutil
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -41,138 +35,163 @@ import hydra
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 
-# Import existing infrastructure (no changes to visualize_validation.py needed)
-from visualize_validation import (
-    RealTimeEigenanalysisVisualizer,
-    VisualizationConfig,
-    HAS_IGL,
-)
+from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
 from neural_local_laplacian.utils.utils import cuda_warmup
-
+from neural_local_laplacian.utils.geodesic_utils import select_multiple_geodesic_sources
+from neural_local_laplacian.utils.validation_utils import (
+    load_mesh_vertices,
+    step_pred_knn,
+    step_pred_inference,
+    step_pred_geodesic,
+    step_robust_geodesic,
+    GeodesicTimingBreakdown,
+)
 
 
 # ============================================================================
 # Worker function — runs on a single GPU
 # ============================================================================
 
-def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
-            output_dir: str, total_meshes: int):
-    """
-    Process a subset of meshes on a single GPU.
+def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_meshes: int):
+    """Process a subset of meshes on a single GPU."""
 
-    Args:
-        rank: GPU index (0-based)
-        world_size: Total number of GPUs
-        cfg_dict: Resolved Hydra config as plain dict (picklable)
-        vis_config_dict: VisualizationConfig fields as dict (picklable)
-        output_dir: Directory for per-rank CSV output
-        total_meshes: Total number of meshes in dataset
-    """
     # ---- Device setup ----
-    device = torch.device(f'cuda:{rank}')
-    torch.cuda.set_device(rank)
+    if torch.cuda.is_available():
+        device = torch.device(f'cuda:{rank}')
+        torch.cuda.set_device(rank)
+    else:
+        device = torch.device('cpu')
 
     tag = f"[GPU {rank}] " if world_size > 1 else ""
-    verbose = getattr(OmegaConf.create(cfg_dict), 'verbose', False)
-
-    # ---- Suppress setup output when not verbose ----
-    if not verbose:
-        import os as _os
-        import warnings as _warnings
-        _devnull = open(_os.devnull, 'w')
-        _saved_stdout = sys.stdout
-        _saved_stderr = sys.stderr
-        sys.stdout = _devnull
-        sys.stderr = _devnull
-        _warnings.filterwarnings('ignore')
-
-    # ---- Reconstruct config objects ----
     cfg = OmegaConf.create(cfg_dict)
-    vis_config = VisualizationConfig(**vis_config_dict)
-
-    # ---- Create visualizer in quantitative mode ----
-    visualizer = RealTimeEigenanalysisVisualizer(config=vis_config)
-    visualizer._quantitative_mode = True
-    visualizer._verbose = verbose
-    visualizer._skip_robust = getattr(cfg, 'skip_robust', False)
-    visualizer._diagnostic_mode = False
-    visualizer._robust_geodesic_heat = getattr(cfg, 'robust_geodesic_heat', False)
 
     # ---- Load model ----
     ckpt_path = Path(cfg.ckpt_path)
-    model = visualizer.load_trained_model(
-        ckpt_path, device, cfg,
+    model = LaplacianTransformerModule.load_from_checkpoint(
+        str(ckpt_path), map_location=device, strict=False
     )
+    model = model.to(device).eval()
 
-    # ---- Load NeLo (optional) ----
-    nelo_ckpt = getattr(cfg, 'nelo_ckpt_path', None)
-    if nelo_ckpt is not None:
-        try:
-            visualizer.load_nelo_pipeline(str(nelo_ckpt), device=str(device))
-        except Exception as e:
-            pass  # will be logged if verbose
+    has_grad = getattr(model, '_operator_mode', 'stiffness') == 'gradient'
 
-    # ---- Configure k values ----
-    default_k = getattr(cfg.globals, 'k', 30)
-    visualizer._initial_k_pred = getattr(cfg.globals, 'k_pred', None) or default_k
-    visualizer._initial_k_robust = getattr(cfg.globals, 'k_robust', None) or default_k
-    visualizer._initial_k_nelo = getattr(cfg.globals, 'k_nelo', None) or default_k
-    visualizer.nelo_k = visualizer._initial_k_nelo
+    # ---- Config ----
+    pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
+    robust_k = getattr(cfg.globals, 'k_robust', None) or 30
+    num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
+    use_amp = device.type == 'cuda'
 
     # ---- CUDA warmup ----
-    cuda_warmup(model, device, k=visualizer._initial_k_pred)
+    if device.type == 'cuda':
+        cuda_warmup(model, device, k=pred_k)
 
-    # ---- Seed for reproducibility ----
+    # ---- Dataset ----
     pl.seed_everything(cfg.globals.seed)
-
-    # ---- Create dataset ----
     data_module = hydra.utils.instantiate(cfg.data_module)
     data_loader = data_module.val_dataloader()
     if isinstance(data_loader, list):
         data_loader = data_loader[0]
     dataset = data_loader.dataset
 
-    # ---- Restore stdout/stderr after setup ----
-    if not verbose:
-        sys.stdout = _saved_stdout
-        sys.stderr = _saved_stderr
-        _devnull.close()
-        _warnings.resetwarnings()
-
-    # ---- Compute this worker's mesh indices (interleaved for load balance) ----
+    # ---- Compute this worker's mesh indices ----
     my_indices = list(range(rank, len(dataset), world_size))
-    print(f"{tag}Ready — {len(my_indices)} meshes on {device}")
+    n_total = len(my_indices)
+    print(f"{tag}Ready — {n_total} meshes on {device}, PRED k={pred_k}, Robust k={robust_k}")
 
     # ---- Process meshes ----
     metrics_list: List[Dict[str, Any]] = []
     t_start = time.time()
-    n_total = len(my_indices)
 
     for local_idx, global_idx in enumerate(my_indices):
         t_mesh_start = time.time()
+        mesh_name = "?"
 
         try:
-            # Load single mesh from dataset (returns a Data object)
             batch_data = dataset[global_idx]
+            data = batch_data[0] if isinstance(batch_data, list) else batch_data
+            mesh_file_path = data.mesh_file_path
+            if isinstance(mesh_file_path, list):
+                mesh_file_path = mesh_file_path[0]
+            mesh_name = Path(mesh_file_path).name
 
-            # process_batch handles both list and single Data
-            success = visualizer.process_batch(model, batch_data, global_idx, device)
+            vertices = load_mesh_vertices(mesh_file_path)
+            N = len(vertices)
+            source_indices = select_multiple_geodesic_sources(
+                vertices.astype(np.float64), num_sources=num_sources,
+                method="farthest_point_sampling", seed=42
+            ).tolist()
+            verts_tensor = torch.from_numpy(vertices).float().to(device)
 
-            if success:
-                mesh_metrics = visualizer._collect_mesh_metrics()
-                if mesh_metrics is not None:
-                    metrics_list.append(mesh_metrics)
-                    mesh_name = mesh_metrics.get('mesh_name', '?')
-                    status = "OK"
-                else:
-                    mesh_name = "?"
-                    status = "no metrics"
+            # ---- Disable GC during timing ----
+            gc.collect()
+            gc.disable()
+
+            # ---- PRED pipeline ----
+            patch_data, t_knn = step_pred_knn(verts_tensor, pred_k, device)
+            pred_result, t_infer = step_pred_inference(model, patch_data, device, use_amp=use_amp)
+
+            pred_lm_total = t_knn['knn'] + t_infer['forward'] + t_infer['assembly']
+
+            if pred_result['G'] is not None:
+                _, pred_geo_timing = step_pred_geodesic(
+                    pred_result['L'], pred_result['M'], pred_result['G'],
+                    source_indices, N,
+                )
             else:
-                mesh_name = "?"
-                status = "skipped"
+                pred_geo_timing = GeodesicTimingBreakdown()
+
+            # ---- Robust pipeline ----
+            _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
+
+            # ---- Re-enable GC ----
+            gc.enable()
+
+            # ---- Compute E2E ----
+            n_src = len(source_indices)
+
+            pred_onetime = (pred_lm_total + t_infer['grad_op']
+                            + pred_geo_timing.build
+                            + pred_geo_timing.heat_factorize
+                            + pred_geo_timing.poisson_factorize)
+            pred_e2e = pred_onetime + pred_geo_timing.solve
+            robust_e2e = robust_timing.total
+
+            metrics = {
+                'mesh_name': mesh_name,
+                'num_vertices': N,
+                'k': pred_k,
+                'num_sources': n_src,
+                # PRED L,M breakdown (ms)
+                'pred_knn_ms': t_knn['knn'] * 1000,
+                'pred_forward_ms': t_infer['forward'] * 1000,
+                'pred_assembly_ms': t_infer['assembly'] * 1000,
+                'pred_grad_op_ms': t_infer['grad_op'] * 1000,
+                'pred_lm_total_ms': pred_lm_total * 1000,
+                # PRED geodesic breakdown (ms)
+                'pred_geo_build_ms': pred_geo_timing.build * 1000,
+                'pred_geo_heat_fact_ms': pred_geo_timing.heat_factorize * 1000,
+                'pred_geo_poisson_fact_ms': pred_geo_timing.poisson_factorize * 1000,
+                'pred_geo_heat_solve_ms': pred_geo_timing.heat_solve * 1000,
+                'pred_geo_poisson_solve_ms': pred_geo_timing.poisson_solve * 1000,
+                'pred_geo_onetime_ms': pred_onetime * 1000,
+                'pred_geo_solve_ms': pred_geo_timing.solve * 1000,
+                'pred_e2e_geodesic_ms': pred_e2e * 1000,
+                'pred_per_src_ms': pred_e2e / n_src * 1000,
+                # Robust breakdown (ms)
+                'robust_lm_ms': robust_timing.lm_assembly * 1000,
+                'robust_constructor_ms': robust_timing.constructor * 1000,
+                'robust_solve_ms': robust_timing.solve * 1000,
+                'robust_e2e_geodesic_ms': robust_e2e * 1000,
+                'robust_per_src_ms': robust_e2e / n_src * 1000,
+                # Ratios
+                'ratio_lm': pred_lm_total / robust_timing.lm_assembly if robust_timing.lm_assembly > 0 else None,
+                'ratio_e2e': pred_e2e / robust_e2e if robust_e2e > 0 else None,
+            }
+            metrics_list.append(metrics)
+            status = "OK"
+
+            del patch_data, pred_result, verts_tensor
 
         except Exception as e:
-            mesh_name = "?"
             status = f"ERROR — {e}"
             import traceback
             traceback.print_exc()
@@ -181,11 +200,15 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, vis_config_dict: dict,
         elapsed = time.time() - t_start
         done = local_idx + 1
         eta = (elapsed / done) * (n_total - done) if done > 0 else 0
-        print(f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<10s} ({t_mesh:.1f}s, ETA {eta:.0f}s)")
+
+        ratio_str = f"{metrics.get('ratio_e2e', 0):.2f}x" if 'metrics' in dir() and metrics.get('ratio_e2e') else "?"
+        print(f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<10s} "
+              f"PRED={metrics.get('pred_e2e_geodesic_ms', 0):.0f}ms "
+              f"Rob={metrics.get('robust_e2e_geodesic_ms', 0):.0f}ms "
+              f"({ratio_str}) [{t_mesh:.1f}s, ETA {eta:.0f}s]")
 
     elapsed = time.time() - t_start
-    print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s "
-          f"({elapsed / max(n_total, 1):.1f}s/mesh)")
+    print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s")
 
     # ---- Write per-rank CSV ----
     rank_csv = Path(output_dir) / f'metrics_rank{rank}.csv'
@@ -202,7 +225,6 @@ def _write_csv(metrics_list: List[Dict[str, Any]], csv_path: Path):
     if not metrics_list:
         return
 
-    # Gather all columns (preserving insertion order across all meshes)
     all_keys = []
     seen = set()
     for m in metrics_list:
@@ -220,7 +242,7 @@ def _write_csv(metrics_list: List[Dict[str, Any]], csv_path: Path):
 
 
 def _read_and_merge_csvs(output_dir: Path, world_size: int) -> List[Dict[str, Any]]:
-    """Read per-rank CSVs and merge into a single list of metric dicts."""
+    """Read per-rank CSVs and merge."""
     all_metrics = []
 
     for rank in range(world_size):
@@ -232,23 +254,54 @@ def _read_and_merge_csvs(output_dir: Path, world_size: int) -> List[Dict[str, An
         with open(rank_csv, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # Convert numeric strings back to proper types
                 parsed = {}
                 for k, v in row.items():
                     if v == '' or v is None:
                         parsed[k] = None
                     else:
                         try:
-                            # Try int first (preserves integer types for counts)
                             if '.' not in v and 'e' not in v.lower():
                                 parsed[k] = int(v)
                             else:
                                 parsed[k] = float(v)
                         except (ValueError, TypeError):
-                            parsed[k] = v  # keep as string (e.g. mesh_name)
+                            parsed[k] = v
                 all_metrics.append(parsed)
 
     return all_metrics
+
+
+def _compute_summary(all_metrics: List[Dict[str, Any]], summary_path: Path):
+    """Compute mean/std/min/max for all numeric columns and save."""
+    if not all_metrics:
+        return
+
+    numeric_keys = []
+    for k in all_metrics[0].keys():
+        vals = [m[k] for m in all_metrics if m.get(k) is not None]
+        if vals and isinstance(vals[0], (int, float)):
+            numeric_keys.append(k)
+
+    rows = []
+    for k in numeric_keys:
+        vals = [float(m[k]) for m in all_metrics if m.get(k) is not None]
+        if not vals:
+            continue
+        rows.append({
+            'metric': k,
+            'mean': np.mean(vals),
+            'std': np.std(vals),
+            'min': np.min(vals),
+            'max': np.max(vals),
+            'count': len(vals),
+        })
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['metric', 'mean', 'std', 'min', 'max', 'count'])
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
 
 
 # ============================================================================
@@ -257,9 +310,8 @@ def _read_and_merge_csvs(output_dir: Path, world_size: int) -> List[Dict[str, An
 
 @hydra.main(version_base="1.2", config_path='./visualization_config')
 def main(cfg: DictConfig) -> None:
-    """Multi-GPU quantitative evaluation."""
+    """Quantitative evaluation."""
 
-    # ---- Validate config ----
     if not hasattr(cfg, 'ckpt_path') or cfg.ckpt_path is None:
         raise ValueError("ckpt_path is required")
 
@@ -270,37 +322,13 @@ def main(cfg: DictConfig) -> None:
     # ---- GPU setup ----
     num_gpus_available = torch.cuda.device_count()
     num_gpus = getattr(cfg, 'num_gpus', None)
-
     if num_gpus is None:
         num_gpus = max(num_gpus_available, 1)
     else:
         num_gpus = min(int(num_gpus), num_gpus_available)
-
     if num_gpus_available == 0:
-        print("[!] No CUDA devices found — running on CPU (slow)")
-        num_gpus = 1  # will use CPU in worker
-
-    # ---- Check dependencies ----
-    print("Checking dependencies...")
-    try:
-        from pyFM.mesh import TriMesh
-        print("[OK] PyFM available")
-    except ImportError:
-        raise ImportError("PyFM required. Install with: pip install pyFM")
-    if HAS_IGL:
-        print("[OK] libigl available")
-    else:
-        print("[!] libigl not available — GT curvature will be skipped")
-
-    # ---- Build configs ----
-    vis_config = VisualizationConfig(
-        point_radius=0.005,
-        num_eigenvectors_to_show=getattr(cfg.globals, 'num_eigenvectors', 60),
-        colormap='coolwarm',
-        enable_eigenvalue_info=True,
-        enable_correlation_analysis=True,
-        num_validation_sources=getattr(cfg.globals, 'num_validation_sources', 5),
-    )
+        print("[!] No CUDA devices found — running on CPU")
+        num_gpus = 1
 
     # ---- Get total mesh count ----
     data_module = hydra.utils.instantiate(cfg.data_module)
@@ -308,7 +336,7 @@ def main(cfg: DictConfig) -> None:
     if isinstance(data_loader, list):
         data_loader = data_loader[0]
     total_meshes = len(data_loader.dataset)
-    del data_module, data_loader  # free before spawning
+    del data_module, data_loader
 
     # ---- Output setup ----
     output_dir = Path(getattr(cfg, 'output_dir', '.'))
@@ -316,73 +344,100 @@ def main(cfg: DictConfig) -> None:
     tmp_dir = output_dir / '.tmp_quantitative_ranks'
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
+    robust_k = getattr(cfg.globals, 'k_robust', None) or 30
+    num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
+
     print(f"\n{'=' * 80}")
-    print(f"MULTI-GPU QUANTITATIVE EVALUATION")
+    print(f"QUANTITATIVE EVALUATION")
     print(f"{'=' * 80}")
     print(f"Checkpoint:  {ckpt_path}")
-    print(f"NeLo:        {getattr(cfg, 'nelo_ckpt_path', 'none')}")
     print(f"Meshes:      {total_meshes}")
     print(f"GPUs:        {num_gpus} / {num_gpus_available} available")
-    print(f"Per GPU:     ~{(total_meshes + num_gpus - 1) // num_gpus} meshes")
+    print(f"PRED k:      {pred_k}")
+    print(f"Robust k:    {robust_k}")
+    print(f"Sources:     {num_sources}")
     print(f"Output:      {output_dir}")
     print(f"{'=' * 80}\n")
 
     # ---- Serialize config for workers ----
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-    vis_config_dict = asdict(vis_config)
 
     # ---- Run ----
     t_start = time.time()
 
     if num_gpus == 1:
-        # Single GPU — run directly (no mp.spawn overhead, works on Windows)
-        _worker(0, 1, cfg_dict, vis_config_dict, str(tmp_dir), total_meshes)
+        _worker(0, 1, cfg_dict, str(tmp_dir), total_meshes)
     else:
-        # Multi-GPU — spawn workers
         mp.spawn(
             _worker,
-            args=(num_gpus, cfg_dict, vis_config_dict, str(tmp_dir), total_meshes),
+            args=(num_gpus, cfg_dict, str(tmp_dir), total_meshes),
             nprocs=num_gpus,
             join=True,
         )
 
     elapsed = time.time() - t_start
-    meshes_per_sec = total_meshes / elapsed if elapsed > 0 else 0
-
-    print(f"\n{'=' * 80}")
-    print(f"All workers completed in {elapsed:.1f}s ({meshes_per_sec:.2f} meshes/sec)")
-    print(f"{'=' * 80}")
 
     # ---- Merge per-rank CSVs ----
     all_metrics = _read_and_merge_csvs(tmp_dir, num_gpus)
-    print(f"Merged {len(all_metrics)} mesh results from {num_gpus} workers")
+    print(f"\nMerged {len(all_metrics)} mesh results from {num_gpus} workers")
 
     if len(all_metrics) == 0:
-        print("[!] No metrics collected — check worker output above for errors")
+        print("[!] No metrics collected")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return
 
-    # ---- Aggregate and save using existing infrastructure ----
+    # ---- Save full CSV ----
     csv_path = output_dir / 'quantitative_results.csv'
-    visualizer = RealTimeEigenanalysisVisualizer(config=vis_config)
-    visualizer._aggregate_and_save_results(all_metrics, csv_path)
+    _write_csv(all_metrics, csv_path)
+    print(f"Saved per-mesh results: {csv_path}")
+
+    # ---- Compute and save summary ----
+    summary_path = csv_path.with_name(csv_path.stem + '_summary.csv')
+    _compute_summary(all_metrics, summary_path)
+    print(f"Saved summary: {summary_path}")
+
+    # ---- Print summary table ----
+    print(f"\n{'=' * 80}")
+    print(f"SUMMARY ({len(all_metrics)} meshes, {num_sources} sources/mesh)")
+    print(f"{'=' * 80}")
+
+    def _stats(key):
+        vals = [float(m[key]) for m in all_metrics if m.get(key) is not None]
+        if not vals:
+            return None, None, None, None
+        return np.mean(vals), np.std(vals), np.min(vals), np.max(vals)
+
+    W = 10
+    print(f"{'':>28s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
+    print(f"{'-' * 28} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
+
+    for label, key in [
+        ("PRED L,M total",         "pred_lm_total_ms"),
+        ("Robust L,M",             "robust_lm_ms"),
+        ("PRED E2E geodesic",      "pred_e2e_geodesic_ms"),
+        ("Robust E2E geodesic",    "robust_e2e_geodesic_ms"),
+        ("PRED per-source",        "pred_per_src_ms"),
+        ("Robust per-source",      "robust_per_src_ms"),
+    ]:
+        m, s, mn, mx = _stats(key)
+        if m is not None:
+            print(f"  {label:<26s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+
+    pred_e2e_vals = [float(m['pred_e2e_geodesic_ms']) for m in all_metrics if m.get('pred_e2e_geodesic_ms')]
+    robust_e2e_vals = [float(m['robust_e2e_geodesic_ms']) for m in all_metrics if m.get('robust_e2e_geodesic_ms')]
+    if pred_e2e_vals and robust_e2e_vals:
+        ratio = np.mean(pred_e2e_vals) / np.mean(robust_e2e_vals)
+        wins = sum(1 for p, r in zip(pred_e2e_vals, robust_e2e_vals) if p < r)
+        print(f"\n  PRED/Robust E2E ratio: {ratio:.2f}x  (PRED wins {wins}/{len(pred_e2e_vals)})")
+
+    print(f"\n  Total time: {elapsed:.1f}s ({len(all_metrics)} meshes, {num_gpus} GPUs)")
+    print(f"{'=' * 80}")
 
     # ---- Cleanup ----
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    print(f"\n{'=' * 80}")
-    print(f"QUANTITATIVE EVALUATION COMPLETE")
-    print(f"  Meshes processed: {len(all_metrics)}/{total_meshes}")
-    print(f"  Total time:       {elapsed:.1f}s ({num_gpus} GPUs)")
-    print(f"  Per-mesh avg:     {elapsed / max(len(all_metrics), 1):.1f}s")
-    print(f"  CSV:              {csv_path}")
-    print(f"  Summary:          {csv_path.with_name(csv_path.stem + '_summary.csv')}")
-    print(f"{'=' * 80}")
-
 
 if __name__ == '__main__':
-    # 'spawn' start method required for CUDA in child processes.
-    # This is the default on Windows; on Linux the default is 'fork' which
-    # doesn't work with CUDA. Setting it explicitly ensures cross-platform compat.
     mp.set_start_method('spawn', force=True)
     main()
