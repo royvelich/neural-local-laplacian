@@ -1,1052 +1,638 @@
+#!/usr/bin/env python3
 """
-Shared validation step functions for timing and quality evaluation.
+Quantitative Evaluation for Neural Local Laplacian.
 
-Each step is a standalone function: takes inputs, returns (results, timing_dict).
-No class state, no side effects. Both timing_sanity_check.py and quantitative_eval.py
-import from here so timing is always identical.
+Uses shared step functions from validation_utils.py so timing numbers are
+identical across scripts.  Outputs per-mesh CSV with timing breakdown AND
+quality metrics (eigenvalues, eigenvectors, Green's, geodesics, probes,
+descriptors, spectral compression).
 
-Timing convention:
-    - All timing values in the returned dicts are in SECONDS.
-    - Callers convert to ms for display.
-    - GPU synchronization is handled inside each step.
+Supports multi-GPU via mp.spawn.
+
+Usage:
+    python quantitative_eval.py +ckpt_path=model.ckpt \
+        +data_module=visualize_validation +globals=visualize_validation +model=visualize_validation
+
+    # Multi-GPU
+    python quantitative_eval.py +ckpt_path=model.ckpt +num_gpus=4
+
+    # Custom output directory
+    python quantitative_eval.py +ckpt_path=model.ckpt +output_dir=results/
 """
 
+import csv
+import gc
+import shutil
+import sys
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+from typing import List, Dict, Any
 
 import numpy as np
-import scipy.sparse
-import scipy.sparse.linalg
 import torch
+import torch.multiprocessing as mp
 
-from neural_local_laplacian.utils.utils import (
-    normalize_mesh_vertices,
-    assemble_stiffness_and_mass_matrices,
-    assemble_gradient_operator,
-    build_patches_from_vertices,
-    compute_laplacian_eigendecomposition,
+import hydra
+import pytorch_lightning as pl
+from omegaconf import DictConfig, OmegaConf
+
+from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
+from neural_local_laplacian.utils.utils import cuda_warmup
+from neural_local_laplacian.utils.geodesic_utils import select_multiple_geodesic_sources
+from neural_local_laplacian.utils.validation_utils import (
+    load_mesh_with_faces,
+    step_pred_laplacian,
+    step_pred_geodesic,
+    step_robust_geodesic,
+    step_gt_laplacian,
+    step_robust_laplacian,
+    step_greens_function,
+    step_eigendecomposition,
+    step_eigenvalue_errors,
+    step_eigenvector_cosine_similarity,
+    GeodesicTimingBreakdown,
 )
-from neural_local_laplacian.utils.geodesic_utils import (
-    heat_method_build,
-    heat_factorize,
-    heat_solve_all,
-    poisson_factorize,
-    poisson_solve_all,
-    make_grad_div_learned,
-    select_multiple_geodesic_sources,
-    ensure_psd,
-    sparse_factorize,
-    compute_geodesic_metrics,
-    compute_exact_geodesics,
-    normalize_distances,
-)
 
 
-# =============================================================================
-# Mesh loading
-# =============================================================================
+# ============================================================================
+# Worker function — runs on a single GPU
+# ============================================================================
 
-def load_mesh_vertices(mesh_file_path: str) -> np.ndarray:
-    """Load and normalize mesh vertices. Returns float32 array."""
-    import trimesh
-    mesh = trimesh.load(mesh_file_path, process=False, force='mesh')
-    vertices = np.array(mesh.vertices, dtype=np.float64)
-    vertices = normalize_mesh_vertices(vertices)
-    return vertices.astype(np.float32)
+def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_meshes: int):
+    """Process a subset of meshes on a single GPU."""
 
-
-# =============================================================================
-# Step: PRED k-NN patch extraction
-# =============================================================================
-
-def step_pred_knn(
-    vertices: torch.Tensor,
-    k: int,
-    device: torch.device,
-) -> Tuple[Any, Dict[str, float]]:
-    """
-    Extract k-NN patches from vertices.
-
-    Returns:
-        (patch_data, timing) where timing has key 'knn'.
-    """
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    patch_data = build_patches_from_vertices(vertices, k, device=device)
-
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t0
-
-    return patch_data, {'knn': elapsed}
-
-
-# =============================================================================
-# Step: PRED model inference (forward + assembly + gradient op)
-# =============================================================================
-
-def step_pred_inference(
-    model,
-    patch_data: Any,
-    device: torch.device,
-    use_amp: bool = True,
-) -> Tuple[Dict[str, Any], Dict[str, float]]:
-    """
-    Run model forward pass, assemble L,M matrices and gradient operator.
-
-    Returns:
-        (result_dict, timing) where:
-        - result_dict has 'L', 'M', 'G' (gradient op, may be None)
-        - timing has keys 'forward', 'assembly', 'grad_op'
-    """
-    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
-
-    # Forward pass
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    with torch.no_grad():
-        if use_amp and device.type == 'cuda':
-            with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                fwd_result = model._forward_pass(patch_data)
-        else:
-            fwd_result = model._forward_pass(patch_data)
-
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    t_forward = time.perf_counter() - t0
-
-    # L, M assembly
-    stiffness_w = fwd_result['stiffness_weights'].float()
-    areas = fwd_result['areas'].float()
-    attention_mask = fwd_result['attention_mask']
-    vi = patch_data.vertex_indices.to(device)
-    ci = patch_data.center_indices.to(device)
-    bi = patch_data.patch_idx.to(device)
-
-    t0 = time.perf_counter()
-    L, M = assemble_stiffness_and_mass_matrices(
-        stiffness_w, areas, attention_mask, vi, ci, bi,
-    )
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    t_assembly = time.perf_counter() - t0
-
-    # Gradient operator
-    t_grad_op = 0.0
-    G = None
-    has_grad = getattr(model, '_operator_mode', 'stiffness') == 'gradient'
-    if has_grad and fwd_result.get('grad_coeffs') is not None:
-        t0 = time.perf_counter()
-        G = assemble_gradient_operator(
-            grad_coeffs=fwd_result['grad_coeffs'],
-            attention_mask=attention_mask,
-            vertex_indices=vi,
-            center_indices=ci,
-            batch_indices=bi,
-        )
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t_grad_op = time.perf_counter() - t0
-
-    result = {'L': ensure_psd(L), 'M': M, 'G': G, 'fwd_result': fwd_result}
-    timing = {'forward': t_forward, 'assembly': t_assembly, 'grad_op': t_grad_op}
-    return result, timing
-
-
-# =============================================================================
-# Step: PRED Laplacian (unified: kNN + inference + assembly)
-# =============================================================================
-
-@dataclass
-class PredLaplacianTiming:
-    """Timing breakdown for the full PRED Laplacian pipeline."""
-    knn: float = 0.0        # k-NN patch extraction
-    forward: float = 0.0    # Transformer forward pass
-    assembly: float = 0.0   # Sparse L, M assembly
-    grad_op: float = 0.0    # Gradient operator assembly (gradient mode only)
-
-    @property
-    def lm_total(self) -> float:
-        """Total L,M assembly time (kNN + forward + assembly)."""
-        return self.knn + self.forward + self.assembly
-
-    @property
-    def total(self) -> float:
-        """Total time including gradient operator."""
-        return self.lm_total + self.grad_op
-
-
-def step_pred_laplacian(
-    model,
-    vertices: torch.Tensor,
-    k: int,
-    device: torch.device,
-    use_amp: bool = True,
-) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix,
-           Optional[scipy.sparse.spmatrix], PredLaplacianTiming]:
-    """
-    Full PRED Laplacian pipeline: kNN → inference → L, M, G assembly.
-
-    Output L is guaranteed PSD. Single call replaces step_pred_knn + step_pred_inference.
-
-    Args:
-        model: LaplacianTransformerModule in eval mode
-        vertices: (N, 3) vertex positions on device
-        k: Number of nearest neighbors
-        device: torch device
-        use_amp: Whether to use automatic mixed precision
-
-    Returns:
-        (L, M, G, timing) where:
-        - L: PSD sparse Laplacian (N, N)
-        - M: Sparse diagonal mass matrix (N, N)
-        - G: Sparse gradient operator (3N, N), or None in stiffness mode
-        - timing: PredLaplacianTiming with per-stage breakdown
-    """
-    timing = PredLaplacianTiming()
-
-    # kNN
-    patch_data, t_knn = step_pred_knn(vertices, k, device)
-    timing.knn = t_knn['knn']
-
-    # Inference + assembly
-    pred_result, t_infer = step_pred_inference(model, patch_data, device, use_amp=use_amp)
-    timing.forward = t_infer['forward']
-    timing.assembly = t_infer['assembly']
-    timing.grad_op = t_infer['grad_op']
-
-    return pred_result['L'], pred_result['M'], pred_result['G'], timing
-
-
-# =============================================================================
-# Step: PRED geodesic (heat method with learned operators)
-# =============================================================================
-
-@dataclass
-class GeodesicTimingBreakdown:
-    """Timing breakdown for heat method geodesics."""
-    build: float = 0.0          # Matrix construction (one-time)
-    heat_factorize: float = 0.0  # Heat matrix factorization (one-time)
-    heat_solve: float = 0.0      # Heat forward-solves + grad/div (per-source)
-    poisson_factorize: float = 0.0  # Poisson matrix factorization (one-time)
-    poisson_solve: float = 0.0   # Poisson forward-solves (per-source)
-
-    @property
-    def onetime(self) -> float:
-        """Total one-time cost (build + factorize)."""
-        return self.build + self.heat_factorize + self.poisson_factorize
-
-    @property
-    def solve(self) -> float:
-        """Total per-source cost (all forward-solves)."""
-        return self.heat_solve + self.poisson_solve
-
-    @property
-    def total(self) -> float:
-        """Total wall time."""
-        return self.onetime + self.solve
-
-
-def step_pred_geodesic(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    G: scipy.sparse.spmatrix,
-    source_indices: List[int],
-    n_vertices: int,
-) -> Tuple[List[Optional[np.ndarray]], GeodesicTimingBreakdown]:
-    """
-    Compute heat method geodesics using learned operators.
-
-    Timing is split into 5 components:
-        build, heat_factorize, heat_solve, poisson_factorize, poisson_solve
-
-    Returns:
-        (distances_list, timing_breakdown)
-    """
-    timing = GeodesicTimingBreakdown()
-    grad_div_fn = make_grad_div_learned(G, M)
-
-    # 1. Build matrices
-    t0 = time.perf_counter()
-    matrices = heat_method_build(S=L, M=M, n_vertices=n_vertices, grad_and_div_fn=grad_div_fn)
-    timing.build = time.perf_counter() - t0
-
-    # 2. Factorize heat matrix
-    t0 = time.perf_counter()
-    hf = heat_factorize(matrices)
-    timing.heat_factorize = time.perf_counter() - t0
-
-    # 3. Heat forward-solve + grad/div
-    t0 = time.perf_counter()
-    rhs_list = heat_solve_all(hf, source_indices, matrices)
-    timing.heat_solve = time.perf_counter() - t0
-
-    # 4. Factorize Poisson matrix
-    t0 = time.perf_counter()
-    pf = poisson_factorize(matrices)
-    timing.poisson_factorize = time.perf_counter() - t0
-
-    # 5. Poisson forward-solve
-    t0 = time.perf_counter()
-    distances = poisson_solve_all(pf, source_indices, rhs_list, n_vertices)
-    timing.poisson_solve = time.perf_counter() - t0
-
-    return distances, timing
-
-
-# =============================================================================
-# Step: Robust geodesic (pp3d)
-# =============================================================================
-
-@dataclass
-class RobustGeodesicTiming:
-    """Timing breakdown for Robust (pp3d) geodesics."""
-    lm_assembly: float = 0.0     # robust_laplacian.point_cloud_laplacian (for non-geodesic tasks)
-    constructor: float = 0.0     # pp3d.PointCloudHeatSolver (one-time)
-    solve: float = 0.0           # compute_distance × N sources (per-source)
-
-    @property
-    def onetime(self) -> float:
-        """One-time cost for geodesics (constructor only, NOT lm_assembly)."""
-        return self.constructor
-
-    @property
-    def total(self) -> float:
-        """Total geodesic wall time (constructor + solves)."""
-        return self.constructor + self.solve
-
-
-def step_robust_geodesic(
-    vertices: np.ndarray,
-    source_indices: List[int],
-    robust_k: int = 30,
-) -> Tuple[List[Optional[np.ndarray]], RobustGeodesicTiming]:
-    """
-    Compute geodesics using pp3d PointCloudHeatSolver.
-
-    Also times robust_laplacian assembly (needed for non-geodesic tasks like
-    eigendecomposition, Green's function) but NOT included in geodesic E2E.
-
-    Returns:
-        (distances_list, timing)
-    """
-    import robust_laplacian
-    import potpourri3d as pp3d
-
-    timing = RobustGeodesicTiming()
-
-    # L,M assembly (for eigen/Green's/HKS — NOT for geodesics)
-    t0 = time.perf_counter()
-    L_rob, M_rob = robust_laplacian.point_cloud_laplacian(vertices, n_neighbors=robust_k)
-    timing.lm_assembly = time.perf_counter() - t0
-
-    # pp3d constructor (one-time — builds its own internal L,M + prefactors)
-    t0 = time.perf_counter()
-    solver = pp3d.PointCloudHeatSolver(vertices)
-    timing.constructor = time.perf_counter() - t0
-
-    # Forward-solves (per-source)
-    distances = []
-    t0 = time.perf_counter()
-    for src in source_indices:
-        try:
-            distances.append(solver.compute_distance(src))
-        except Exception:
-            distances.append(None)
-    timing.solve = time.perf_counter() - t0
-
-    return distances, timing
-
-
-# =============================================================================
-# Step: Load mesh with faces
-# =============================================================================
-
-def load_mesh_with_faces(mesh_file_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load mesh, normalize vertices, return (vertices_f32, faces_i32).
-
-    Raises RuntimeError if mesh has no faces.
-    """
-    import trimesh
-    mesh = trimesh.load(mesh_file_path, process=False, force='mesh')
-    vertices = np.array(mesh.vertices, dtype=np.float64)
-    vertices = normalize_mesh_vertices(vertices).astype(np.float32)
-    faces = np.array(mesh.faces, dtype=np.int32)
-    if len(faces) == 0:
-        raise RuntimeError(f"Mesh has no faces: {mesh_file_path}")
-    return vertices, faces
-
-
-# =============================================================================
-# Step: GT Laplacian (cotangent) from mesh faces
-# =============================================================================
-
-def step_gt_laplacian(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-) -> Tuple[Optional[scipy.sparse.spmatrix], Optional[scipy.sparse.spmatrix], Dict[str, float]]:
-    """
-    Compute GT cotangent Laplacian and mass matrix using igl.
-
-    Output L is guaranteed PSD (handles igl NSD convention).
-
-    Args:
-        vertices: (N, 3) mesh vertices
-        faces: (F, 3) face indices
-
-    Returns:
-        (L, M, timing) where timing has key 'assembly'.
-        Returns (None, None, timing) if igl is unavailable.
-    """
-    try:
-        import igl
-    except ImportError:
-        return None, None, {'assembly': 0.0}
-
-    V = vertices.astype(np.float64)
-    F = faces.astype(np.int32)
-
-    t0 = time.perf_counter()
-    L = igl.cotmatrix(V, F)
-    M = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
-    L = ensure_psd(L)
-    elapsed = time.perf_counter() - t0
-
-    return L, M, {'assembly': elapsed}
-
-
-# =============================================================================
-# Step: Robust Laplacian (point cloud)
-# =============================================================================
-
-def step_robust_laplacian(
-    vertices: np.ndarray,
-    k: int = 30,
-) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix, Dict[str, float]]:
-    """
-    Compute robust Laplacian from point cloud.
-
-    Output L is guaranteed PSD.
-
-    Returns:
-        (L, M, timing) where timing has key 'assembly'.
-    """
-    import robust_laplacian as rl
-
-    t0 = time.perf_counter()
-    L, M = rl.point_cloud_laplacian(vertices, n_neighbors=k)
-    L = ensure_psd(L)
-    elapsed = time.perf_counter() - t0
-
-    return L, M, {'assembly': elapsed}
-
-
-# =============================================================================
-# Step: Eigendecomposition
-# =============================================================================
-
-def step_eigendecomposition(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    num_eigenvalues: int = 50,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, float]]:
-    """
-    Compute generalized eigendecomposition L v = λ M v.
-
-    Uses shift-invert eigsh (sigma=-0.01). Assumes L is already PSD
-    (assembly steps guarantee this).
-
-    Returns:
-        (eigenvalues, eigenvectors, timing) where timing has key 'eigen'.
-        Returns (None, None, timing) on failure.
-    """
-    t0 = time.perf_counter()
-    try:
-        eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
-            L, num_eigenvalues, mass_matrix=M,
-        )
-    except Exception:
-        return None, None, {'eigen': time.perf_counter() - t0}
-    elapsed = time.perf_counter() - t0
-
-    return eigenvalues, eigenvectors, {'eigen': elapsed}
-
-
-# =============================================================================
-# Step: Eigenvalue errors
-# =============================================================================
-
-@dataclass
-class EigenvalueErrors:
-    """Eigenvalue error metrics relative to GT."""
-    spectrum_rel_err_mean: float = 0.0   # |pred-gt| / max(gt), mean
-    spectrum_rel_err_max: float = 0.0    # |pred-gt| / max(gt), max
-    per_eval_rel_err_mean: float = 0.0   # |pred-gt| / |gt| (stable evals), mean
-    per_eval_rel_err_max: float = 0.0    # |pred-gt| / |gt| (stable evals), max
-
-
-def step_eigenvalue_errors(
-    method_evals: np.ndarray,
-    gt_evals: np.ndarray,
-) -> EigenvalueErrors:
-    """
-    Compute eigenvalue error metrics (method vs GT).
-
-    Skips λ_0 (constant eigenvector). Uses eigenvalues > 1% of max(gt)
-    for per-eigenvalue relative error to avoid instability near zero.
-
-    Returns:
-        EigenvalueErrors dataclass.
-    """
-    result = EigenvalueErrors()
-    n_compare = min(len(method_evals), len(gt_evals))
-    if n_compare <= 1:
-        return result
-
-    gt_slice = np.asarray(gt_evals[1:n_compare], dtype=np.float64)
-    pred_slice = np.asarray(method_evals[1:n_compare], dtype=np.float64)
-
-    spectral_range = np.abs(gt_slice).max()
-    if spectral_range < 1e-10:
-        return result
-
-    # Spectrum-relative error
-    spectrum_rel = np.abs(pred_slice - gt_slice) / spectral_range
-    result.spectrum_rel_err_mean = float(spectrum_rel.mean())
-    result.spectrum_rel_err_max = float(spectrum_rel.max())
-
-    # Per-eigenvalue relative error (skip near-zero)
-    threshold = spectral_range * 0.01
-    stable = np.abs(gt_slice) > threshold
-    if stable.sum() > 0:
-        rel = np.abs(pred_slice[stable] - gt_slice[stable]) / np.abs(gt_slice[stable])
-        result.per_eval_rel_err_mean = float(rel.mean())
-        result.per_eval_rel_err_max = float(rel.max())
-
-    return result
-
-
-# =============================================================================
-# Step: Eigenvector cosine similarity
-# =============================================================================
-
-def step_eigenvector_cosine_similarity(
-    gt_evecs: np.ndarray,
-    method_evecs: np.ndarray,
-) -> np.ndarray:
-    """
-    Compute per-eigenvector cosine similarity (handles sign ambiguity).
-
-    For each eigenvector index i, computes |cos(gt_i, method_i)|.
-
-    Args:
-        gt_evecs: (N, K_gt) GT eigenvectors
-        method_evecs: (N, K_method) method eigenvectors
-
-    Returns:
-        cosine_sims: (min(K_gt, K_method),) array of cosine similarities in [0, 1].
-    """
-    gt = np.asarray(gt_evecs, dtype=np.float64)
-    pred = np.asarray(method_evecs, dtype=np.float64)
-    n_compare = min(gt.shape[1], pred.shape[1])
-
-    sims = np.zeros(n_compare)
-    for i in range(n_compare):
-        g = gt[:, i]
-        p = pred[:, i]
-        gn = np.linalg.norm(g)
-        pn = np.linalg.norm(p)
-        if gn > 1e-15 and pn > 1e-15:
-            sims[i] = abs(float(np.dot(g, p) / (gn * pn)))
-    return sims
-
-
-# =============================================================================
-# Step: Green's function (batch, multi-source)
-# =============================================================================
-
-@dataclass
-class GreensResult:
-    """Aggregated Green's function quality metrics across sources."""
-    max_principle_pass_rate: float = 0.0   # fraction of sources where max is at source
-    mean_corr_with_gt: float = 0.0
-    std_corr_with_gt: float = 0.0
-    mean_residual_norm: float = 0.0
-    num_sources_ok: int = 0
-    # Per-source Green's function values (source_idx -> normalized array)
-    values: Dict[int, np.ndarray] = field(default_factory=dict)
-
-
-@dataclass
-class GreensTiming:
-    """Timing breakdown for Green's function computation."""
-    factorize: float = 0.0
-    solve: float = 0.0
-
-    @property
-    def total(self) -> float:
-        return self.factorize + self.solve
-
-
-def step_greens_function(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    source_indices: List[int],
-    gt_greens_values: Optional[Dict[int, np.ndarray]] = None,
-    regularization: float = 1e-6,
-) -> Tuple[GreensResult, GreensTiming]:
-    """
-    Compute Green's function for multiple sources with one factorization.
-
-    Solves (L + μM)g = δ_s for each source, normalizes, checks maximum principle,
-    and optionally computes correlation with GT.
-
-    Args:
-        L: Sparse Laplacian (N, N)
-        M: Sparse mass matrix (N, N)
-        source_indices: Source vertex indices
-        gt_greens_values: Optional dict source_idx -> GT Green's values for correlation
-        regularization: Base regularization (scaled adaptively by L's diagonal)
-
-    Returns:
-        (GreensResult, GreensTiming)
-    """
-    timing = GreensTiming()
-    result = GreensResult()
-
-    n = L.shape[0]
-    L_f64 = ensure_psd(L.astype(np.float64))
-    M_f64 = M.astype(np.float64)
-
-    # Adaptive regularization
-    diag = np.array(L_f64.diagonal()).flatten()
-    L_scale = np.abs(diag).mean() if len(diag) > 0 else 1.0
-    adaptive_reg = regularization * max(L_scale, 1e-4)
-
-    A = L_f64 + adaptive_reg * M_f64
-
-    # Factorize once
-    t0 = time.perf_counter()
-    try:
-        factor = sparse_factorize(A)
-    except Exception:
-        return result, timing
-    timing.factorize = time.perf_counter() - t0
-
-    M_diag = np.array(M_f64.diagonal()).flatten()
-    total_mass = M_diag.sum()
-
-    max_principle_passes = []
-    corrs_with_gt = []
-    residual_norms = []
-
-    t0 = time.perf_counter()
-    for source_idx in source_indices:
-        try:
-            delta = np.zeros(n, dtype=np.float64)
-            delta[source_idx] = 1.0
-            g_raw = factor.solve(delta)
-
-            if not np.isfinite(g_raw).all():
-                continue
-
-            # Residual before normalization
-            Lg = L_f64 @ g_raw
-            residual_norm = float(np.linalg.norm(Lg - delta) / max(np.linalg.norm(delta), 1e-15))
-            residual_norms.append(residual_norm)
-
-            # Max principle check on raw solution (argmax invariant to normalization)
-            max_principle_passes.append(int(np.argmax(g_raw)) == source_idx)
-
-            # Normalize: remove weighted mean, shift min=0, scale max=1
-            if total_mass > 0:
-                g = g_raw - (g_raw * M_diag).sum() / total_mass
-            else:
-                g = g_raw - g_raw.mean()
-            g = g - g.min()
-            if g.max() > 0:
-                g = g / g.max()
-
-            result.values[source_idx] = g
-
-            # Correlation with GT
-            if gt_greens_values is not None and source_idx in gt_greens_values:
-                gt_g = gt_greens_values[source_idx]
-                if len(gt_g) == n:
-                    corr = np.corrcoef(g, gt_g)[0, 1]
-                    if np.isfinite(corr):
-                        corrs_with_gt.append(float(corr))
-
-        except Exception:
-            continue
-    timing.solve = time.perf_counter() - t0
-
-    result.num_sources_ok = len(max_principle_passes)
-    if max_principle_passes:
-        result.max_principle_pass_rate = float(np.mean(max_principle_passes))
-    if corrs_with_gt:
-        result.mean_corr_with_gt = float(np.mean(corrs_with_gt))
-        result.std_corr_with_gt = float(np.std(corrs_with_gt))
-    if residual_norms:
-        result.mean_residual_norm = float(np.mean(residual_norms))
-
-    return result, timing
-
-
-# =============================================================================
-# Step: Geodesic quality (compare distances vs exact)
-# =============================================================================
-
-@dataclass
-class GeodesicQuality:
-    """Aggregated geodesic quality metrics across sources."""
-    corr_mean: float = 0.0
-    corr_std: float = 0.0
-    mae_mean: float = 0.0
-    mae_std: float = 0.0
-    max_err_mean: float = 0.0
-    mono_mean: float = 0.0
-    mono_std: float = 0.0
-    num_sources_ok: int = 0
-
-
-def step_geodesic_quality(
-    computed_distances: List[Optional[np.ndarray]],
-    source_indices: List[int],
-    vertices: np.ndarray,
-    faces: np.ndarray,
-) -> GeodesicQuality:
-    """
-    Compare computed geodesic distances against exact geodesics.
-
-    Computes exact geodesics on-the-fly for each source, then aggregates
-    correlation, MAE, max error, and monotonicity across sources.
-
-    Args:
-        computed_distances: List of distance arrays (one per source), may contain None
-        source_indices: Source vertex indices
-        vertices: (N, 3) mesh vertices (float64)
-        faces: (F, 3) mesh faces (int32)
-
-    Returns:
-        GeodesicQuality dataclass with aggregated metrics.
-    """
-    result = GeodesicQuality()
-    corrs, maes, max_errs, monos = [], [], [], []
-
-    for i, src_idx in enumerate(source_indices):
-        computed = computed_distances[i] if i < len(computed_distances) else None
-        if computed is None:
-            continue
-
-        exact = compute_exact_geodesics(
-            vertices.astype(np.float64), faces.astype(np.int32), int(src_idx),
-        )
-        if exact is None:
-            continue
-
-        metrics = compute_geodesic_metrics(computed, exact, num_monotonicity_samples=5000)
-        corrs.append(metrics.correlation)
-        maes.append(metrics.mae_normalized)
-        max_errs.append(metrics.max_error_normalized)
-        monos.append(metrics.monotonicity)
-
-    result.num_sources_ok = len(corrs)
-    if corrs:
-        result.corr_mean = float(np.mean(corrs))
-        result.corr_std = float(np.std(corrs))
-        result.mae_mean = float(np.mean(maes))
-        result.mae_std = float(np.std(maes))
-        result.max_err_mean = float(np.mean(max_errs))
-        result.mono_mean = float(np.mean(monos))
-        result.mono_std = float(np.std(monos))
-
-    return result
-
-
-# =============================================================================
-# Step: Probe function MSE (NeLo Table 1 metric)
-# =============================================================================
-
-@dataclass
-class ProbeResult:
-    """Probe function MSE results for one method."""
-    mse: float = 0.0              # Raw MSE, clipped at 1.0 per probe
-    cosine_similarity: float = 0.0  # Mean cosine similarity of Lf responses
-    failure_rate: float = 0.0     # Fraction of probes with MSE > 1.0
-    n_probes: int = 0
-
-
-def step_probe_function_mse(
-    L: scipy.sparse.spmatrix,
-    M: scipy.sparse.spmatrix,
-    L_gt: scipy.sparse.spmatrix,
-    M_gt: scipy.sparse.spmatrix,
-    vertices: np.ndarray,
-    gt_evals: np.ndarray,
-    gt_evecs: np.ndarray,
-) -> ProbeResult:
-    """
-    Compute Lf probe function MSE (NeLo paper Table 1 metric).
-
-    Uses 112 probe functions: 64 spectral + 42 trig + 6 polynomial.
-    Reports mean ||M^{-1}Lf - M_gt^{-1}L_gt f||^2 (clipped at 1.0) and
-    mean cosine similarity.
-
-    Args:
-        L, M: Method's Laplacian and mass matrix
-        L_gt, M_gt: GT Laplacian and mass matrix
-        vertices: (N, 3) mesh vertices (float64)
-        gt_evals: GT eigenvalues
-        gt_evecs: GT eigenvectors (N, K)
-
-    Returns:
-        ProbeResult dataclass.
-    """
-    result = ProbeResult()
-    vertices = vertices.astype(np.float64)
-    n = len(vertices)
-
-    # Build probe functions
-    probes = []
-
-    # 1) Spectral probes: first 64 non-constant eigenvectors, scaled by 1/(λ+0.1)
-    n_spectral = min(64, len(gt_evals) - 1)
-    for i in range(1, n_spectral + 1):
-        f = gt_evecs[:, i] / (gt_evals[i] + 0.1)
-        probes.append(f)
-
-    # 2) Trigonometric probes
-    coords = [vertices[:, 0], vertices[:, 1], vertices[:, 2]]
-    for k_val in [1, 2, 4, 8, 16, 32, 64]:
-        for coord in coords:
-            for phi in [0.0, np.pi / 2.0]:
-                probes.append(np.sin(k_val * coord + phi) / (2.0 * k_val))
-
-    # 3) Polynomial probes
-    for d in range(3):
-        probes.append(vertices[:, d])
-    for d in range(3):
-        probes.append(vertices[:, d] ** 2)
-
-    probes = np.column_stack(probes)  # (N, n_probes)
-    n_probes = probes.shape[1]
-    result.n_probes = n_probes
-
-    # GT reference: M_gt^{-1} L_gt f
-    M_gt_diag = np.array(M_gt.diagonal()).flatten()
-    M_gt_inv = np.where(M_gt_diag > 1e-15, 1.0 / M_gt_diag, 0.0)
-    gt_result = M_gt_inv[:, None] * (L_gt @ probes)
-
-    # Method: M^{-1} L f
-    try:
-        M_diag = np.array(M.diagonal()).flatten()
-        M_inv = np.where(M_diag > 1e-15, 1.0 / M_diag, 0.0)
-        method_result = M_inv[:, None] * (L @ probes)
-    except Exception:
-        return result
-
-    diff = method_result - gt_result
-
-    # Raw MSE (clipped at 1.0)
-    per_probe_mse = np.mean(diff ** 2, axis=0)
-    clipped = np.minimum(per_probe_mse, 1.0)
-    result.mse = float(clipped.mean())
-    result.failure_rate = float(np.mean(per_probe_mse > 1.0))
-
-    # Cosine similarity
-    cosines = []
-    for p in range(n_probes):
-        gn = np.linalg.norm(gt_result[:, p])
-        mn = np.linalg.norm(method_result[:, p])
-        if gn > 1e-15 and mn > 1e-15:
-            cosines.append(float(np.dot(gt_result[:, p], method_result[:, p]) / (gn * mn)))
-    result.cosine_similarity = float(np.mean(cosines)) if cosines else 0.0
-
-    return result
-
-
-# =============================================================================
-# Step: HKS / WKS descriptor comparison
-# =============================================================================
-
-@dataclass
-class DescriptorResult:
-    """HKS and WKS descriptor comparison results."""
-    hks_l2_error: float = -1.0     # Normalized L2 error vs GT (-1 = N/A)
-    hks_correlation: float = 0.0   # Mean per-scale Pearson correlation with GT
-    wks_l2_error: float = -1.0
-    wks_correlation: float = 0.0
-
-
-def step_descriptor_comparison(
-    method_evals: np.ndarray,
-    method_evecs: np.ndarray,
-    gt_evals: np.ndarray,
-    gt_evecs: np.ndarray,
-    n_scales: int = 100,
-    max_eigenvectors: int = 50,
-) -> DescriptorResult:
-    """
-    Compute HKS and WKS descriptor error vs GT.
-
-    Time/energy scales are derived from GT eigenvalues for fair comparison.
-
-    Args:
-        method_evals, method_evecs: Method's eigenpairs
-        gt_evals, gt_evecs: GT eigenpairs
-        n_scales: Number of descriptor scales
-        max_eigenvectors: Max eigenvectors to use
-
-    Returns:
-        DescriptorResult dataclass.
-    """
-    result = DescriptorResult()
-
-    def _compute_hks(evals, evecs, t_values, max_k):
-        evals_pos = evals[1:]
-        evecs_pos = evecs[:, 1:]
-        mask = evals_pos > 1e-10
-        evals_pos, evecs_pos = evals_pos[mask], evecs_pos[:, mask]
-        k = min(len(evals_pos), max_k)
-        if k < 2:
-            return None
-        evals_pos, evecs_pos = evals_pos[:k], evecs_pos[:, :k]
-        phi_sq = evecs_pos ** 2
-        exp_terms = np.exp(-evals_pos[None, :] * t_values[:, None])
-        return phi_sq @ exp_terms.T
-
-    def _compute_wks(evals, evecs, e_values, sigma, max_k):
-        evals_pos = evals[1:]
-        evecs_pos = evecs[:, 1:]
-        mask = evals_pos > 1e-10
-        evals_pos, evecs_pos = evals_pos[mask], evecs_pos[:, mask]
-        k = min(len(evals_pos), max_k)
-        if k < 2:
-            return None
-        evals_pos, evecs_pos = evals_pos[:k], evecs_pos[:, :k]
-        log_evals = np.log(evals_pos)
-        phi_sq = evecs_pos ** 2
-        weights = np.exp(-((e_values[:, None] - log_evals[None, :]) ** 2) / (2 * sigma ** 2))
-        return phi_sq @ weights.T
-
-    def _compare(desc_m, desc_gt):
-        if desc_m is None or desc_gt is None:
-            return None, None
-        l2s, corrs = [], []
-        for s in range(desc_gt.shape[1]):
-            gn = np.linalg.norm(desc_gt[:, s])
-            if gn < 1e-15:
-                continue
-            l2s.append(np.linalg.norm(desc_m[:, s] - desc_gt[:, s]) / gn)
-            if np.std(desc_gt[:, s]) > 1e-15 and np.std(desc_m[:, s]) > 1e-15:
-                corrs.append(float(np.corrcoef(desc_m[:, s], desc_gt[:, s])[0, 1]))
-        mean_l2 = float(np.mean(l2s)) if l2s else -1.0
-        mean_corr = float(np.mean(corrs)) if corrs else 0.0
-        return mean_l2, mean_corr
-
-    # Prepare GT scales
-    gt_evals_pos = gt_evals[1:]
-    gt_evals_pos = gt_evals_pos[gt_evals_pos > 1e-10]
-    if len(gt_evals_pos) < 2:
-        return result
-
-    # HKS time scales
-    t_min = 4.0 * np.log(10.0) / gt_evals_pos[min(len(gt_evals_pos) - 1, max_eigenvectors - 1)]
-    t_max = 4.0 * np.log(10.0) / gt_evals_pos[0]
-    hks_t = np.exp(np.linspace(np.log(t_min), np.log(t_max), n_scales))
-
-    # WKS energy scales
-    log_gt = np.log(gt_evals_pos[:min(len(gt_evals_pos), max_eigenvectors)])
-    wks_sigma = 7.0 * (log_gt[-1] - log_gt[0]) / n_scales
-    wks_e = np.linspace(log_gt[0], log_gt[-1], n_scales) if wks_sigma > 1e-10 else None
-
-    # GT descriptors
-    hks_gt = _compute_hks(gt_evals, gt_evecs, hks_t, max_eigenvectors)
-    wks_gt = _compute_wks(gt_evals, gt_evecs, wks_e, wks_sigma, max_eigenvectors) if wks_e is not None else None
-
-    # Method descriptors (using GT scales for fair comparison)
-    m_evals = np.asarray(method_evals, dtype=np.float64)
-    m_evecs = np.asarray(method_evecs, dtype=np.float64)
-    hks_m = _compute_hks(m_evals, m_evecs, hks_t, max_eigenvectors)
-    wks_m = _compute_wks(m_evals, m_evecs, wks_e, wks_sigma, max_eigenvectors) if wks_e is not None else None
-
-    hks_l2, hks_corr = _compare(hks_m, hks_gt)
-    wks_l2, wks_corr = _compare(wks_m, wks_gt)
-
-    if hks_l2 is not None:
-        result.hks_l2_error = hks_l2
-        result.hks_correlation = hks_corr
-    if wks_l2 is not None:
-        result.wks_l2_error = wks_l2
-        result.wks_correlation = wks_corr
-
-    return result
-
-
-# =============================================================================
-# Step: Spectral compression error
-# =============================================================================
-
-@dataclass
-class CompressionResult:
-    """Per-k spectral compression errors."""
-    # k -> {'mean_l2': float, 'max_l2': float}
-    errors: Dict[int, Dict[str, float]] = field(default_factory=dict)
-
-
-def step_spectral_compression(
-    eigenvectors: np.ndarray,
-    M: scipy.sparse.spmatrix,
-    vertices: np.ndarray,
-    k_values: List[int] = None,
-) -> CompressionResult:
-    """
-    Compute spectral mesh compression error at key eigenvector counts.
-
-    Projects original vertices onto k eigenvectors and measures
-    per-vertex L2 reconstruction error.
-
-    Args:
-        eigenvectors: (N, K) eigenvectors
-        M: Mass matrix (N, N) for computing spectral coefficients
-        vertices: (N, 3) original mesh vertices
-        k_values: List of eigenvector counts to test (default [5, 10, 20, 50])
-
-    Returns:
-        CompressionResult with per-k errors.
-    """
-    if k_values is None:
-        k_values = [5, 10, 20, 50]
-
-    result = CompressionResult()
-    evecs = np.asarray(eigenvectors, dtype=np.float64)
-    verts = np.asarray(vertices, dtype=np.float64)
-
-    if M is not None:
-        M_diag = np.array(M.diagonal()).flatten() if scipy.sparse.issparse(M) else np.diag(M)
+    # ---- Device setup ----
+    if torch.cuda.is_available():
+        device = torch.device(f'cuda:{rank}')
+        torch.cuda.set_device(rank)
     else:
-        M_diag = np.ones(len(verts))
+        device = torch.device('cpu')
 
-    max_k = min(evecs.shape[1], max(k_values))
+    tag = f"[GPU {rank}] " if world_size > 1 else ""
+    cfg = OmegaConf.create(cfg_dict)
 
-    # Coefficients: φᵀ M x for each coordinate
-    M_verts = M_diag[:, None] * verts
-    coeffs = evecs[:, :max_k].T @ M_verts  # (max_k, 3)
+    # ---- Load model ----
+    ckpt_path = Path(cfg.ckpt_path)
+    model = LaplacianTransformerModule.load_from_checkpoint(
+        str(ckpt_path), map_location=device, strict=False
+    )
+    model = model.to(device).eval()
 
-    for k in k_values:
-        if k > evecs.shape[1]:
+    has_grad = getattr(model, '_operator_mode', 'stiffness') == 'gradient'
+
+    # ---- Config ----
+    pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
+    robust_k = getattr(cfg.globals, 'k_robust', None) or 30
+    num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
+    num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
+    use_amp = device.type == 'cuda'
+
+    # ---- CUDA warmup ----
+    if device.type == 'cuda':
+        cuda_warmup(model, device, k=pred_k)
+
+    # ---- Dataset ----
+    pl.seed_everything(cfg.globals.seed)
+    data_module = hydra.utils.instantiate(cfg.data_module)
+    data_loader = data_module.val_dataloader()
+    if isinstance(data_loader, list):
+        data_loader = data_loader[0]
+    dataset = data_loader.dataset
+
+    # ---- Compute this worker's mesh indices ----
+    my_indices = list(range(rank, len(dataset), world_size))
+    n_total = len(my_indices)
+    print(f"{tag}Ready — {n_total} meshes on {device}, PRED k={pred_k}, Robust k={robust_k}")
+
+    # ---- Process meshes ----
+    metrics_list: List[Dict[str, Any]] = []
+    t_start = time.time()
+
+    for local_idx, global_idx in enumerate(my_indices):
+        t_mesh_start = time.time()
+        mesh_name = "?"
+        metrics: Dict[str, Any] = {}
+
+        try:
+            batch_data = dataset[global_idx]
+            data = batch_data[0] if isinstance(batch_data, list) else batch_data
+            mesh_file_path = data.mesh_file_path
+            if isinstance(mesh_file_path, list):
+                mesh_file_path = mesh_file_path[0]
+            mesh_name = Path(mesh_file_path).name
+
+            vertices, faces = load_mesh_with_faces(mesh_file_path)
+            N = len(vertices)
+            source_indices = select_multiple_geodesic_sources(
+                vertices.astype(np.float64), num_sources=num_sources,
+                method="farthest_point_sampling", seed=42
+            ).tolist()
+            verts_tensor = torch.from_numpy(vertices).float().to(device)
+
+            # ---- Disable GC during timing ----
+            gc.collect()
+            gc.disable()
+
+            # ---- PRED pipeline ----
+            pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
+                model, verts_tensor, pred_k, device, use_amp=use_amp,
+            )
+
+            if pred_G is not None:
+                _, pred_geo_timing = step_pred_geodesic(
+                    pred_L, pred_M, pred_G,
+                    source_indices, N,
+                )
+            else:
+                pred_geo_timing = GeodesicTimingBreakdown()
+
+            # ---- Robust pipeline ----
+            _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
+
+            # ---- GT Laplacian (for Green's function reference) ----
+            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
+
+            # ---- Robust Laplacian (for Green's function) ----
+            rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+
+            # ---- Green's function (GT → PRED → Robust) ----
+            gt_greens = None
+            t_greens_gt = None
+            if gt_L is not None:
+                gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
+
+            gt_gvals = gt_greens.values if gt_greens is not None else None
+
+            pred_greens, t_greens_pred = step_greens_function(
+                pred_L, pred_M, source_indices,
+                gt_greens_values=gt_gvals,
+            )
+
+            rob_greens, t_greens_rob = step_greens_function(
+                rob_L, rob_M, source_indices,
+                gt_greens_values=gt_gvals,
+            )
+
+            # ---- Eigendecomposition (all methods) ----
+            gt_evals, gt_evecs = None, None
+            if gt_L is not None:
+                gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
+                    gt_L, gt_M, num_eigenvalues,
+                )
+
+            pred_evals, pred_evecs, t_eig_pred = step_eigendecomposition(
+                pred_L, pred_M, num_eigenvalues,
+            )
+
+            rob_evals, rob_evecs, t_eig_rob = step_eigendecomposition(
+                rob_L, rob_M, num_eigenvalues,
+            )
+
+            # ---- Re-enable GC ----
+            gc.enable()
+
+            # ---- Compute E2E ----
+            n_src = len(source_indices)
+
+            pred_onetime = (t_pred.total
+                            + pred_geo_timing.build
+                            + pred_geo_timing.heat_factorize
+                            + pred_geo_timing.poisson_factorize)
+            pred_e2e = pred_onetime + pred_geo_timing.solve
+            robust_e2e = robust_timing.total
+
+            # Green's E2E: L,M assembly + factorize + solve
+            pred_greens_e2e = t_pred.lm_total + t_greens_pred.total
+            robust_greens_e2e = t_rob_lm['assembly'] + t_greens_rob.total
+
+            metrics = {
+                'mesh_name': mesh_name,
+                'num_vertices': N,
+                'num_faces': len(faces),
+                'k': pred_k,
+                'num_sources': n_src,
+                # PRED L,M breakdown (ms)
+                'pred_knn_ms': t_pred.knn * 1000,
+                'pred_forward_ms': t_pred.forward * 1000,
+                'pred_assembly_ms': t_pred.assembly * 1000,
+                'pred_grad_op_ms': t_pred.grad_op * 1000,
+                'pred_lm_total_ms': t_pred.lm_total * 1000,
+                # PRED geodesic breakdown (ms)
+                'pred_geo_build_ms': pred_geo_timing.build * 1000,
+                'pred_geo_heat_fact_ms': pred_geo_timing.heat_factorize * 1000,
+                'pred_geo_poisson_fact_ms': pred_geo_timing.poisson_factorize * 1000,
+                'pred_geo_heat_solve_ms': pred_geo_timing.heat_solve * 1000,
+                'pred_geo_poisson_solve_ms': pred_geo_timing.poisson_solve * 1000,
+                'pred_geo_onetime_ms': pred_onetime * 1000,
+                'pred_geo_solve_ms': pred_geo_timing.solve * 1000,
+                'pred_e2e_geodesic_ms': pred_e2e * 1000,
+                'pred_per_src_ms': pred_e2e / n_src * 1000,
+                # Robust breakdown (ms)
+                'robust_lm_ms': robust_timing.lm_assembly * 1000,
+                'robust_constructor_ms': robust_timing.constructor * 1000,
+                'robust_solve_ms': robust_timing.solve * 1000,
+                'robust_e2e_geodesic_ms': robust_e2e * 1000,
+                'robust_per_src_ms': robust_e2e / n_src * 1000,
+                # Ratios (geodesic)
+                'ratio_lm': t_pred.lm_total / robust_timing.lm_assembly if robust_timing.lm_assembly > 0 else None,
+                'ratio_e2e': pred_e2e / robust_e2e if robust_e2e > 0 else None,
+                # GT assembly (ms)
+                'gt_assembly_ms': t_gt['assembly'] * 1000,
+                'robust_lm_assembly_ms': t_rob_lm['assembly'] * 1000,
+                # Green's function — PRED
+                'pred_greens_fact_ms': t_greens_pred.factorize * 1000,
+                'pred_greens_solve_ms': t_greens_pred.solve * 1000,
+                'pred_greens_total_ms': t_greens_pred.total * 1000,
+                'pred_greens_e2e_ms': pred_greens_e2e * 1000,
+                'pred_greens_max_principle': pred_greens.max_principle_pass_rate,
+                'pred_greens_gt_corr_mean': pred_greens.mean_corr_with_gt,
+                'pred_greens_gt_corr_std': pred_greens.std_corr_with_gt,
+                'pred_greens_residual_norm': pred_greens.mean_residual_norm,
+                # Green's function — Robust
+                'robust_greens_fact_ms': t_greens_rob.factorize * 1000,
+                'robust_greens_solve_ms': t_greens_rob.solve * 1000,
+                'robust_greens_total_ms': t_greens_rob.total * 1000,
+                'robust_greens_e2e_ms': robust_greens_e2e * 1000,
+                'robust_greens_max_principle': rob_greens.max_principle_pass_rate,
+                'robust_greens_gt_corr_mean': rob_greens.mean_corr_with_gt,
+                'robust_greens_gt_corr_std': rob_greens.std_corr_with_gt,
+                'robust_greens_residual_norm': rob_greens.mean_residual_norm,
+            }
+            # Green's function — GT (optional, may be None if igl unavailable)
+            if t_greens_gt is not None:
+                metrics['gt_greens_total_ms'] = t_greens_gt.total * 1000
+                metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
+            # Green's E2E ratio
+            if robust_greens_e2e > 0:
+                metrics['ratio_greens_e2e'] = pred_greens_e2e / robust_greens_e2e
+
+            # ---- Eigendecomposition timing ----
+            metrics['pred_eigen_ms'] = t_eig_pred['eigen'] * 1000
+            metrics['robust_eigen_ms'] = t_eig_rob['eigen'] * 1000
+            if gt_evals is not None:
+                metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
+
+            # ---- Eigenvalue errors (vs GT) ----
+            if gt_evals is not None:
+                if pred_evals is not None:
+                    ev_err = step_eigenvalue_errors(pred_evals, gt_evals)
+                    metrics['pred_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
+                    metrics['pred_eval_spectrum_rel_err_max'] = ev_err.spectrum_rel_err_max
+                    metrics['pred_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
+                    metrics['pred_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
+
+                if rob_evals is not None:
+                    ev_err = step_eigenvalue_errors(rob_evals, gt_evals)
+                    metrics['robust_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
+                    metrics['robust_eval_spectrum_rel_err_max'] = ev_err.spectrum_rel_err_max
+                    metrics['robust_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
+                    metrics['robust_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
+
+            # ---- Eigenvector cosine similarity (vs GT) ----
+            if gt_evecs is not None:
+                if pred_evecs is not None:
+                    sims = step_eigenvector_cosine_similarity(gt_evecs, pred_evecs)
+                    for c in [5, 10, 20, 50]:
+                        if c <= len(sims):
+                            metrics[f'pred_eigvec_cos_top{c}'] = float(sims[:c].mean())
+                    metrics['pred_eigvec_cos_all'] = float(sims.mean())
+
+                if rob_evecs is not None:
+                    sims = step_eigenvector_cosine_similarity(gt_evecs, rob_evecs)
+                    for c in [5, 10, 20, 50]:
+                        if c <= len(sims):
+                            metrics[f'robust_eigvec_cos_top{c}'] = float(sims[:c].mean())
+                    metrics['robust_eigvec_cos_all'] = float(sims.mean())
+
+            metrics_list.append(metrics)
+            status = "OK"
+
+            del verts_tensor
+
+        except Exception as e:
+            gc.enable()
+            status = f"ERROR — {e}"
+            import traceback
+            traceback.print_exc()
+
+        t_mesh = time.time() - t_mesh_start
+        elapsed = time.time() - t_start
+        done = local_idx + 1
+        eta = (elapsed / done) * (n_total - done) if done > 0 else 0
+
+        ratio_str = f"{metrics.get('ratio_e2e', 0):.2f}x" if metrics.get('ratio_e2e') else "?"
+        greens_corr = f"{metrics.get('pred_greens_gt_corr_mean', 0):.3f}"
+        greens_mp = f"{metrics.get('pred_greens_max_principle', 0):.0%}"
+        evec_cos = f"{metrics.get('pred_eigvec_cos_all', 0):.3f}"
+        print(f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<10s} "
+              f"PRED={metrics.get('pred_e2e_geodesic_ms', 0):.0f}ms "
+              f"Rob={metrics.get('robust_e2e_geodesic_ms', 0):.0f}ms "
+              f"({ratio_str}) "
+              f"G_corr={greens_corr} mp={greens_mp} evec={evec_cos} "
+              f"[{t_mesh:.1f}s, ETA {eta:.0f}s]")
+
+    elapsed = time.time() - t_start
+    print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s")
+
+    # ---- Write per-rank CSV ----
+    rank_csv = Path(output_dir) / f'metrics_rank{rank}.csv'
+    _write_csv(metrics_list, rank_csv)
+    print(f"{tag}Saved {rank_csv}")
+
+
+# ============================================================================
+# CSV utilities
+# ============================================================================
+
+def _write_csv(metrics_list: List[Dict[str, Any]], csv_path: Path):
+    """Write a list of metric dicts to CSV."""
+    if not metrics_list:
+        return
+
+    all_keys = []
+    seen = set()
+    for m in metrics_list:
+        for k in m.keys():
+            if k not in seen:
+                all_keys.append(k)
+                seen.add(k)
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction='ignore')
+        writer.writeheader()
+        for m in metrics_list:
+            writer.writerow(m)
+
+
+def _read_and_merge_csvs(output_dir: Path, world_size: int) -> List[Dict[str, Any]]:
+    """Read per-rank CSVs and merge."""
+    all_metrics = []
+
+    for rank in range(world_size):
+        rank_csv = output_dir / f'metrics_rank{rank}.csv'
+        if not rank_csv.exists():
+            print(f"[!] Missing {rank_csv}")
             continue
-        recon = evecs[:, :k] @ coeffs[:k]
-        per_vertex_err = np.linalg.norm(verts - recon, axis=1)
-        result.errors[k] = {
-            'mean_l2': float(per_vertex_err.mean()),
-            'max_l2': float(per_vertex_err.max()),
-        }
 
-    return result
+        with open(rank_csv, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                parsed = {}
+                for k, v in row.items():
+                    if v == '' or v is None:
+                        parsed[k] = None
+                    else:
+                        try:
+                            if '.' not in v and 'e' not in v.lower():
+                                parsed[k] = int(v)
+                            else:
+                                parsed[k] = float(v)
+                        except (ValueError, TypeError):
+                            parsed[k] = v
+                all_metrics.append(parsed)
+
+    return all_metrics
+
+
+def _compute_summary(all_metrics: List[Dict[str, Any]], summary_path: Path):
+    """Compute mean/std/min/max for all numeric columns and save."""
+    if not all_metrics:
+        return
+
+    numeric_keys = []
+    for k in all_metrics[0].keys():
+        vals = [m[k] for m in all_metrics if m.get(k) is not None]
+        if vals and isinstance(vals[0], (int, float)):
+            numeric_keys.append(k)
+
+    rows = []
+    for k in numeric_keys:
+        vals = [float(m[k]) for m in all_metrics if m.get(k) is not None]
+        if not vals:
+            continue
+        rows.append({
+            'metric': k,
+            'mean': np.mean(vals),
+            'std': np.std(vals),
+            'min': np.min(vals),
+            'max': np.max(vals),
+            'count': len(vals),
+        })
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['metric', 'mean', 'std', 'min', 'max', 'count'])
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+@hydra.main(version_base="1.2", config_path='./visualization_config')
+def main(cfg: DictConfig) -> None:
+    """Quantitative evaluation."""
+
+    if not hasattr(cfg, 'ckpt_path') or cfg.ckpt_path is None:
+        raise ValueError("ckpt_path is required")
+
+    ckpt_path = Path(cfg.ckpt_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    # ---- GPU setup ----
+    num_gpus_available = torch.cuda.device_count()
+    num_gpus = getattr(cfg, 'num_gpus', None)
+    if num_gpus is None:
+        num_gpus = max(num_gpus_available, 1)
+    else:
+        num_gpus = min(int(num_gpus), num_gpus_available)
+    if num_gpus_available == 0:
+        print("[!] No CUDA devices found — running on CPU")
+        num_gpus = 1
+
+    # ---- Get total mesh count ----
+    data_module = hydra.utils.instantiate(cfg.data_module)
+    data_loader = data_module.val_dataloader()
+    if isinstance(data_loader, list):
+        data_loader = data_loader[0]
+    total_meshes = len(data_loader.dataset)
+    del data_module, data_loader
+
+    # ---- Output setup ----
+    output_dir = Path(getattr(cfg, 'output_dir', '.'))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = output_dir / '.tmp_quantitative_ranks'
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
+    robust_k = getattr(cfg.globals, 'k_robust', None) or 30
+    num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
+    num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
+
+    print(f"\n{'=' * 80}")
+    print(f"QUANTITATIVE EVALUATION")
+    print(f"{'=' * 80}")
+    print(f"Checkpoint:  {ckpt_path}")
+    print(f"Meshes:      {total_meshes}")
+    print(f"GPUs:        {num_gpus} / {num_gpus_available} available")
+    print(f"PRED k:      {pred_k}")
+    print(f"Robust k:    {robust_k}")
+    print(f"Sources:     {num_sources}")
+    print(f"Eigenvalues: {num_eigenvalues}")
+    print(f"Output:      {output_dir}")
+    print(f"{'=' * 80}\n")
+
+    # ---- Serialize config for workers ----
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+
+    # ---- Run ----
+    t_start = time.time()
+
+    if num_gpus == 1:
+        _worker(0, 1, cfg_dict, str(tmp_dir), total_meshes)
+    else:
+        mp.spawn(
+            _worker,
+            args=(num_gpus, cfg_dict, str(tmp_dir), total_meshes),
+            nprocs=num_gpus,
+            join=True,
+        )
+
+    elapsed = time.time() - t_start
+
+    # ---- Merge per-rank CSVs ----
+    all_metrics = _read_and_merge_csvs(tmp_dir, num_gpus)
+    print(f"\nMerged {len(all_metrics)} mesh results from {num_gpus} workers")
+
+    if len(all_metrics) == 0:
+        print("[!] No metrics collected")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+
+    # ---- Save full CSV ----
+    csv_path = output_dir / 'quantitative_results.csv'
+    _write_csv(all_metrics, csv_path)
+    print(f"Saved per-mesh results: {csv_path}")
+
+    # ---- Compute and save summary ----
+    summary_path = csv_path.with_name(csv_path.stem + '_summary.csv')
+    _compute_summary(all_metrics, summary_path)
+    print(f"Saved summary: {summary_path}")
+
+    # ---- Print summary table ----
+    print(f"\n{'=' * 80}")
+    print(f"SUMMARY ({len(all_metrics)} meshes, {num_sources} sources/mesh)")
+    print(f"{'=' * 80}")
+
+    def _stats(key):
+        vals = [float(m[key]) for m in all_metrics if m.get(key) is not None]
+        if not vals:
+            return None, None, None, None
+        return np.mean(vals), np.std(vals), np.min(vals), np.max(vals)
+
+    W = 10
+
+    print(f"{'':>28s} {'Mean':>{W}s} {'Std':>{W}s} {'Min':>{W}s} {'Max':>{W}s}")
+    print(f"{'-' * 28} {'-' * W} {'-' * W} {'-' * W} {'-' * W}")
+
+    for label, key in [
+        ("PRED L,M total",         "pred_lm_total_ms"),
+        ("Robust L,M",             "robust_lm_ms"),
+        ("PRED E2E geodesic",      "pred_e2e_geodesic_ms"),
+        ("Robust E2E geodesic",    "robust_e2e_geodesic_ms"),
+        ("PRED per-source",        "pred_per_src_ms"),
+        ("Robust per-source",      "robust_per_src_ms"),
+        ("",                       ""),
+        ("PRED Green's E2E",       "pred_greens_e2e_ms"),
+        ("Robust Green's E2E",     "robust_greens_e2e_ms"),
+        ("PRED Green's solve",     "pred_greens_solve_ms"),
+        ("Robust Green's solve",   "robust_greens_solve_ms"),
+        ("",                       ""),
+        ("PRED eigendecomp",       "pred_eigen_ms"),
+        ("Robust eigendecomp",     "robust_eigen_ms"),
+        ("GT eigendecomp",         "gt_eigen_ms"),
+    ]:
+        if not key:
+            print()
+            continue
+        m, s, mn, mx = _stats(key)
+        if m is not None:
+            print(f"  {label:<26s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+
+    # --- Green's function quality ---
+    print(f"\n  GREEN'S FUNCTION QUALITY")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+    for label, key in [
+        ("PRED max principle",     "pred_greens_max_principle"),
+        ("Robust max principle",   "robust_greens_max_principle"),
+        ("GT max principle",       "gt_greens_max_principle"),
+        ("PRED GT correlation",    "pred_greens_gt_corr_mean"),
+        ("Robust GT correlation",  "robust_greens_gt_corr_mean"),
+        ("PRED residual norm",     "pred_greens_residual_norm"),
+        ("Robust residual norm",   "robust_greens_residual_norm"),
+    ]:
+        m, s, _, _ = _stats(key)
+        if m is not None:
+            print(f"  {label:<26s} {m:>{W}.4f} {s:>{W}.4f}")
+
+    # --- Eigenvalue / eigenvector quality ---
+    print(f"\n  SPECTRAL QUALITY")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+    for label, key in [
+        ("PRED eval rel err mean", "pred_eval_spectrum_rel_err_mean"),
+        ("PRED eval rel err max",  "pred_eval_spectrum_rel_err_max"),
+        ("Robust eval rel err mean", "robust_eval_spectrum_rel_err_mean"),
+        ("Robust eval rel err max",  "robust_eval_spectrum_rel_err_max"),
+        ("",                       ""),
+        ("PRED eigvec cos top5",   "pred_eigvec_cos_top5"),
+        ("PRED eigvec cos top10",  "pred_eigvec_cos_top10"),
+        ("PRED eigvec cos top20",  "pred_eigvec_cos_top20"),
+        ("PRED eigvec cos all",    "pred_eigvec_cos_all"),
+        ("Robust eigvec cos top5", "robust_eigvec_cos_top5"),
+        ("Robust eigvec cos top10","robust_eigvec_cos_top10"),
+        ("Robust eigvec cos top20","robust_eigvec_cos_top20"),
+        ("Robust eigvec cos all",  "robust_eigvec_cos_all"),
+    ]:
+        if not key:
+            print()
+            continue
+        m, s, _, _ = _stats(key)
+        if m is not None:
+            print(f"  {label:<26s} {m:>{W}.4f} {s:>{W}.4f}")
+
+    pred_e2e_vals = [float(m['pred_e2e_geodesic_ms']) for m in all_metrics
+                     if m.get('pred_e2e_geodesic_ms')]
+    robust_e2e_vals = [float(m['robust_e2e_geodesic_ms']) for m in all_metrics
+                       if m.get('robust_e2e_geodesic_ms')]
+    if pred_e2e_vals and robust_e2e_vals:
+        ratio = np.mean(pred_e2e_vals) / np.mean(robust_e2e_vals)
+        wins = sum(1 for p, r in zip(pred_e2e_vals, robust_e2e_vals) if p < r)
+        print(f"\n  PRED/Robust E2E geodesic ratio: {ratio:.2f}x  "
+              f"(PRED wins {wins}/{len(pred_e2e_vals)})")
+
+    pred_greens_vals = [float(m['pred_greens_e2e_ms']) for m in all_metrics
+                        if m.get('pred_greens_e2e_ms')]
+    robust_greens_vals = [float(m['robust_greens_e2e_ms']) for m in all_metrics
+                          if m.get('robust_greens_e2e_ms')]
+    if pred_greens_vals and robust_greens_vals:
+        ratio = np.mean(pred_greens_vals) / np.mean(robust_greens_vals)
+        wins = sum(1 for p, r in zip(pred_greens_vals, robust_greens_vals) if p < r)
+        print(f"  PRED/Robust E2E Green's ratio:  {ratio:.2f}x  "
+              f"(PRED wins {wins}/{len(pred_greens_vals)})")
+
+    print(f"\n  Total time: {elapsed:.1f}s ({len(all_metrics)} meshes, {num_gpus} GPUs)")
+    print(f"{'=' * 80}")
+
+    # ---- Cleanup ----
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    main()
