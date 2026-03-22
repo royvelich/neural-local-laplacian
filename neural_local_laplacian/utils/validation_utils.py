@@ -1109,13 +1109,35 @@ class GeodesicQuality:
     num_sources_ok: int = 0
 
 
+def _exact_geodesics_worker(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    source_indices: List[int],
+    result_queue,
+):
+    """Run exact geodesics in a child process. Puts dict of results into queue."""
+    verts_f64 = vertices.astype(np.float64)
+    faces_i32 = faces.astype(np.int32)
+    exact = {}
+    for src_idx in source_indices:
+        try:
+            exact[src_idx] = compute_exact_geodesics(verts_f64, faces_i32, int(src_idx))
+        except Exception:
+            exact[src_idx] = None
+    result_queue.put(exact)
+
+
 def step_exact_geodesics(
     vertices: np.ndarray,
     faces: np.ndarray,
     source_indices: List[int],
+    timeout: float = 300.0,
 ) -> Dict[int, Optional[np.ndarray]]:
     """
     Precompute exact geodesic distances for all source vertices.
+
+    Runs in a subprocess to survive C++ segfaults (pygeodesic can crash
+    on meshes with degenerate topology or int32 overflow).
 
     Call once per mesh, then pass the result to step_geodesic_quality
     for each method to avoid redundant computation.
@@ -1123,12 +1145,34 @@ def step_exact_geodesics(
     Returns:
         Dict mapping source_idx -> exact distances (N,), or None if failed.
     """
-    exact = {}
-    verts_f64 = vertices.astype(np.float64)
-    faces_i32 = faces.astype(np.int32)
-    for src_idx in source_indices:
-        exact[src_idx] = compute_exact_geodesics(verts_f64, faces_i32, int(src_idx))
-    return exact
+    import multiprocessing as _mp
+
+    empty = {src: None for src in source_indices}
+
+    ctx = _mp.get_context('fork')
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_exact_geodesics_worker,
+        args=(vertices, faces, source_indices, result_queue),
+    )
+    proc.start()
+    proc.join(timeout=timeout)
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        print(f"  [!] Exact geodesics timed out after {timeout:.0f}s (N={len(vertices)})")
+        return empty
+
+    if proc.exitcode != 0:
+        print(f"  [!] Exact geodesics crashed (exit code {proc.exitcode}, "
+              f"N={len(vertices)}, F={len(faces)})")
+        return empty
+
+    try:
+        return result_queue.get_nowait()
+    except Exception:
+        return empty
 
 
 def step_geodesic_quality(
