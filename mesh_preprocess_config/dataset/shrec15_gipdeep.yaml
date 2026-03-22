@@ -1,0 +1,3 @@
+folder: "/home/royve/datasets/neural-laplacian/shrec15"
+file_size_range_mb: [0.2, 2.0]
+num_components_range: [1, 1]
