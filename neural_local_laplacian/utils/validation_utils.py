@@ -387,14 +387,17 @@ def step_eigendecomposition(
     """
     Compute generalized eigendecomposition L v = λ M v.
 
+    Ensures PSD convention before solving (handles igl NSD cotangent matrices).
+
     Returns:
         (eigenvalues, eigenvectors, timing) where timing has key 'eigen'.
         Returns (None, None, timing) on failure.
     """
     t0 = time.perf_counter()
     try:
+        L_psd = ensure_psd(L)
         eigenvalues, eigenvectors = compute_laplacian_eigendecomposition(
-            L, num_eigenvalues, mass_matrix=M,
+            L_psd, num_eigenvalues, mass_matrix=M,
         )
     except Exception:
         return None, None, {'eigen': time.perf_counter() - t0}
