@@ -48,15 +48,18 @@ from neural_local_laplacian.utils.validation_utils import (
     load_mesh_with_faces,
     step_pred_laplacian,
     step_pred_geodesic,
-    step_robust_geodesic,
     step_gt_laplacian,
+    step_gt_geodesic,
     step_robust_laplacian,
+    step_robust_geodesic,
+    step_pcdiff_geodesic,
     step_greens_function,
     step_eigendecomposition,
     step_eigenvalue_errors,
     step_eigenvector_cosine_similarity,
     GeodesicTimingBreakdown,
     HAS_NELO,
+    HAS_PCDIFF,
 )
 
 if HAS_NELO:
@@ -82,19 +85,15 @@ def _parse_methods(methods_str: str) -> Set[str]:
 # Helper: add metrics for a method's Green's / eigen / etc.
 # ============================================================================
 
-def _add_method_metrics(
+def _add_greens_metrics(
     metrics: Dict[str, Any],
     prefix: str,
     L, M,
     source_indices: List[int],
     gt_greens_values,
-    gt_evals, gt_evecs,
-    num_eigenvalues: int,
     lm_timing_total: float,
 ):
-    """Run Green's + eigen for one method and add to metrics dict."""
-
-    # Green's function
+    """Run Green's function for one method and add to metrics dict. Phase 1."""
     greens, t_greens = step_greens_function(
         L, M, source_indices, gt_greens_values=gt_greens_values,
     )
@@ -107,12 +106,20 @@ def _add_method_metrics(
     metrics[f'{prefix}_greens_gt_corr_mean'] = greens.mean_corr_with_gt
     metrics[f'{prefix}_greens_gt_corr_std'] = greens.std_corr_with_gt
     metrics[f'{prefix}_greens_residual_norm'] = greens.mean_residual_norm
+    return greens
 
-    # Eigendecomposition
+
+def _add_eigen_metrics(
+    metrics: Dict[str, Any],
+    prefix: str,
+    L, M,
+    gt_evals, gt_evecs,
+    num_eigenvalues: int,
+):
+    """Run eigen for one method and add to metrics dict. Phase 2."""
     evals, evecs, t_eig = step_eigendecomposition(L, M, num_eigenvalues)
     metrics[f'{prefix}_eigen_ms'] = t_eig['eigen'] * 1000
 
-    # Eigenvalue errors (vs GT)
     if gt_evals is not None and evals is not None:
         ev_err = step_eigenvalue_errors(evals, gt_evals)
         metrics[f'{prefix}_eval_spectrum_rel_err_mean'] = ev_err.spectrum_rel_err_mean
@@ -120,7 +127,6 @@ def _add_method_metrics(
         metrics[f'{prefix}_eval_rel_err_mean'] = ev_err.per_eval_rel_err_mean
         metrics[f'{prefix}_eval_rel_err_max'] = ev_err.per_eval_rel_err_max
 
-    # Eigenvector cosine similarity (vs GT)
     if gt_evecs is not None and evecs is not None:
         sims = step_eigenvector_cosine_similarity(gt_evecs, evecs)
         for c in [5, 10, 20, 50]:
@@ -128,7 +134,7 @@ def _add_method_metrics(
                 metrics[f'{prefix}_eigvec_cos_top{c}'] = float(sims[:c].mean())
         metrics[f'{prefix}_eigvec_cos_all'] = float(sims.mean())
 
-    return greens, evals, evecs
+    return evals, evecs
 
 
 # ============================================================================
@@ -233,21 +239,29 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             gc.disable()
 
             # ==============================================================
-            # Phase 1: TIMING-SENSITIVE (GPU hot, GC disabled)
-            # Runs all assembly + geodesic steps while GPU caches are warm.
+            # Phase 1: TIMING-SENSITIVE (GC disabled)
+            # Grouped by type: assemblies → geodesics → Green's
+            # GPU mini-warmup before each GPU method.
             # ==============================================================
 
-            # Mini warmup: single matmul to wake GPU from idle power state.
-            # Prevents cold-start inflation after long CPU phases (eigen ~20s).
-            if device.type == 'cuda':
-                _dummy = torch.randn(256, 256, device=device) @ torch.randn(256, 256, device=device)
-                torch.cuda.synchronize()
-                del _dummy
+            n_src = len(source_indices)
 
-            # ---- PRED assembly + geodesic ----
+            # ---- Assemblies ----
+            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
+            metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
+
+            rob_L, rob_M, t_rob_lm = None, None, None
+            if run_robust:
+                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+                metrics['robust_k'] = robust_k
+                metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
+
             pred_L, pred_M, pred_G, t_pred = None, None, None, None
-            pred_geo_timing = GeodesicTimingBreakdown()
             if run_pred:
+                if device.type == 'cuda':
+                    _w = torch.randn(256, 256, device=device) @ torch.randn(256, 256, device=device)
+                    torch.cuda.synchronize()
+                    del _w
                 pred_L, pred_M, pred_G, t_pred = step_pred_laplacian(
                     model, verts_tensor, pred_k, device, use_amp=use_amp,
                 )
@@ -258,35 +272,12 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['pred_grad_op_ms'] = t_pred.grad_op * 1000
                 metrics['pred_lm_total_ms'] = t_pred.lm_total * 1000
 
-                if pred_G is not None:
-                    _, pred_geo_timing = step_pred_geodesic(
-                        pred_L, pred_M, pred_G, source_indices, N,
-                    )
-                    pred_onetime = (t_pred.total
-                                    + pred_geo_timing.build
-                                    + pred_geo_timing.heat_factorize
-                                    + pred_geo_timing.poisson_factorize)
-                    pred_e2e = pred_onetime + pred_geo_timing.solve
-                    metrics['pred_geo_build_ms'] = pred_geo_timing.build * 1000
-                    metrics['pred_geo_heat_fact_ms'] = pred_geo_timing.heat_factorize * 1000
-                    metrics['pred_geo_poisson_fact_ms'] = pred_geo_timing.poisson_factorize * 1000
-                    metrics['pred_geo_solve_ms'] = pred_geo_timing.solve * 1000
-                    metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
-                    metrics['pred_per_src_ms'] = pred_e2e / len(source_indices) * 1000
-
-            # ---- Robust geodesic (pp3d, self-contained timing) ----
-            robust_timing = None
-            if run_robust:
-                _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
-                robust_e2e = robust_timing.total
-                metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
-                metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
-                metrics['robust_e2e_geodesic_ms'] = robust_e2e * 1000
-                metrics['robust_per_src_ms'] = robust_e2e / len(source_indices) * 1000
-
-            # ---- NeLo assembly (timing-sensitive) ----
             nelo_L, nelo_M, t_nelo = None, None, None
             if run_nelo:
+                if device.type == 'cuda':
+                    _w = torch.randn(256, 256, device=device) @ torch.randn(256, 256, device=device)
+                    torch.cuda.synchronize()
+                    del _w
                 nelo_L, nelo_M, t_nelo = step_nelo_laplacian(
                     nelo_pipeline, vertices, nelo_k, device,
                 )
@@ -296,27 +287,55 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['nelo_assembly_ms'] = t_nelo.assembly * 1000
                 metrics['nelo_lm_total_ms'] = t_nelo.total * 1000
 
-            # ---- Re-enable GC (timing-sensitive section done) ----
-            gc.enable()
+            # ---- Geodesics ----
+            # GT geodesic (mesh-based heat method)
+            if gt_L is not None:
+                _, gt_geo_timing = step_gt_geodesic(
+                    gt_L, gt_M, vertices, faces, source_indices, N,
+                )
+                gt_geo_e2e = t_gt['assembly'] + gt_geo_timing.total
+                metrics['gt_geo_total_ms'] = gt_geo_timing.total * 1000
+                metrics['gt_e2e_geodesic_ms'] = gt_geo_e2e * 1000
 
-            # ==============================================================
-            # Phase 2: QUALITY (not timing-sensitive)
-            # GT assembly, Green's, eigendecomposition, comparisons.
-            # ==============================================================
-
-            # ---- GT Laplacian ----
-            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
-            metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
-
-            # ---- Robust Laplacian (for Green's / eigen, separate from pp3d) ----
-            rob_L, rob_M = None, None
+            # Robust geodesic (pp3d)
+            robust_timing = None
             if run_robust:
-                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
-                metrics['robust_k'] = robust_k
-                metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
+                _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
+                robust_e2e = robust_timing.total
+                metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
+                metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
+                metrics['robust_e2e_geodesic_ms'] = robust_e2e * 1000
+                metrics['robust_per_src_ms'] = robust_e2e / n_src * 1000
 
-            # ---- GT Green's (reference for correlation) ----
-            gt_greens = None
+            # PRED geodesic (learned G)
+            if run_pred and pred_G is not None:
+                _, pred_geo_timing = step_pred_geodesic(
+                    pred_L, pred_M, pred_G, source_indices, N,
+                )
+                pred_onetime = (t_pred.total
+                                + pred_geo_timing.build
+                                + pred_geo_timing.heat_factorize
+                                + pred_geo_timing.poisson_factorize)
+                pred_e2e = pred_onetime + pred_geo_timing.solve
+                metrics['pred_geo_build_ms'] = pred_geo_timing.build * 1000
+                metrics['pred_geo_heat_fact_ms'] = pred_geo_timing.heat_factorize * 1000
+                metrics['pred_geo_poisson_fact_ms'] = pred_geo_timing.poisson_factorize * 1000
+                metrics['pred_geo_solve_ms'] = pred_geo_timing.solve * 1000
+                metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
+                metrics['pred_per_src_ms'] = pred_e2e / n_src * 1000
+
+            # NeLo geodesic (pcdiff operators)
+            if run_nelo and nelo_L is not None:
+                _, nelo_geo_timing = step_pcdiff_geodesic(
+                    nelo_L, nelo_M, vertices, nelo_k, source_indices, N,
+                )
+                nelo_geo_e2e = t_nelo.total + nelo_geo_timing.total
+                metrics['nelo_geo_total_ms'] = nelo_geo_timing.total * 1000
+                metrics['nelo_e2e_geodesic_ms'] = nelo_geo_e2e * 1000
+                metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
+
+            # ---- Green's function ----
+            # GT first (provides reference values)
             gt_gvals = None
             if gt_L is not None:
                 gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
@@ -324,7 +343,30 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
                 gt_gvals = gt_greens.values
 
-            # ---- GT eigendecomposition ----
+            if run_robust and rob_L is not None:
+                _add_greens_metrics(
+                    metrics, 'robust', rob_L, rob_M,
+                    source_indices, gt_gvals, t_rob_lm['assembly'],
+                )
+            if run_pred and pred_L is not None:
+                _add_greens_metrics(
+                    metrics, 'pred', pred_L, pred_M,
+                    source_indices, gt_gvals, t_pred.lm_total,
+                )
+            if run_nelo and nelo_L is not None:
+                _add_greens_metrics(
+                    metrics, 'nelo', nelo_L, nelo_M,
+                    source_indices, gt_gvals, t_nelo.total,
+                )
+
+            # ---- Re-enable GC (timing-sensitive section done) ----
+            gc.enable()
+
+            # ==============================================================
+            # Phase 2: QUALITY (not timing-sensitive)
+            # Eigendecomposition + spectral comparisons.
+            # ==============================================================
+
             gt_evals, gt_evecs = None, None
             if gt_L is not None:
                 gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
@@ -332,35 +374,27 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 )
                 metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
 
-            # ---- PRED quality (Green's + eigen) ----
             if run_pred and pred_L is not None:
-                _add_method_metrics(
+                _add_eigen_metrics(
                     metrics, 'pred', pred_L, pred_M,
-                    source_indices, gt_gvals, gt_evals, gt_evecs,
-                    num_eigenvalues, t_pred.lm_total,
+                    gt_evals, gt_evecs, num_eigenvalues,
                 )
-
-            # ---- Robust quality (Green's + eigen) ----
             if run_robust and rob_L is not None:
-                _add_method_metrics(
+                _add_eigen_metrics(
                     metrics, 'robust', rob_L, rob_M,
-                    source_indices, gt_gvals, gt_evals, gt_evecs,
-                    num_eigenvalues, t_rob_lm['assembly'],
+                    gt_evals, gt_evecs, num_eigenvalues,
                 )
-
-            # ---- NeLo quality (Green's + eigen) ----
             if run_nelo and nelo_L is not None:
-                _add_method_metrics(
+                _add_eigen_metrics(
                     metrics, 'nelo', nelo_L, nelo_M,
-                    source_indices, gt_gvals, gt_evals, gt_evecs,
-                    num_eigenvalues, t_nelo.total,
+                    gt_evals, gt_evecs, num_eigenvalues,
                 )
 
             # ==============================================================
             # Timing ratios
             # ==============================================================
             if run_pred and run_robust and robust_timing is not None:
-                if robust_timing.lm_assembly > 0:
+                if robust_timing.lm_assembly > 0 and t_pred is not None:
                     metrics['ratio_lm'] = t_pred.lm_total / robust_timing.lm_assembly
                 if metrics.get('pred_e2e_geodesic_ms') and metrics.get('robust_e2e_geodesic_ms'):
                     metrics['ratio_e2e_geodesic'] = (
@@ -656,7 +690,8 @@ def _print_summary(
     print()
 
     # Geodesic E2E
-    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust')]:
+    _print_timing_row("GT E2E geodesic", "gt_e2e_geodesic_ms")
+    for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
         if prefix not in methods:
             continue
         _print_timing_row(f"{label} E2E geodesic", f"{prefix}_e2e_geodesic_ms")

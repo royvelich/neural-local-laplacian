@@ -36,12 +36,16 @@ from neural_local_laplacian.utils.geodesic_utils import (
     poisson_factorize,
     poisson_solve_all,
     make_grad_div_learned,
+    make_grad_div_mesh,
+    make_grad_div_pointcloud,
+    build_pointcloud_grad_div_operators,
     select_multiple_geodesic_sources,
     ensure_psd,
     sparse_factorize,
     compute_geodesic_metrics,
     compute_exact_geodesics,
     normalize_distances,
+    HAS_PCDIFF,
 )
 
 
@@ -353,6 +357,135 @@ def step_pred_geodesic(
     timing.poisson_factorize = time.perf_counter() - t0
 
     # 5. Poisson forward-solve
+    t0 = time.perf_counter()
+    distances = poisson_solve_all(pf, source_indices, rhs_list, n_vertices)
+    timing.poisson_solve = time.perf_counter() - t0
+
+    return distances, timing
+
+
+# =============================================================================
+# Step: GT geodesic (heat method with mesh-based igl operators)
+# =============================================================================
+
+def step_gt_geodesic(
+    L: scipy.sparse.spmatrix,
+    M: scipy.sparse.spmatrix,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    source_indices: List[int],
+    n_vertices: int,
+) -> Tuple[List[Optional[np.ndarray]], GeodesicTimingBreakdown]:
+    """
+    Compute heat method geodesics using GT mesh-based operators (igl.grad).
+
+    Uses face-based gradient operator from igl, matching the cotangent Laplacian.
+
+    Returns:
+        (distances_list, timing_breakdown)
+    """
+    try:
+        import igl
+    except ImportError:
+        return [None] * len(source_indices), GeodesicTimingBreakdown()
+
+    timing = GeodesicTimingBreakdown()
+
+    V = vertices.astype(np.float64)
+    F = faces.astype(np.int32)
+
+    # Build mesh gradient operator and face areas
+    t0 = time.perf_counter()
+    grad_op = igl.grad(V, F)
+    face_areas = igl.doublearea(V, F).flatten() / 2.0
+    grad_div_fn = make_grad_div_mesh(grad_op, face_areas)
+
+    # Use face-area-based time step (matches pyFM / igl convention)
+    h = 1.52 * np.sqrt(face_areas.mean())
+    t = h ** 2
+
+    matrices = heat_method_build(S=L, M=M, n_vertices=n_vertices,
+                                  grad_and_div_fn=grad_div_fn, t=t)
+    timing.build = time.perf_counter() - t0
+
+    # 2–5: same heat method pipeline
+    t0 = time.perf_counter()
+    hf = heat_factorize(matrices)
+    timing.heat_factorize = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    rhs_list = heat_solve_all(hf, source_indices, matrices)
+    timing.heat_solve = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    pf = poisson_factorize(matrices)
+    timing.poisson_factorize = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    distances = poisson_solve_all(pf, source_indices, rhs_list, n_vertices)
+    timing.poisson_solve = time.perf_counter() - t0
+
+    return distances, timing
+
+
+# =============================================================================
+# Step: Point-cloud geodesic (heat method with pcdiff operators)
+# =============================================================================
+
+def step_pcdiff_geodesic(
+    L: scipy.sparse.spmatrix,
+    M: scipy.sparse.spmatrix,
+    vertices: np.ndarray,
+    k: int,
+    source_indices: List[int],
+    n_vertices: int,
+) -> Tuple[List[Optional[np.ndarray]], GeodesicTimingBreakdown]:
+    """
+    Compute heat method geodesics using pcdiff point-cloud operators.
+
+    Builds a kNN graph from vertices, constructs 2D tangent-plane gradient
+    and divergence operators, then runs the standard heat method pipeline.
+
+    Suitable for any method that produces L, M but no gradient operator G
+    (e.g. NeLo, Robust).
+
+    Requires pcdiff to be installed.
+
+    Returns:
+        (distances_list, timing_breakdown)
+    """
+    if not HAS_PCDIFF:
+        return [None] * len(source_indices), GeodesicTimingBreakdown()
+
+    from pcdiff import knn_graph as pcdiff_knn_graph
+
+    timing = GeodesicTimingBreakdown()
+
+    # Build pcdiff operators from fresh kNN
+    t0 = time.perf_counter()
+    edge_index = pcdiff_knn_graph(vertices.astype(np.float64), k=k)
+    grad_op, div_op = build_pointcloud_grad_div_operators(
+        vertices.astype(np.float64), edge_index,
+    )
+    grad_div_fn = make_grad_div_pointcloud(grad_op, div_op)
+
+    matrices = heat_method_build(S=L, M=M, n_vertices=n_vertices,
+                                  grad_and_div_fn=grad_div_fn)
+    timing.build = time.perf_counter() - t0
+
+    # 2–5: same heat method pipeline
+    t0 = time.perf_counter()
+    hf = heat_factorize(matrices)
+    timing.heat_factorize = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    rhs_list = heat_solve_all(hf, source_indices, matrices)
+    timing.heat_solve = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    pf = poisson_factorize(matrices)
+    timing.poisson_factorize = time.perf_counter() - t0
+
     t0 = time.perf_counter()
     distances = poisson_solve_all(pf, source_indices, rhs_list, n_vertices)
     timing.poisson_solve = time.perf_counter() - t0
