@@ -31,14 +31,30 @@ Usage:
 
 import csv
 import gc
+import os
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 
 import numpy as np
 import torch
 import torch.multiprocessing as mp
+
+
+@contextmanager
+def _suppress_c_stderr():
+    """Suppress C-level stderr (e.g. 'skipping degenerate neighborhood' from robust_laplacian)."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old_stderr = os.dup(2)
+    os.dup2(devnull, 2)
+    try:
+        yield
+    finally:
+        os.dup2(old_stderr, 2)
+        os.close(devnull)
+        os.close(old_stderr)
 
 import matplotlib
 matplotlib.use('Agg')
@@ -187,6 +203,14 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
     num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
     use_amp = device.type == 'cuda'
+    verbose = getattr(cfg, 'verbose', True)
+    if isinstance(verbose, str):
+        verbose = verbose.lower() not in ('false', '0', 'no')
+
+    def vprint(*args, **kwargs):
+        """Print only when verbose is True."""
+        if verbose:
+            print(*args, **kwargs)
 
     # ---- Top-k pruning sweep ----
     # Accepts: +top_k_values=[6,10,20] or +'top_k_values=[6,10,20]'
@@ -246,7 +270,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     # ==================================================================
     # Pre-load all meshes (shared across passes)
     # ==================================================================
-    print(f"{tag}Loading {n_total} meshes...")
+    vprint(f"{tag}Loading {n_total} meshes...")
     mesh_data_list: List[Optional[Dict[str, Any]]] = []
     for local_idx, global_idx in enumerate(my_indices):
         try:
@@ -270,7 +294,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 'source_indices': source_indices,
             })
         except Exception as e:
-            print(f"{tag}  Failed to load mesh {global_idx}: {e}")
+            vprint(f"{tag}  Failed to load mesh {global_idx}: {e}")
             mesh_data_list.append(None)
 
         metrics_list.append({})
@@ -330,7 +354,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
                 del verts_tensor, patch_data
             except Exception as e:
-                print(f"{tag}  PRED assembly failed for {md['mesh_name']} "
+                vprint(f"{tag}  PRED assembly failed for {md['mesh_name']} "
                       f"(N={md['N']}): {e}")
         gc.enable()
         print(f"{tag}Pass 1 done: {time.time() - t_start:.1f}s")
@@ -358,7 +382,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics_list[i]['nelo_assembly_ms'] = t_nelo.assembly * 1000
                 metrics_list[i]['nelo_lm_total_ms'] = t_nelo.total * 1000
             except Exception as e:
-                print(f"{tag}  NeLo assembly failed for {md['mesh_name']} "
+                vprint(f"{tag}  NeLo assembly failed for {md['mesh_name']} "
                       f"(N={md['N']}): {e}")
         gc.enable()
         print(f"{tag}Pass 2 done: {time.time() - t_start:.1f}s")
@@ -399,7 +423,11 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
             rob_L, rob_M, t_rob_lm = None, None, None
             if run_robust:
-                rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+                if verbose:
+                    rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+                else:
+                    with _suppress_c_stderr():
+                        rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
                 metrics['robust_k'] = robust_k
                 metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
                 cache['rob_L'] = rob_L
@@ -416,21 +444,25 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     metrics['gt_e2e_geodesic_ms'] = (t_gt['assembly'] + gt_geo_timing.total) * 1000
                     metrics['gt_geodesic_failed'] = 0
                 except Exception as e:
-                    print(f"{tag}  GT geodesic failed for {mesh_name} (N={N}): {e}")
+                    vprint(f"{tag}  GT geodesic failed for {mesh_name} (N={N}): {e}")
                     metrics['gt_geodesic_failed'] = 1
 
             robust_distances = None
             robust_timing = None
             if run_robust:
                 try:
-                    robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
+                    if verbose:
+                        robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k, verbose=True)
+                    else:
+                        with _suppress_c_stderr():
+                            robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k, verbose=False)
                     metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
                     metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
                     metrics['robust_e2e_geodesic_ms'] = robust_timing.total * 1000
                     metrics['robust_per_src_ms'] = robust_timing.total / n_src * 1000
                     metrics['robust_geodesic_failed'] = 0
                 except Exception as e:
-                    print(f"{tag}  Robust geodesic failed for {mesh_name} (N={N}): {e}")
+                    vprint(f"{tag}  Robust geodesic failed for {mesh_name} (N={N}): {e}")
                     metrics['robust_geodesic_failed'] = 1
 
             pred_distances = None
@@ -456,7 +488,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     metrics['pred_per_src_ms'] = pred_e2e / n_src * 1000
                     metrics['pred_geodesic_failed'] = 0
                 except Exception as e:
-                    print(f"{tag}  PRED geodesic failed for {mesh_name} (N={N}): {e}")
+                    vprint(f"{tag}  PRED geodesic failed for {mesh_name} (N={N}): {e}")
                     metrics['pred_geodesic_failed'] = 1
 
             nelo_distances = None
@@ -474,18 +506,18 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
                     metrics['nelo_geodesic_failed'] = 0
                 except Exception as e:
-                    print(f"{tag}  NeLo geodesic failed for {mesh_name} (N={N}): {e}")
+                    vprint(f"{tag}  NeLo geodesic failed for {mesh_name} (N={N}): {e}")
                     metrics['nelo_geodesic_failed'] = 1
 
             # ---- Geodesic quality vs exact (precompute exact once) ----
             exact_geo = {}
             try:
-                print(f"{tag}  Computing exact geodesics for {mesh_name} (N={N}, F={len(faces)})...",
+                vprint(f"{tag}  Computing exact geodesics for {mesh_name} (N={N}, F={len(faces)})...",
                       flush=True)
-                exact_geo = step_exact_geodesics(vertices, faces, source_indices)
+                exact_geo = step_exact_geodesics(vertices, faces, source_indices, verbose=verbose)
                 metrics['exact_geodesic_failed'] = 0
             except Exception as e:
-                print(f"{tag}  Exact geodesics failed for {mesh_name} (N={N}): {e}")
+                vprint(f"{tag}  Exact geodesics failed for {mesh_name} (N={N}): {e}")
                 metrics['exact_geodesic_failed'] = 1
             n_exact = sum(1 for v in exact_geo.values() if v is not None)
             metrics['num_exact_geodesics'] = n_exact

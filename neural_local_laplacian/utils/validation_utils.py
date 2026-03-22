@@ -582,6 +582,7 @@ def step_robust_geodesic(
     source_indices: List[int],
     robust_k: int = 30,
     timeout: float = 120.0,
+    verbose: bool = True,
 ) -> Tuple[List[Optional[np.ndarray]], RobustGeodesicTiming]:
     """
     Compute geodesics using pp3d PointCloudHeatSolver.
@@ -616,12 +617,14 @@ def step_robust_geodesic(
         # Timeout — kill subprocess
         proc.kill()
         proc.join()
-        print(f"  [!] pp3d timed out after {timeout:.0f}s (N={len(vertices)})")
+        if verbose:
+            print(f"  [!] pp3d timed out after {timeout:.0f}s (N={len(vertices)})")
         return [None] * len(source_indices), timing
 
     if proc.exitcode != 0:
         # Segfault or other crash
-        print(f"  [!] pp3d crashed (exit code {proc.exitcode}, N={len(vertices)})")
+        if verbose:
+            print(f"  [!] pp3d crashed (exit code {proc.exitcode}, N={len(vertices)})")
         return [None] * len(source_indices), timing
 
     # Success — retrieve results
@@ -1132,6 +1135,7 @@ def step_exact_geodesics(
     faces: np.ndarray,
     source_indices: List[int],
     timeout: float = 300.0,
+    verbose: bool = True,
 ) -> Dict[int, Optional[np.ndarray]]:
     """
     Precompute exact geodesic distances for all source vertices.
@@ -1161,12 +1165,14 @@ def step_exact_geodesics(
     if proc.is_alive():
         proc.kill()
         proc.join()
-        print(f"  [!] Exact geodesics timed out after {timeout:.0f}s (N={len(vertices)})")
+        if verbose:
+            print(f"  [!] Exact geodesics timed out after {timeout:.0f}s (N={len(vertices)})")
         return empty
 
     if proc.exitcode != 0:
-        print(f"  [!] Exact geodesics crashed (exit code {proc.exitcode}, "
-              f"N={len(vertices)}, F={len(faces)})")
+        if verbose:
+            print(f"  [!] Exact geodesics crashed (exit code {proc.exitcode}, "
+                  f"N={len(vertices)}, F={len(faces)})")
         return empty
 
     try:
