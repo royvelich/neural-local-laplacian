@@ -40,11 +40,14 @@ from neural_local_laplacian.modules.laplacian_modules import LaplacianTransforme
 from neural_local_laplacian.utils.utils import cuda_warmup
 from neural_local_laplacian.utils.geodesic_utils import select_multiple_geodesic_sources
 from neural_local_laplacian.utils.validation_utils import (
-    load_mesh_vertices,
+    load_mesh_with_faces,
     step_pred_knn,
     step_pred_inference,
     step_pred_geodesic,
     step_robust_geodesic,
+    step_gt_laplacian,
+    step_robust_laplacian,
+    step_greens_function,
     GeodesicTimingBreakdown,
 )
 
@@ -115,7 +118,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 mesh_file_path = mesh_file_path[0]
             mesh_name = Path(mesh_file_path).name
 
-            vertices = load_mesh_vertices(mesh_file_path)
+            vertices, faces = load_mesh_with_faces(mesh_file_path)
             N = len(vertices)
             source_indices = select_multiple_geodesic_sources(
                 vertices.astype(np.float64), num_sources=num_sources,
@@ -144,6 +147,30 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             # ---- Robust pipeline ----
             _, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
 
+            # ---- GT Laplacian (for Green's function reference) ----
+            gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
+
+            # ---- Robust Laplacian (for Green's function) ----
+            rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
+
+            # ---- Green's function (GT → PRED → Robust) ----
+            gt_greens = None
+            t_greens_gt = None
+            if gt_L is not None:
+                gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
+
+            gt_gvals = gt_greens.values if gt_greens is not None else None
+
+            pred_greens, t_greens_pred = step_greens_function(
+                pred_result['L'], pred_result['M'], source_indices,
+                gt_greens_values=gt_gvals,
+            )
+
+            rob_greens, t_greens_rob = step_greens_function(
+                rob_L, rob_M, source_indices,
+                gt_greens_values=gt_gvals,
+            )
+
             # ---- Re-enable GC ----
             gc.enable()
 
@@ -157,9 +184,14 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             pred_e2e = pred_onetime + pred_geo_timing.solve
             robust_e2e = robust_timing.total
 
+            # Green's E2E: L,M assembly + factorize + solve
+            pred_greens_e2e = pred_lm_total + t_greens_pred.total
+            robust_greens_e2e = t_rob_lm['assembly'] + t_greens_rob.total
+
             metrics = {
                 'mesh_name': mesh_name,
                 'num_vertices': N,
+                'num_faces': len(faces),
                 'k': pred_k,
                 'num_sources': n_src,
                 # PRED L,M breakdown (ms)
@@ -184,10 +216,39 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 'robust_solve_ms': robust_timing.solve * 1000,
                 'robust_e2e_geodesic_ms': robust_e2e * 1000,
                 'robust_per_src_ms': robust_e2e / n_src * 1000,
-                # Ratios
+                # Ratios (geodesic)
                 'ratio_lm': pred_lm_total / robust_timing.lm_assembly if robust_timing.lm_assembly > 0 else None,
                 'ratio_e2e': pred_e2e / robust_e2e if robust_e2e > 0 else None,
+                # GT assembly (ms)
+                'gt_assembly_ms': t_gt['assembly'] * 1000,
+                'robust_lm_assembly_ms': t_rob_lm['assembly'] * 1000,
+                # Green's function — PRED
+                'pred_greens_fact_ms': t_greens_pred.factorize * 1000,
+                'pred_greens_solve_ms': t_greens_pred.solve * 1000,
+                'pred_greens_total_ms': t_greens_pred.total * 1000,
+                'pred_greens_e2e_ms': pred_greens_e2e * 1000,
+                'pred_greens_max_principle': pred_greens.max_principle_pass_rate,
+                'pred_greens_gt_corr_mean': pred_greens.mean_corr_with_gt,
+                'pred_greens_gt_corr_std': pred_greens.std_corr_with_gt,
+                'pred_greens_residual_norm': pred_greens.mean_residual_norm,
+                # Green's function — Robust
+                'robust_greens_fact_ms': t_greens_rob.factorize * 1000,
+                'robust_greens_solve_ms': t_greens_rob.solve * 1000,
+                'robust_greens_total_ms': t_greens_rob.total * 1000,
+                'robust_greens_e2e_ms': robust_greens_e2e * 1000,
+                'robust_greens_max_principle': rob_greens.max_principle_pass_rate,
+                'robust_greens_gt_corr_mean': rob_greens.mean_corr_with_gt,
+                'robust_greens_gt_corr_std': rob_greens.std_corr_with_gt,
+                'robust_greens_residual_norm': rob_greens.mean_residual_norm,
             }
+            # Green's function — GT (optional, may be None if igl unavailable)
+            if t_greens_gt is not None:
+                metrics['gt_greens_total_ms'] = t_greens_gt.total * 1000
+                metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
+            # Green's E2E ratio
+            if robust_greens_e2e > 0:
+                metrics['ratio_greens_e2e'] = pred_greens_e2e / robust_greens_e2e
+
             metrics_list.append(metrics)
             status = "OK"
 
@@ -205,10 +266,14 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         eta = (elapsed / done) * (n_total - done) if done > 0 else 0
 
         ratio_str = f"{metrics.get('ratio_e2e', 0):.2f}x" if metrics.get('ratio_e2e') else "?"
+        greens_corr = f"{metrics.get('pred_greens_gt_corr_mean', 0):.3f}"
+        greens_mp = f"{metrics.get('pred_greens_max_principle', 0):.0%}"
         print(f"{tag}[{done}/{n_total}] {mesh_name:<16s} {status:<10s} "
               f"PRED={metrics.get('pred_e2e_geodesic_ms', 0):.0f}ms "
               f"Rob={metrics.get('robust_e2e_geodesic_ms', 0):.0f}ms "
-              f"({ratio_str}) [{t_mesh:.1f}s, ETA {eta:.0f}s]")
+              f"({ratio_str}) "
+              f"Green's corr={greens_corr} mp={greens_mp} "
+              f"[{t_mesh:.1f}s, ETA {eta:.0f}s]")
 
     elapsed = time.time() - t_start
     print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s")
@@ -423,10 +488,35 @@ def main(cfg: DictConfig) -> None:
         ("Robust E2E geodesic",    "robust_e2e_geodesic_ms"),
         ("PRED per-source",        "pred_per_src_ms"),
         ("Robust per-source",      "robust_per_src_ms"),
+        ("",                       ""),
+        ("PRED Green's E2E",       "pred_greens_e2e_ms"),
+        ("Robust Green's E2E",     "robust_greens_e2e_ms"),
+        ("PRED Green's solve",     "pred_greens_solve_ms"),
+        ("Robust Green's solve",   "robust_greens_solve_ms"),
     ]:
+        if not key:
+            print()
+            continue
         m, s, mn, mx = _stats(key)
         if m is not None:
             print(f"  {label:<26s} {m:>{W}.1f} {s:>{W}.1f} {mn:>{W}.1f} {mx:>{W}.1f}")
+
+    # --- Green's function quality ---
+    print(f"\n  GREEN'S FUNCTION QUALITY")
+    print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
+    print(f"  {'-' * 28} {'-' * W} {'-' * W}")
+    for label, key in [
+        ("PRED max principle",     "pred_greens_max_principle"),
+        ("Robust max principle",   "robust_greens_max_principle"),
+        ("GT max principle",       "gt_greens_max_principle"),
+        ("PRED GT correlation",    "pred_greens_gt_corr_mean"),
+        ("Robust GT correlation",  "robust_greens_gt_corr_mean"),
+        ("PRED residual norm",     "pred_greens_residual_norm"),
+        ("Robust residual norm",   "robust_greens_residual_norm"),
+    ]:
+        m, s, _, _ = _stats(key)
+        if m is not None:
+            print(f"  {label:<26s} {m:>{W}.4f} {s:>{W}.4f}")
 
     pred_e2e_vals = [float(m['pred_e2e_geodesic_ms']) for m in all_metrics
                      if m.get('pred_e2e_geodesic_ms')]
@@ -435,8 +525,18 @@ def main(cfg: DictConfig) -> None:
     if pred_e2e_vals and robust_e2e_vals:
         ratio = np.mean(pred_e2e_vals) / np.mean(robust_e2e_vals)
         wins = sum(1 for p, r in zip(pred_e2e_vals, robust_e2e_vals) if p < r)
-        print(f"\n  PRED/Robust E2E ratio: {ratio:.2f}x  "
+        print(f"\n  PRED/Robust E2E geodesic ratio: {ratio:.2f}x  "
               f"(PRED wins {wins}/{len(pred_e2e_vals)})")
+
+    pred_greens_vals = [float(m['pred_greens_e2e_ms']) for m in all_metrics
+                        if m.get('pred_greens_e2e_ms')]
+    robust_greens_vals = [float(m['robust_greens_e2e_ms']) for m in all_metrics
+                          if m.get('robust_greens_e2e_ms')]
+    if pred_greens_vals and robust_greens_vals:
+        ratio = np.mean(pred_greens_vals) / np.mean(robust_greens_vals)
+        wins = sum(1 for p, r in zip(pred_greens_vals, robust_greens_vals) if p < r)
+        print(f"  PRED/Robust E2E Green's ratio:  {ratio:.2f}x  "
+              f"(PRED wins {wins}/{len(pred_greens_vals)})")
 
     print(f"\n  Total time: {elapsed:.1f}s ({len(all_metrics)} meshes, {num_gpus} GPUs)")
     print(f"{'=' * 80}")
