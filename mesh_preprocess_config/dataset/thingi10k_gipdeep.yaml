@@ -1,0 +1,6 @@
+folder: "/home/royve/datasets/neural-laplacian/thingi10k"
+vertices_range: [0, 12000]
+num_components_range: [1, 1]
+num_sources: 10
+seed: 42
+num_workers: 8
