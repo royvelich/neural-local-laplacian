@@ -31,6 +31,7 @@ from neural_local_laplacian.utils.utils import (
     scan_mesh_folders,
     load_mesh_lookup_table,
     save_mesh_lookup_table,
+    SUPPORTED_MESH_FORMATS,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_exact_geodesics,
@@ -134,8 +135,15 @@ def main(cfg: DictConfig) -> None:
     print(f"Workers:     {num_workers}")
     print(f"{'=' * 70}\n")
 
-    # Step 1: Scan + filter + build lookup table
+    # Step 1: Count total files and scan + filter + build lookup table
     print("Step 1: Scanning and filtering meshes...")
+    total_files = 0
+    for folder_path in folder_paths:
+        for file_path in folder_path.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_MESH_FORMATS:
+                total_files += 1
+    print(f"  Total mesh files found: {total_files}")
+
     mesh_files = scan_mesh_folders(
         folder_paths=folder_paths,
         file_size_range_mb=file_size_range,
@@ -145,9 +153,11 @@ def main(cfg: DictConfig) -> None:
         max_meshes=None,
         shuffle=False,
     )
-    print(f"Found {len(mesh_files)} meshes after filtering.\n")
+    n_filtered = len(mesh_files)
+    n_skipped = total_files - n_filtered
+    print(f"  After filtering: {n_filtered} kept, {n_skipped} skipped\n")
 
-    if len(mesh_files) == 0:
+    if n_filtered == 0:
         print("No meshes to process.")
         return
 
@@ -192,14 +202,25 @@ def main(cfg: DictConfig) -> None:
     save_mesh_lookup_table(lookup, folder_paths)
     print(f"  Updated {updated} entries.")
 
-    n_ok = sum(1 for _, _, ok, _, _, _ in results if ok)
-    n_fail = sum(1 for _, _, ok, _, _, _ in results if not ok)
+    n_geo_ok = sum(1 for _, _, ok, _, _, _ in results if ok)
+    n_geo_fail = sum(1 for _, _, ok, _, _, _ in results if not ok)
 
+    # Summary
     print(f"\n{'=' * 70}")
-    print(f"DONE: {n_ok} succeeded, {n_fail} failed, {elapsed:.1f}s")
+    print(f"SUMMARY")
+    print(f"{'=' * 70}")
+    print(f"  Total mesh files:        {total_files:>6d}")
+    print(f"  Skipped by filters:      {n_skipped:>6d}")
+    print(f"  Passed filters:          {n_filtered:>6d}")
+    print(f"    Geodesics OK:          {n_geo_ok:>6d}")
+    print(f"    Geodesics failed:      {n_geo_fail:>6d}")
+    print(f"  ──────────────────────── ──────")
+    print(f"  Check:                   {n_skipped + n_geo_ok + n_geo_fail:>6d}  "
+          f"({'OK' if n_skipped + n_geo_ok + n_geo_fail == total_files else 'MISMATCH'})")
+    print(f"  Time:                    {elapsed:>6.1f}s")
     print(f"{'=' * 70}")
 
-    if n_fail > 0:
+    if n_geo_fail > 0:
         print(f"\nFailed meshes:")
         for fpath, name, ok, n_ok_i, n_src, msg in results:
             if not ok:
