@@ -152,6 +152,7 @@ def main(cfg: DictConfig) -> None:
         num_components_range=components_range,
         max_meshes=None,
         shuffle=False,
+        num_workers=num_workers,
     )
     n_filtered = len(mesh_files)
     n_skipped = total_files - n_filtered

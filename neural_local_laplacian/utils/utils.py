@@ -913,6 +913,20 @@ def get_mesh_geometry_info(
     return num_vertices, num_faces, num_components
 
 
+def _get_mesh_geometry_info_worker(file_path_str: str) -> Optional[Tuple[str, int, int, int, int]]:
+    """Pool worker: load mesh, return (path, size_bytes, num_v, num_f, num_c) or None."""
+    file_path = Path(file_path_str)
+    info = get_mesh_geometry_info(file_path)
+    if info is None:
+        return None
+    num_v, num_f, num_c = info
+    try:
+        size_bytes = file_path.stat().st_size
+    except OSError:
+        size_bytes = 0
+    return file_path_str, size_bytes, num_v, num_f, num_c
+
+
 def scan_mesh_folders(
     folder_paths: List[Path],
     file_size_range_mb: Optional[Tuple[float, float]] = None,
@@ -922,6 +936,7 @@ def scan_mesh_folders(
     max_meshes: Optional[int] = None,
     shuffle: bool = False,
     seed: Optional[int] = None,
+    num_workers: int = 1,
 ) -> List[Path]:
     """
     Scan mesh folders, apply filters, build/update lookup table.
@@ -941,6 +956,7 @@ def scan_mesh_folders(
         max_meshes: Cap on number of meshes (applied after shuffle)
         shuffle: Shuffle before capping
         seed: Random seed for shuffle
+        num_workers: Number of parallel workers for geometry filtering (cache misses)
 
     Returns:
         List of mesh file Path objects
@@ -971,9 +987,9 @@ def scan_mesh_folders(
 
     if has_geo_filters and mesh_files:
         lookup = load_mesh_lookup_table(folder_paths)
-        cache_hits, cache_misses = 0, 0
-        kept = []
-        skipped = 0
+        cache_hits = 0
+        cached_info = {}    # key -> (num_v, num_f, num_c)
+        miss_paths = []     # paths needing trimesh.load
 
         filter_parts = []
         if vertices_count_range is not None:
@@ -985,38 +1001,50 @@ def scan_mesh_folders(
         print(f"Geometry filter ({', '.join(filter_parts)}): checking {len(mesh_files)} meshes "
               f"({len(lookup)} cached entries) ...")
 
+        # Pass 1: check cache, collect misses
         for file_path in mesh_files:
             key = str(file_path)
-            info = None
-
-            # Try cache
             if key in lookup:
                 props = lookup[key]
                 try:
                     current_size = file_path.stat().st_size
                     if current_size == props.get('size_bytes'):
-                        info = (props['num_vertices'], props['num_faces'], props['num_components'])
+                        cached_info[key] = (props['num_vertices'], props['num_faces'], props['num_components'])
                         cache_hits += 1
+                        continue
                 except (OSError, KeyError):
                     pass
+            miss_paths.append(file_path)
 
-            # Cache miss — load mesh
-            if info is None:
-                cache_misses += 1
-                info = get_mesh_geometry_info(file_path)
-                if info is not None:
-                    num_v, num_f, num_c = info
-                    try:
-                        size_bytes = file_path.stat().st_size
-                    except OSError:
-                        size_bytes = 0
-                    lookup[key] = {
+        # Pass 2: load cache misses (parallel if num_workers > 1)
+        if miss_paths:
+            miss_strs = [str(p) for p in miss_paths]
+            if num_workers > 1:
+                import multiprocessing as _mp
+                print(f"  Loading {len(miss_paths)} uncached meshes ({num_workers} workers)...")
+                with _mp.Pool(num_workers) as pool:
+                    miss_results = pool.map(_get_mesh_geometry_info_worker, miss_strs)
+            else:
+                print(f"  Loading {len(miss_paths)} uncached meshes...")
+                miss_results = [_get_mesh_geometry_info_worker(s) for s in miss_strs]
+
+            for result in miss_results:
+                if result is not None:
+                    fpath_str, size_bytes, num_v, num_f, num_c = result
+                    cached_info[fpath_str] = (num_v, num_f, num_c)
+                    lookup[fpath_str] = {
                         'size_bytes': size_bytes,
                         'num_vertices': num_v,
                         'num_faces': num_f,
                         'num_components': num_c,
                     }
 
+        # Pass 3: apply filters
+        kept = []
+        skipped = 0
+        for file_path in mesh_files:
+            key = str(file_path)
+            info = cached_info.get(key)
             if info is None:
                 skipped += 1
                 continue
@@ -1038,9 +1066,9 @@ def scan_mesh_folders(
             kept.append(file_path)
 
         print(f"Geometry filter: kept {len(kept)}, skipped {skipped} "
-              f"(cache: {cache_hits} hits, {cache_misses} misses)")
+              f"(cache: {cache_hits} hits, {len(miss_paths)} misses)")
 
-        if cache_misses > 0:
+        if miss_paths:
             save_mesh_lookup_table(lookup, folder_paths)
 
         mesh_files = kept
