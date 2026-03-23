@@ -49,10 +49,9 @@ import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
-from neural_local_laplacian.utils.utils import cuda_warmup
+from neural_local_laplacian.utils.utils import cuda_warmup, load_mesh
 from neural_local_laplacian.utils.geodesic_utils import select_multiple_geodesic_sources
 from neural_local_laplacian.utils.validation_utils import (
-    load_mesh_with_faces,
     step_pred_knn,
     step_pred_inference,
     step_pred_reassemble,
@@ -256,18 +255,27 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             if isinstance(mesh_file_path, list):
                 mesh_file_path = mesh_file_path[0]
             mesh_name = Path(mesh_file_path).name
-            vertices, faces = load_mesh_with_faces(mesh_file_path)
+            vertices, faces, _ = load_mesh(mesh_file_path)
             N = len(vertices)
             source_indices = select_multiple_geodesic_sources(
                 vertices.astype(np.float64), num_sources=num_sources,
                 method="farthest_point_sampling", seed=42
             ).tolist()
+
+            # Pull precomputed exact geodesics from dataset (if available)
+            exact_geodesics = None
+            geo_data = getattr(data, 'geodesic_data', None)
+            if geo_data is not None and geo_data.get('has_geodesic_data'):
+                exact_geodesics = geo_data.get('exact_geodesics')
+
             mesh_data_list.append({
                 'mesh_name': mesh_name,
+                'mesh_file_path': mesh_file_path,
                 'vertices': vertices,
                 'faces': faces,
                 'N': N,
                 'source_indices': source_indices,
+                'exact_geodesics': exact_geodesics,
             })
         except Exception as e:
             print(f"{tag}  Failed to load mesh {global_idx}: {e}")
@@ -455,8 +463,14 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['nelo_e2e_geodesic_ms'] = nelo_geo_e2e * 1000
                 metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
 
-            # ---- Geodesic quality vs exact (precompute exact once) ----
-            exact_geo = step_exact_geodesics(vertices, faces, source_indices)
+            # ---- Geodesic quality vs exact (preloaded or from cache) ----
+            exact_geo = md.get('exact_geodesics')
+            if exact_geo is None:
+                # Not preloaded — try cache, then compute on the fly
+                exact_geo = step_exact_geodesics(
+                    vertices, faces, source_indices,
+                    mesh_file_path=md.get('mesh_file_path'),
+                )
             n_exact = sum(1 for v in exact_geo.values() if v is not None)
             metrics['num_exact_geodesics'] = n_exact
 

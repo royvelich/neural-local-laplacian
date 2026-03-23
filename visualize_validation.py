@@ -77,6 +77,7 @@ from neural_local_laplacian.utils.utils import (
     build_patches_from_vertices,
     set_knn_backend,
     cuda_warmup,
+    load_mesh,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesics_batch,
@@ -3511,17 +3512,7 @@ class RealTimeEigenanalysisVisualizer:
         print(f"Loading mesh for GT computation: {Path(mesh_file_path).name}")
 
         try:
-            # Load mesh using trimesh
-            mesh = trimesh.load(str(mesh_file_path))
-            raw_vertices = np.array(mesh.vertices, dtype=np.float32)
-            faces = np.array(mesh.faces, dtype=np.int32)
-
-            # Apply the same normalization as MeshDataset
-            vertices = normalize_mesh_vertices(raw_vertices)
-
-            # Update mesh with normalized vertices for normal computation
-            mesh.vertices = vertices
-            gt_vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
+            vertices, faces, gt_vertex_normals = load_mesh(mesh_file_path)
 
             print(f"Mesh has {len(vertices)} vertices and {len(faces)} faces")
             print(f"Normalized vertices: center at origin, max distance = {np.linalg.norm(vertices, axis=1).max():.6f}")

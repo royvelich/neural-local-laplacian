@@ -113,23 +113,23 @@ def main(cfg: DictConfig) -> None:
     num_workers = getattr(ds, 'num_workers', 8)
 
     # Parse filter ranges from dataset config (None if not set)
-    file_size_range = tuple(ds.file_size_range_mb) if getattr(ds, 'file_size_range_mb', None) is not None else None
-    vertices_range = tuple(ds.vertices_count_range) if getattr(ds, 'vertices_count_range', None) is not None else None
-    faces_range = tuple(ds.faces_count_range) if getattr(ds, 'faces_count_range', None) is not None else None
-    components_range = tuple(ds.num_components_range) if getattr(ds, 'num_components_range', None) is not None else None
+    file_size_range_mb = tuple(ds.file_size_range_mb) if getattr(ds, 'file_size_range_mb', None) is not None else None
+    vertices_count_range = tuple(ds.vertices_count_range) if getattr(ds, 'vertices_count_range', None) is not None else None
+    faces_count_range = tuple(ds.faces_count_range) if getattr(ds, 'faces_count_range', None) is not None else None
+    num_components_range = tuple(ds.num_components_range) if getattr(ds, 'num_components_range', None) is not None else None
 
     print(f"\n{'=' * 70}")
     print(f"PREPROCESS MESH FOLDER")
     print(f"{'=' * 70}")
     print(f"Folder:      {ds.folder}")
-    if file_size_range:
-        print(f"File size:   {file_size_range[0]:.2f} - {file_size_range[1]:.2f} MB")
-    if vertices_range:
-        print(f"Vertices:    {vertices_range[0]} - {vertices_range[1]}")
-    if faces_range:
-        print(f"Faces:       {faces_range[0]} - {faces_range[1]}")
-    if components_range:
-        print(f"Components:  {components_range[0]} - {components_range[1]}")
+    if file_size_range_mb:
+        print(f"File size:   {file_size_range_mb[0]:.2f} - {file_size_range_mb[1]:.2f} MB")
+    if vertices_count_range:
+        print(f"Vertices:    {vertices_count_range[0]} - {vertices_count_range[1]}")
+    if faces_count_range:
+        print(f"Faces:       {faces_count_range[0]} - {faces_count_range[1]}")
+    if num_components_range:
+        print(f"Components:  {num_components_range[0]} - {num_components_range[1]}")
     print(f"Sources:     {num_sources}")
     print(f"Seed:        {seed}")
     print(f"Workers:     {num_workers}")
@@ -146,10 +146,10 @@ def main(cfg: DictConfig) -> None:
 
     mesh_files = scan_mesh_folders(
         folder_paths=folder_paths,
-        file_size_range_mb=file_size_range,
-        vertices_count_range=vertices_range,
-        faces_count_range=faces_range,
-        num_components_range=components_range,
+        file_size_range_mb=file_size_range_mb,
+        vertices_count_range=vertices_count_range,
+        faces_count_range=faces_count_range,
+        num_components_range=num_components_range,
         max_meshes=None,
         shuffle=False,
         num_workers=num_workers,

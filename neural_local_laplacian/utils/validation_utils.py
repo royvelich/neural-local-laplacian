@@ -45,6 +45,7 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_geodesic_metrics,
     compute_exact_geodesics,
     normalize_distances,
+    load_cached_geodesics,
     HAS_PCDIFF,
 )
 
@@ -106,19 +107,6 @@ try:
     HAS_NELO = True
 except ImportError:
     pass
-
-
-# =============================================================================
-# Mesh loading
-# =============================================================================
-
-def load_mesh_vertices(mesh_file_path: str) -> np.ndarray:
-    """Load and normalize mesh vertices. Returns float32 array."""
-    import trimesh
-    mesh = trimesh.load(mesh_file_path, process=False, force='mesh')
-    vertices = np.array(mesh.vertices, dtype=np.float64)
-    vertices = normalize_mesh_vertices(vertices)
-    return vertices.astype(np.float32)
 
 
 # =============================================================================
@@ -600,25 +588,6 @@ def step_robust_geodesic(
 
 
 # =============================================================================
-# Step: Load mesh with faces
-# =============================================================================
-
-def load_mesh_with_faces(mesh_file_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load mesh, normalize vertices, return (vertices_f32, faces_i32).
-
-    Raises RuntimeError if mesh has no faces.
-    """
-    import trimesh
-    mesh = trimesh.load(mesh_file_path, process=False, force='mesh')
-    vertices = np.array(mesh.vertices, dtype=np.float64)
-    vertices = normalize_mesh_vertices(vertices).astype(np.float32)
-    faces = np.array(mesh.faces, dtype=np.int32)
-    if len(faces) == 0:
-        raise RuntimeError(f"Mesh has no faces: {mesh_file_path}")
-    return vertices, faces
-
-
-# =============================================================================
 # Step: GT Laplacian (cotangent) from mesh faces
 # =============================================================================
 
@@ -1077,16 +1046,26 @@ def step_exact_geodesics(
     vertices: np.ndarray,
     faces: np.ndarray,
     source_indices: List[int],
+    mesh_file_path: Optional[str] = None,
 ) -> Dict[int, Optional[np.ndarray]]:
     """
-    Precompute exact geodesic distances for all source vertices.
+    Load or compute exact geodesic distances for all source vertices.
 
-    Call once per mesh, then pass the result to step_geodesic_quality
-    for each method to avoid redundant computation.
+    If mesh_file_path is provided, tries to load from .geodesics_cache/
+    (built by preprocess_mesh_folder.py). Falls back to on-the-fly
+    computation on cache miss.
 
     Returns:
         Dict mapping source_idx -> exact distances (N,), or None if failed.
     """
+    # Try cache first
+    if mesh_file_path is not None:
+        source_arr = np.array(source_indices)
+        cached = load_cached_geodesics(mesh_file_path, len(vertices), source_arr)
+        if cached is not None:
+            return cached
+
+    # Cache miss — compute on the fly
     exact = {}
     verts_f64 = vertices.astype(np.float64)
     faces_i32 = faces.astype(np.int32)

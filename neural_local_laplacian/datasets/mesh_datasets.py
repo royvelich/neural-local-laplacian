@@ -10,14 +10,11 @@ from scipy.spatial import cKDTree
 import robust_laplacian
 import scipy.sparse
 
-# Trimesh for mesh loading
-import trimesh
-
 # Local imports
 from neural_local_laplacian.datasets.base_datasets import PoseType
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 from neural_local_laplacian.utils import utils
-from neural_local_laplacian.utils.utils import load_mesh_list_from_lookup
+from neural_local_laplacian.utils.utils import load_mesh_list_from_lookup, load_mesh
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_exact_geodesics,
     select_multiple_geodesic_sources,
@@ -68,6 +65,7 @@ class MeshDataset(Dataset):
             faces_count_range: Optional[Tuple[int, int]] = None,
             num_components_range: Optional[Tuple[int, int]] = None,
             shuffle: bool = False,
+            require_complete_geodesics: bool = False,
             verbose_diagnostics: bool = False,
             # Backward compatibility: singular form still accepted
             mesh_folder_path: Union[str, Path] = None
@@ -102,6 +100,9 @@ class MeshDataset(Dataset):
                 Use None for no filtering.
             shuffle: If True, shuffle the mesh file list before applying max_meshes cap.
                 Useful for random subsampling from a large collection.
+            require_complete_geodesics: If True, skip meshes where precomputed exact
+                geodesics are missing or incomplete (geodesics_num_ok < geodesics_num_sources
+                in the lookup table). Requires running preprocess_mesh_folder.py first.
             verbose_diagnostics: If True, print detailed diagnostic messages before each
                 native call during mesh loading (useful for debugging segfaults).
         """
@@ -129,6 +130,7 @@ class MeshDataset(Dataset):
         self._faces_count_range = faces_count_range
         self._num_components_range = num_components_range
         self._shuffle = shuffle
+        self._require_complete_geodesics = require_complete_geodesics
         self._verbose = verbose_diagnostics
 
         # Validate inputs
@@ -143,6 +145,7 @@ class MeshDataset(Dataset):
             num_components_range=self._num_components_range,
             max_meshes=self._max_meshes,
             shuffle=self._shuffle,
+            require_complete_geodesics=self._require_complete_geodesics,
         )
 
         if len(self._mesh_file_paths) == 0:
@@ -229,40 +232,13 @@ class MeshDataset(Dataset):
         if _v: print(f"  [MeshDataset] Loading mesh [{idx}]: {mesh_file_path.name}", flush=True)
 
         try:
-            # Load mesh using trimesh
-            if _v: print(f"    [diag] trimesh.load ...", flush=True)
-            mesh = trimesh.load(str(mesh_file_path))
-
-            # Extract vertices as numpy array
-            if hasattr(mesh, 'vertices'):
-                raw_vertices = np.array(mesh.vertices, dtype=np.float32)
-            else:
-                raise ValueError(f"Loaded mesh has no vertices: {mesh_file_path}")
-
-            # Store original mesh dimensions before normalization
-            original_num_vertices = len(raw_vertices)
-
-            # Extract faces before normalization
-            if hasattr(mesh, 'faces'):
-                faces = np.array(mesh.faces, dtype=np.int64)
-                original_num_faces = len(faces)
-            else:
-                faces = np.array([])
-                original_num_faces = 0
+            # Load mesh using shared loader
+            if _v: print(f"    [diag] load_mesh ...", flush=True)
+            vertices, faces, vertex_normals = load_mesh(str(mesh_file_path))
+            original_num_vertices = len(vertices)
+            original_num_faces = len(faces)
 
             if _v: print(f"    [diag] Loaded: {original_num_vertices} verts, {original_num_faces} faces", flush=True)
-
-            # Normalize mesh vertices: center at origin and fit in unit sphere
-            if _v: print(f"    [diag] normalize_mesh_vertices ...", flush=True)
-            vertices = utils.normalize_mesh_vertices(raw_vertices)
-
-            # Calculate vertex normals using trimesh with normalized vertices
-            if _v: print(f"    [diag] vertex_normals ...", flush=True)
-            mesh.vertices = vertices
-            if hasattr(mesh, 'vertex_normals'):
-                vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
-            else:
-                raise ValueError(f"Could not compute vertex normals for mesh: {mesh_file_path}")
 
             # Compute ground-truth Laplacian eigendecomposition using robust-laplacian
             if _v: print(f"    [diag] GT eigendecomposition ...", flush=True)

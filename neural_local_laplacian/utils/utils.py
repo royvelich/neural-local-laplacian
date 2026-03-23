@@ -805,6 +805,42 @@ def cuda_warmup(model, device: torch.device, k: int):
 
 
 # =============================================================================
+# Mesh loading
+# =============================================================================
+
+import trimesh as _trimesh
+
+
+def load_mesh(
+    path: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load a mesh file, merge duplicate vertices, normalize, compute normals.
+
+    This is the single shared mesh loader used across the codebase.
+    Uses trimesh with default processing (merges duplicates, removes
+    degenerate faces, fixes winding).
+
+    Args:
+        path: Path to mesh file (.obj, .ply, .off, .stl)
+
+    Returns:
+        (vertices, faces, vertex_normals) where:
+        - vertices: (N, 3) float32, normalized to unit sphere
+        - faces: (F, 3) int32
+        - vertex_normals: (N, 3) float32
+    """
+    mesh = _trimesh.load(str(path), force='mesh')
+    vertices = normalize_mesh_vertices(
+        np.array(mesh.vertices, dtype=np.float64)
+    ).astype(np.float32)
+    faces = np.array(mesh.faces, dtype=np.int32)
+    mesh.vertices = vertices
+    vertex_normals = np.array(mesh.vertex_normals, dtype=np.float32)
+    return vertices, faces, vertex_normals
+
+
+# =============================================================================
 # Mesh folder scanning and lookup table
 # =============================================================================
 
@@ -1097,6 +1133,7 @@ def load_mesh_list_from_lookup(
     max_meshes: Optional[int] = None,
     shuffle: bool = False,
     seed: Optional[int] = None,
+    require_complete_geodesics: bool = False,
 ) -> List[Path]:
     """
     Load mesh file list from existing lookup table. No scanning, no trimesh.
@@ -1105,6 +1142,8 @@ def load_mesh_list_from_lookup(
 
     Args:
         folder_paths: List of dataset folder paths
+        require_complete_geodesics: If True, skip meshes where
+            geodesics_num_ok < geodesics_num_sources in the lookup table.
         (remaining args same as scan_mesh_folders)
 
     Returns:
@@ -1120,6 +1159,7 @@ def load_mesh_list_from_lookup(
 
     # Filter from lookup entries
     mesh_files = []
+    n_geo_skipped = 0
     for abs_path_str, props in lookup.items():
         path = Path(abs_path_str)
 
@@ -1150,7 +1190,18 @@ def load_mesh_list_from_lookup(
             if not (num_components_range[0] <= num_c <= num_components_range[1]):
                 continue
 
+        # Geodesic completeness filter
+        if require_complete_geodesics:
+            geo_sources = props.get('geodesics_num_sources', 0)
+            geo_ok = props.get('geodesics_num_ok', 0)
+            if geo_sources == 0 or geo_ok < geo_sources:
+                n_geo_skipped += 1
+                continue
+
         mesh_files.append(path)
+
+    if n_geo_skipped > 0:
+        print(f"Geodesic filter: skipped {n_geo_skipped} meshes with incomplete geodesics")
 
     mesh_files.sort()
 
