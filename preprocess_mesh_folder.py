@@ -51,8 +51,16 @@ def _compute_one_mesh(args) -> Tuple[str, str, bool, int, int, str]:
     Returns:
         (mesh_file_path, mesh_name, success, n_ok, num_sources, message)
     """
-    mesh_file_path, num_sources, seed = args
+    import signal
+
+    mesh_file_path, num_sources, seed, timeout_per_source = args
     mesh_name = Path(mesh_file_path).name
+
+    class _Timeout(Exception):
+        pass
+
+    def _alarm_handler(signum, frame):
+        raise _Timeout()
 
     try:
         import trimesh
@@ -78,25 +86,35 @@ def _compute_one_mesh(args) -> Tuple[str, str, bool, int, int, str]:
             return mesh_file_path, mesh_name, True, n_ok, num_sources, \
                 f"cached ({n_ok}/{num_sources} sources)"
 
-        # Compute exact geodesics
+        # Compute exact geodesics with per-source timeout
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
         geodesics = {}
+        n_timeout = 0
         for src_idx in source_indices:
             try:
+                signal.alarm(timeout_per_source)
                 geodesics[int(src_idx)] = compute_exact_geodesics(
                     vertices, faces, int(src_idx),
                 )
+            except _Timeout:
+                geodesics[int(src_idx)] = None
+                n_timeout += 1
             except Exception:
                 geodesics[int(src_idx)] = None
+            finally:
+                signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
         n_ok = sum(1 for v in geodesics.values() if v is not None)
+        timeout_str = f", {n_timeout} timed out" if n_timeout > 0 else ""
 
         if n_ok > 0:
             save_geodesics_to_cache(mesh_file_path, N, source_indices, geodesics)
             return mesh_file_path, mesh_name, True, n_ok, num_sources, \
-                f"computed ({n_ok}/{num_sources} sources, N={N})"
+                f"computed ({n_ok}/{num_sources} sources, N={N}{timeout_str})"
         else:
             return mesh_file_path, mesh_name, False, 0, num_sources, \
-                f"all sources failed (N={N}, F={len(faces)})"
+                f"all sources failed (N={N}, F={len(faces)}{timeout_str})"
 
     except Exception as e:
         return mesh_file_path, mesh_name, False, 0, num_sources, str(e)
@@ -111,6 +129,7 @@ def main(cfg: DictConfig) -> None:
     num_sources = getattr(ds, 'num_sources', 10)
     seed = getattr(ds, 'seed', 42)
     num_workers = getattr(ds, 'num_workers', 8)
+    timeout_per_source = getattr(ds, 'timeout_per_source', 60)
 
     # Parse filter ranges from dataset config (None if not set)
     file_size_range_mb = tuple(ds.file_size_range_mb) if getattr(ds, 'file_size_range_mb', None) is not None else None
@@ -131,6 +150,7 @@ def main(cfg: DictConfig) -> None:
     if num_components_range:
         print(f"Components:  {num_components_range[0]} - {num_components_range[1]}")
     print(f"Sources:     {num_sources}")
+    print(f"Timeout:     {timeout_per_source}s per source")
     print(f"Seed:        {seed}")
     print(f"Workers:     {num_workers}")
     print(f"{'=' * 70}\n")
@@ -165,7 +185,7 @@ def main(cfg: DictConfig) -> None:
     # Step 2: Precompute exact geodesics
     print(f"Step 2: Precomputing exact geodesics "
           f"({num_sources} sources per mesh)...")
-    worker_args = [(str(f), num_sources, seed) for f in mesh_files]
+    worker_args = [(str(f), num_sources, seed, timeout_per_source) for f in mesh_files]
     t_start = time.time()
 
     if num_workers <= 1:
