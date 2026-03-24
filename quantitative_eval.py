@@ -50,7 +50,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
 from neural_local_laplacian.utils.utils import cuda_warmup, load_mesh
-from neural_local_laplacian.utils.geodesic_utils import select_multiple_geodesic_sources
 from neural_local_laplacian.utils.validation_utils import (
     step_pred_knn,
     step_pred_inference,
@@ -130,10 +129,10 @@ def _add_eigen_metrics(
     prefix: str,
     L, M,
     gt_evals, gt_evecs,
-    num_eigenvalues: int,
+    num_eigenpairs: int,
 ):
     """Run eigen for one method and add to metrics dict. Phase 2."""
-    evals, evecs, t_eig = step_eigendecomposition(L, M, num_eigenvalues)
+    evals, evecs, t_eig = step_eigendecomposition(L, M, num_eigenpairs)
     metrics[f'{prefix}_eigen_ms'] = t_eig['eigen'] * 1000
 
     if gt_evals is not None and evals is not None:
@@ -180,11 +179,10 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     run_nelo = 'nelo' in methods
 
     # ---- Config ----
-    pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
-    robust_k = getattr(cfg.globals, 'k_robust', None) or 30
-    nelo_k = getattr(cfg, 'nelo_k', 8)
-    num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
-    num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
+    pred_k = getattr(cfg, 'k_pred', None) or getattr(cfg, 'k', 30)
+    robust_k = getattr(cfg, 'k_robust', None) or 30
+    nelo_k = getattr(cfg, 'k_nelo', 8)
+    num_eigenpairs = getattr(cfg, 'num_eigenpairs', 50)
     use_amp = device.type == 'cuda'
 
     # ---- Top-k pruning sweep ----
@@ -223,7 +221,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         nelo_pipeline = load_nelo_model(str(nelo_ckpt), device)
 
     # ---- Dataset ----
-    pl.seed_everything(cfg.globals.seed)
+    pl.seed_everything(cfg.seed)
     data_module = hydra.utils.instantiate(cfg.data_module)
     data_loader = data_module.val_dataloader()
     if isinstance(data_loader, list):
@@ -257,16 +255,24 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             mesh_name = Path(mesh_file_path).name
             vertices, faces, _ = load_mesh(mesh_file_path)
             N = len(vertices)
-            source_indices = select_multiple_geodesic_sources(
-                vertices.astype(np.float64), num_sources=num_sources,
-                method="farthest_point_sampling", seed=42
-            ).tolist()
 
-            # Pull precomputed exact geodesics from dataset (if available)
+            # Pull precomputed source indices and exact geodesics from dataset
+            source_indices = None
             exact_geodesics = None
             geo_data = getattr(data, 'geodesic_data', None)
-            if geo_data is not None and geo_data.get('has_geodesic_data'):
-                exact_geodesics = geo_data.get('exact_geodesics')
+            if geo_data is not None:
+                src = geo_data.get('source_indices')
+                if src is not None:
+                    source_indices = src.tolist() if hasattr(src, 'tolist') else list(src)
+                if geo_data.get('has_geodesic_data'):
+                    exact_geodesics = geo_data.get('exact_geodesics')
+
+            if source_indices is None:
+                print(f"{tag}  Warning: no precomputed source indices for {mesh_name}, skipping")
+                mesh_data_list.append(None)
+                metrics_list.append({})
+                mesh_cache.append({})
+                continue
 
             mesh_data_list.append({
                 'mesh_name': mesh_name,
@@ -515,7 +521,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             gt_evals, gt_evecs = None, None
             if gt_L is not None:
                 gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
-                    gt_L, gt_M, num_eigenvalues,
+                    gt_L, gt_M, num_eigenpairs,
                 )
                 metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
 
@@ -523,19 +529,19 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             if run_pred and pred_L is not None:
                 pred_evals, pred_evecs = _add_eigen_metrics(
                     metrics, 'pred', pred_L, pred_M,
-                    gt_evals, gt_evecs, num_eigenvalues,
+                    gt_evals, gt_evecs, num_eigenpairs,
                 )
             rob_evals, rob_evecs = None, None
             if run_robust and rob_L is not None:
                 rob_evals, rob_evecs = _add_eigen_metrics(
                     metrics, 'robust', rob_L, rob_M,
-                    gt_evals, gt_evecs, num_eigenvalues,
+                    gt_evals, gt_evecs, num_eigenpairs,
                 )
             nelo_evals, nelo_evecs = None, None
             if run_nelo and nelo_L is not None:
                 nelo_evals, nelo_evecs = _add_eigen_metrics(
                     metrics, 'nelo', nelo_L, nelo_M,
-                    gt_evals, gt_evecs, num_eigenvalues,
+                    gt_evals, gt_evecs, num_eigenpairs,
                 )
 
             # ---- HKS / WKS descriptor comparison ----
@@ -584,7 +590,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics[f'{prefix}_density_pct'] = sp.density_percent
 
             # ---- Spectral compression ----
-            compression_k_values = list(range(5, num_eigenvalues + 1, 5))
+            compression_k_values = list(range(5, num_eigenpairs + 1, 5))
             for prefix, m_evecs, m_M in [
                 ('gt', gt_evecs, gt_M),
                 ('pred', pred_evecs, pred_M),
@@ -619,7 +625,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 if gt_evals is not None:
                     tk_evals, tk_evecs = _add_eigen_metrics(
                         metrics, pfx, tk_L, tk_M,
-                        gt_evals, gt_evecs, num_eigenvalues,
+                        gt_evals, gt_evecs, num_eigenpairs,
                     )
 
                 # Descriptors
@@ -795,7 +801,7 @@ def _compute_summary(all_metrics: List[Dict[str, Any]], summary_path: Path):
 # Main entry point
 # ============================================================================
 
-@hydra.main(version_base="1.2", config_path='./visualization_config')
+@hydra.main(version_base="1.2", config_path='./quantitative_config')
 def main(cfg: DictConfig) -> None:
     """Quantitative evaluation."""
 
@@ -833,11 +839,10 @@ def main(cfg: DictConfig) -> None:
     tmp_dir = output_dir / '.tmp_quantitative_ranks'
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    pred_k = getattr(cfg.globals, 'k_pred', None) or getattr(cfg.globals, 'k', 30)
-    robust_k = getattr(cfg.globals, 'k_robust', None) or 30
-    nelo_k = getattr(cfg, 'nelo_k', 8)
-    num_sources = getattr(cfg.globals, 'num_validation_sources', 10)
-    num_eigenvalues = getattr(cfg.globals, 'num_eigenvalues', 50)
+    pred_k = getattr(cfg, 'k_pred', None) or getattr(cfg, 'k', 30)
+    robust_k = getattr(cfg, 'k_robust', None) or 30
+    nelo_k = getattr(cfg, 'k_nelo', 8)
+    num_eigenpairs = getattr(cfg, 'num_eigenpairs', 50)
 
     print(f"\n{'=' * 80}")
     print(f"QUANTITATIVE EVALUATION")
@@ -859,8 +864,7 @@ def main(cfg: DictConfig) -> None:
     if 'nelo' in methods:
         print(f"NeLo k:      {nelo_k}")
         print(f"NeLo ckpt:   {getattr(cfg, 'nelo_ckpt_path', 'N/A')}")
-    print(f"Sources:     {num_sources}")
-    print(f"Eigenvalues: {num_eigenvalues}")
+    print(f"Eigenpairs:  {num_eigenpairs}")
     print(f"Output:      {output_dir}")
     print(f"{'=' * 80}\n")
 
@@ -902,12 +906,12 @@ def main(cfg: DictConfig) -> None:
     print(f"Saved summary: {summary_path}")
 
     # ---- Print summary table ----
-    _print_summary(all_metrics, methods, num_sources, num_eigenvalues, elapsed, num_gpus)
+    _print_summary(all_metrics, methods, num_eigenpairs, elapsed, num_gpus)
 
     # ---- Generate plots ----
     figures_dir = output_dir / 'figures'
     figures_dir.mkdir(parents=True, exist_ok=True)
-    _generate_plots(all_metrics, methods, figures_dir, num_eigenvalues)
+    _generate_plots(all_metrics, methods, figures_dir, num_eigenpairs)
 
     # ---- Cleanup ----
     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -916,8 +920,7 @@ def main(cfg: DictConfig) -> None:
 def _print_summary(
     all_metrics: List[Dict[str, Any]],
     methods: Set[str],
-    num_sources: int,
-    num_eigenvalues: int,
+    num_eigenpairs: int,
     elapsed: float,
     num_gpus: int,
 ):
@@ -941,6 +944,9 @@ def _print_summary(
 
     W = 10
     n_meshes = len(all_metrics)
+    # Derive num_sources from metrics (per-mesh, take the most common value)
+    src_counts = [int(m['num_sources']) for m in all_metrics if m.get('num_sources') is not None]
+    num_sources = max(set(src_counts), key=src_counts.count) if src_counts else 0
 
     print(f"\n{'=' * 80}")
     print(f"SUMMARY ({n_meshes} meshes, {num_sources} sources/mesh)")
@@ -1068,7 +1074,7 @@ def _print_summary(
     print(f"  {'':>28s} {'Mean':>{W}s} {'Std':>{W}s}")
     print(f"  {'-' * 28} {'-' * W} {'-' * W}")
 
-    for k in range(5, num_eigenvalues + 1, 5):
+    for k in range(5, num_eigenpairs + 1, 5):
         _print_quality_row(f"GT k={k}", f"gt_compress_k{k}_mean_l2")
         for prefix, label in [('pred', 'PRED'), ('robust', 'Robust'), ('nelo', 'NeLo')]:
             if prefix not in methods:
@@ -1194,7 +1200,7 @@ def _generate_plots(
     all_metrics: List[Dict[str, Any]],
     methods: Set[str],
     output_dir: Path,
-    num_eigenvalues: int = 50,
+    num_eigenpairs: int = 50,
 ):
     """Generate all plots from collected metrics."""
     _setup_plot_style()
@@ -1208,7 +1214,7 @@ def _generate_plots(
     _plot_descriptor_quality(all_metrics, active, output_dir)
     _plot_probe_quality(all_metrics, active, output_dir)
     _plot_sparsity(all_metrics, active, output_dir)
-    _plot_spectral_compression(all_metrics, active, output_dir, num_eigenvalues)
+    _plot_spectral_compression(all_metrics, active, output_dir, num_eigenpairs)
 
     # Top-k sweep (if present)
     tk_values = _detect_top_k_values(all_metrics)
@@ -1596,11 +1602,11 @@ def _plot_sparsity(all_metrics: List[Dict], methods: List[str], output_dir: Path
 
 
 def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], output_dir: Path,
-                               num_eigenvalues: int = 50):
+                               num_eigenpairs: int = 50):
     """Line plot: mean L2 reconstruction error vs number of eigenvectors (k)."""
 
     all_prefixes = ['gt'] + methods
-    k_values = list(range(5, num_eigenvalues + 1, 5))
+    k_values = list(range(5, num_eigenpairs + 1, 5))
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
 
@@ -1634,7 +1640,7 @@ def _plot_spectral_compression(all_metrics: List[Dict], methods: List[str], outp
     ax.set_xlabel('Number of Eigenvectors (k)')
     ax.set_ylabel('Mean L2 Reconstruction Error')
     ax.set_title('Spectral Compression Quality')
-    ax.set_xticks(list(range(5, num_eigenvalues + 1, 10)))
+    ax.set_xticks(list(range(5, num_eigenpairs + 1, 10)))
     ax.set_xticks(k_values, minor=True)
     ax.set_xlim(k_values[0] - 1, k_values[-1] + 1)
     ax.set_ylim(bottom=0)
