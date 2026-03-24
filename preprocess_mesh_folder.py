@@ -105,7 +105,7 @@ def _compute_one_mesh(args) -> Tuple[str, str, bool, int, int, str]:
                 signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
 
-        n_ok = sum(1 for v in geodesics.values() if v is not None)
+        n_ok = sum(1 for v in geodesics.values() if v is not None and len(v) == N)
         timeout_str = f", {n_timeout} timed out" if n_timeout > 0 else ""
 
         if n_ok > 0:

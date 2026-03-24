@@ -941,7 +941,10 @@ def load_cached_geodesics(
         for src_idx in source_indices:
             key = f'distances_{src_idx}'
             if key in data:
-                result[int(src_idx)] = data[key]
+                arr = data[key]
+                if len(arr) != num_vertices:
+                    return None  # Corrupted cache entry
+                result[int(src_idx)] = arr
             else:
                 return None  # Incomplete cache
 
@@ -974,7 +977,7 @@ def save_geodesics_to_cache(
     }
 
     for src_idx, dists in geodesics.items():
-        if dists is not None:
+        if dists is not None and len(dists) == num_vertices:
             save_dict[f'distances_{src_idx}'] = dists.astype(np.float64)
 
     np.savez_compressed(str(cache_path), **save_dict)

@@ -508,12 +508,15 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                                ('robust', robust_distances), ('nelo', nelo_distances)]:
             if dists is None:
                 continue
-            qual = step_geodesic_quality(dists, source_indices, exact_geo)
-            metrics[f'{prefix}_geodesic_corr_mean'] = qual.corr_mean
-            metrics[f'{prefix}_geodesic_corr_std'] = qual.corr_std
-            metrics[f'{prefix}_geodesic_mae_mean'] = qual.mae_mean
-            metrics[f'{prefix}_geodesic_max_err_mean'] = qual.max_err_mean
-            metrics[f'{prefix}_geodesic_mono_mean'] = qual.mono_mean
+            try:
+                qual = step_geodesic_quality(dists, source_indices, exact_geo)
+                metrics[f'{prefix}_geodesic_corr_mean'] = qual.corr_mean
+                metrics[f'{prefix}_geodesic_corr_std'] = qual.corr_std
+                metrics[f'{prefix}_geodesic_mae_mean'] = qual.mae_mean
+                metrics[f'{prefix}_geodesic_max_err_mean'] = qual.max_err_mean
+                metrics[f'{prefix}_geodesic_mono_mean'] = qual.mono_mean
+            except Exception as e:
+                errors.append(f"{prefix} geodesic quality: {e}")
 
         # ---- Green's function ----
         gt_gvals = None
