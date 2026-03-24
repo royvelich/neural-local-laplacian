@@ -45,7 +45,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 import hydra
-import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
@@ -221,7 +220,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         nelo_pipeline = load_nelo_model(str(nelo_ckpt), device)
 
     # ---- Dataset ----
-    pl.seed_everything(getattr(cfg, 'seed', 42))
     data_module = hydra.utils.instantiate(cfg.data_module)
     data_loader = data_module.val_dataloader()
     if isinstance(data_loader, list):
