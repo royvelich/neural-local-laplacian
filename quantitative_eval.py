@@ -397,48 +397,65 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         metrics['num_faces'] = len(faces)
         metrics['num_sources'] = n_src
 
-        try:
-            gc.collect()
-            gc.disable()
+        errors = []
+        gc.collect()
+        gc.disable()
 
-            # ---- CPU assemblies ----
+        # ---- GT assembly ----
+        gt_L, gt_M, t_gt = None, None, None
+        try:
             gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
             metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
             cache['gt_L'] = gt_L
             cache['gt_M'] = gt_M
+        except Exception as e:
+            errors.append(f"GT assembly: {e}")
 
-            rob_L, rob_M, t_rob_lm = None, None, None
-            if run_robust:
+        # ---- Robust assembly ----
+        rob_L, rob_M, t_rob_lm = None, None, None
+        if run_robust:
+            try:
                 rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
                 metrics['robust_k'] = robust_k
                 metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
                 cache['rob_L'] = rob_L
                 cache['rob_M'] = rob_M
+            except Exception as e:
+                errors.append(f"Robust assembly: {e}")
 
-            # ---- Geodesics ----
-            gt_distances = None
-            if gt_L is not None:
+        # ---- GT geodesics ----
+        gt_distances = None
+        if gt_L is not None:
+            try:
                 gt_distances, gt_geo_timing = step_gt_geodesic(
                     gt_L, gt_M, vertices, faces, source_indices, N,
                 )
                 metrics['gt_geo_total_ms'] = gt_geo_timing.total * 1000
                 metrics['gt_e2e_geodesic_ms'] = (t_gt['assembly'] + gt_geo_timing.total) * 1000
+            except Exception as e:
+                errors.append(f"GT geodesic: {e}")
 
-            robust_distances = None
-            robust_timing = None
-            if run_robust:
+        # ---- Robust geodesics ----
+        robust_distances = None
+        robust_timing = None
+        if run_robust and rob_L is not None:
+            try:
                 robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
                 metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
                 metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
                 metrics['robust_e2e_geodesic_ms'] = robust_timing.total * 1000
                 metrics['robust_per_src_ms'] = robust_timing.total / n_src * 1000
+            except Exception as e:
+                errors.append(f"Robust geodesic: {e}")
 
-            pred_distances = None
-            pred_L = cache.get('pred_L')
-            pred_M = cache.get('pred_M')
-            pred_G = cache.get('pred_G')
-            t_pred = cache.get('t_pred')
-            if run_pred and pred_G is not None:
+        # ---- PRED geodesics ----
+        pred_distances = None
+        pred_L = cache.get('pred_L')
+        pred_M = cache.get('pred_M')
+        pred_G = cache.get('pred_G')
+        t_pred = cache.get('t_pred')
+        if run_pred and pred_G is not None:
+            try:
                 pred_distances, pred_geo_timing = step_pred_geodesic(
                     pred_L, pred_M, pred_G, source_indices, N,
                 )
@@ -453,12 +470,16 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['pred_geo_solve_ms'] = pred_geo_timing.solve * 1000
                 metrics['pred_e2e_geodesic_ms'] = pred_e2e * 1000
                 metrics['pred_per_src_ms'] = pred_e2e / n_src * 1000
+            except Exception as e:
+                errors.append(f"PRED geodesic: {e}")
 
-            nelo_distances = None
-            nelo_L = cache.get('nelo_L')
-            nelo_M = cache.get('nelo_M')
-            t_nelo = cache.get('t_nelo')
-            if run_nelo and nelo_L is not None:
+        # ---- NeLo geodesics ----
+        nelo_distances = None
+        nelo_L = cache.get('nelo_L')
+        nelo_M = cache.get('nelo_M')
+        t_nelo = cache.get('t_nelo')
+        if run_nelo and nelo_L is not None:
+            try:
                 nelo_distances, nelo_geo_timing = step_pcdiff_geodesic(
                     nelo_L, nelo_M, vertices, nelo_k, source_indices, N,
                 )
@@ -466,216 +487,235 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics['nelo_geo_total_ms'] = nelo_geo_timing.total * 1000
                 metrics['nelo_e2e_geodesic_ms'] = nelo_geo_e2e * 1000
                 metrics['nelo_per_src_ms'] = nelo_geo_e2e / n_src * 1000
+            except Exception as e:
+                errors.append(f"NeLo geodesic: {e}")
 
-            # ---- Geodesic quality vs exact (preloaded or from cache) ----
-            exact_geo = md.get('exact_geodesics')
-            if exact_geo is None:
-                # Not preloaded — try cache, then compute on the fly
+        # ---- Geodesic quality vs exact ----
+        exact_geo = md.get('exact_geodesics') or {}
+        if not exact_geo:
+            try:
                 exact_geo = step_exact_geodesics(
                     vertices, faces, source_indices,
                     mesh_file_path=md.get('mesh_file_path'),
                 )
-            n_exact = sum(1 for v in exact_geo.values() if v is not None)
-            metrics['num_exact_geodesics'] = n_exact
+            except Exception as e:
+                errors.append(f"Exact geodesics: {e}")
+                exact_geo = {}
+        n_exact = sum(1 for v in exact_geo.values() if v is not None)
+        metrics['num_exact_geodesics'] = n_exact
 
-            for prefix, dists in [('gt', gt_distances), ('pred', pred_distances),
-                                   ('robust', robust_distances), ('nelo', nelo_distances)]:
-                if dists is None:
-                    continue
-                qual = step_geodesic_quality(dists, source_indices, exact_geo)
-                metrics[f'{prefix}_geodesic_corr_mean'] = qual.corr_mean
-                metrics[f'{prefix}_geodesic_corr_std'] = qual.corr_std
-                metrics[f'{prefix}_geodesic_mae_mean'] = qual.mae_mean
-                metrics[f'{prefix}_geodesic_max_err_mean'] = qual.max_err_mean
-                metrics[f'{prefix}_geodesic_mono_mean'] = qual.mono_mean
+        for prefix, dists in [('gt', gt_distances), ('pred', pred_distances),
+                               ('robust', robust_distances), ('nelo', nelo_distances)]:
+            if dists is None:
+                continue
+            qual = step_geodesic_quality(dists, source_indices, exact_geo)
+            metrics[f'{prefix}_geodesic_corr_mean'] = qual.corr_mean
+            metrics[f'{prefix}_geodesic_corr_std'] = qual.corr_std
+            metrics[f'{prefix}_geodesic_mae_mean'] = qual.mae_mean
+            metrics[f'{prefix}_geodesic_max_err_mean'] = qual.max_err_mean
+            metrics[f'{prefix}_geodesic_mono_mean'] = qual.mono_mean
 
-            # ---- Green's function ----
-            gt_gvals = None
-            if gt_L is not None:
+        # ---- Green's function ----
+        gt_gvals = None
+        if gt_L is not None:
+            try:
                 gt_greens, t_greens_gt = step_greens_function(gt_L, gt_M, source_indices)
                 metrics['gt_greens_total_ms'] = t_greens_gt.total * 1000
                 metrics['gt_greens_max_principle'] = gt_greens.max_principle_pass_rate
                 gt_gvals = gt_greens.values
+            except Exception as e:
+                errors.append(f"GT Green's: {e}")
 
-            if run_robust and rob_L is not None:
-                _add_greens_metrics(
-                    metrics, 'robust', rob_L, rob_M,
-                    source_indices, gt_gvals, t_rob_lm['assembly'],
-                )
-            if run_pred and pred_L is not None:
-                _add_greens_metrics(
-                    metrics, 'pred', pred_L, pred_M,
-                    source_indices, gt_gvals, t_pred.lm_total,
-                )
-            if run_nelo and nelo_L is not None:
-                _add_greens_metrics(
-                    metrics, 'nelo', nelo_L, nelo_M,
-                    source_indices, gt_gvals, t_nelo.total,
-                )
+        if run_robust and rob_L is not None:
+            _add_greens_metrics(
+                metrics, 'robust', rob_L, rob_M,
+                source_indices, gt_gvals, t_rob_lm['assembly'] if t_rob_lm else 0,
+            )
+        if run_pred and pred_L is not None:
+            _add_greens_metrics(
+                metrics, 'pred', pred_L, pred_M,
+                source_indices, gt_gvals, t_pred.lm_total if t_pred else 0,
+            )
+        if run_nelo and nelo_L is not None:
+            _add_greens_metrics(
+                metrics, 'nelo', nelo_L, nelo_M,
+                source_indices, gt_gvals, t_nelo.total if t_nelo else 0,
+            )
 
-            gc.enable()
+        gc.enable()
 
-            # ---- Eigendecomposition (not timing-sensitive) ----
-            gt_evals, gt_evecs = None, None
-            if gt_L is not None:
+        # ---- Eigendecomposition (not timing-sensitive) ----
+        gt_evals, gt_evecs = None, None
+        if gt_L is not None:
+            try:
                 gt_evals, gt_evecs, t_eig_gt = step_eigendecomposition(
                     gt_L, gt_M, num_eigenpairs,
                 )
                 metrics['gt_eigen_ms'] = t_eig_gt['eigen'] * 1000
+            except Exception as e:
+                errors.append(f"GT eigen: {e}")
 
-            pred_evals, pred_evecs = None, None
-            if run_pred and pred_L is not None:
+        pred_evals, pred_evecs = None, None
+        if run_pred and pred_L is not None:
+            try:
                 pred_evals, pred_evecs = _add_eigen_metrics(
                     metrics, 'pred', pred_L, pred_M,
                     gt_evals, gt_evecs, num_eigenpairs,
                 )
-            rob_evals, rob_evecs = None, None
-            if run_robust and rob_L is not None:
+            except Exception as e:
+                errors.append(f"PRED eigen: {e}")
+        rob_evals, rob_evecs = None, None
+        if run_robust and rob_L is not None:
+            try:
                 rob_evals, rob_evecs = _add_eigen_metrics(
                     metrics, 'robust', rob_L, rob_M,
                     gt_evals, gt_evecs, num_eigenpairs,
                 )
-            nelo_evals, nelo_evecs = None, None
-            if run_nelo and nelo_L is not None:
+            except Exception as e:
+                errors.append(f"Robust eigen: {e}")
+        nelo_evals, nelo_evecs = None, None
+        if run_nelo and nelo_L is not None:
+            try:
                 nelo_evals, nelo_evecs = _add_eigen_metrics(
                     metrics, 'nelo', nelo_L, nelo_M,
                     gt_evals, gt_evecs, num_eigenpairs,
                 )
+            except Exception as e:
+                errors.append(f"NeLo eigen: {e}")
 
-            # ---- HKS / WKS descriptor comparison ----
-            if gt_evals is not None and gt_evecs is not None:
-                for prefix, m_evals, m_evecs in [
-                    ('pred', pred_evals, pred_evecs),
-                    ('robust', rob_evals, rob_evecs),
-                    ('nelo', nelo_evals, nelo_evecs),
-                ]:
-                    if m_evals is None or m_evecs is None:
-                        continue
-                    desc = step_descriptor_comparison(m_evals, m_evecs, gt_evals, gt_evecs)
-                    metrics[f'{prefix}_hks_corr'] = desc.hks_correlation
-                    metrics[f'{prefix}_hks_l2_err'] = desc.hks_l2_error
-                    metrics[f'{prefix}_wks_corr'] = desc.wks_correlation
-                    metrics[f'{prefix}_wks_l2_err'] = desc.wks_l2_error
+        # ---- HKS / WKS descriptor comparison ----
+        if gt_evals is not None and gt_evecs is not None:
+            for prefix, m_evals, m_evecs in [
+                ('pred', pred_evals, pred_evecs),
+                ('robust', rob_evals, rob_evecs),
+                ('nelo', nelo_evals, nelo_evecs),
+            ]:
+                if m_evals is None or m_evecs is None:
+                    continue
+                desc = step_descriptor_comparison(m_evals, m_evecs, gt_evals, gt_evecs)
+                metrics[f'{prefix}_hks_corr'] = desc.hks_correlation
+                metrics[f'{prefix}_hks_l2_err'] = desc.hks_l2_error
+                metrics[f'{prefix}_wks_corr'] = desc.wks_correlation
+                metrics[f'{prefix}_wks_l2_err'] = desc.wks_l2_error
 
-            # ---- Probe function MSE ----
-            if gt_L is not None and gt_evals is not None and gt_evecs is not None:
-                for prefix, m_L, m_M in [
-                    ('pred', pred_L, pred_M),
-                    ('robust', rob_L, rob_M),
-                    ('nelo', nelo_L, nelo_M),
-                ]:
-                    if m_L is None:
-                        continue
-                    probe = step_probe_function_mse(
-                        m_L, m_M, gt_L, gt_M, vertices, gt_evals, gt_evecs,
-                    )
-                    metrics[f'{prefix}_probe_mse'] = probe.mse
-                    metrics[f'{prefix}_probe_cosine'] = probe.cosine_similarity
-                    metrics[f'{prefix}_probe_failure_rate'] = probe.failure_rate
-
-            # ---- Sparsity ----
-            if gt_L is not None:
-                sp_gt = step_sparsity(gt_L)
-                metrics['gt_nnz'] = sp_gt.nnz
-                metrics['gt_avg_nnz_per_row'] = sp_gt.avg_nnz_per_row
-                metrics['gt_density_pct'] = sp_gt.density_percent
-            for prefix, m_L in [('pred', pred_L), ('robust', rob_L), ('nelo', nelo_L)]:
+        # ---- Probe function MSE ----
+        if gt_L is not None and gt_evals is not None and gt_evecs is not None:
+            for prefix, m_L, m_M in [
+                ('pred', pred_L, pred_M),
+                ('robust', rob_L, rob_M),
+                ('nelo', nelo_L, nelo_M),
+            ]:
                 if m_L is None:
                     continue
-                sp = step_sparsity(m_L)
-                metrics[f'{prefix}_nnz'] = sp.nnz
-                metrics[f'{prefix}_avg_nnz_per_row'] = sp.avg_nnz_per_row
-                metrics[f'{prefix}_density_pct'] = sp.density_percent
+                probe = step_probe_function_mse(
+                    m_L, m_M, gt_L, gt_M, vertices, gt_evals, gt_evecs,
+                )
+                metrics[f'{prefix}_probe_mse'] = probe.mse
+                metrics[f'{prefix}_probe_cosine'] = probe.cosine_similarity
+                metrics[f'{prefix}_probe_failure_rate'] = probe.failure_rate
 
-            # ---- Spectral compression ----
-            compression_k_values = list(range(5, num_eigenpairs + 1, 5))
-            for prefix, m_evecs, m_M in [
-                ('gt', gt_evecs, gt_M),
-                ('pred', pred_evecs, pred_M),
-                ('robust', rob_evecs, rob_M),
-                ('nelo', nelo_evecs, nelo_M),
-            ]:
-                if m_evecs is None or m_M is None:
-                    continue
-                comp = step_spectral_compression(m_evecs, m_M, vertices, compression_k_values)
-                for k, errs in comp.errors.items():
-                    metrics[f'{prefix}_compress_k{k}_mean_l2'] = errs['mean_l2']
-                    metrics[f'{prefix}_compress_k{k}_max_l2'] = errs['max_l2']
+        # ---- Sparsity ----
+        if gt_L is not None:
+            sp_gt = step_sparsity(gt_L)
+            metrics['gt_nnz'] = sp_gt.nnz
+            metrics['gt_avg_nnz_per_row'] = sp_gt.avg_nnz_per_row
+            metrics['gt_density_pct'] = sp_gt.density_percent
+        for prefix, m_L in [('pred', pred_L), ('robust', rob_L), ('nelo', nelo_L)]:
+            if m_L is None:
+                continue
+            sp = step_sparsity(m_L)
+            metrics[f'{prefix}_nnz'] = sp.nnz
+            metrics[f'{prefix}_avg_nnz_per_row'] = sp.avg_nnz_per_row
+            metrics[f'{prefix}_density_pct'] = sp.density_percent
 
-            # ---- Top-k pruning variants (full quality sweep) ----
-            for tk in top_k_values:
-                pfx = f'pred_tk{tk}'
-                tk_L = cache.get(f'{pfx}_L')
-                tk_M = cache.get(f'{pfx}_M')
-                if tk_L is None:
-                    continue
+        # ---- Spectral compression ----
+        compression_k_values = list(range(5, num_eigenpairs + 1, 5))
+        for prefix, m_evecs, m_M in [
+            ('gt', gt_evecs, gt_M),
+            ('pred', pred_evecs, pred_M),
+            ('robust', rob_evecs, rob_M),
+            ('nelo', nelo_evecs, nelo_M),
+        ]:
+            if m_evecs is None or m_M is None:
+                continue
+            comp = step_spectral_compression(m_evecs, m_M, vertices, compression_k_values)
+            for k, errs in comp.errors.items():
+                metrics[f'{prefix}_compress_k{k}_mean_l2'] = errs['mean_l2']
+                metrics[f'{prefix}_compress_k{k}_max_l2'] = errs['max_l2']
 
-                # Green's
-                if gt_gvals is not None:
-                    tk_lm_total = metrics.get(f'{pfx}_lm_total_ms', 0) / 1000
-                    _add_greens_metrics(
-                        metrics, pfx, tk_L, tk_M,
-                        source_indices, gt_gvals, tk_lm_total,
-                    )
+        # ---- Top-k pruning variants (full quality sweep) ----
+        for tk in top_k_values:
+            pfx = f'pred_tk{tk}'
+            tk_L = cache.get(f'{pfx}_L')
+            tk_M = cache.get(f'{pfx}_M')
+            if tk_L is None:
+                continue
 
-                # Eigen
-                tk_evals, tk_evecs = None, None
-                if gt_evals is not None:
-                    tk_evals, tk_evecs = _add_eigen_metrics(
-                        metrics, pfx, tk_L, tk_M,
-                        gt_evals, gt_evecs, num_eigenpairs,
-                    )
+            # Green's
+            if gt_gvals is not None:
+                tk_lm_total = metrics.get(f'{pfx}_lm_total_ms', 0) / 1000
+                _add_greens_metrics(
+                    metrics, pfx, tk_L, tk_M,
+                    source_indices, gt_gvals, tk_lm_total,
+                )
 
-                # Descriptors
-                if gt_evals is not None and tk_evals is not None and tk_evecs is not None:
-                    desc = step_descriptor_comparison(tk_evals, tk_evecs, gt_evals, gt_evecs)
-                    metrics[f'{pfx}_hks_corr'] = desc.hks_correlation
-                    metrics[f'{pfx}_hks_l2_err'] = desc.hks_l2_error
-                    metrics[f'{pfx}_wks_corr'] = desc.wks_correlation
-                    metrics[f'{pfx}_wks_l2_err'] = desc.wks_l2_error
+            # Eigen
+            tk_evals, tk_evecs = None, None
+            if gt_evals is not None:
+                tk_evals, tk_evecs = _add_eigen_metrics(
+                    metrics, pfx, tk_L, tk_M,
+                    gt_evals, gt_evecs, num_eigenpairs,
+                )
 
-                # Probe
-                if gt_L is not None and gt_evals is not None and gt_evecs is not None:
-                    probe = step_probe_function_mse(
-                        tk_L, tk_M, gt_L, gt_M, vertices, gt_evals, gt_evecs,
-                    )
-                    metrics[f'{pfx}_probe_mse'] = probe.mse
-                    metrics[f'{pfx}_probe_cosine'] = probe.cosine_similarity
-                    metrics[f'{pfx}_probe_failure_rate'] = probe.failure_rate
+            # Descriptors
+            if gt_evals is not None and tk_evals is not None and tk_evecs is not None:
+                desc = step_descriptor_comparison(tk_evals, tk_evecs, gt_evals, gt_evecs)
+                metrics[f'{pfx}_hks_corr'] = desc.hks_correlation
+                metrics[f'{pfx}_hks_l2_err'] = desc.hks_l2_error
+                metrics[f'{pfx}_wks_corr'] = desc.wks_correlation
+                metrics[f'{pfx}_wks_l2_err'] = desc.wks_l2_error
 
-                # Sparsity
-                sp = step_sparsity(tk_L)
-                metrics[f'{pfx}_nnz'] = sp.nnz
-                metrics[f'{pfx}_avg_nnz_per_row'] = sp.avg_nnz_per_row
-                metrics[f'{pfx}_density_pct'] = sp.density_percent
+            # Probe
+            if gt_L is not None and gt_evals is not None and gt_evecs is not None:
+                probe = step_probe_function_mse(
+                    tk_L, tk_M, gt_L, gt_M, vertices, gt_evals, gt_evecs,
+                )
+                metrics[f'{pfx}_probe_mse'] = probe.mse
+                metrics[f'{pfx}_probe_cosine'] = probe.cosine_similarity
+                metrics[f'{pfx}_probe_failure_rate'] = probe.failure_rate
 
-                # Spectral compression
-                if tk_evecs is not None and tk_M is not None:
-                    comp = step_spectral_compression(tk_evecs, tk_M, vertices, compression_k_values)
-                    for kc, errs in comp.errors.items():
-                        metrics[f'{pfx}_compress_k{kc}_mean_l2'] = errs['mean_l2']
-                        metrics[f'{pfx}_compress_k{kc}_max_l2'] = errs['max_l2']
+            # Sparsity
+            sp = step_sparsity(tk_L)
+            metrics[f'{pfx}_nnz'] = sp.nnz
+            metrics[f'{pfx}_avg_nnz_per_row'] = sp.avg_nnz_per_row
+            metrics[f'{pfx}_density_pct'] = sp.density_percent
 
-            # ---- Timing ratios ----
-            if run_pred and run_robust and robust_timing is not None and t_pred is not None:
-                if robust_timing.lm_assembly > 0:
-                    metrics['ratio_lm'] = t_pred.lm_total / robust_timing.lm_assembly
-                if metrics.get('pred_e2e_geodesic_ms') and metrics.get('robust_e2e_geodesic_ms'):
-                    metrics['ratio_e2e_geodesic'] = (
-                        metrics['pred_e2e_geodesic_ms'] / metrics['robust_e2e_geodesic_ms']
-                    )
-                if metrics.get('pred_greens_e2e_ms') and metrics.get('robust_greens_e2e_ms'):
-                    metrics['ratio_greens_e2e'] = (
-                        metrics['pred_greens_e2e_ms'] / metrics['robust_greens_e2e_ms']
-                    )
+            # Spectral compression
+            if tk_evecs is not None and tk_M is not None:
+                comp = step_spectral_compression(tk_evecs, tk_M, vertices, compression_k_values)
+                for kc, errs in comp.errors.items():
+                    metrics[f'{pfx}_compress_k{kc}_mean_l2'] = errs['mean_l2']
+                    metrics[f'{pfx}_compress_k{kc}_max_l2'] = errs['max_l2']
 
+        # ---- Timing ratios ----
+        if run_pred and run_robust and robust_timing is not None and t_pred is not None:
+            if robust_timing.lm_assembly > 0:
+                metrics['ratio_lm'] = t_pred.lm_total / robust_timing.lm_assembly
+            if metrics.get('pred_e2e_geodesic_ms') and metrics.get('robust_e2e_geodesic_ms'):
+                metrics['ratio_e2e_geodesic'] = (
+                    metrics['pred_e2e_geodesic_ms'] / metrics['robust_e2e_geodesic_ms']
+                )
+            if metrics.get('pred_greens_e2e_ms') and metrics.get('robust_greens_e2e_ms'):
+                metrics['ratio_greens_e2e'] = (
+                    metrics['pred_greens_e2e_ms'] / metrics['robust_greens_e2e_ms']
+                )
+
+        # ---- Status ----
+        if errors:
+            status = f"ERROR — {'; '.join(errors)}"
+            metrics['errors'] = '; '.join(errors)
+        else:
             status = "OK"
-
-        except Exception as e:
-            gc.enable()
-            status = f"ERROR — {e}"
-            import traceback
-            traceback.print_exc()
 
         t_mesh = time.time() - t_mesh_start
         elapsed = time.time() - t_start
