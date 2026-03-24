@@ -6,7 +6,7 @@ val_dataset_specifications:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
       mesh_folder_path: '/home/royve/datasets/neural-laplacian/thingi10k'
       max_meshes: 200
-      vertices_count_range: [0, 10000]
+      vertices_count_range: [200, 12000]
       num_components_range: [1, 1]
       require_complete_geodesics: True
       shuffle: True
