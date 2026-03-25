@@ -124,7 +124,7 @@ def main(cfg: DictConfig) -> None:
 # W&B sweep entry point
 # =============================================================================
 
-def wandb_sweep_main(overrides=None, data_root=None):
+def wandb_sweep_main(overrides=None, data_root=None, checkpoint_path=None):
     """Entry point for ``wandb.agent``.
 
     On the first (rank-0) process ``wandb.init()`` pulls the sweep config.
@@ -136,6 +136,8 @@ def wandb_sweep_main(overrides=None, data_root=None):
                    (e.g. ["trainer.max_epochs=500", "globals.k=20"]).
         data_root: Optional path to override pair_generator.root in both
                    train and val dataset specifications.
+        checkpoint_path: Optional path to override the pretrained model
+                         checkpoint (globals + model block).
     """
     if 'WANDB_SWEEP_CONFIG' not in os.environ:
         wandb.init()
@@ -155,6 +157,13 @@ def wandb_sweep_main(overrides=None, data_root=None):
         config.data_module.module.train_dataset_specification.dataset.pair_generator.root = data_root
         for val_spec in config.data_module.module.val_dataset_specifications:
             val_spec.dataset.pair_generator.root = data_root
+
+    # Override checkpoint path (must set both globals AND the resolved model
+    # field, because resolve=True above flattens ${globals.checkpoint_path}
+    # to a literal before overrides are applied)
+    if checkpoint_path is not None:
+        config.globals.checkpoint_path = checkpoint_path
+        config.model.module.checkpoint_path = checkpoint_path
 
     main(cfg=config)
 
@@ -192,13 +201,14 @@ if __name__ == "__main__":
     else:
         overrides = list(args.override)
 
-        if args.checkpoint_path is not None:
-            overrides.append(f"globals.checkpoint_path={args.checkpoint_path}")
-
         if 'WANDB_SWEEP_CONFIG' not in os.environ:
             wandb.agent(sweep_id=args.sweep_id,
-                        function=lambda: wandb_sweep_main(overrides,
-                                                          data_root=args.data_root),
+                        function=lambda: wandb_sweep_main(
+                            overrides,
+                            data_root=args.data_root,
+                            checkpoint_path=args.checkpoint_path),
                         count=1)
         else:
-            wandb_sweep_main(overrides, data_root=args.data_root)
+            wandb_sweep_main(overrides,
+                             data_root=args.data_root,
+                             checkpoint_path=args.checkpoint_path)
