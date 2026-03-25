@@ -45,6 +45,15 @@ Usage examples:
 
   # W&B sweep (config supplied by the sweep agent, not Hydra)
   python train_fmaps.py --sweep-id <entity/project/sweep_id>
+
+  # W&B sweep with CLI overrides on top of sweep config
+  python train_fmaps.py --sweep-id <entity/project/sweep_id> \\
+      --override trainer.max_epochs=500 globals.k=20
+
+  # W&B sweep with dataset and model path overrides
+  python train_fmaps.py --sweep-id <entity/project/sweep_id> \\
+      --data-root /workspace/datasets/DeformingThings4DMatching \\
+      --checkpoint-path /workspace/models/model.ckpt
 """
 # standard library
 import os
@@ -115,12 +124,18 @@ def main(cfg: DictConfig) -> None:
 # W&B sweep entry point
 # =============================================================================
 
-def wandb_sweep_main():
+def wandb_sweep_main(overrides=None, data_root=None):
     """Entry point for ``wandb.agent``.
 
     On the first (rank-0) process ``wandb.init()`` pulls the sweep config.
     For DDP subprocesses the config is passed via the ``WANDB_SWEEP_CONFIG``
     environment variable so they don't re-initialise a W&B run.
+
+    Args:
+        overrides: Optional list of OmegaConf dot-list overrides
+                   (e.g. ["trainer.max_epochs=500", "globals.k=20"]).
+        data_root: Optional path to override pair_generator.root in both
+                   train and val dataset specifications.
     """
     if 'WANDB_SWEEP_CONFIG' not in os.environ:
         wandb.init()
@@ -130,6 +145,16 @@ def wandb_sweep_main():
         os.environ['WANDB_SWEEP_CONFIG'] = OmegaConf.to_yaml(config)
     else:
         config = OmegaConf.create(yaml.safe_load(os.environ['WANDB_SWEEP_CONFIG']))
+
+    # Apply CLI overrides on top of sweep config
+    if overrides:
+        config = OmegaConf.merge(config, OmegaConf.from_dotlist(overrides))
+
+    # Override dataset root in both train and val pair generators
+    if data_root is not None:
+        config.data_module.module.train_dataset_specification.dataset.pair_generator.root = data_root
+        for val_spec in config.data_module.module.val_dataset_specifications:
+            val_spec.dataset.pair_generator.root = data_root
 
     main(cfg=config)
 
@@ -152,12 +177,28 @@ if __name__ == "__main__":
     parser.add_argument("--sweep-id", type=str, default=None,
                         help="W&B sweep ID (<entity>/<project>/<sweep_id>). "
                              "When provided, runs as a sweep agent instead of Hydra.")
+    parser.add_argument("--override", nargs="*", default=[],
+                        help="OmegaConf dot-list overrides applied on top of the "
+                             "sweep config, e.g. globals.k=20 trainer.max_epochs=500")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="Override the dataset root path (sets both train and val "
+                             "pair_generator.root)")
+    parser.add_argument("--checkpoint-path", type=str, default=None,
+                        help="Override globals.checkpoint_path (pretrained model)")
     args, _ = parser.parse_known_args()
 
     if args.sweep_id is None:
         main_hydra()
     else:
+        overrides = list(args.override)
+
+        if args.checkpoint_path is not None:
+            overrides.append(f"globals.checkpoint_path={args.checkpoint_path}")
+
         if 'WANDB_SWEEP_CONFIG' not in os.environ:
-            wandb.agent(sweep_id=args.sweep_id, function=wandb_sweep_main, count=1)
+            wandb.agent(sweep_id=args.sweep_id,
+                        function=lambda: wandb_sweep_main(overrides,
+                                                          data_root=args.data_root),
+                        count=1)
         else:
-            wandb_sweep_main()
+            wandb_sweep_main(overrides, data_root=args.data_root)
