@@ -1,4 +1,4 @@
-folder: "/home/royve/datasets/neural-laplacian/thingi10k"
+folder: "/mnt/gipnetapp_public/neural-cotangent-weights/thingi10k"
 vertices_count_range: [0, 12000]
 num_components_range: [1, 1]
 num_sources: 15

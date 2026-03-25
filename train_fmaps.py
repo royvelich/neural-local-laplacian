@@ -3,7 +3,7 @@
 
 Usage examples:
 
-  # SMAL — single GPU, fine-tune from pretrained checkpoint
+  # SMAL — single GPU, fine-tune from pretrained checkpoint (Hydra)
   python train_fmaps.py \\
       globals.checkpoint_path=/path/to/model.ckpt \\
       data_module=smal \\
@@ -42,16 +42,47 @@ Usage examples:
       data_module=smal ... \\
       model.module.loss_fn.loss_type=dclw \\
       model.module.loss_fn.num_landmarks=1024
-"""
-import torch
-import hydra
-from omegaconf import DictConfig
-import lightning.pytorch as pl
 
+  # W&B sweep (config supplied by the sweep agent, not Hydra)
+  python train_fmaps.py --sweep-id <entity/project/sweep_id>
+"""
+# standard library
+import os
+import sys
+import io
+import argparse
+import yaml
+
+sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
+
+os.environ.setdefault("WANDB_DIR", "C:/wandb/WANDB_DIR")
+os.environ.setdefault("WANDB_ARTIFACT_DIR", "C:/wandb/WANDB_ARTIFACT_DIR")
+os.environ.setdefault("WANDB_CACHE_DIR", "C:/wandb/WANDB_CACHE_DIR")
+os.environ.setdefault("WANDB_CONFIG_DIR", "C:/wandb/WANDB_CONFIG_DIR")
+os.environ.setdefault("WANDB_DATA_DIR", "C:/wandb/WANDB_DATA_DIR")
+
+# hydra
+import hydra
+
+# omegaconf
+from omegaconf import OmegaConf, DictConfig
+
+# torch
+import torch
 torch.multiprocessing.set_sharing_strategy("file_system")
 
+# wandb
+import wandb
 
-@hydra.main(version_base="1.2", config_path="fmaps_config")
+# lightning
+import lightning.pytorch as pl
+
+
+# =============================================================================
+# Core training logic (no decorators — callable from Hydra or W&B sweep)
+# =============================================================================
+
 def main(cfg: DictConfig) -> None:
     torch.set_float32_matmul_precision("medium")
     pl.seed_everything(seed=cfg.globals.training_seed)
@@ -80,5 +111,53 @@ def main(cfg: DictConfig) -> None:
     )
 
 
+# =============================================================================
+# W&B sweep entry point
+# =============================================================================
+
+def wandb_sweep_main():
+    """Entry point for ``wandb.agent``.
+
+    On the first (rank-0) process ``wandb.init()`` pulls the sweep config.
+    For DDP subprocesses the config is passed via the ``WANDB_SWEEP_CONFIG``
+    environment variable so they don't re-initialise a W&B run.
+    """
+    if 'WANDB_SWEEP_CONFIG' not in os.environ:
+        wandb.init()
+        config = OmegaConf.create(dict(wandb.config))
+        config = OmegaConf.to_container(config, resolve=True)
+        config = OmegaConf.create(config)
+        os.environ['WANDB_SWEEP_CONFIG'] = OmegaConf.to_yaml(config)
+    else:
+        config = OmegaConf.create(yaml.safe_load(os.environ['WANDB_SWEEP_CONFIG']))
+
+    main(cfg=config)
+
+
+# =============================================================================
+# Hydra entry point (normal CLI usage)
+# =============================================================================
+
+@hydra.main(version_base="1.2", config_path="fmaps_config")
+def main_hydra(cfg: DictConfig) -> None:
+    main(cfg=cfg)
+
+
+# =============================================================================
+# Dispatcher
+# =============================================================================
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sweep-id", type=str, default=None,
+                        help="W&B sweep ID (<entity>/<project>/<sweep_id>). "
+                             "When provided, runs as a sweep agent instead of Hydra.")
+    args, _ = parser.parse_known_args()
+
+    if args.sweep_id is None:
+        main_hydra()
+    else:
+        if 'WANDB_SWEEP_CONFIG' not in os.environ:
+            wandb.agent(sweep_id=args.sweep_id, function=wandb_sweep_main, count=1)
+        else:
+            wandb_sweep_main()
