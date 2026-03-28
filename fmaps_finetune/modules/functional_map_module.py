@@ -855,6 +855,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         num_eigenvectors: int = 100,
         sparsify_laplacian: bool = False,
         max_vertices: int = 0,
+        max_vertices_val: int = 0,
         vertex_noise: float = 0.05,
         w_prox: float = 20.0,
         cross_ratio_start: float = 0.0,
@@ -1054,21 +1055,69 @@ class FunctionalMapModule(LaplacianModuleBase):
             ev_names = [ev.name for ev in self._evaluators
                         if summary.get(f"{ev.name}/accuracy") is not None]
             name_w = max((len(n) for n in ev_names), default=12)
+            n_pairs = len(all_metrics)
 
             print(f"  {label}:", flush=True)
 
             # Per-evaluator rows (aligned columns)
             for ev in self._evaluators:
-                ev_acc = summary.get(f"{ev.name}/accuracy")
+                ev_key = f"{ev.name}/accuracy"
+                ev_acc = summary.get(ev_key)
                 ev_err = summary.get(f"{ev.name}/mean_error", 0.0)
                 if ev_acc is None:
                     continue
-                sp_ev = summary.get(f"sp_{ev.name}/accuracy")
-                iso_ev = summary.get(f"iso_{ev.name}/accuracy")
-                sp_col = f"  │ sp={sp_ev*100:5.1f}%" if sp_ev is not None else ""
-                iso_col = f"  │ iso={iso_ev*100:5.1f}%" if iso_ev is not None else ""
-                print(f"    {ev.name:<{name_w}}  top1={ev_acc*100:5.1f}%  "
-                      f"Err={ev_err:.4f}{sp_col}{iso_col}", flush=True)
+
+                # Count valid pairs per variant
+                n_dense = sum(1 for m in all_metrics
+                              if ev_key in m and np.isfinite(m[ev_key]))
+                fail_dense = n_pairs - n_dense
+                fail_str = f"  ({fail_dense}/{n_pairs} failed)" if fail_dense else ""
+
+                # Sparse
+                sp_key = f"sp_{ev.name}/accuracy"
+                sp_ev = summary.get(sp_key)
+                if sp_ev is not None:
+                    n_sp = sum(1 for m in all_metrics
+                              if sp_key in m and np.isfinite(m[sp_key]))
+                    fail_sp = n_pairs - n_sp
+                    sp_fail = f" [{fail_sp}F]" if fail_sp else ""
+                    sp_col = f"  │ sp={sp_ev*100:5.1f}%{sp_fail}"
+                else:
+                    sp_col = ""
+
+                # Isotropic
+                iso_key = f"iso_{ev.name}/accuracy"
+                iso_ev = summary.get(iso_key)
+                if iso_ev is not None:
+                    n_iso = sum(1 for m in all_metrics
+                               if iso_key in m and np.isfinite(m[iso_key]))
+                    fail_iso = n_pairs - n_iso
+                    iso_fail = f" [{fail_iso}F]" if fail_iso else ""
+                    iso_col = f"  │ iso={iso_ev*100:5.1f}%{iso_fail}"
+                else:
+                    iso_col = ""
+
+                # Build the main metrics string
+                parts = [f"    {ev.name:<{name_w}}  top1={ev_acc*100:5.1f}%"]
+
+                # Top-k accuracy (if available)
+                for topk in (3, 5, 10):
+                    topk_val = summary.get(f"{ev.name}/top{topk}_acc")
+                    if topk_val is not None:
+                        parts.append(f"  top{topk}={topk_val*100:5.1f}%")
+
+                parts.append(f"  Err={ev_err:.4f}")
+
+                # GeomFuM sanity check (only for fmap evaluators)
+                gfm_acc = summary.get(f"{ev.name}/geomfum_accuracy")
+                if gfm_acc is not None:
+                    parts.append(f"  gfm={gfm_acc*100:5.1f}%")
+
+                parts.append(fail_str)
+                parts.append(sp_col)
+                parts.append(iso_col)
+
+                print("".join(parts), flush=True)
 
         return summary
 
@@ -1097,8 +1146,9 @@ class FunctionalMapModule(LaplacianModuleBase):
             return
 
         def _subsample(pair):
-            if hp.max_vertices > 0:
-                return subsample_pair(pair, hp.max_vertices,
+            mv = hp.max_vertices_val if hp.max_vertices_val > 0 else hp.max_vertices
+            if mv > 0:
+                return subsample_pair(pair, mv,
                                       np.random.RandomState(_stable_hash(pair.name)))
             return pair
 
@@ -1288,8 +1338,9 @@ class FunctionalMapModule(LaplacianModuleBase):
     def validation_step(self, batch: List[PairSample], batch_idx: int) -> None:
         assert len(batch) == 1
         pair = batch[0]
-        if self.hparams.max_vertices > 0:
-            pair = subsample_pair(pair, self.hparams.max_vertices,
+        mv = self.hparams.max_vertices_val or self.hparams.max_vertices
+        if mv > 0:
+            pair = subsample_pair(pair, mv,
                                   np.random.RandomState(_stable_hash(pair.name)))
         self._val_outputs.append(evaluate_pair(
             self.model, pair, self.hparams.k,

@@ -17,6 +17,7 @@ gradient_clip_algorithm: norm
 precision: 32               # 32 | 16-mixed | bf16-mixed
 
 # ── Validation / logging ──────────────────────────────────────────────────────
+num_sanity_val_steps: 0     # our on_fit_start baselines already verify the pipeline
 check_val_every_n_epoch: 50
 log_every_n_steps: 1
 enable_progress_bar: true

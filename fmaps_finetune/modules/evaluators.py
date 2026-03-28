@@ -391,10 +391,9 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
         vertices_b: np.ndarray,
         gt_corr: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
-        import gsops.backend as gs
-        from geomfum.convert import P2pFromFmConverter
         from geomfum.refine import ZoomOut
         from geomfum.forward_functional_map import ForwardFunctionalMap
+        from geomfum.convert import P2pFromFmConverter
 
         n_a = eigvecs_a.shape[0]
         n_b = eigvecs_b.shape[0]
@@ -457,30 +456,26 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
         # Convert to numpy for metrics computation
         fmap_np = np.array(fmap_matrix)
 
-        # --- Step 5: Convert to pointwise map ---
-        p2p_converter = P2pFromFmConverter()
+        # --- Step 5: Compute metrics ---
+        k_eval_a = min(fmap_np.shape[1], eigvecs_a.shape[1])
+        k_eval_b = min(fmap_np.shape[0], eigvecs_b.shape[1])
 
-        # Set use_k to match the fmap size
-        k_fmap = fmap_np.shape[1]  # columns = source basis size
-        k_fmap_b = fmap_np.shape[0]  # rows = target basis size
-        shape_a.basis.use_k = k_fmap
-        shape_b.basis.use_k = k_fmap_b
-
-        p2p = p2p_converter(fmap_matrix, shape_a.basis, shape_b.basis)
-        p2p_np = np.array(p2p)
-
-        # --- Step 6: Compute metrics ---
         metrics = self._fmap_quality_metrics(fmap_np)
 
-        # Pointwise metrics via NN (for top-k we need the full NN search)
-        k_eval_a = min(k_fmap, eigvecs_a.shape[1])
-        k_eval_b = min(k_fmap_b, eigvecs_b.shape[1])
+        # Our NN search (returns top-k for top3/5/10 metrics)
         pred_corr, nn_indices = self._fmap_to_pointwise(
             fmap_np, eigvecs_a[:, :k_eval_a], eigvecs_b[:, :k_eval_b]
         )
         metrics.update(self._pointwise_metrics(
             pred_corr, nn_indices, gt_corr[:n_a], vertices_b
         ))
+
+        # GeomFuM's P2pFromFmConverter (sanity check — should match our top1)
+        shape_a.basis.use_k = k_eval_a
+        shape_b.basis.use_k = k_eval_b
+        p2p_converter = P2pFromFmConverter()
+        p2p_gfm = np.array(p2p_converter(fmap_matrix, shape_a.basis, shape_b.basis))
+        metrics['geomfum_accuracy'] = float((p2p_gfm == gt_corr[:n_a]).mean())
 
         return metrics
 
