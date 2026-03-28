@@ -11,7 +11,14 @@ ckpt_path: null
 checkpoint_path: 'C:\Users\Roy\Downloads\model.ckpt'
 
 # kNN neighbourhood size for the differentiable Laplacian.
-k: 30
+k: 20
+
+# kNN neighbourhood size for the sparsification mask.
+# null = reuse k (current behaviour).  When set to an integer < k, the
+# dense G^T M G Laplacian is assembled with k neighbours but sparsified
+# to the k_sparsify-NN graph, decoupling the model's receptive field
+# from the operator's support.
+k_sparsify: null
 
 # Number of LBO eigenvectors used during evaluation.
 num_eigenvectors: 100

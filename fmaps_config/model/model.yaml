@@ -15,11 +15,11 @@ module:
   loss_fn:
     _target_: fmaps_finetune.modules.functional_map_module.SoftCorrespondenceLoss
     num_landmarks: 128
-    alphas: [1.0, 10.0, 100.0]    # diffusion scales α for fingerprint descriptors
-    temperature: 0.07
+    alphas: [0.01, 0.1, 1.0]    # diffusion scales α for fingerprint descriptors
+    temperature: 0.1
     num_sample_vertices: 512      # vertices subsampled for contrastive ranking per step
     loss_type: infonce             # infonce | dcl | dclw
-    dclw_sigma: 0.5                # only used when loss_type=dclw
+    dclw_sigma: 0.1                # only used when loss_type=dclw
 
   # ── Model initialisation ────────────────────────────────────────────────
   random_init: false               # reset all weights after loading architecture
@@ -29,10 +29,11 @@ module:
 
   # ── Laplacian assembly ──────────────────────────────────────────────────
   sparsify_laplacian: false        # zero out off-kNN entries in the dense G^TMG
+  k_sparsify: ${globals.k_sparsify}  # null = reuse k; integer < k = separate kNN for mask
 
   # ── Training augmentation ───────────────────────────────────────────────
-  max_vertices: 1000               # 0 = no subsampling; lower → faster O(N³) solve
-  vertex_noise: 0.02               # Gaussian noise scale relative to mean vertex radius
+  max_vertices: 2000               # 0 = no subsampling; lower → faster O(N³) solve
+  vertex_noise: 0.0               # Gaussian noise scale relative to mean vertex radius
 
   # ── Proximity regularisation ────────────────────────────────────────────
   w_prox: 10.0                     # 0.0 to disable; ignored with random_init or use_lora
@@ -41,8 +42,8 @@ module:
   # Linearly ramps the fraction of cross-category pairs from start → end
   # over the first curriculum_epochs epochs, then stays at cross_ratio_end.
   cross_ratio_start: 0.0
-  cross_ratio_end: 0.5
-  curriculum_epochs: 50
+  cross_ratio_end: 0.8
+  curriculum_epochs: 0
 
   # ── LoRA (Low-Rank Adaptation) ──────────────────────────────────────────
   use_lora: false
