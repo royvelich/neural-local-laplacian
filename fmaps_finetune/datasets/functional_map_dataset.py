@@ -793,6 +793,20 @@ class ValPairDataset(Dataset):
     ):
         rng        = np.random.RandomState(seed)
         self.pairs = pair_generator.get_val_pairs(rng, val_poses_per_pair)
+        # Derive a human-readable name from the generator class
+        gen_cls = type(pair_generator).__name__
+        if "Animal" in gen_cls:
+            self._name = "animals"
+        elif "Humanoid" in gen_cls:
+            self._name = "humanoids"
+        elif "SMAL" in gen_cls or "Smal" in gen_cls:
+            self._name = "smal"
+        else:
+            self._name = gen_cls
+
+    @property
+    def name(self) -> str:
+        return self._name
 
     def __len__(self) -> int:
         return len(self.pairs)

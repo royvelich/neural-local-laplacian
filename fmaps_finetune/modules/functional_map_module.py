@@ -544,49 +544,92 @@ def _build_gt_corr_from_pair(pair: PairSample) -> Optional[np.ndarray]:
     return gt_corr
 
 
-def _compute_geodesic_dists(pair: PairSample) -> Optional[np.ndarray]:
-    """Compute normalised geodesic distance matrix on (subsampled) mesh B.
+class GeodesicCache:
+    """Lazy geodesic distance computation on mesh B.
 
-    Uses the heat method (potpourri3d) on the original mesh for accurate
-    geodesics that can cut across face interiors. Distances are normalised
-    by sqrt(total surface area).
+    Factorizes the Laplacian once (fast), then computes geodesic distances
+    from individual source vertices on demand. Caches distance vectors so
+    the same GT target vertex is never solved twice.
 
-    Returns:
-        (N_B_sub, N_B_sub) matrix, or None if faces are not available.
+    Usage in _pointwise_metrics:
+        geo_errors = geo_cache.compute_errors(pred_corr, gt_corr)
     """
+
+    def __init__(self, pair: PairSample):
+        import potpourri3d as pp3d
+
+        verts_full = pair._verts_b_full if pair._verts_b_full is not None else pair.verts_b
+        faces = pair.faces_b
+        self._idx_b = pair._idx_b if pair._idx_b is not None else np.arange(len(pair.verts_b))
+
+        # Factorize Laplacian (one-time cost, fast)
+        self._solver = pp3d.MeshHeatMethodDistanceSolver(verts_full, faces)
+
+        # Normalisation: sqrt(surface area)
+        v0, v1, v2 = verts_full[faces[:, 0]], verts_full[faces[:, 1]], verts_full[faces[:, 2]]
+        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum()
+        self._sqrt_area = np.sqrt(max(area, 1e-12))
+
+        # Cache: subsampled B index → normalised distance to all subsampled B vertices
+        self._dist_cache: Dict[int, np.ndarray] = {}
+
+    def _get_dists_from(self, sub_idx: int) -> np.ndarray:
+        """Get normalised geodesic distances from subsampled vertex sub_idx to all others."""
+        if sub_idx not in self._dist_cache:
+            full_idx = int(self._idx_b[sub_idx])
+            full_dists = self._solver.compute_distance(full_idx)  # (N_full,)
+            self._dist_cache[sub_idx] = full_dists[self._idx_b] / self._sqrt_area
+        return self._dist_cache[sub_idx]
+
+    def precompute_from_gt(self, gt_corr: np.ndarray) -> None:
+        """Eagerly compute and cache distances from all unique GT targets.
+
+        Call this once during on_fit_start so that per-pair evaluation
+        incurs zero geodesic computation cost.
+        """
+        unique_gt = np.unique(gt_corr)
+        for g in unique_gt:
+            self._get_dists_from(int(g))
+
+    def compute_errors(self, pred_corr: np.ndarray, gt_corr: np.ndarray) -> np.ndarray:
+        """Compute normalised geodesic error for each (pred, gt) pair.
+
+        Only solves from unique GT targets — typically much fewer than N_sub.
+        Results are cached, so calling with different pred_corr but same gt_corr
+        (e.g. different evaluators on the same eigenbasis) is essentially free.
+
+        Args:
+            pred_corr: (N_A,) predicted B vertex indices.
+            gt_corr: (N_A,) ground-truth B vertex indices.
+
+        Returns:
+            (N_A,) normalised geodesic errors.
+        """
+        unique_gt = np.unique(gt_corr)
+        # Ensure all unique GT targets are cached
+        for g in unique_gt:
+            self._get_dists_from(int(g))
+        # Vectorised lookup
+        errors = np.empty(len(pred_corr), dtype=np.float32)
+        for g in unique_gt:
+            mask = gt_corr == g
+            errors[mask] = self._dist_cache[int(g)][pred_corr[mask]]
+        return errors
+
+
+def _build_geo_cache(pair: PairSample) -> Optional['GeodesicCache']:
+    """Build a GeodesicCache for pair, or None if faces/potpourri3d unavailable."""
     if pair.faces_b is None:
         return None
-
     try:
-        import potpourri3d as pp3d
+        return GeodesicCache(pair)
     except ImportError:
         print("    [geodesic] potpourri3d not installed — skipping geodesic metrics",
               flush=True)
         return None
-
-    verts_full = pair._verts_b_full if pair._verts_b_full is not None else pair.verts_b
-    faces = pair.faces_b
-    idx_b = pair._idx_b if pair._idx_b is not None else np.arange(len(pair.verts_b))
-    n_sub = len(idx_b)
-
-    # Heat method solver on the full mesh
-    solver = pp3d.MeshHeatMethodDistanceSolver(verts_full, faces)
-
-    # Compute geodesic distances from each subsampled vertex
-    geo_sub = np.zeros((n_sub, n_sub), dtype=np.float32)
-    for i, src in enumerate(idx_b):
-        dists_from_src = solver.compute_distance(int(src))  # (N_full,)
-        geo_sub[i] = dists_from_src[idx_b]
-
-    # Normalise by sqrt(surface area)
-    v0 = verts_full[faces[:, 0]]
-    v1 = verts_full[faces[:, 1]]
-    v2 = verts_full[faces[:, 2]]
-    area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum()
-    sqrt_area = np.sqrt(max(area, 1e-12))
-    geo_sub /= sqrt_area
-
-    return geo_sub
+    except Exception as e:
+        print(f"    [geodesic] failed to build cache: {e}", flush=True)
+        return None
 
 
 @torch.no_grad()
@@ -631,7 +674,7 @@ def evaluate_pair(
     device: torch.device,
     k_sparsify: Optional[int] = None,
     evaluators: Optional[List] = None,
-    geo_dists: Optional[np.ndarray] = None,
+    geo_cache = None,
 ) -> Dict[str, float]:
     """Evaluate correspondence quality using functional maps (non-differentiable).
 
@@ -640,8 +683,8 @@ def evaluate_pair(
         evaluators: List of ShapePairEvaluator instances. When provided,
             runs each evaluator and prefixes metrics with evaluator.name.
             When None, uses the legacy _correspondence_metrics path.
-        geo_dists: Precomputed normalised geodesic distance matrix on B.
-            If None and pair has faces_b, computes on the fly.
+        geo_cache: Precomputed GeodesicCache for mesh B.
+            If None and pair has faces_b, builds on the fly.
     """
     n_a             = len(pair.verts_a)
     is_gradient_mode = False
@@ -696,8 +739,8 @@ def evaluate_pair(
             dense_bases[label] = (evecs, evals, M_np)
 
     gt_corr = _build_gt_corr_from_pair(pair)
-    if geo_dists is None:
-        geo_dists = _compute_geodesic_dists(pair)
+    if geo_cache is None:
+        geo_cache = _build_geo_cache(pair)
     evA_d, evalsA_d, mA = dense_bases['A']
     evB_d, evalsB_d, mB = dense_bases['B']
 
@@ -708,7 +751,7 @@ def evaluate_pair(
             ev_metrics = evaluator.evaluate(
                 evA_d, evB_d, evalsA_d, evalsB_d,
                 mA, mB, pair.verts_b, gt_corr=gt_corr,
-                geo_dists=geo_dists,
+                geo_cache=geo_cache,
             )
             for mk, mv in ev_metrics.items():
                 metrics[f"{evaluator.name}/{mk}"] = mv
@@ -721,7 +764,7 @@ def evaluate_pair(
                 sp_metrics = evaluator.evaluate(
                     evA_sp, evB_sp, evalsA_sp, evalsB_sp,
                     mA, mB, pair.verts_b, gt_corr=gt_corr,
-                    geo_dists=geo_dists,
+                    geo_cache=geo_cache,
                 )
                 for mk, mv in sp_metrics.items():
                     metrics[f"sp_{evaluator.name}/{mk}"] = mv
@@ -734,7 +777,7 @@ def evaluate_pair(
                 iso_metrics = evaluator.evaluate(
                     evA_iso, evB_iso, evalsA_iso, evalsB_iso,
                     mA, mB, pair.verts_b, gt_corr=gt_corr,
-                    geo_dists=geo_dists,
+                    geo_cache=geo_cache,
                 )
                 for mk, mv in iso_metrics.items():
                     metrics[f"iso_{evaluator.name}/{mk}"] = mv
@@ -760,7 +803,7 @@ def evaluate_pair_robust(
     num_eigenvectors: int,
     n_neighbors: int = 30,
     evaluators: Optional[List] = None,
-    geo_dists: Optional[np.ndarray] = None,
+    geo_cache = None,
 ) -> Dict[str, float]:
     """Evaluate using robust Laplacian (baseline, no model).
 
@@ -768,8 +811,8 @@ def evaluate_pair_robust(
         evaluators: List of ShapePairEvaluator instances. When provided,
             runs each evaluator and prefixes metrics with evaluator.name.
             When None, uses the legacy _correspondence_metrics path.
-        geo_dists: Precomputed normalised geodesic distance matrix on B.
-            If None and pair has faces_b, computes on the fly.
+        geo_cache: Precomputed GeodesicCache for mesh B.
+            If None and pair has faces_b, builds on the fly.
     """
     import robust_laplacian
     n_a = len(pair.verts_a)
@@ -780,8 +823,8 @@ def evaluate_pair_robust(
         bases[label] = (evecs, evals, np.array(M.diagonal()).flatten())
 
     gt_corr = _build_gt_corr_from_pair(pair)
-    if geo_dists is None:
-        geo_dists = _compute_geodesic_dists(pair)
+    if geo_cache is None:
+        geo_cache = _build_geo_cache(pair)
     evA, evalsA, mA = bases['A']
     evB, evalsB, mB = bases['B']
 
@@ -791,7 +834,7 @@ def evaluate_pair_robust(
             ev_metrics = evaluator.evaluate(
                 evA, evB, evalsA, evalsB,
                 mA, mB, pair.verts_b, gt_corr=gt_corr,
-                geo_dists=geo_dists,
+                geo_cache=geo_cache,
             )
             for mk, mv in ev_metrics.items():
                 metrics[f"{evaluator.name}/{mk}"] = mv
@@ -946,7 +989,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         self.loss_fn: SoftCorrespondenceLoss = loss_fn
         self.model: Optional[nn.Module] = None
         self._train_rng: Optional[np.random.RandomState] = None
-        self._val_outputs: List[Dict[str, float]] = []
+        self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
 
         # Validate k_sparsify
         if k_sparsify is not None:
@@ -966,9 +1009,9 @@ class FunctionalMapModule(LaplacianModuleBase):
                 fmap_resolvent_gamma=geomfum_fmap_resolvent_gamma,
             ))
 
-        # Cache for geodesic distance matrices (pair_name → (N_sub, N_sub) array)
+        # Cache for geodesic solvers (pair_name → GeodesicCache)
         # Precomputed in on_fit_start, reused in validation_step.
-        self._geo_cache: Dict[str, Optional[np.ndarray]] = {}
+        self._geo_cache: Dict[str, Optional] = {}
 
     # ------------------------------------------------------------------
     # Setup
@@ -1180,7 +1223,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         """Log robust-Laplacian and epoch-0 model baselines to W&B at step 0.
 
         Only runs on rank 0 to avoid duplicated evaluation in DDP.
-        Uses the first val dataset specification.
+        Iterates over all val dataset specifications.
         """
         if not self.trainer.is_global_zero:
             return
@@ -1191,11 +1234,6 @@ class FunctionalMapModule(LaplacianModuleBase):
         if dm is None or not dm._val_dataset_specifications:
             return
 
-        val_dataset = dm._val_dataset_specifications[0].dataset
-        val_pairs   = [val_dataset[i] for i in range(len(val_dataset))]
-        if not val_pairs:
-            return
-
         def _subsample(pair):
             mv = hp.max_vertices_val if hp.max_vertices_val > 0 else hp.max_vertices
             if mv > 0:
@@ -1203,69 +1241,99 @@ class FunctionalMapModule(LaplacianModuleBase):
                                       np.random.RandomState(_stable_hash(pair.name)))
             return pair
 
-        # Precompute geodesic distances for all val pairs (once)
-        print("\n  Precomputing geodesic distances on mesh B...", flush=True)
+        # Collect all val pairs across all datasets
+        all_val_datasets: List[Tuple[str, List[PairSample]]] = []
+        for spec in dm._val_dataset_specifications:
+            ds = spec.dataset
+            ds_name = getattr(ds, 'name', ds.__class__.__name__)
+            pairs = [ds[i] for i in range(len(ds))]
+            all_val_datasets.append((ds_name, pairs))
+
+        # Precompute geodesic caches for all val pairs across all datasets.
+        # Build solver + eagerly compute distances from all unique GT targets
+        # so that per-pair evaluation incurs zero geodesic cost.
+        all_pairs = [(name, p) for name, pairs in all_val_datasets for p in pairs]
+        print(f"\n  Precomputing geodesic caches ({len(all_pairs)} pairs)...", flush=True)
         t0_geo = time.perf_counter()
-        for p in val_pairs:
-            sub_p = _subsample(p)
-            self._geo_cache[p.name] = _compute_geodesic_dists(sub_p)
+        n_total_pairs = len(all_pairs)
+        cw_geo = len(str(n_total_pairs))
+        for i, (_, p) in enumerate(all_pairs):
+            if p.name not in self._geo_cache:
+                sub_p = _subsample(p)
+                cache = _build_geo_cache(sub_p)
+                if cache is not None:
+                    gt_corr = _build_gt_corr_from_pair(sub_p)
+                    if gt_corr is not None:
+                        cache.precompute_from_gt(gt_corr)
+                self._geo_cache[p.name] = cache
+            if (i + 1) % 10 == 0 or (i + 1) == n_total_pairs:
+                dt_so_far = time.perf_counter() - t0_geo
+                print(f"    [{i+1:>{cw_geo}}/{n_total_pairs}] {dt_so_far:.1f}s",
+                      flush=True)
         dt_geo = time.perf_counter() - t0_geo
         n_with_geo = sum(1 for v in self._geo_cache.values() if v is not None)
-        print(f"    Done: {n_with_geo}/{len(val_pairs)} pairs with faces "
+        print(f"    Done: {n_with_geo}/{len(all_pairs)} pairs with faces "
               f"({dt_geo:.1f}s)", flush=True)
 
-        # ── Robust Laplacian baseline ──────────────────────────────────────────
-        try:
-            import robust_laplacian  # noqa: F401
-            print(f"\n  Computing robust Laplacian baseline ({len(val_pairs)} pairs)...",
-                  flush=True)
-            robust_metrics = []
+        # Run baselines per dataset
+        for ds_name, val_pairs in all_val_datasets:
+            if not val_pairs:
+                continue
             n_total = len(val_pairs)
-            cw = len(str(n_total))  # counter width
-            for i, p in enumerate(val_pairs):
-                print(f"    [robust {i+1:>{cw}}/{n_total}] {p.name}...",
-                      end="", flush=True)
-                t0_ = time.perf_counter()
-                m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
-                                         evaluators=self._evaluators,
-                                         geo_dists=self._geo_cache.get(p.name))
-                dt_ = time.perf_counter() - t0_
-                robust_metrics.append(m)
-                print(f" {dt_:.1f}s", flush=True)
-            rb_summary = self._summarise_and_print(robust_metrics, "Robust baseline")
+            cw = len(str(n_total))
+            ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
+
+            # ── Robust Laplacian baseline ──────────────────────────────────
+            try:
+                import robust_laplacian  # noqa: F401
+                print(f"\n  Computing robust Laplacian baseline{ds_label} "
+                      f"({n_total} pairs)...", flush=True)
+                robust_metrics = []
+                for i, p in enumerate(val_pairs):
+                    print(f"    [robust {i+1:>{cw}}/{n_total}] {p.name}...",
+                          end="", flush=True)
+                    t0_ = time.perf_counter()
+                    m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
+                                             evaluators=self._evaluators,
+                                             geo_cache=self._geo_cache.get(p.name))
+                    dt_ = time.perf_counter() - t0_
+                    robust_metrics.append(m)
+                    print(f" {dt_:.1f}s", flush=True)
+                rb_summary = self._summarise_and_print(
+                    robust_metrics, f"Robust baseline{ds_label}")
+                self.logger.log_metrics(
+                    {f"baseline/robust/{ds_name}/{k}": v
+                     for k, v in rb_summary.items()}, step=0)
+            except ImportError:
+                print("  (robust_laplacian not installed — skipping robust baseline)")
+
+            # ── Epoch-0 model baseline ─────────────────────────────────────
+            init_label = "random init" if hp.random_init else "pretrained"
+            print(f"\n  Computing {init_label} model baseline{ds_label} "
+                  f"({n_total} pairs)...", flush=True)
+            self.model.eval()
+            ep0_metrics = []
+            with torch.no_grad():
+                for i, p in enumerate(val_pairs):
+                    sub_p = _subsample(p)
+                    print(f"    [model  {i+1:>{cw}}/{n_total}] {p.name}...",
+                          end="", flush=True)
+                    t0_ = time.perf_counter()
+                    m = evaluate_pair(self.model, sub_p,
+                                      hp.k, hp.num_eigenvectors, device,
+                                      k_sparsify=hp.k_sparsify,
+                                      evaluators=self._evaluators,
+                                      geo_cache=self._geo_cache.get(p.name))
+                    dt_ = time.perf_counter() - t0_
+                    ep0_metrics.append(m)
+                    print(f" {dt_:.1f}s", flush=True)
+            self.model.train()
+
+            ep0_summary = self._summarise_and_print(
+                ep0_metrics, f"Model baseline ({init_label}){ds_label}")
             self.logger.log_metrics(
-                {f"baseline/robust/{k}": v for k, v in rb_summary.items()}, step=0)
-        except ImportError:
-            print("  (robust_laplacian not installed — skipping robust baseline)")
-
-        # ── Epoch-0 model baseline ────────────────────────────────────────────
-        init_label = "random init" if hp.random_init else "pretrained"
-        print(f"\n  Computing {init_label} model baseline ({len(val_pairs)} pairs)...",
-              flush=True)
-        self.model.eval()
-        ep0_metrics = []
-        n_total = len(val_pairs)
-        cw = len(str(n_total))
-        with torch.no_grad():
-            for i, p in enumerate(val_pairs):
-                sub_p = _subsample(p)
-                print(f"    [model  {i+1:>{cw}}/{n_total}] {p.name}...",
-                      end="", flush=True)
-                t0_ = time.perf_counter()
-                m = evaluate_pair(self.model, sub_p,
-                                  hp.k, hp.num_eigenvectors, device,
-                                  k_sparsify=hp.k_sparsify,
-                                  evaluators=self._evaluators,
-                                  geo_dists=self._geo_cache.get(p.name))
-                dt_ = time.perf_counter() - t0_
-                ep0_metrics.append(m)
-                print(f" {dt_:.1f}s", flush=True)
-        self.model.train()
-
-        ep0_summary = self._summarise_and_print(
-            ep0_metrics, f"Model baseline ({init_label})")
-        self.logger.log_metrics(
-            {f"baseline/model/{k}": v for k, v in ep0_summary.items()}, step=0)
+                {f"baseline/model/{ds_name}/{k}": v
+                 for k, v in ep0_summary.items()}, step=0)
 
     # ------------------------------------------------------------------
     # Curriculum
@@ -1396,65 +1464,93 @@ class FunctionalMapModule(LaplacianModuleBase):
     # ------------------------------------------------------------------
 
     def on_validation_epoch_start(self) -> None:
-        self._val_outputs = []
+        self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
 
     @torch.no_grad()
-    def validation_step(self, batch: List[PairSample], batch_idx: int) -> None:
+    def validation_step(self, batch: List[PairSample], batch_idx: int,
+                        dataloader_idx: int = 0) -> None:
         assert len(batch) == 1
         pair = batch[0]
         mv = self.hparams.max_vertices_val or self.hparams.max_vertices
         if mv > 0:
             pair = subsample_pair(pair, mv,
                                   np.random.RandomState(_stable_hash(pair.name)))
-        self._val_outputs.append(evaluate_pair(
+        if dataloader_idx not in self._val_outputs:
+            self._val_outputs[dataloader_idx] = []
+        self._val_outputs[dataloader_idx].append(evaluate_pair(
             self.model, pair, self.hparams.k,
             self.hparams.num_eigenvectors, self.device,
             k_sparsify=self.hparams.k_sparsify,
             evaluators=self._evaluators,
-            geo_dists=self._geo_cache.get(pair.name),
+            geo_cache=self._geo_cache.get(pair.name),
         ))
 
     def on_validation_epoch_end(self) -> None:
         if not self._val_outputs:
             return
 
-        # --- DDP gather ---
-        sample     = self._val_outputs[0]
-        float_keys = [k for k, v in sample.items()
-                      if isinstance(v, (int, float)) and not k.startswith("_")]
-        local_t = torch.tensor(
-            [[d.get(k, float("nan")) for k in float_keys] for d in self._val_outputs],
-            device=self.device, dtype=torch.float32)
+        dm = self.trainer.datamodule
+        val_specs = dm._val_dataset_specifications
 
-        gathered = self.all_gather(local_t)
-        if gathered.dim() == 2:
-            gathered = gathered.unsqueeze(0)
-        all_flat = gathered.reshape(-1, len(float_keys))
+        # Process each val dataset independently
+        primary_acc = None  # from first dataset, used for checkpointing
 
-        true_val_size = len(self.trainer.datamodule._val_dataset_specifications[0].dataset)
-        all_flat = all_flat[:true_val_size]
+        for dl_idx, outputs in sorted(self._val_outputs.items()):
+            if not outputs:
+                continue
 
-        all_metrics = [{k: all_flat[i, j].item() for j, k in enumerate(float_keys)}
-                       for i in range(all_flat.shape[0])]
+            # Dataset name for logging and printing
+            ds = val_specs[dl_idx].dataset if dl_idx < len(val_specs) else None
+            ds_name = getattr(ds, 'name', f'val_{dl_idx}')
 
-        # --- Summarise + print (shared code path) ---
-        summary = self._summarise_and_print(
-            all_metrics, f"Val epoch {self.current_epoch}",
-            silent=not self.trainer.is_global_zero)
+            # --- DDP gather ---
+            sample = outputs[0]
+            float_keys = [k for k, v in sample.items()
+                          if isinstance(v, (int, float)) and not k.startswith("_")]
+            local_t = torch.tensor(
+                [[d.get(k, float("nan")) for k in float_keys] for d in outputs],
+                device=self.device, dtype=torch.float32)
 
-        # --- Log to W&B / Lightning ---
-        for mk, mv in summary.items():
-            self.log(f"val/{mk}", mv, sync_dist=True)
+            gathered = self.all_gather(local_t)
+            if gathered.dim() == 2:
+                gathered = gathered.unsqueeze(0)
+            all_flat = gathered.reshape(-1, len(float_keys))
 
-        # Prog-bar shortcuts
-        nn_prefix = "spectral_nn/"
-        has_nn = any(k.startswith(nn_prefix) for k in summary)
-        acc_key = f"{nn_prefix}accuracy" if has_nn else "accuracy"
-        self.log("val/top1", summary.get(acc_key, 0.0), prog_bar=True, sync_dist=True)
+            true_val_size = len(val_specs[dl_idx].dataset) if dl_idx < len(val_specs) else len(outputs)
+            all_flat = all_flat[:true_val_size]
 
-        sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
-        if sp_key in summary:
-            self.log("val/sp_top1", summary[sp_key], prog_bar=True, sync_dist=True)
+            all_metrics = [{k: all_flat[i, j].item() for j, k in enumerate(float_keys)}
+                           for i in range(all_flat.shape[0])]
 
-        primary = summary.get(sp_key, summary.get(acc_key, 0.0))
-        self.log("val/best_acc", primary, prog_bar=True, sync_dist=True)
+            # --- Summarise + print (shared code path) ---
+            summary = self._summarise_and_print(
+                all_metrics, f"Val epoch {self.current_epoch} [{ds_name}]",
+                silent=not self.trainer.is_global_zero)
+
+            # --- Log to W&B / Lightning ---
+            prefix = f"val/{ds_name}" if len(val_specs) > 1 else "val"
+            for mk, mv in summary.items():
+                self.log(f"{prefix}/{mk}", mv, sync_dist=True,
+                         add_dataloader_idx=False)
+
+            # Primary metrics from first dataset
+            nn_prefix = "spectral_nn/"
+            has_nn = any(k.startswith(nn_prefix) for k in summary)
+            acc_key = f"{nn_prefix}accuracy" if has_nn else "accuracy"
+            sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
+            iso_geo5_key = f"iso_{nn_prefix}geo_at_05pct" if has_nn else "iso_geo_at_05pct"
+
+            if dl_idx == 0:
+                self.log("val/top1", summary.get(acc_key, 0.0),
+                         prog_bar=True, sync_dist=True, add_dataloader_idx=False)
+                if sp_key in summary:
+                    self.log("val/sp_top1", summary[sp_key],
+                             prog_bar=True, sync_dist=True, add_dataloader_idx=False)
+                # Primary for checkpointing: iso @5% geodesic > sp top1 > dense top1
+                primary_acc = summary.get(
+                    iso_geo5_key,
+                    summary.get(sp_key, summary.get(acc_key, 0.0)))
+
+        if primary_acc is not None:
+            self.log("val/best_acc", primary_acc,
+                     prog_bar=True, sync_dist=True, add_dataloader_idx=False)
