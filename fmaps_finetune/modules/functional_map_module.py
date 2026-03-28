@@ -1051,71 +1051,50 @@ class FunctionalMapModule(LaplacianModuleBase):
 
         # --- Print summary ---
         if not silent:
-            # Compute column width from evaluator names
-            ev_names = [ev.name for ev in self._evaluators
-                        if summary.get(f"{ev.name}/accuracy") is not None]
-            name_w = max((len(n) for n in ev_names), default=12)
+            # Collect all variant rows: (display_name, prefix) for each evaluator
+            # e.g. ("spectral_nn", ""), ("sp_spectral_nn", "sp_"), ("iso_spectral_nn", "iso_")
+            rows = []
+            for ev in self._evaluators:
+                for prefix, variant_label in [("", ""), ("sp_", "sp_"), ("iso_", "iso_")]:
+                    key = f"{prefix}{ev.name}/accuracy"
+                    if summary.get(key) is not None:
+                        rows.append((f"{variant_label}{ev.name}", prefix, ev))
+
+            if not rows:
+                return summary
+
+            name_w = max(len(r[0]) for r in rows)
             n_pairs = len(all_metrics)
 
             print(f"  {label}:", flush=True)
 
-            # Per-evaluator rows (aligned columns)
-            for ev in self._evaluators:
-                ev_key = f"{ev.name}/accuracy"
-                ev_acc = summary.get(ev_key)
-                ev_err = summary.get(f"{ev.name}/mean_error", 0.0)
-                if ev_acc is None:
-                    continue
+            for display_name, prefix, ev in rows:
+                full_prefix = f"{prefix}{ev.name}"
+                acc = summary.get(f"{full_prefix}/accuracy", 0.0)
+                err = summary.get(f"{full_prefix}/mean_error", 0.0)
 
-                # Count valid pairs per variant
-                n_dense = sum(1 for m in all_metrics
-                              if ev_key in m and np.isfinite(m[ev_key]))
-                fail_dense = n_pairs - n_dense
-                fail_str = f"  ({fail_dense}/{n_pairs} failed)" if fail_dense else ""
+                # Count failures
+                acc_key = f"{full_prefix}/accuracy"
+                n_valid = sum(1 for m in all_metrics
+                              if acc_key in m and np.isfinite(m[acc_key]))
+                n_fail = n_pairs - n_valid
+                fail_str = f"  ({n_fail}/{n_pairs} failed)" if n_fail else ""
 
-                # Sparse
-                sp_key = f"sp_{ev.name}/accuracy"
-                sp_ev = summary.get(sp_key)
-                if sp_ev is not None:
-                    n_sp = sum(1 for m in all_metrics
-                              if sp_key in m and np.isfinite(m[sp_key]))
-                    fail_sp = n_pairs - n_sp
-                    sp_fail = f" [{fail_sp}F]" if fail_sp else ""
-                    sp_col = f"  │ sp={sp_ev*100:5.1f}%{sp_fail}"
-                else:
-                    sp_col = ""
+                # Build metrics string
+                parts = [f"    {display_name:<{name_w}}  top1={acc*100:5.1f}%"]
 
-                # Isotropic
-                iso_key = f"iso_{ev.name}/accuracy"
-                iso_ev = summary.get(iso_key)
-                if iso_ev is not None:
-                    n_iso = sum(1 for m in all_metrics
-                               if iso_key in m and np.isfinite(m[iso_key]))
-                    fail_iso = n_pairs - n_iso
-                    iso_fail = f" [{fail_iso}F]" if fail_iso else ""
-                    iso_col = f"  │ iso={iso_ev*100:5.1f}%{iso_fail}"
-                else:
-                    iso_col = ""
-
-                # Build the main metrics string
-                parts = [f"    {ev.name:<{name_w}}  top1={ev_acc*100:5.1f}%"]
-
-                # Top-k accuracy (if available)
                 for topk in (3, 5, 10):
-                    topk_val = summary.get(f"{ev.name}/top{topk}_acc")
+                    topk_val = summary.get(f"{full_prefix}/top{topk}_acc")
                     if topk_val is not None:
                         parts.append(f"  top{topk}={topk_val*100:5.1f}%")
 
-                parts.append(f"  Err={ev_err:.4f}")
+                parts.append(f"  Err={err:.4f}")
 
-                # GeomFuM sanity check (only for fmap evaluators)
-                gfm_acc = summary.get(f"{ev.name}/geomfum_accuracy")
+                gfm_acc = summary.get(f"{full_prefix}/geomfum_accuracy")
                 if gfm_acc is not None:
                     parts.append(f"  gfm={gfm_acc*100:5.1f}%")
 
                 parts.append(fail_str)
-                parts.append(sp_col)
-                parts.append(iso_col)
 
                 print("".join(parts), flush=True)
 

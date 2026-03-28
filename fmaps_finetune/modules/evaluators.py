@@ -470,12 +470,22 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
             pred_corr, nn_indices, gt_corr[:n_a], vertices_b
         ))
 
-        # GeomFuM's P2pFromFmConverter (sanity check — should match our top1)
-        shape_a.basis.use_k = k_eval_a
-        shape_b.basis.use_k = k_eval_b
-        p2p_converter = P2pFromFmConverter()
-        p2p_gfm = np.array(p2p_converter(fmap_matrix, shape_a.basis, shape_b.basis))
-        metrics['geomfum_accuracy'] = float((p2p_gfm == gt_corr[:n_a]).mean())
+        # GeomFuM's P2pFromFmConverter sanity check.
+        # Our _fmap_to_pointwise computes A→B: project A into B's spectral
+        # space via Φ_A @ C^T, then NN in B.
+        # GeomFuM's P2pFromFmConverter(C, basis_a, basis_b) returns B→A.
+        # To get A→B, pass C^T with swapped bases.
+        try:
+            shape_a.basis.use_k = k_eval_a
+            shape_b.basis.use_k = k_eval_b
+            p2p_converter = P2pFromFmConverter()
+            # fmap_np is (k_b, k_a); transpose to (k_a, k_b), swap bases
+            import gsops.backend as gs
+            fmap_t = gs.array(fmap_np.T.copy())
+            p2p_gfm = np.array(p2p_converter(fmap_t, shape_b.basis, shape_a.basis))
+            metrics['geomfum_accuracy'] = float((p2p_gfm == gt_corr[:n_a]).mean())
+        except Exception as e:
+            print(f"    [GeomFuM p2p sanity check failed: {e}]", flush=True)
 
         return metrics
 
