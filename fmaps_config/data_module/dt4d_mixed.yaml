@@ -1,0 +1,72 @@
+# fmaps_config/data_module/dt4d_mixed.yaml
+# Mixed DT4D training: humanoids + animals via CompositePairGenerator.
+# Validation on held-out categories from each dataset, reported separately.
+#
+# Required CLI overrides (or edit paths below):
+#   data_module.module.train_dataset_specification.dataset.pair_generator.generators.0.root=<humanoids_path>
+#   data_module.module.train_dataset_specification.dataset.pair_generator.generators.1.root=<animals_path>
+#   (and similarly for val specs)
+
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericPlainDataModule
+
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_:  fmaps_finetune.datasets.functional_map_dataset.ShapePairDataset
+      pair_generator:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.CompositePairGenerator
+        generators:
+          - _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+            root: '/path/to/DeformingThings4DMatching'
+            exclude_categories: [pumpkinhulk, skeletonzombie]  # held out for val
+            enable_cross_category: true
+          - _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+            root: '/path/to/DeformingThings4DMatching-Animals'
+            exclude_categories: [tigerD8H, zebraBM]            # held out for val
+        weights: [0.5, 0.5]   # 50/50 humanoid/animal pairs during training
+      num_samples: 60
+      cross_ratio: 0.0
+    batch_size: 10
+    num_workers: 0
+    shuffle: true
+    collate_fn:
+      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+      _partial_: true
+
+  # Separate val dataloaders → separate metrics per dataset
+  val_dataset_specifications:
+    # Val set 1: held-out humanoid categories
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+          root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
+          categories: [pumpkinhulk, skeletonzombie]
+          enable_cross_category: true
+        val_poses_per_pair: 2
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
+
+    # Val set 2: held-out animal categories
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+          root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
+          categories: [tigerD8H, zebraBM]
+        val_poses_per_pair: 2
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true

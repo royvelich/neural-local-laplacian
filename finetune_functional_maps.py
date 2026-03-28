@@ -800,8 +800,19 @@ def compute_laplacian_differentiable(
     k: int,
     device: torch.device,
     sparsify: bool = False,
+    k_sparsify: Optional[int] = None,
 ):
-    """Forward pass through model → dense Laplacian (differentiable)."""
+    """Forward pass through model → dense Laplacian (differentiable).
+
+    Args:
+        k: kNN neighbourhood size for the model's receptive field.
+        sparsify: If True, mask the dense G^T M G to a kNN sparsity pattern.
+        k_sparsify: kNN neighbourhood size for the sparsification mask.
+            When None or equal to *k*, the model's own kNN graph is reused
+            (current behaviour).  When set to an integer < k, a second kNN
+            graph is built and used as the mask, decoupling the model's
+            receptive field from the assembled operator's support.
+    """
     vertices_t = torch.from_numpy(vertices_np).float().to(device)
     knn = compute_knn(vertices_np, k)
     knn_t = torch.from_numpy(knn).long().to(device)
@@ -818,7 +829,12 @@ def compute_laplacian_differentiable(
             knn=knn_t,
         )
         if sparsify:
-            L = _sparsify_L_to_knn(L, knn_t)
+            if k_sparsify is not None and k_sparsify != k:
+                knn_sp = compute_knn(vertices_np, k_sparsify)
+                knn_sp_t = torch.from_numpy(knn_sp).long().to(device)
+                L = _sparsify_L_to_knn(L, knn_sp_t)
+            else:
+                L = _sparsify_L_to_knn(L, knn_t)
         return L, M_diag
     else:
         batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
@@ -1274,8 +1290,15 @@ def evaluate_pair(
     k: int,
     num_eigenvectors: int,
     device: torch.device,
+    k_sparsify: Optional[int] = None,
 ) -> Dict[str, float]:
-    """Evaluate correspondence quality using functional maps."""
+    """Evaluate correspondence quality using functional maps.
+
+    Args:
+        k: kNN neighbourhood size for the model's receptive field.
+        k_sparsify: kNN neighbourhood size for the sparsification mask.
+            None or equal to k → reuse the model's kNN graph (current behaviour).
+    """
     from neural_local_laplacian.utils.utils import (
         assemble_stiffness_and_mass_matrices,
         compute_laplacian_eigendecomposition,
@@ -1307,7 +1330,13 @@ def evaluate_pair(
             M_diag = M_diag_t.cpu().numpy()
             dense_bases[label] = (evecs_d, M_diag)
 
-            L_sp = _sparsify_L_to_knn(L, knn_t)
+            # Sparsify with a separate kNN graph when k_sparsify is set
+            if k_sparsify is not None and k_sparsify != k:
+                knn_sp_np = compute_knn(verts, k_sparsify)
+                knn_sp_t = torch.from_numpy(knn_sp_np).long().to(device)
+                L_sp = _sparsify_L_to_knn(L, knn_sp_t)
+            else:
+                L_sp = _sparsify_L_to_knn(L, knn_t)
             evals_sp, evecs_sp = _eigh_from_sparse_L(L_sp, M_diag_t, num_eigenvectors)
             sparse_bases[label] = (evecs_sp, M_diag)
         else:
@@ -1655,7 +1684,8 @@ def train(args):
         if args.max_vertices > 0:
             eval_pair = subsample_pair(pair, args.max_vertices,
                                        np.random.RandomState(_stable_hash(pair.name)))
-        val_metrics = evaluate_pair(model, eval_pair, args.k_pred, args.num_eigenvectors, device)
+        val_metrics = evaluate_pair(model, eval_pair, args.k_pred, args.num_eigenvectors, device,
+                                   k_sparsify=args.k_sparsify)
         ep0_metrics_list.append(val_metrics)
 
         sp_str = ""
@@ -1719,6 +1749,8 @@ def train(args):
     print()
     print("=" * 80)
     lap_mode = "sparse (kNN-masked G^TMG)" if args.sparsify_laplacian else "dense (full G^TMG)"
+    if args.sparsify_laplacian and args.k_sparsify is not None and args.k_sparsify != args.k_pred:
+        lap_mode = f"sparse (k_model={args.k_pred}, k_sparsify={args.k_sparsify})"
     init_mode = "from scratch" if from_scratch else "fine-tuning"
     print(f"TRAINING ({args.dataset.upper()}, {init_mode}, {args.loss_type.upper()} contrastive, "
           f"{args.num_landmarks} landmarks, "
@@ -1776,10 +1808,12 @@ def train(args):
                 # Forward: differentiable Laplacians
                 S_A, M_A = compute_laplacian_differentiable(
                     model, pair.verts_a, args.k_pred, device,
-                    sparsify=args.sparsify_laplacian)
+                    sparsify=args.sparsify_laplacian,
+                    k_sparsify=args.k_sparsify)
                 S_B, M_B = compute_laplacian_differentiable(
                     model, pair.verts_b, args.k_pred, device,
-                    sparsify=args.sparsify_laplacian)
+                    sparsify=args.sparsify_laplacian,
+                    k_sparsify=args.k_sparsify)
 
                 # InfoNCE contrastive loss (correspondence-aware)
                 loss_nce, metrics = loss_fn(
@@ -1890,7 +1924,8 @@ def train(args):
                     eval_pair = subsample_pair(pair, args.max_vertices,
                                                np.random.RandomState(_stable_hash(pair.name)))
                 val_metrics = evaluate_pair(
-                    model, eval_pair, args.k_pred, args.num_eigenvectors, device)
+                    model, eval_pair, args.k_pred, args.num_eigenvectors, device,
+                    k_sparsify=args.k_sparsify)
                 val_metrics_list.append(val_metrics)
 
                 val_log.write(f"{epoch},{pair.name},"
@@ -2066,6 +2101,10 @@ def main():
     parser.add_argument("--keep_areas_head", action="store_true",
                         help="[with --random_init] Preserve pretrained areas head weights during reset")
     parser.add_argument("--k_pred", type=int, default=15)
+    parser.add_argument("--k_sparsify", type=int, default=None,
+                        help="kNN for sparsification mask (default: same as --k_pred). "
+                             "Must be <= --k_pred. Decouples the model's receptive field "
+                             "from the assembled operator's sparsity pattern.")
     parser.add_argument("--num_eigenvectors", type=int, default=100)
     parser.add_argument("--freeze_input_projection", action="store_true")
     parser.add_argument("--freeze_areas_head", action="store_true",
@@ -2156,6 +2195,12 @@ def main():
 
     if args.keep_areas_head and not args.random_init:
         parser.error("--keep_areas_head only makes sense with --random_init")
+
+    if args.k_sparsify is not None:
+        if args.k_sparsify > args.k_pred:
+            parser.error(f"--k_sparsify ({args.k_sparsify}) must be <= --k_pred ({args.k_pred})")
+        if not args.sparsify_laplacian:
+            parser.error("--k_sparsify requires --sparsify_laplacian")
 
     train(args)
 

@@ -333,7 +333,7 @@ def _load_vts(path: str) -> np.ndarray:
 
 
 class DT4DCategory:
-    """One DT4D humanoid category with all poses pre-loaded."""
+    """One DT4D category (humanoid or animal) with all poses pre-loaded."""
 
     def __init__(self, root: Path, name: str):
         self.name    = name
@@ -359,68 +359,185 @@ class DT4DCategory:
         return f"DT4DCategory({self.name}, {self.num_poses} poses, ref={self.ref_size})"
 
 
-class DT4DPairGenerator(PairGenerator):
-    """Generate DT4D Humanoid shape pairs with VTS-based correspondence.
+# ── Category discovery helpers ────────────────────────────────────────────────
 
-    train_categories / val_categories: null → auto-detected from root directory.
+def _discover_categories(root: Path) -> List[str]:
+    """Discover all valid category directories under *root*."""
+    cats = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith('.'):
+            continue
+        corres_dir = d / "corres"
+        if not corres_dir.exists():
+            continue
+        if any((corres_dir / f"{o.stem}.vts").exists() for o in d.glob("*.obj")):
+            cats.append(d.name)
+    return cats
+
+
+def _resolve_categories(
+    root: Path,
+    categories: Optional[List[str]],
+    exclude_categories: Optional[List[str]],
+) -> List[str]:
+    """Resolve category specification to a concrete list.
+
+    Exactly one of *categories* / *exclude_categories* may be non-None.
+    Both None → use all categories discovered from *root*.
     """
+    if categories is not None and exclude_categories is not None:
+        raise ValueError(
+            "Specify 'categories' OR 'exclude_categories', not both.")
+    all_cats = _discover_categories(root)
+    if not all_cats:
+        raise FileNotFoundError(
+            f"No valid DT4D categories found in {root}.")
+    if categories is not None:
+        missing = [c for c in categories if c not in all_cats]
+        if missing:
+            raise ValueError(f"Categories not found in {root}: {missing}")
+        return sorted(categories)
+    if exclude_categories is not None:
+        result = [c for c in all_cats if c not in exclude_categories]
+        if not result:
+            raise ValueError("All categories excluded.")
+        return result
+    return all_cats
+
+
+# ── Base pair generator ──────────────────────────────────────────────────────
+
+class DT4DPairGeneratorBase(PairGenerator):
+    """Shared DT4D logic: category loading, same-category pairs, val pairs."""
 
     def __init__(
         self,
         root: str,
-        train_categories: Optional[List[str]] = None,
-        val_categories:   Optional[List[str]] = None,
+        categories: Optional[List[str]] = None,
+        exclude_categories: Optional[List[str]] = None,
     ):
         self.root = Path(root)
+        resolved = _resolve_categories(self.root, categories, exclude_categories)
+        print(f"  [{self.__class__.__name__}] root: {self.root}")
+        print(f"  [{self.__class__.__name__}] Loading {len(resolved)} categories...",
+              flush=True)
 
-        if train_categories is None or val_categories is None:
-            all_cats = sorted([
-                d.name for d in self.root.iterdir()
-                if d.is_dir() and (d / "corres").exists()
-            ])
-            if not all_cats:
-                raise FileNotFoundError(
-                    f"No DT4D categories found under {self.root}.")
-            if val_categories is None:
-                val_categories = all_cats[-2:]
-            if train_categories is None:
-                train_categories = [c for c in all_cats if c not in val_categories]
-
-        self.train_categories = train_categories
-        self.val_categories   = val_categories
-
-        all_cats = sorted(set(train_categories + val_categories))
-        print(f"  Loading DT4D categories: {all_cats}")
+        self.category_names: List[str] = resolved
         self.categories: Dict[str, DT4DCategory] = {}
-        for name in all_cats:
+        for i, name in enumerate(resolved):
             cat = DT4DCategory(self.root, name)
             self.categories[name] = cat
-            print(f"    {cat}")
+            print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
+
+        self.same_pairs = [(c, c) for c in self.category_names]
+        print(f"  [{self.__class__.__name__}] Loading complete.", flush=True)
+
+    def _build_same_category_correspondence(
+        self, cat_name: str, pose_a: int, pose_b: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        cat = self.categories[cat_name]
+        vts_a, vts_b = cat.vts[pose_a], cat.vts[pose_b]
+        n_a = len(cat.vertices[pose_a])
+        n_b = len(cat.vertices[pose_b])
+
+        # VTS files may differ in length across poses (independently remeshed).
+        # Use only the shared reference range.
+        n_ref = min(len(vts_a), len(vts_b))
+        vts_a = vts_a[:n_ref]
+        vts_b = vts_b[:n_ref]
+
+        mask = (vts_a >= 0) & (vts_a < n_a) & (vts_b >= 0) & (vts_b < n_b)
+        return vts_a[mask], vts_b[mask]
+
+    def _build_correspondence(
+        self, cat_a: str, pose_a: int, cat_b: str, pose_b: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if cat_a == cat_b:
+            return self._build_same_category_correspondence(cat_a, pose_a, pose_b)
+        raise NotImplementedError(
+            f"Cross-category correspondence not supported in {self.__class__.__name__}")
+
+    def _get_val_pair_list(self) -> List[Tuple[str, str]]:
+        return self.same_pairs
+
+    def get_val_pairs(
+        self, rng: np.random.RandomState, poses_per_pair: int = 1,
+    ) -> List[PairSample]:
+        pairs = []
+        for cat_a, cat_b in self._get_val_pair_list():
+            pair_rng = np.random.RandomState(_stable_hash((cat_a, cat_b)))
+            c_a, c_b = self.categories[cat_a], self.categories[cat_b]
+            seen: set = set()
+            for _ in range(poses_per_pair):
+                for _attempt in range(200):
+                    pa = pair_rng.randint(c_a.num_poses)
+                    pb = pair_rng.randint(c_b.num_poses)
+                    if cat_a == cat_b and pa == pb and c_a.num_poses > 1:
+                        continue
+                    if (pa, pb) not in seen:
+                        break
+                else:
+                    break
+                seen.add((pa, pb))
+                corr_a, corr_b = self._build_correspondence(cat_a, pa, cat_b, pb)
+                pairs.append(PairSample(
+                    verts_a=c_a.vertices[pa], verts_b=c_b.vertices[pb],
+                    corr_a=corr_a, corr_b=corr_b,
+                    name=f"val_{cat_a}:{c_a.poses[pa]}_vs_{cat_b}:{c_b.poses[pb]}",
+                ))
+        return pairs
+
+
+# ── Humanoid pair generator (with cross-category bridges) ────────────────────
+
+class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
+    """DT4D Humanoid pairs with optional cross-category bridge support."""
+
+    def __init__(
+        self,
+        root: str,
+        categories: Optional[List[str]] = None,
+        exclude_categories: Optional[List[str]] = None,
+        enable_cross_category: bool = True,
+        # Legacy compat: accept old-style args, ignore them with a warning
+        train_categories: Optional[List[str]] = None,
+        val_categories: Optional[List[str]] = None,
+    ):
+        # Legacy compat shim
+        if train_categories is not None or val_categories is not None:
+            import warnings
+            warnings.warn(
+                "train_categories / val_categories are deprecated. "
+                "Use categories / exclude_categories instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+            if categories is None and exclude_categories is None:
+                merged = sorted(set((train_categories or []) + (val_categories or [])))
+                categories = merged if merged else None
+
+        super().__init__(root, categories, exclude_categories)
+        self.enable_cross_category = enable_cross_category
 
         self.bridges: Dict[Tuple[str, str], np.ndarray] = {}
-        bridge_dir = self.root / "cross_category_corres"
-        if bridge_dir.exists():
-            for f in bridge_dir.glob("*.vts"):
-                parts = f.stem.split("_", 1)
-                if len(parts) == 2:
-                    src, dst = parts
-                    if src in self.categories and dst in self.categories:
-                        self.bridges[(src, dst)] = _load_vts(str(f))
-            print(f"  Loaded {len(self.bridges)} cross-category bridges")
+        if enable_cross_category:
+            bridge_dir = self.root / "cross_category_corres"
+            if bridge_dir.exists():
+                for f in bridge_dir.glob("*.vts"):
+                    parts = f.stem.split("_", 1)
+                    if len(parts) == 2:
+                        src, dst = parts
+                        if src in self.categories and dst in self.categories:
+                            self.bridges[(src, dst)] = _load_vts(str(f))
+                print(f"  Loaded {len(self.bridges)} cross-category bridges")
 
-        self.same_pairs  = [(c, c) for c in train_categories]
-        self.cross_pairs = [(a, b) for a, b in combinations(train_categories, 2)
-                            if self._can_bridge(a, b)]
-        self.val_pairs   = [(a, b) for a, b in combinations(val_categories, 2)
-                            if self._can_bridge(a, b)]
-        for t in train_categories:
-            for v in val_categories:
-                if self._can_bridge(t, v):
-                    self.val_pairs.append((t, v))
-
+        self.cross_pairs = []
+        if enable_cross_category:
+            self.cross_pairs = [
+                (a, b) for a, b in combinations(self.category_names, 2)
+                if self._can_bridge(a, b)
+            ]
         print(f"  Same-category pairs:  {len(self.same_pairs)}")
-        print(f"  Cross-category pairs: {self.cross_pairs}")
-        print(f"  Val pairs:            {self.val_pairs}")
+        print(f"  Cross-category pairs: {len(self.cross_pairs)}")
 
     def _can_bridge(self, a: str, b: str) -> bool:
         if a == b: return True
@@ -460,32 +577,34 @@ class DT4DPairGenerator(PairGenerator):
     def _build_correspondence(
         self, cat_a: str, pose_a: int, cat_b: str, pose_b: int,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        if cat_a == cat_b:
+            return self._build_same_category_correspondence(cat_a, pose_a, pose_b)
+
         vts_a = self.categories[cat_a].vts[pose_a]
         vts_b = self.categories[cat_b].vts[pose_b]
         n_a   = len(self.categories[cat_a].vertices[pose_a])
         n_b   = len(self.categories[cat_b].vertices[pose_b])
-        if cat_a == cat_b:
-            corr_a, corr_b = vts_a, vts_b
-        else:
-            bridge     = self._get_bridge(cat_a, cat_b)
-            valid      = (bridge >= 0) & (bridge < len(vts_b))
-            ref        = np.where(valid)[0]
-            corr_a     = vts_a[ref]
-            corr_b     = vts_b[bridge[ref]]
+
+        bridge = self._get_bridge(cat_a, cat_b)
+        valid  = (bridge >= 0) & (bridge < len(vts_b))
+        ref    = np.where(valid)[0]
+        # Ensure ref indices are within vts_a range
+        ref    = ref[ref < len(vts_a)]
+        corr_a = vts_a[ref]
+        corr_b = vts_b[bridge[ref]]
         mask = (corr_a >= 0) & (corr_a < n_a) & (corr_b >= 0) & (corr_b < n_b)
         return corr_a[mask], corr_b[mask]
 
     def sample_train_pair(
         self, rng: np.random.RandomState, cross_ratio: float = 0.5,
     ) -> PairSample:
-        if rng.rand() < cross_ratio and self.cross_pairs:
+        if self.enable_cross_category and rng.rand() < cross_ratio and self.cross_pairs:
             cat_a, cat_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
             pair_type = "cross"
         else:
             cat_a, cat_b = self.same_pairs[rng.randint(len(self.same_pairs))]
             pair_type = "same"
-        c_a    = self.categories[cat_a]
-        c_b    = self.categories[cat_b]
+        c_a, c_b = self.categories[cat_a], self.categories[cat_b]
         pose_a = rng.randint(c_a.num_poses)
         pose_b = rng.randint(c_b.num_poses)
         if cat_a == cat_b and c_a.num_poses > 1:
@@ -498,32 +617,86 @@ class DT4DPairGenerator(PairGenerator):
             name=f"{pair_type}_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
         )
 
+    def _get_val_pair_list(self) -> List[Tuple[str, str]]:
+        val_pairs = list(self.same_pairs)
+        if self.enable_cross_category:
+            for a, b in combinations(self.category_names, 2):
+                if self._can_bridge(a, b):
+                    val_pairs.append((a, b))
+        return val_pairs
+
+
+# Backward compatibility alias
+DT4DPairGenerator = DT4DHumanoidPairGenerator
+
+
+# ── Animals pair generator (inter-category only) ─────────────────────────────
+
+class DT4DAnimalsPairGenerator(DT4DPairGeneratorBase):
+    """DT4D Animals — same-category pairs only (no cross-category bridges)."""
+
+    def __init__(
+        self,
+        root: str,
+        categories: Optional[List[str]] = None,
+        exclude_categories: Optional[List[str]] = None,
+    ):
+        super().__init__(root, categories, exclude_categories)
+        print(f"  Same-category pairs: {len(self.same_pairs)} "
+              f"(cross-category not available)")
+
+    def sample_train_pair(
+        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
+    ) -> PairSample:
+        cat_name = self.category_names[rng.randint(len(self.category_names))]
+        cat = self.categories[cat_name]
+        pose_a = rng.randint(cat.num_poses)
+        pose_b = rng.randint(cat.num_poses)
+        if cat.num_poses > 1:
+            while pose_b == pose_a:
+                pose_b = rng.randint(cat.num_poses)
+        corr_a, corr_b = self._build_same_category_correspondence(
+            cat_name, pose_a, pose_b)
+        return PairSample(
+            verts_a=cat.vertices[pose_a], verts_b=cat.vertices[pose_b],
+            corr_a=corr_a, corr_b=corr_b,
+            name=f"same_{cat_name}:{cat.poses[pose_a]}_vs_{cat_name}:{cat.poses[pose_b]}",
+        )
+
+
+# ── Composite pair generator ─────────────────────────────────────────────────
+
+class CompositePairGenerator(PairGenerator):
+    """Merge multiple PairGenerators with configurable sampling weights."""
+
+    def __init__(
+        self,
+        generators: List[PairGenerator],
+        weights: Optional[List[float]] = None,
+    ):
+        if not generators:
+            raise ValueError("CompositePairGenerator requires at least one generator")
+        self.generators = generators
+        if weights is not None:
+            total = sum(weights)
+            self.weights = [w / total for w in weights]
+        else:
+            n = len(generators)
+            self.weights = [1.0 / n] * n
+
+    def sample_train_pair(
+        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
+    ) -> PairSample:
+        idx = rng.choice(len(self.generators), p=self.weights)
+        return self.generators[idx].sample_train_pair(rng, cross_ratio)
+
     def get_val_pairs(
         self, rng: np.random.RandomState, poses_per_pair: int = 1,
     ) -> List[PairSample]:
-        pairs = []
-        for cat_a, cat_b in self.val_pairs:
-            pair_rng = np.random.RandomState(_stable_hash((cat_a, cat_b)))
-            c_a, c_b = self.categories[cat_a], self.categories[cat_b]
-            seen: set = set()
-            for _ in range(poses_per_pair):
-                for _attempt in range(200):
-                    pa = pair_rng.randint(c_a.num_poses)
-                    pb = pair_rng.randint(c_b.num_poses)
-                    if cat_a == cat_b and pa == pb and c_a.num_poses > 1:
-                        continue
-                    if (pa, pb) not in seen:
-                        break
-                else:
-                    break
-                seen.add((pa, pb))
-                corr_a, corr_b = self._build_correspondence(cat_a, pa, cat_b, pb)
-                pairs.append(PairSample(
-                    verts_a=c_a.vertices[pa], verts_b=c_b.vertices[pb],
-                    corr_a=corr_a, corr_b=corr_b,
-                    name=f"val_{cat_a}:{c_a.poses[pa]}_vs_{cat_b}:{c_b.poses[pb]}",
-                ))
-        return pairs
+        all_pairs = []
+        for gen in self.generators:
+            all_pairs.extend(gen.get_val_pairs(rng, poses_per_pair))
+        return all_pairs
 
 
 # =============================================================================

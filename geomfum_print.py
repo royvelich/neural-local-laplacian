@@ -1,0 +1,3 @@
+from geomfum.forward_functional_map import ForwardFunctionalMap
+import inspect
+print(inspect.signature(ForwardFunctionalMap.__init__))

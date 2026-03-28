@@ -1,724 +1,181 @@
-#!/usr/bin/env python3
 """
-Fine-tune (or train from scratch) neural Laplacian for functional map correspondence.
+LightningModule for functional map fine-tuning of the neural Laplacian.
 
-Supports two datasets:
-  --dataset smal   : SMAL parametric animal model (on-the-fly generation)
-  --dataset dt4d   : DeformingThings4DMatching Humanoids (pre-loaded meshes)
-
-Pipeline (fully differentiable, NO eigendecomposition in training):
-    vertices → kNN → patches → model(θ) → S_A, S_B (dense)
-    → for L landmarks at T scales: d(v) = concat[(S + αM)^{-1} M δ_l]
-    → L2-normalize descriptors → cosine similarity matrix
-    → InfoNCE contrastive loss (correspondence-aware)
-    → ∂Loss/∂θ via torch.linalg.solve backward
-
-Key insight: InfoNCE only cares about RANKING, not absolute descriptor values.
-Unlike ||d_A - d_B||² which has an irreducible floor from genuine geometric
-differences between non-isometric shapes, contrastive loss can reach zero
-as long as corresponding vertices are each other's nearest neighbors.
-
-Evaluation uses scipy eigenvectors + functional maps (non-differentiable).
-
-Usage:
-    # Fine-tune from pretrained checkpoint
-    python finetune_functional_maps.py --dataset dt4d \
-        --dt4d_root /path/to/DeformingThings4DMatching \
-        --checkpoint model.ckpt --epochs 200 --lr 1e-4
-
-    # Train from random initialization (uses checkpoint for architecture only)
-    python finetune_functional_maps.py --dataset dt4d \
-        --dt4d_root /path/to/DeformingThings4DMatching \
-        --checkpoint model.ckpt --random_init --epochs 200 --lr 1e-4
+All Laplacian assembly, loss, and evaluation utilities live here alongside
+FunctionalMapModule so this file is self-contained on the model side.
 """
-
-import argparse
-import copy
-import math
-import sys
-import types
-import pickle
-import json
+from __future__ import annotations
+import os
+import contextlib
 import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Tuple, Optional, Dict, List
-from itertools import combinations
+
+import scipy.sparse
+import scipy.sparse.linalg
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import scipy.sparse
 import torch
+import lightning
+import torch.nn as nn
 import torch.nn.functional as F
+from omegaconf import DictConfig
+from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Batch
 
-from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
+from neural_local_laplacian.modules.laplacian_modules import (
+    LaplacianModuleBase,
+    LaplacianTransformerModule,
+)
 from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
 from neural_local_laplacian.utils.utils import (
     normalize_mesh_vertices,
+    assemble_stiffness_and_mass_matrices,
+    compute_laplacian_eigendecomposition,
 )
 
+from fmaps_finetune.datasets.functional_map_dataset import (
+    PairSample,
+    _compute_bijective_refs,
+    subsample_pair,
+    _stable_hash,
+)
 
-# =============================================================================
-# Common pair protocol
-# =============================================================================
+from fmaps_finetune.modules.evaluators import SpectralNNEvaluator, FunctionalMapEvaluator, fmt_topk
 
-import hashlib
-
-def _stable_hash(obj) -> int:
-    """Deterministic hash that is consistent across Python runs.
-
-    Unlike built-in hash(), this is not affected by PYTHONHASHSEED and
-    returns the same value across different processes and machines.
-    """
-    return int(hashlib.sha256(str(obj).encode()).hexdigest(), 16) % (2**31)
-
-
-@dataclass
-class PairSample:
-    """A shape pair with known vertex-to-vertex correspondence.
-
-    corr_a[i] on mesh A corresponds to corr_b[i] on mesh B,
-    for i in range(len(corr_a)).
-
-    For identity correspondence (e.g. SMAL), corr_a = corr_b = arange(N).
-    For general correspondence (e.g. DT4D), they may differ.
-    """
-    verts_a: np.ndarray   # (N_A, 3)
-    verts_b: np.ndarray   # (N_B, 3)
-    corr_a: np.ndarray    # (C,) int — vertex indices into mesh A
-    corr_b: np.ndarray    # (C,) int — vertex indices into mesh B
-    name: str
-
-
-class PairGenerator(ABC):
-    """Abstract base for training/validation pair generators."""
-
-    @abstractmethod
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float,
-    ) -> PairSample:
-        ...
-
-    @abstractmethod
-    def get_val_pairs(
-        self, rng: np.random.RandomState,
-        poses_per_pair: int = 1,
-    ) -> List[PairSample]:
-        ...
 
 
 # =============================================================================
-# Correspondence utilities
+# Step profiler (optional, activated by profile_steps > 0)
 # =============================================================================
 
-def _compute_bijective_refs(corr_a: np.ndarray, corr_b: np.ndarray) -> np.ndarray:
-    """Find reference indices where the mapping is injective on both sides.
+class _StepProfiler:
+    """Lightweight per-phase CUDA wall-time profiler.
 
-    Returns indices r such that corr_a[r] appears exactly once in corr_a
-    AND corr_b[r] appears exactly once in corr_b. This ensures no two
-    selected reference indices produce identical descriptors on either shape,
-    which would create ambiguous contrastive targets.
-    """
-    # Count how many times each mesh vertex is referenced
-    counts_a = np.bincount(corr_a, minlength=corr_a.max() + 1)
-    counts_b = np.bincount(corr_b, minlength=corr_b.max() + 1)
+    Wraps major training_step phases with CUDA-synchronized wall timings.
+    Activated when hparams.profile_steps > 0; prints a summary every
+    profile_steps steps then resets accumulators.
 
-    # Keep reference indices where both sides map to a unique vertex
-    mask = (counts_a[corr_a] == 1) & (counts_b[corr_b] == 1)
-    return np.where(mask)[0]
-
-
-def identity_correspondence(n: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Identity correspondence: vertex i ↔ vertex i."""
-    c = np.arange(n)
-    return c, c
-
-
-def subsample_pair(
-    pair: PairSample, max_vertices: int, rng: np.random.RandomState,
-) -> PairSample:
-    """Subsample both shapes to at most max_vertices, remapping correspondence.
-
-    Each shape is independently randomly subsampled. Correspondence pairs
-    where either vertex was dropped are discarded. Different random subset
-    each call → data augmentation effect.
-    """
-    verts_a, verts_b = pair.verts_a, pair.verts_b
-    corr_a, corr_b = pair.corr_a, pair.corr_b
-    n_a, n_b = len(verts_a), len(verts_b)
-
-    # Subsample A
-    if n_a > max_vertices:
-        idx_a = np.sort(rng.choice(n_a, max_vertices, replace=False))
-        verts_a = verts_a[idx_a]
-        remap_a = np.full(n_a, -1, dtype=np.int64)
-        remap_a[idx_a] = np.arange(max_vertices)
-    else:
-        remap_a = np.arange(n_a, dtype=np.int64)
-
-    # Subsample B
-    if n_b > max_vertices:
-        idx_b = np.sort(rng.choice(n_b, max_vertices, replace=False))
-        verts_b = verts_b[idx_b]
-        remap_b = np.full(n_b, -1, dtype=np.int64)
-        remap_b[idx_b] = np.arange(max_vertices)
-    else:
-        remap_b = np.arange(n_b, dtype=np.int64)
-
-    # Remap correspondences — keep only surviving pairs
-    new_ca = remap_a[corr_a]
-    new_cb = remap_b[corr_b]
-    valid = (new_ca >= 0) & (new_cb >= 0)
-    new_ca = new_ca[valid]
-    new_cb = new_cb[valid]
-
-    return PairSample(verts_a, verts_b, new_ca, new_cb, pair.name)
-
-
-# =============================================================================
-# SMAL loading
-# =============================================================================
-
-def _install_fake_chumpy():
-    if 'chumpy' in sys.modules:
-        return
-    chumpy = types.ModuleType('chumpy')
-    chumpy_ch = types.ModuleType('chumpy.ch')
-    chumpy_ch_ops = types.ModuleType('chumpy.ch_ops')
-    chumpy_reordering = types.ModuleType('chumpy.reordering')
-    chumpy_utils = types.ModuleType('chumpy.utils')
-    chumpy_logic = types.ModuleType('chumpy.logic')
-
-    class FakeCh:
-        def __init__(self, *args, **kwargs):
-            self._data = None
-            if args and isinstance(args[0], np.ndarray):
-                self._data = args[0]
-        def __setstate__(self, state):
-            if isinstance(state, dict):
-                self.__dict__.update(state)
-                for key in ['x', 'a', '_data']:
-                    if key in state and isinstance(state[key], np.ndarray):
-                        self._data = state[key]; break
-        @property
-        def r(self):
-            return np.array(self._data) if self._data is not None else np.array([])
-        def __array__(self, dtype=None):
-            arr = self.r
-            return arr.astype(dtype) if dtype else arr
-
-    sys.modules['chumpy'] = chumpy
-    sys.modules['chumpy.ch'] = chumpy_ch
-    sys.modules['chumpy.ch_ops'] = chumpy_ch_ops
-    sys.modules['chumpy.reordering'] = chumpy_reordering
-    sys.modules['chumpy.utils'] = chumpy_utils
-    sys.modules['chumpy.logic'] = chumpy_logic
-    chumpy.ch = chumpy_ch; chumpy.ch_ops = chumpy_ch_ops
-    chumpy.reordering = chumpy_reordering; chumpy.utils = chumpy_utils
-    chumpy.logic = chumpy_logic; chumpy.Ch = FakeCh
-    chumpy_ch.Ch = FakeCh
-    for attr in ['add', 'subtract', 'multiply', 'divide']:
-        setattr(chumpy_ch_ops, attr, FakeCh)
-    chumpy_reordering.transpose = FakeCh
-    chumpy_reordering.concatenate = FakeCh
-
-
-def _to_numpy(x):
-    if hasattr(x, 'r'): return np.array(x.r)
-    elif isinstance(x, np.ndarray): return x
-    elif scipy.sparse.issparse(x): return x
-    return np.array(x)
-
-
-def _rodrigues(axis_angle):
-    N = axis_angle.shape[0]
-    theta = np.clip(np.linalg.norm(axis_angle, axis=1, keepdims=True), 1e-8, None)
-    k = axis_angle / theta
-    K = np.zeros((N, 3, 3))
-    K[:, 0, 1] = -k[:, 2]; K[:, 0, 2] = k[:, 1]
-    K[:, 1, 0] = k[:, 2]; K[:, 1, 2] = -k[:, 0]
-    K[:, 2, 0] = -k[:, 1]; K[:, 2, 1] = k[:, 0]
-    s = np.sin(theta)[:, :, np.newaxis]
-    c = np.cos(theta)[:, :, np.newaxis]
-    I = np.broadcast_to(np.eye(3), (N, 3, 3)).copy()
-    return I + s * K + (1 - c) * np.einsum('nij,njk->nik', K, K)
-
-
-class SMALModel:
-    """Cached SMAL model — load once, generate shapes quickly."""
-
-    def __init__(self, model_path: str, data_path: str):
-        _install_fake_chumpy()
-
-        with open(model_path, 'rb') as f:
-            params = pickle.load(f, encoding='latin1')
-        with open(data_path, 'rb') as f:
-            smal_data = pickle.load(f, encoding='latin1')
-
-        self.v_template = _to_numpy(params['v_template']).astype(np.float64)
-        self.shapedirs = _to_numpy(params['shapedirs']).astype(np.float64)
-        self.posedirs = _to_numpy(params['posedirs']).astype(np.float64)
-        J_regressor = params['J_regressor']
-        self.J_regressor = (J_regressor.toarray().astype(np.float64)
-                            if scipy.sparse.issparse(J_regressor)
-                            else _to_numpy(J_regressor).astype(np.float64))
-        self.weights = _to_numpy(params['weights']).astype(np.float64)
-        self.kintree_table = _to_numpy(params['kintree_table']).astype(np.int64)
-        self.faces = _to_numpy(params['f']).astype(np.int32)
-        self.num_joints = self.kintree_table.shape[1]
-        self.num_betas = self.shapedirs.shape[2]
-        self.cluster_means = smal_data['cluster_means']
-        self.num_families = len(self.cluster_means)
-
-    def generate(self, family_idx: int, pose_scale: float = 0.2,
-                 rng: np.random.RandomState = None) -> np.ndarray:
-        """Generate a normalized SMAL shape. Returns (N, 3) float32 vertices."""
-        if rng is None:
-            rng = np.random.RandomState(0)  # deterministic fallback
-
-        betas = np.zeros(self.num_betas)
-        family_betas = self.cluster_means[family_idx]
-        n = min(len(family_betas), self.num_betas)
-        betas[:n] = family_betas[:n]
-
-        pose = rng.randn(self.num_joints * 3) * pose_scale
-        pose[:3] *= 0.1
-
-        v_shaped = self.v_template + self.shapedirs.dot(betas)
-        J = self.J_regressor.dot(v_shaped)
-        pose_vec = pose.reshape(-1, 3)
-        R = _rodrigues(pose_vec)
-        I_cube = np.broadcast_to(np.eye(3), (self.num_joints - 1, 3, 3))
-        lrotmin = (R[1:] - I_cube).ravel()
-        v_posed = v_shaped + self.posedirs.dot(lrotmin)
-
-        parent = {}
-        for i in range(1, self.num_joints):
-            parent[i] = self.kintree_table[0, i]
-
-        def with_zeros(x):
-            return np.vstack([x, [0, 0, 0, 1]])
-
-        G = np.empty((self.num_joints, 4, 4))
-        G[0] = with_zeros(np.hstack([R[0], J[0].reshape(3, 1)]))
-        for i in range(1, self.num_joints):
-            G[i] = G[parent[i]].dot(
-                with_zeros(np.hstack([R[i], (J[i] - J[parent[i]]).reshape(3, 1)])))
-
-        G_rest = np.matmul(
-            G, np.hstack([J, np.zeros((self.num_joints, 1))]).reshape(self.num_joints, 4, 1))
-        G_packed = np.zeros((self.num_joints, 4, 4))
-        G_packed[:, :, 3] = G_rest.squeeze(-1)
-        G = G - G_packed
-
-        T = np.tensordot(self.weights, G, axes=[[1], [0]])
-        v_homo = np.hstack([v_posed, np.ones((len(v_posed), 1))])
-        v_final = np.einsum('vij,vj->vi', T, v_homo)[:, :3]
-
-        return normalize_mesh_vertices(v_final.astype(np.float32))
-
-
-# =============================================================================
-# SMAL pair generator
-# =============================================================================
-
-class SMALPairGenerator(PairGenerator):
-    """Generate SMAL shape pairs with identity correspondence."""
-
-    def __init__(
-        self,
-        smal: SMALModel,
-        train_families: List[int],
-        val_families: List[int],
-        pose_scale: float = 0.2,
-    ):
-        self.smal = smal
-        self.train_families = train_families
-        self.val_families = val_families
-        self.pose_scale = pose_scale
-
-        self.cross_pairs = list(combinations(train_families, 2))
-        self.same_pairs = [(f, f) for f in train_families]
-        self.val_pairs = list(combinations(val_families, 2))
-        for t in train_families:
-            for v in val_families:
-                self.val_pairs.append((t, v))
-
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.5,
-    ) -> PairSample:
-        if rng.rand() < cross_ratio and len(self.cross_pairs) > 0:
-            fam_a, fam_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
-        else:
-            fam_a, fam_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
-        verts_a = self.smal.generate(fam_a, self.pose_scale, rng)
-        verts_b = self.smal.generate(fam_b, self.pose_scale, rng)
-        n = len(verts_a)
-        corr_a, corr_b = identity_correspondence(n)
-        return PairSample(verts_a, verts_b, corr_a, corr_b,
-                          f"{pair_type}_{fam_a}_vs_{fam_b}")
-
-    def get_val_pairs(self, rng: np.random.RandomState,
-                      poses_per_pair: int = 1) -> List[PairSample]:
-        pairs = []
-        for fam_a, fam_b in self.val_pairs:
-            for pose_idx in range(poses_per_pair):
-                pair_rng = np.random.RandomState(fam_a * 100 + fam_b + pose_idx * 10000)
-                verts_a = self.smal.generate(fam_a, self.pose_scale, pair_rng)
-                verts_b = self.smal.generate(fam_b, self.pose_scale, pair_rng)
-                n = len(verts_a)
-                corr_a, corr_b = identity_correspondence(n)
-                pairs.append(PairSample(verts_a, verts_b, corr_a, corr_b,
-                                        f"val_{fam_a}_vs_{fam_b}_p{pose_idx}"))
-        return pairs
-
-
-# =============================================================================
-# DT4D Humanoid loading
-# =============================================================================
-
-def _load_obj_vertices(path: str) -> np.ndarray:
-    """Load vertices from an OBJ file. Returns (N, 3) float32."""
-    verts = []
-    with open(path) as f:
-        for line in f:
-            if line.startswith('v '):
-                verts.append([float(x) for x in line.split()[1:4]])
-    return np.array(verts, dtype=np.float32)
-
-
-def _load_vts(path: str) -> np.ndarray:
-    """Load a VTS file. Returns (R,) int32 array, converted to 0-indexed."""
-    vals = np.loadtxt(path, dtype=np.int32)
-    return vals - 1  # VTS files are 1-indexed
-
-
-class DT4DCategory:
-    """One DT4D humanoid category (e.g. 'prisoner') with all poses pre-loaded."""
-
-    def __init__(self, root: Path, name: str):
-        self.name = name
-        cat_dir = root / name
-        corres_dir = cat_dir / "corres"
-
-        # Discover all OBJ/VTS pairs
-        obj_files = sorted(cat_dir.glob("*.obj"))
-        self.poses: List[str] = []       # pose names (no extension)
-        self.vertices: List[np.ndarray] = []   # (N_i, 3) per pose
-        self.vts: List[np.ndarray] = []        # (R,) per pose, 0-indexed
-
-        for obj_path in obj_files:
-            pose_name = obj_path.stem
-            vts_path = corres_dir / f"{pose_name}.vts"
-            if not vts_path.exists():
-                continue
-            verts = normalize_mesh_vertices(_load_obj_vertices(str(obj_path)))
-            vts = _load_vts(str(vts_path))
-            self.poses.append(pose_name)
-            self.vertices.append(verts)
-            self.vts.append(vts)
-
-        self.num_poses = len(self.poses)
-        self.ref_size = len(self.vts[0]) if self.vts else 0
-
-    def __repr__(self):
-        return f"DT4DCategory({self.name}, {self.num_poses} poses, ref={self.ref_size})"
-
-
-class DT4DPairGenerator(PairGenerator):
-    """Generate DT4D Humanoid shape pairs with VTS-based correspondence.
-
-    Same-category pairs: two poses of the same humanoid, correspondence
-    via shared reference VTS (near-isometric).
-
-    Cross-category pairs: two different humanoids, correspondence chained
-    through cross_category_corres/ bridge files (non-isometric).
+    Usage::
+        with prof.phase("knn"):        ...
+        with prof.phase("transformer"): ...
+        with prof.phase("assembly"):   ...
     """
 
-    def __init__(
-        self,
-        root: str,
-        train_categories: List[str],
-        val_categories: List[str],
-    ):
-        self.root = Path(root)
-        self.train_categories = train_categories
-        self.val_categories = val_categories
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._times:  Dict[str, float] = {}
+        self._counts: Dict[str, int]   = {}
 
-        # Load all categories
-        all_cats = sorted(set(train_categories + val_categories))
-        print(f"  Loading DT4D categories: {all_cats}")
-        self.categories: Dict[str, DT4DCategory] = {}
-        for name in all_cats:
-            cat = DT4DCategory(self.root, name)
-            self.categories[name] = cat
-            print(f"    {cat}")
+    def __enter__(self):
+        return self
 
-        # Load cross-category bridges
-        self.bridges: Dict[Tuple[str, str], np.ndarray] = {}
-        bridge_dir = self.root / "cross_category_corres"
-        if bridge_dir.exists():
-            for f in bridge_dir.glob("*.vts"):
-                parts = f.stem.split("_", 1)
-                if len(parts) == 2:
-                    src, dst = parts
-                    if src in self.categories and dst in self.categories:
-                        self.bridges[(src, dst)] = _load_vts(str(f))
-            print(f"  Loaded {len(self.bridges)} cross-category bridges")
+    def __exit__(self, *_):
+        pass
 
-        # Build pair lists
-        self.same_pairs = [(c, c) for c in train_categories]
-        self.cross_pairs = [
-            (a, b) for a, b in combinations(train_categories, 2)
-            if self._can_bridge(a, b)
-        ]
-        self.val_pairs = [
-            (a, b) for a, b in combinations(val_categories, 2)
-            if self._can_bridge(a, b)
-        ]
-        for t in train_categories:
-            for v in val_categories:
-                if self._can_bridge(t, v):
-                    self.val_pairs.append((t, v))
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        yield
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        self._times[name]  = self._times.get(name, 0.0)  + dt
+        self._counts[name] = self._counts.get(name, 0)    + 1
 
-        print(f"  Same-category pairs: {len(self.same_pairs)}")
-        print(f"  Cross-category pairs: {self.cross_pairs}")
-        print(f"  Val pairs: {self.val_pairs}")
+    def summary_str(self, step: int) -> str:
+        if not self._times:
+            return ""
+        total = sum(self._times.values())
+        lines = [f"  [Profiler step={step}]  total={total*1e3:.1f}ms"]
+        for name, t in self._times.items():
+            n   = self._counts[name]
+            pct = 100.0 * t / total if total > 0 else 0.0
+            lines.append(
+                f"    {name:<28s}  {t/n*1e3:7.2f}ms/call  "
+                f"{t*1e3:8.2f}ms total  {pct:5.1f}%  (n={n})")
+        return "\n".join(lines)
 
-    def _can_bridge(self, cat_a: str, cat_b: str) -> bool:
-        """Check if a cross-category bridge exists (direct or 2-hop via hub)."""
-        if cat_a == cat_b:
-            return True
-        # Direct
-        if (cat_a, cat_b) in self.bridges or (cat_b, cat_a) in self.bridges:
-            return True
-        # 2-hop: cat_a → hub → cat_b
-        for hub in self.categories:
-            if hub == cat_a or hub == cat_b:
-                continue
-            a_to_hub = (cat_a, hub) in self.bridges or (hub, cat_a) in self.bridges
-            hub_to_b = (hub, cat_b) in self.bridges or (cat_b, hub) in self.bridges
-            if a_to_hub and hub_to_b:
-                return True
-        return False
-
-    def _get_bridge(self, cat_a: str, cat_b: str) -> np.ndarray:
-        """Get bridge mapping: reference(cat_a) → reference(cat_b), 0-indexed.
-
-        Supports direct bridges and 2-hop chaining through a hub category
-        (typically 'crypto', since all DT4D humanoid bridges go through it).
-        """
-        # Direct bridge
-        if (cat_a, cat_b) in self.bridges:
-            return self.bridges[(cat_a, cat_b)]
-        if (cat_b, cat_a) in self.bridges:
-            return self._invert_bridge(self.bridges[(cat_b, cat_a)],
-                                       self.categories[cat_a].ref_size)
-
-        # 2-hop: cat_a → hub → cat_b
-        for hub in self.categories:
-            if hub == cat_a or hub == cat_b:
-                continue
-            a_to_hub = (cat_a, hub) in self.bridges or (hub, cat_a) in self.bridges
-            hub_to_b = (hub, cat_b) in self.bridges or (cat_b, hub) in self.bridges
-            if a_to_hub and hub_to_b:
-                bridge_a_hub = self._get_bridge(cat_a, hub)   # cat_a ref → hub ref
-                bridge_hub_b = self._get_bridge(hub, cat_b)   # hub ref → cat_b ref
-                # Chain: for cat_a ref r, hub ref = bridge_a_hub[r],
-                #        cat_b ref = bridge_hub_b[bridge_a_hub[r]]
-                result = np.full(len(bridge_a_hub), -1, dtype=np.int32)
-                valid = (bridge_a_hub >= 0) & (bridge_a_hub < len(bridge_hub_b))
-                result[valid] = bridge_hub_b[bridge_a_hub[valid]]
-                return result
-
-        raise ValueError(f"No bridge between {cat_a} and {cat_b}")
-
-    @staticmethod
-    def _invert_bridge(fwd: np.ndarray, target_size: int) -> np.ndarray:
-        """Invert a many-to-one bridge: fwd[r_src] = r_dst → inv[r_dst] = r_src."""
-        inv = np.full(target_size, -1, dtype=np.int32)
-        for r_src, r_dst in enumerate(fwd):
-            if 0 <= r_dst < target_size:
-                inv[r_dst] = r_src
-        return inv
-
-    def _build_correspondence(
-        self, cat_a: str, pose_a: int, cat_b: str, pose_b: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Build mesh-level correspondence arrays.
-
-        Returns (corr_a, corr_b) where corr_a[i] on mesh A corresponds
-        to corr_b[i] on mesh B. Only includes valid (in-bounds, bijective) pairs.
-        """
-        vts_a = self.categories[cat_a].vts[pose_a]  # ref → mesh_a
-        vts_b = self.categories[cat_b].vts[pose_b]  # ref → mesh_b
-        n_a = len(self.categories[cat_a].vertices[pose_a])
-        n_b = len(self.categories[cat_b].vertices[pose_b])
-
-        if cat_a == cat_b:
-            # Same category: shared reference space
-            # For ref index r: mesh_a[vts_a[r]] ↔ mesh_b[vts_b[r]]
-            corr_a = vts_a
-            corr_b = vts_b
-        else:
-            # Cross category: chain through bridge
-            bridge = self._get_bridge(cat_a, cat_b)
-            # For ref index r (in cat_a's space):
-            #   mesh_a vertex = vts_a[r]
-            #   cat_b ref vertex = bridge[r]
-            #   mesh_b vertex = vts_b[bridge[r]]
-            valid = (bridge >= 0) & (bridge < len(vts_b))
-            ref_indices = np.where(valid)[0]
-            corr_a = vts_a[ref_indices]
-            corr_b = vts_b[bridge[ref_indices]]
-
-        # Filter out-of-bounds (safety)
-        mask = (corr_a >= 0) & (corr_a < n_a) & (corr_b >= 0) & (corr_b < n_b)
-        return corr_a[mask], corr_b[mask]
-
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.5,
-    ) -> PairSample:
-        if rng.rand() < cross_ratio and len(self.cross_pairs) > 0:
-            cat_a, cat_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
-        else:
-            cat_a, cat_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
-
-        c_a = self.categories[cat_a]
-        c_b = self.categories[cat_b]
-        pose_a = rng.randint(c_a.num_poses)
-        pose_b = rng.randint(c_b.num_poses)
-
-        # Avoid identical pose for same-category
-        if cat_a == cat_b and c_a.num_poses > 1:
-            while pose_b == pose_a:
-                pose_b = rng.randint(c_b.num_poses)
-
-        corr_a, corr_b = self._build_correspondence(cat_a, pose_a, cat_b, pose_b)
-
-        return PairSample(
-            verts_a=c_a.vertices[pose_a],
-            verts_b=c_b.vertices[pose_b],
-            corr_a=corr_a,
-            corr_b=corr_b,
-            name=f"{pair_type}_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
-        )
-
-    def get_val_pairs(self, rng: np.random.RandomState,
-                      poses_per_pair: int = 1) -> List[PairSample]:
-        pairs = []
-        for cat_a, cat_b in self.val_pairs:
-            # Deterministic poses per pair
-            pair_rng = np.random.RandomState(_stable_hash((cat_a, cat_b)))
-            c_a = self.categories[cat_a]
-            c_b = self.categories[cat_b]
-
-            # Collect distinct pose combinations
-            seen = set()
-            for _ in range(poses_per_pair):
-                # Draw candidates until we get an unseen combo
-                # (cap attempts to avoid infinite loops if pose space is small)
-                for _attempt in range(200):
-                    pa = pair_rng.randint(c_a.num_poses)
-                    pb = pair_rng.randint(c_b.num_poses)
-                    if cat_a == cat_b and pa == pb and c_a.num_poses > 1:
-                        continue
-                    if (pa, pb) not in seen:
-                        break
-                else:
-                    break  # exhausted attempts, skip remaining combos
-                seen.add((pa, pb))
-
-                corr_a, corr_b = self._build_correspondence(cat_a, pa, cat_b, pb)
-                pairs.append(PairSample(
-                    verts_a=c_a.vertices[pa],
-                    verts_b=c_b.vertices[pb],
-                    corr_a=corr_a,
-                    corr_b=corr_b,
-                    name=f"val_{cat_a}:{c_a.poses[pa]}_vs_{cat_b}:{c_b.poses[pb]}",
-                ))
-        return pairs
+    def reset(self):
+        self._times.clear()
+        self._counts.clear()
 
 
 # =============================================================================
-# Differentiable dense Laplacian assembly
+# kNN + patch building
 # =============================================================================
 
 def compute_knn(vertices_np: np.ndarray, k: int) -> np.ndarray:
     """Compute k-nearest neighbors excluding self. Returns (N, k) indices."""
-    from scipy.spatial import cKDTree
-    tree = cKDTree(vertices_np)
-    _, indices = tree.query(vertices_np, k=k + 1, workers=-1)  # (N, k+1)
-    return indices[:, 1:]  # drop self (first column)
+    n    = len(vertices_np)
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
+    _, indices = nbrs.kneighbors(vertices_np)
+    center     = np.arange(n)[:, np.newaxis]
+    keep       = ~(indices == center)
+    keep_pos   = np.cumsum(keep, axis=1)
+    final      = (keep_pos <= k) & keep
+    return indices[final].reshape(n, k)
 
 
-def build_patch_data(vertices_t, knn, device):
-    """Build MeshPatchData for model input.
-
-    Features = relative positions (neighbor - center), matching
-    the format expected by LaplacianTransformerModule.forward_fixed_k.
-    """
-    N = vertices_t.shape[0]
-    k = knn.shape[1]
-
-    knn_t = torch.from_numpy(knn).long().to(device) if isinstance(knn, np.ndarray) else knn
-
-    # Relative positions: differentiable w.r.t. vertices_t
-    patch_pos = vertices_t[knn_t] - vertices_t[:, None, :]  # (N, k, 3)
-    all_pos = patch_pos.reshape(-1, 3)  # (N*k, 3)
-
-    batch_data = MeshPatchData(
+def build_patch_data(vertices_t: torch.Tensor, knn: np.ndarray, device: torch.device):
+    """Build MeshPatchData from vertices and precomputed kNN indices."""
+    N   = vertices_t.shape[0]
+    k   = knn.shape[1]
+    knn_t     = torch.from_numpy(knn).long().to(device)
+    patch_pos = vertices_t[knn_t] - vertices_t[:, None, :]   # (N, k, 3)
+    all_pos   = patch_pos.reshape(-1, 3)
+    return MeshPatchData(
         pos=all_pos,
-        x=all_pos,  # features = relative positions
+        x=all_pos,
         patch_idx=torch.arange(N, device=device).repeat_interleave(k),
         vertex_indices=knn_t.flatten(),
         center_indices=torch.arange(N, device=device),
     )
-    return batch_data
 
+
+# =============================================================================
+# Laplacian assembly
+# =============================================================================
 
 def assemble_dense_stiffness_and_mass(
     stiffness_weights, areas, attention_mask,
     vertex_indices, center_indices, batch_indices,
 ):
-    """Differentiable dense S and M assembly from scalar edge weights.
-
-    Uses only non-in-place operations so autograd tracks gradients.
-    """
-    device = stiffness_weights.device
-    num_patches = stiffness_weights.shape[0]
-    max_k = stiffness_weights.shape[1]
+    """Differentiable dense S and M from scalar edge weights."""
+    device       = stiffness_weights.device
+    num_patches  = stiffness_weights.shape[0]
+    max_k        = stiffness_weights.shape[1]
     num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
 
-    weights_flat = stiffness_weights.flatten()
-    mask_flat = attention_mask.flatten()
+    weights_flat      = stiffness_weights.flatten()
+    mask_flat         = attention_mask.flatten()
     patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)
 
-    valid_weights = weights_flat[mask_flat]
+    valid_weights       = weights_flat[mask_flat]
     valid_patch_indices = patch_indices_flat[mask_flat]
-    num_valid = len(valid_patch_indices)
+    num_valid           = len(valid_patch_indices)
 
     if num_valid > 0:
         patch_changes = torch.ones(num_valid, dtype=torch.bool, device=device)
         if num_valid > 1:
             patch_changes[1:] = valid_patch_indices[1:] != valid_patch_indices[:-1]
-        group_ids = torch.cumsum(patch_changes.long(), dim=0) - 1
+        group_ids    = torch.cumsum(patch_changes.long(), dim=0) - 1
         change_indices = torch.where(patch_changes)[0]
         group_starts = change_indices[group_ids]
         positions_in_patch = torch.arange(num_valid, device=device, dtype=torch.long) - group_starts
     else:
         positions_in_patch = torch.tensor([], device=device, dtype=torch.long)
 
-    batch_sizes = batch_indices.bincount(minlength=num_patches)
-    cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
-    starts = torch.cat([torch.tensor([0], device=device, dtype=torch.long), cumsum_sizes[:-1]])
+    batch_sizes   = batch_indices.bincount(minlength=num_patches)
+    cumsum_sizes  = torch.cumsum(batch_sizes, dim=0)
+    starts        = torch.cat([torch.tensor([0], device=device, dtype=torch.long),
+                               cumsum_sizes[:-1]])
 
-    valid_centers = center_indices[valid_patch_indices]
+    valid_centers   = center_indices[valid_patch_indices]
     valid_neighbors = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
 
     all_rows = torch.cat([valid_centers, valid_neighbors])
@@ -726,72 +183,104 @@ def assemble_dense_stiffness_and_mass(
     all_vals = torch.cat([-valid_weights, -valid_weights])
 
     flat_indices = all_rows * num_vertices + all_cols
-    S_flat = torch.zeros(num_vertices * num_vertices, device=device, dtype=stiffness_weights.dtype)
+    S_flat = torch.zeros(num_vertices * num_vertices, device=device,
+                         dtype=stiffness_weights.dtype)
     S_flat = S_flat.scatter_add(0, flat_indices, all_vals)
-    S = S_flat.view(num_vertices, num_vertices)
+    S      = S_flat.view(num_vertices, num_vertices)
+    S      = 0.5 * (S + S.T)
+    S      = S - torch.diag(S.sum(dim=1))
 
-    S = 0.5 * (S + S.T)
-    row_sums = S.sum(dim=1)
-    S = S - torch.diag(row_sums)
-
-    M_diag = torch.zeros(num_vertices, device=device, dtype=areas.dtype)
-    M_diag = M_diag.scatter_add(0, center_indices, areas)
+    M_diag  = torch.zeros(num_vertices, device=device, dtype=areas.dtype)
+    M_diag  = M_diag.scatter_add(0, center_indices, areas)
     M_count = torch.zeros(num_vertices, device=device, dtype=areas.dtype)
     M_count = M_count.scatter_add(0, center_indices, torch.ones_like(areas))
-    M_count = torch.clamp(M_count, min=1.0)
-    M_diag = M_diag / M_count
-    M_diag = torch.clamp(M_diag, min=1e-8)
-
+    M_diag  = M_diag / M_count.clamp(min=1.0)
+    M_diag  = M_diag.clamp(min=1e-8)
     return S, M_diag
 
 
-def assemble_anisotropic_laplacian(grad_coeffs, areas, knn):
+def assemble_anisotropic_laplacian(
+    grad_coeffs: torch.Tensor,
+    areas: torch.Tensor,
+    knn: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Differentiable L = G^T M_3 G from gradient coefficients."""
     N, k, _ = grad_coeffs.shape
-    device = grad_coeffs.device
+    device   = grad_coeffs.device
 
     center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)
-    ext_coeffs = torch.cat([center_coeffs, grad_coeffs], dim=1)
+    ext_coeffs    = torch.cat([center_coeffs, grad_coeffs], dim=1)
+    sqrt_a        = areas.sqrt()[:, None, None]
+    scaled        = sqrt_a * ext_coeffs
+    gram          = torch.bmm(scaled, scaled.transpose(1, 2))
 
-    sqrt_a = areas.sqrt()[:, None, None]
-    scaled = sqrt_a * ext_coeffs
-    gram = torch.bmm(scaled, scaled.transpose(1, 2))
-
-    center_idx = torch.arange(N, device=device).unsqueeze(1)
+    center_idx  = torch.arange(N, device=device).unsqueeze(1)
     ext_indices = torch.cat([center_idx, knn], dim=1)
-
-    kp1 = k + 1
-    row_idx = ext_indices[:, :, None].expand(-1, -1, kp1)
-    col_idx = ext_indices[:, None, :].expand(-1, kp1, -1)
-    flat_idx = (row_idx * N + col_idx).reshape(-1)
+    kp1         = k + 1
+    row_idx     = ext_indices[:, :, None].expand(-1, -1, kp1)
+    col_idx     = ext_indices[:, None, :].expand(-1, kp1, -1)
+    flat_idx    = (row_idx * N + col_idx).reshape(-1)
 
     L_flat = torch.zeros(N * N, device=device, dtype=grad_coeffs.dtype)
     L_flat = L_flat.scatter_add(0, flat_idx, gram.reshape(-1))
-    L = L_flat.view(N, N)
-    L = 0.5 * (L + L.T)
-
+    L      = L_flat.view(N, N)
+    L      = 0.5 * (L + L.T)
     return L, areas.detach()
 
 
-def _sparsify_L_to_knn(L, knn_t):
+def _sparsify_L_to_knn(L: torch.Tensor, knn_t: torch.Tensor) -> torch.Tensor:
     """Zero out entries of L not in the 1-hop kNN graph, fix diagonal."""
-    N = L.shape[0]
+    N      = L.shape[0]
     device = L.device
-
-    mask = torch.zeros(N, N, dtype=torch.bool, device=device)
+    mask   = torch.zeros(N, N, dtype=torch.bool, device=device)
     row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn_t)
     mask[row_idx, knn_t] = True
-    mask = mask | mask.T
-
+    mask   = mask | mask.T
     diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    keep = (mask | diag_mask).float()
-    L_sp = L * keep
-
-    off_diag = L_sp * (1.0 - diag_mask.float())
-    row_sums = off_diag.sum(dim=1)
-    L_sp = off_diag - torch.diag(row_sums)
-
+    L_sp   = L * (mask | diag_mask).float()
+    off    = L_sp * (1.0 - diag_mask.float())
+    L_sp   = off - torch.diag(off.sum(dim=1))
     return L_sp
+
+
+def assemble_isotropic_laplacian(
+    grad_coeffs: torch.Tensor,
+    areas: torch.Tensor,
+    knn: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Isotropic graph Laplacian from gradient coefficients.
+
+    Uses scalar edge weights w_ij = area_i * ||g_ij||^2, producing a
+    standard graph Laplacian L = D - W with non-negative weights.
+    This is guaranteed PSD and sparse (kNN only, no 2-hop fill-in).
+
+    Args:
+        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
+        areas: (N,) per-vertex areas.
+        knn: (N, k) kNN indices.
+
+    Returns:
+        L: (N, N) isotropic Laplacian (PSD, sparse).
+        M_diag: (N,) mass diagonal (same as areas).
+    """
+    N, k, _ = grad_coeffs.shape
+    device  = grad_coeffs.device
+
+    # w_ij = area_i * ||g_ij||^2  — scalar weight per edge (i, j)
+    edge_weights = areas[:, None] * (grad_coeffs ** 2).sum(dim=2)  # (N, k)
+
+    # Build sparse graph Laplacian: L_ij = -w_ij, L_ii = sum_j w_ij
+    # Symmetrise: w_ij_sym = 0.5 * (w_ij + w_ji)
+    L = torch.zeros(N, N, device=device, dtype=grad_coeffs.dtype)
+    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn)
+    L[row_idx, knn] -= edge_weights
+    L[knn, row_idx] -= edge_weights
+    L = 0.5 * L  # average the two directions
+    # Fix diagonal: L_ii = -sum of off-diagonal in row i
+    L.fill_diagonal_(0.0)
+    L.diagonal().copy_(-L.sum(dim=1))
+
+    return L, areas.detach()
 
 
 def compute_laplacian_differentiable(
@@ -800,45 +289,22 @@ def compute_laplacian_differentiable(
     k: int,
     device: torch.device,
     sparsify: bool = False,
-    k_sparsify: Optional[int] = None,
-):
-    """Forward pass through model → dense Laplacian (differentiable).
-
-    Args:
-        k: kNN neighbourhood size for the model's receptive field.
-        sparsify: If True, mask the dense G^T M G to a kNN sparsity pattern.
-        k_sparsify: kNN neighbourhood size for the sparsification mask.
-            When None or equal to *k*, the model's own kNN graph is reused
-            (current behaviour).  When set to an integer < k, a second kNN
-            graph is built and used as the mask, decoupling the model's
-            receptive field from the assembled operator's support.
-    """
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Full forward pass: vertices → dense differentiable (S, M)."""
     vertices_t = torch.from_numpy(vertices_np).float().to(device)
-    knn = compute_knn(vertices_np, k)
-    knn_t = torch.from_numpy(knn).long().to(device)
-
-    batch_data = build_patch_data(vertices_t, knn, device)
-    batch_data = Batch.from_data_list([batch_data]).to(device)
-
-    fwd = model._forward_pass(batch_data)
+    knn        = compute_knn(vertices_np, k)
+    knn_t      = torch.from_numpy(knn).long().to(device)
+    batch_data = Batch.from_data_list([build_patch_data(vertices_t, knn, device)]).to(device)
+    fwd        = model._forward_pass(batch_data)
 
     if fwd.get('grad_coeffs') is not None:
-        L, M_diag = assemble_anisotropic_laplacian(
-            grad_coeffs=fwd['grad_coeffs'],
-            areas=fwd['areas'],
-            knn=knn_t,
-        )
+        L, M_diag = assemble_anisotropic_laplacian(fwd['grad_coeffs'], fwd['areas'], knn_t)
         if sparsify:
-            if k_sparsify is not None and k_sparsify != k:
-                knn_sp = compute_knn(vertices_np, k_sparsify)
-                knn_sp_t = torch.from_numpy(knn_sp).long().to(device)
-                L = _sparsify_L_to_knn(L, knn_sp_t)
-            else:
-                L = _sparsify_L_to_knn(L, knn_t)
+            L = _sparsify_L_to_knn(L, knn_t)
         return L, M_diag
     else:
         batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
-        S, M_diag = assemble_dense_stiffness_and_mass(
+        return assemble_dense_stiffness_and_mass(
             stiffness_weights=fwd['stiffness_weights'],
             areas=fwd['areas'],
             attention_mask=fwd['attention_mask'],
@@ -846,11 +312,10 @@ def compute_laplacian_differentiable(
             center_indices=batch_data.center_indices,
             batch_indices=batch_idx,
         )
-        return S, M_diag
 
 
 # =============================================================================
-# Differentiable eigendecomposition (clamped-gap backward)
+# Differentiable eigendecomposition (stable backward)
 # =============================================================================
 
 class _StableEigh(torch.autograd.Function):
@@ -866,80 +331,52 @@ class _StableEigh(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_evals, grad_evecs):
         evals, evecs = ctx.saved_tensors
-        min_gap = ctx.min_gap
-        N = evals.shape[0]
+        min_gap      = ctx.min_gap
+        N            = evals.shape[0]
 
-        col_norms = grad_evecs.norm(dim=0)
-        active_mask = col_norms > 0
+        col_norms    = grad_evecs.norm(dim=0)
+        active_mask  = col_norms > 0
         if grad_evals is not None:
             active_mask = active_mask | (grad_evals.abs() > 0)
-        active_idx = torch.where(active_mask)[0]
-        k_active = len(active_idx)
-
-        if k_active == 0:
+        active_idx  = torch.where(active_mask)[0]
+        if len(active_idx) == 0:
             return torch.zeros_like(evecs @ evecs.T), None
 
-        V = evecs
         dV_active = grad_evecs[:, active_idx]
-        VtdV = V.T @ dV_active  # (N, k_active)
-
-        deval = grad_evals if grad_evals is not None else torch.zeros(N, device=evals.device)
-
-        # Build D_active: (N, k_active)
-        gaps = evals[:, None] - evals[None, active_idx]  # (N, k_active)
+        VtdV      = evecs.T @ dV_active
+        deval     = grad_evals if grad_evals is not None else torch.zeros(N, device=evals.device)
+        gaps      = evals[:, None] - evals[None, active_idx]
         gaps_clamped = gaps.sign() * gaps.abs().clamp(min=min_gap)
-        F_active = VtdV / gaps_clamped  # (N, k_active)
-        # Zero out diagonal-like terms (where i == active_idx[j])
+        F_active  = VtdV / gaps_clamped
         for j_local, j_global in enumerate(active_idx):
             F_active[j_global, j_local] = deval[j_global]
 
-        D_active = F_active
-
-        VD = V @ D_active
-        V_active = V[:, active_idx]
-        grad_A = VD @ V_active.T
-        grad_A = 0.5 * (grad_A + grad_A.T)
-
-        return grad_A, None
+        V_active = evecs[:, active_idx]
+        grad_A   = (evecs @ F_active) @ V_active.T
+        return 0.5 * (grad_A + grad_A.T), None
 
 
-def stable_eigh(A, min_gap=1.0):
+def stable_eigh(A: torch.Tensor, min_gap: float = 1.0):
     return _StableEigh.apply(A, min_gap)
 
 
-def differentiable_eigh(S, M_diag, k, min_gap=1.0):
+def differentiable_eigh(
+    S: torch.Tensor, M_diag: torch.Tensor, k: int, min_gap: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Differentiable generalized eigendecomposition with stable backward."""
     M_sqrt_inv = 1.0 / M_diag.sqrt().clamp(min=1e-8)
-    S_std = (S * M_sqrt_inv[None, :]) * M_sqrt_inv[:, None]
-    S_std = 0.5 * (S_std + S_std.T)
-
-    eigenvalues_all, eigenvectors_all = stable_eigh(S_std, min_gap)
-
-    eigenvalues = eigenvalues_all[1:k+1]
-    eigenvectors_std = eigenvectors_all[:, 1:k+1]
-    eigenvectors = eigenvectors_std * M_sqrt_inv[:, None]
-
-    return eigenvalues, eigenvectors
+    S_std      = (S * M_sqrt_inv[None, :]) * M_sqrt_inv[:, None]
+    S_std      = 0.5 * (S_std + S_std.T)
+    evals_all, evecs_all = stable_eigh(S_std, min_gap)
+    return evals_all[1:k+1], evecs_all[:, 1:k+1] * M_sqrt_inv[:, None]
 
 
 # =============================================================================
-# Loss function — correspondence-aware InfoNCE
+# InfoNCE / DCL contrastive loss
 # =============================================================================
 
-class SoftCorrespondenceLoss(torch.nn.Module):
-    """InfoNCE contrastive loss via correspondence-aware diffusion fingerprints.
-
-    Handles both identity correspondence (SMAL: same N, vertex i ↔ vertex i)
-    and general correspondence (DT4D: different N, corr_a[r] ↔ corr_b[r]).
-
-    Descriptors: diffusion fingerprints from L landmark sources at T scales.
-        d(v) = concat over α: row v of (S + αM)^{-1} M E_landmarks
-
-    Loss: InfoNCE = -mean_v log softmax(sim(v, v)) over all w
-
-    Vertex subsampling: compute descriptors for ALL N vertices (so gradients
-    flow to all parts of S), but subsample V vertices for the contrastive ranking.
-    """
+class SoftCorrespondenceLoss(nn.Module):
+    """Correspondence-aware contrastive loss via diffusion fingerprint descriptors."""
 
     def __init__(
         self,
@@ -952,338 +389,195 @@ class SoftCorrespondenceLoss(torch.nn.Module):
         dclw_sigma: float = 0.5,
     ):
         super().__init__()
-        self.num_landmarks = num_landmarks
-        self.alphas = alphas
-        self.temperature = temperature
+        self.num_landmarks       = num_landmarks
+        self.alphas              = alphas
+        self.temperature         = temperature
         self.num_sample_vertices = num_sample_vertices
-        self.landmark_seed = landmark_seed
-        self.loss_type = loss_type  # "infonce", "dcl", or "dclw"
-        self.dclw_sigma = dclw_sigma
+        self.landmark_seed       = landmark_seed
+        self.loss_type           = loss_type
+        self.dclw_sigma          = dclw_sigma
 
-    def _compute_descriptors(
-        self, S: torch.Tensor, M: torch.Tensor, E: torch.Tensor,
-    ) -> torch.Tensor:
-        """Solve diffusion at multiple scales. Returns (N, L*T) descriptors."""
+    def _compute_descriptors(self, S, M, E) -> torch.Tensor:
         parts = []
         for alpha in self.alphas:
-            A_mat = S + alpha * torch.diag(M)
-            rhs = M[:, None] * E
-            D = torch.linalg.solve(A_mat, rhs)
+            D = torch.linalg.solve(S + alpha * torch.diag(M), M[:, None] * E)
             parts.append(D)
-        desc = torch.cat(parts, dim=1)
-        return F.normalize(desc, p=2, dim=1)
+        return F.normalize(torch.cat(parts, dim=1), p=2, dim=1)
 
     def forward(
         self,
-        S_A: torch.Tensor,
-        S_B: torch.Tensor,
-        M_A: torch.Tensor,
-        M_B: torch.Tensor,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
         rng: np.random.RandomState,
         corr_a: Optional[np.ndarray] = None,
         corr_b: Optional[np.ndarray] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        N_A = S_A.shape[0]
-        N_B = S_B.shape[0]
-        device = S_A.device
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device   = S_A.device
 
-        # --- Determine correspondence pool ---
         if corr_a is None or corr_b is None:
-            # Identity correspondence (SMAL)
-            assert N_A == N_B, f"Identity corr requires same N, got {N_A} vs {N_B}"
-            pool = np.arange(N_A)
-            ca = pool
-            cb = pool
+            assert N_A == N_B
+            pool = np.arange(N_A); ca = pool; cb = pool
         else:
-            # General correspondence — restrict to bijective reference indices
             pool = _compute_bijective_refs(corr_a, corr_b)
             if len(pool) < self.num_landmarks + self.num_sample_vertices:
-                # Fallback: use all indices (allow some duplicates)
                 pool = np.arange(len(corr_a))
-            ca = corr_a
-            cb = corr_b
+            ca, cb = corr_a, corr_b
 
-        # --- Select landmarks (fixed per-shape, deterministic) ---
-        lm_rng = np.random.RandomState(self.landmark_seed)
-        L = min(self.num_landmarks, len(pool))
+        lm_rng  = np.random.RandomState(self.landmark_seed)
+        L       = min(self.num_landmarks, len(pool))
         lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
 
         E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
         E_A[ca[lm_refs], torch.arange(L, device=device)] = 1.0
-
         E_B = torch.zeros(N_B, L, device=device, dtype=S_B.dtype)
         E_B[cb[lm_refs], torch.arange(L, device=device)] = 1.0
 
-        # --- Compute descriptors for ALL vertices ---
-        desc_A = self._compute_descriptors(S_A, M_A, E_A)  # (N_A, L*T)
-        desc_B = self._compute_descriptors(S_B, M_B, E_B)  # (N_B, L*T)
+        desc_A = self._compute_descriptors(S_A, M_A, E_A)
+        desc_B = self._compute_descriptors(S_B, M_B, E_B)
 
-        # --- Subsample for contrastive ranking (stochastic per step) ---
-        V = min(self.num_sample_vertices, len(pool))
+        V           = min(self.num_sample_vertices, len(pool))
         sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
-
-        desc_A_sub = desc_A[ca[sample_refs]]  # (V, D)
-        desc_B_sub = desc_B[cb[sample_refs]]  # (V, D)
-
-        # --- Contrastive loss ---
-        sim = (desc_A_sub @ desc_B_sub.T) / self.temperature  # (V, V)
-        labels = torch.arange(V, device=device)
+        dA          = desc_A[ca[sample_refs]]
+        dB          = desc_B[cb[sample_refs]]
+        sim         = (dA @ dB.T) / self.temperature
+        labels      = torch.arange(V, device=device)
 
         if self.loss_type == "infonce":
-            # Standard InfoNCE: positive is in the softmax denominator
             loss_nce = 0.5 * (F.cross_entropy(sim, labels) +
                               F.cross_entropy(sim.T, labels))
-
         elif self.loss_type in ("dcl", "dclw"):
-            # DCL: remove positive from denominator
-            # L_DCL(i) = -s_pos(i)/τ + log(Σ_{j≠i} exp(s_neg(i,j)/τ))
-            pos_sim = torch.diag(sim)  # (V,) — positive similarities
+            pos_sim  = torch.diag(sim)
             neg_mask = ~torch.eye(V, dtype=torch.bool, device=device)
-
-            # A→B direction
-            neg_A2B = sim.masked_select(neg_mask).view(V, V - 1)
-            loss_A2B = -pos_sim + torch.logsumexp(neg_A2B, dim=1)
-
-            # B→A direction
-            neg_B2A = sim.T.masked_select(neg_mask).view(V, V - 1)
-            loss_B2A = -pos_sim + torch.logsumexp(neg_B2A, dim=1)
-
+            neg_A2B  = sim.masked_select(neg_mask).view(V, V - 1)
+            neg_B2A  = sim.T.masked_select(neg_mask).view(V, V - 1)
+            lA = -pos_sim + torch.logsumexp(neg_A2B, dim=1)
+            lB = -pos_sim + torch.logsumexp(neg_B2A, dim=1)
             if self.loss_type == "dclw":
-                # DCLW: reweight per-vertex loss by positive difficulty.
-                # w(i) = 2 - V · softmax_i(cos_sim_pos / σ)
-                # Easy positives (high sim) → w < 1 (downweight)
-                # Hard positives (low sim)  → w > 1 (upweight)
-                # pos_sim already has /τ baked in, undo it and apply /σ:
-                sigma = self.dclw_sigma
-                pos_for_weight = pos_sim * (self.temperature / sigma)  # cos_sim / σ
-                weight = (2 - V * F.softmax(pos_for_weight, dim=0)).detach()
-                loss_A2B = weight * loss_A2B
-                loss_B2A = weight * loss_B2A
-
-            loss_nce = 0.5 * (loss_A2B.mean() + loss_B2A.mean())
-
+                w  = (2 - V * F.softmax(pos_sim * (self.temperature / self.dclw_sigma),
+                                        dim=0)).detach()
+                lA = w * lA; lB = w * lB
+            loss_nce = 0.5 * (lA.mean() + lB.mean())
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
         with torch.no_grad():
-            pred_A2B = sim.argmax(dim=1)
-            train_acc = (pred_A2B == labels).float().mean().item()
-            topk_accs = {}
+            pred       = sim.argmax(dim=1)
+            train_acc  = (pred == labels).float().mean().item()
+            topk_accs  = {}
             for k in (3, 5, 10):
                 if k <= V:
-                    _, topk = sim.topk(k, dim=1)
-                    topk_accs[f'train_top{k}'] = (topk == labels.unsqueeze(1)).any(dim=1).float().mean().item()
+                    _, tk = sim.topk(k, dim=1)
+                    topk_accs[f'train_top{k}'] = (
+                        tk == labels.unsqueeze(1)).any(dim=1).float().mean().item()
 
-        metrics = {
-            'loss_total': loss_nce.item(),
-            'loss_nce': loss_nce.item(),
-            'train_acc': train_acc,
-            **topk_accs,
-        }
+        metrics = {'loss_total': loss_nce.item(), 'loss_nce': loss_nce.item(),
+                   'train_acc': train_acc, **topk_accs}
         return loss_nce, metrics
 
 
 # =============================================================================
-# Evaluation (non-differentiable, uses scipy)
+# Evaluation utilities (non-differentiable)
 # =============================================================================
 
 def _fmt_topk(m: Dict[str, float], prefix: str = '') -> str:
-    """Format top-1/3/5/10 accuracy + error as an aligned string.
-
-    Works for both dense and sparse metrics dicts. ``prefix`` is prepended
-    to key lookups (e.g. prefix='sp_' for sparse metrics).
-    """
-    acc_key = f'{prefix}accuracy'
-    err_key = f'{prefix}mean_error'
-    parts = [f"top1={m[acc_key]*100:5.1f}%"]
+    parts = [f"top1={m[f'{prefix}accuracy']*100:5.1f}%"]
     for k in (3, 5, 10):
         key = f'{prefix}top{k}_acc'
         if key in m:
             parts.append(f"top{k}={m[key]*100:5.1f}%")
-    parts.append(f"Err={m[err_key]:.4f}")
+    parts.append(f"Err={m[f'{prefix}mean_error']:.4f}")
     return "  ".join(parts)
 
+
 def _correspondence_metrics(
-    eigvecs_a: np.ndarray,
-    eigvecs_b: np.ndarray,
-    mass_a: np.ndarray,
-    mass_b: np.ndarray,
-    vertices_b: np.ndarray,
-    n: int,
+    eigvecs_a: np.ndarray, eigvecs_b: np.ndarray,
+    mass_a: np.ndarray,    mass_b: np.ndarray,
+    vertices_b: np.ndarray, n: int,
     gt_corr: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    """Compute functional map correspondence metrics from eigenbases.
-
-    Args:
-        gt_corr: (n,) ground-truth correspondence array. gt_corr[i] is the
-                 index in mesh B that corresponds to vertex i in mesh A.
-                 If None, assumes identity (vertex i ↔ vertex i).
-    """
-    if gt_corr is None:
-        gt_corr = np.arange(n)
-
-    # Functional map: C = Φ_B^T M_B Π Φ_A
-    # Where Π permutes rows of Φ_A to align with Φ_B's ordering
-    # For identity corr: C = Φ_B^T M_B Φ_A
-    # For general corr:  C = Φ_B^T M_B Φ_A[gt_corr_inverse]... no.
-    #
-    # Actually the standard way: C maps functions on A to functions on B.
-    # C = Φ_B^T M_B Π Φ_A, where Π[i,j] = 1 iff vertex j on A corresponds
-    # to vertex i on B. For identity: Π = I. For general gt_corr:
-    # Π[gt_corr[j], j] = 1, so Π Φ_A has row i = Φ_A[j] where gt_corr[j]=i.
-    #
-    # Efficient computation: (Φ_B^T M_B)[k, i] * Π[i, j] * Φ_A[j, l]
-    # = Σ_j (Φ_B[gt_corr[j], :] * M_B[gt_corr[j]])^T @ Φ_A[j, :]
-    # = (weighted_phi_b_permuted)^T @ Φ_A
-    # where weighted_phi_b_permuted[j, :] = Φ_B[gt_corr[j], :] * M_B[gt_corr[j]]
-
+    """Functional map metrics from eigenbases."""
     n_a = eigvecs_a.shape[0]
-    weighted_phi_b_permuted = eigvecs_b[gt_corr[:n_a]] * mass_b[gt_corr[:n_a], None]
-    C = weighted_phi_b_permuted.T @ eigvecs_a[:n_a]
-
+    weighted_phi_b = eigvecs_b[gt_corr[:n_a]] * mass_b[gt_corr[:n_a], None] \
+        if gt_corr is not None else eigvecs_b[:n_a] * mass_b[:n_a, None]
+    C    = weighted_phi_b.T @ eigvecs_a[:n_a]
     k_fm = C.shape[0]
-    I = np.eye(k_fm)
-
-    metrics = {}
-    metrics['ortho_error'] = float(np.linalg.norm(C.T @ C - I, 'fro'))
-    metrics['biject_error'] = float(np.linalg.norm(C @ C.T - I, 'fro'))
-    metrics['corr_error'] = float(np.linalg.norm(C - I, 'fro'))
-
-    diag_energy = np.sum(np.diag(C) ** 2)
-    total_energy = np.sum(C ** 2)
-    metrics['diag_ratio'] = float(diag_energy / (total_energy + 1e-10))
-
-    # Pointwise correspondence: project A into B's spectral space, NN search
+    I    = np.eye(k_fm)
+    metrics = {
+        'ortho_error':   float(np.linalg.norm(C.T @ C - I, 'fro')),
+        'biject_error':  float(np.linalg.norm(C @ C.T - I, 'fro')),
+        'corr_error':    float(np.linalg.norm(C - I, 'fro')),
+        'diag_ratio':    float(np.sum(np.diag(C) ** 2) / (np.sum(C ** 2) + 1e-10)),
+    }
     projected_a = eigvecs_a[:n_a] @ C.T
-    from scipy.spatial import cKDTree
-    tree = cKDTree(eigvecs_b)
-    n_query = min(10, eigvecs_b.shape[0])
-    dists, indices = tree.query(projected_a, k=n_query)
-    if n_query == 1:
-        indices = indices[:, np.newaxis]
-    pred_corr = indices[:, 0]
-
-    gt = gt_corr[:n_a]
+    nbrs = NearestNeighbors(n_neighbors=min(10, eigvecs_b.shape[0]),
+                            algorithm='auto').fit(eigvecs_b)
+    _, indices = nbrs.kneighbors(projected_a)
+    pred_corr  = indices[:, 0]
+    gt         = gt_corr[:n_a] if gt_corr is not None else np.arange(n_a)
     metrics['accuracy'] = float((pred_corr == gt).mean())
     for k in (3, 5, 10):
         if k <= indices.shape[1]:
-            metrics[f'top{k}_acc'] = float((indices[:, :k] == gt[:, None]).any(axis=1).mean())
-
+            metrics[f'top{k}_acc'] = float(
+                (indices[:, :k] == gt[:, None]).any(axis=1).mean())
     errors = np.linalg.norm(vertices_b[pred_corr] - vertices_b[gt], axis=1)
     bb_diag = np.linalg.norm(vertices_b.max(0) - vertices_b.min(0))
-    metrics['mean_error'] = float(errors.mean() / bb_diag)
+    metrics['mean_error']   = float(errors.mean()   / bb_diag)
     metrics['median_error'] = float(np.median(errors) / bb_diag)
-
     return metrics
 
 
 def _build_gt_corr_from_pair(pair: PairSample) -> Optional[np.ndarray]:
-    """Build a dense gt_corr array: gt_corr[i] = corresponding vertex on B.
-
-    Returns (N_A,) array where gt_corr[i] is the index in mesh B corresponding
-    to vertex i in mesh A, or None for identity correspondence.
-    """
     n_a = len(pair.verts_a)
-    # Check identity
     if (len(pair.corr_a) == n_a and
-        np.array_equal(pair.corr_a, np.arange(n_a)) and
-        np.array_equal(pair.corr_b, np.arange(n_a))):
-        return None  # identity
-
-    # Build dense mapping. Multiple corr entries may map the same vertex on A.
-    # We keep the last one (arbitrary but consistent).
+            np.array_equal(pair.corr_a, np.arange(n_a)) and
+            np.array_equal(pair.corr_b, np.arange(n_a))):
+        return None
     gt_corr = np.full(n_a, -1, dtype=np.int64)
     gt_corr[pair.corr_a] = pair.corr_b
-
-    # For vertices with no correspondence, map to nearest correspondent
     unmapped = gt_corr == -1
-    if unmapped.any():
-        mapped_mask = ~unmapped
-        if mapped_mask.any():
-            from scipy.spatial import cKDTree
-            tree = cKDTree(pair.verts_a[mapped_mask])
-            _, idx = tree.query(pair.verts_a[unmapped])
-            mapped_indices = np.where(mapped_mask)[0]
-            gt_corr[unmapped] = gt_corr[mapped_indices[idx.flatten()]]
-
+    if unmapped.any() and (~unmapped).any():
+        nbrs = NearestNeighbors(n_neighbors=1).fit(pair.verts_a[~unmapped])
+        _, idx = nbrs.kneighbors(pair.verts_a[unmapped])
+        mapped_indices = np.where(~unmapped)[0]
+        gt_corr[unmapped] = gt_corr[mapped_indices[idx.flatten()]]
     return gt_corr
 
 
-def evaluate_pair_robust(
-    pair: PairSample,
-    num_eigenvectors: int,
-    n_neighbors: int = 30,
-) -> Dict[str, float]:
-    """Evaluate correspondence using robust Laplacian (baseline)."""
-    import robust_laplacian
-    from neural_local_laplacian.utils.utils import compute_laplacian_eigendecomposition
-
-    n_a = len(pair.verts_a)
-    n_b = len(pair.verts_b)
-
-    for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
-        S, M = robust_laplacian.point_cloud_laplacian(verts, n_neighbors=n_neighbors)
-        evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
-        M_diag = np.array(M.diagonal()).flatten()
-        if label == 'A':
-            eigvecs_a, mass_a = evecs, M_diag
-        else:
-            eigvecs_b, mass_b = evecs, M_diag
-
-    gt_corr = _build_gt_corr_from_pair(pair)
-    return _correspondence_metrics(eigvecs_a, eigvecs_b, mass_a, mass_b,
-                                   pair.verts_b, n_a, gt_corr=gt_corr)
-
-
 @torch.no_grad()
-def _eigh_from_dense_L(L, M_diag_t, num_eigenvectors):
-    """Generalized eigenproblem on GPU: L v = λ M v → evals, evecs (numpy)."""
+def _eigh_from_dense_L(
+    L: torch.Tensor, M_diag_t: torch.Tensor, num_eigenvectors: int,
+) -> Tuple[np.ndarray, np.ndarray]:
     M_inv_sqrt = 1.0 / M_diag_t.sqrt().clamp(min=1e-8)
-    L_std = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
-    L_std = 0.5 * (L_std + L_std.T)
-    all_evals, all_evecs = torch.linalg.eigh(L_std)
-    evals = all_evals[:num_eigenvectors].cpu().numpy()
-    evecs = (M_inv_sqrt[:, None] * all_evecs[:, :num_eigenvectors]).cpu().numpy()
+    L_std      = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
+    L_std      = 0.5 * (L_std + L_std.T)
+    evals_all, evecs_all = torch.linalg.eigh(L_std)
+    evals = evals_all[:num_eigenvectors].cpu().numpy()
+    evecs = (M_inv_sqrt[:, None] * evecs_all[:, :num_eigenvectors]).cpu().numpy()
     return evals, evecs
 
 
 @torch.no_grad()
-def _eigh_from_sparse_L(L_sp, M_diag_t, num_eigenvectors):
-    """Sparse generalized eigenproblem: convert structurally-sparse L to scipy sparse, use eigsh.
-
-    Much faster than _eigh_from_dense_L for large meshes since eigsh
-    exploits sparsity via Lanczos iteration: O(N * nnz_per_row * num_eigenvectors).
-    """
-    import scipy.sparse.linalg
-
-    N = L_sp.shape[0]
-    L_np = L_sp.cpu().numpy()
-    M_diag_np = M_diag_t.cpu().numpy()
-
-    # Build scipy sparse from the dense-but-sparse tensor
+def _eigh_from_sparse_L(
+    L_sp: torch.Tensor, M_diag_t: torch.Tensor, num_eigenvectors: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    N      = L_sp.shape[0]
+    L_np   = L_sp.cpu().numpy()
+    M_np   = M_diag_t.cpu().numpy()
     rows, cols = np.nonzero(L_np)
-    vals = L_np[rows, cols]
-    L_scipy = scipy.sparse.csc_matrix((vals, (rows, cols)), shape=(N, N))
-    M_scipy = scipy.sparse.diags(M_diag_np)
-
+    L_scipy = scipy.sparse.csc_matrix((L_np[rows, cols], (rows, cols)), shape=(N, N))
+    M_scipy = scipy.sparse.diags(M_np)
     try:
-        v0 = np.ones(N)  # deterministic starting vector for Lanczos
         evals, evecs = scipy.sparse.linalg.eigsh(
             L_scipy, k=num_eigenvectors, M=M_scipy,
-            sigma=-1e-6, which='LM',  # shift-invert for smallest eigenvalues
-            v0=v0,
-        )
-        # Sort by eigenvalue
+            sigma=-1e-6, which='LM', v0=np.ones(N))
         order = np.argsort(evals)
-        evals = evals[order]
-        evecs = evecs[:, order]
+        return evals[order], evecs[:, order]
     except Exception:
-        # Fallback to dense if eigsh fails (e.g. singular)
         return _eigh_from_dense_L(L_sp, M_diag_t, num_eigenvectors)
 
-    return evals, evecs
 
-
+@torch.no_grad()
 def evaluate_pair(
     model: LaplacianTransformerModule,
     pair: PairSample,
@@ -1291,44 +585,37 @@ def evaluate_pair(
     num_eigenvectors: int,
     device: torch.device,
     k_sparsify: Optional[int] = None,
+    evaluators: Optional[List] = None,
 ) -> Dict[str, float]:
-    """Evaluate correspondence quality using functional maps.
+    """Evaluate correspondence quality using functional maps (non-differentiable).
 
     Args:
-        k: kNN neighbourhood size for the model's receptive field.
-        k_sparsify: kNN neighbourhood size for the sparsification mask.
-            None or equal to k → reuse the model's kNN graph (current behaviour).
+        k_sparsify: kNN for sparsification mask. None = reuse k.
+        evaluators: List of ShapePairEvaluator instances. When provided,
+            runs each evaluator and prefixes metrics with evaluator.name.
+            When None, uses the legacy _correspondence_metrics path.
     """
-    from neural_local_laplacian.utils.utils import (
-        assemble_stiffness_and_mass_matrices,
-        compute_laplacian_eigendecomposition,
-    )
-
-    n_a = len(pair.verts_a)
+    n_a             = len(pair.verts_a)
     is_gradient_mode = False
-    dense_bases = {}
-    sparse_bases = {}
+    dense_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}   # (evecs, evals, mass)
+    sparse_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    iso_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
     for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
-        verts_t = torch.from_numpy(verts).float().to(device)
-        knn_np = compute_knn(verts, k)
-        batch_data = build_patch_data(verts_t, knn_np, device)
-        batch_data = Batch.from_data_list([batch_data]).to(device)
-
-        fwd = model._forward_pass(batch_data)
+        verts_t    = torch.from_numpy(verts).float().to(device)
+        knn_np     = compute_knn(verts, k)
+        batch_data = Batch.from_data_list(
+            [build_patch_data(verts_t, knn_np, device)]).to(device)
+        fwd        = model._forward_pass(batch_data)
 
         if fwd.get('grad_coeffs') is not None:
             is_gradient_mode = True
-            knn_t = torch.from_numpy(knn_np).long().to(device)
-            with torch.no_grad():
-                L, M_diag_t = assemble_anisotropic_laplacian(
-                    grad_coeffs=fwd['grad_coeffs'],
-                    areas=fwd['areas'],
-                    knn=knn_t,
-                )
-            evals_d, evecs_d = _eigh_from_sparse_L(L, M_diag_t, num_eigenvectors)
-            M_diag = M_diag_t.cpu().numpy()
-            dense_bases[label] = (evecs_d, M_diag)
+            knn_t     = torch.from_numpy(knn_np).long().to(device)
+            L, M_diag = assemble_anisotropic_laplacian(fwd['grad_coeffs'],
+                                                       fwd['areas'], knn_t)
+            evals_d, evecs_d = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
+            M_np = M_diag.cpu().numpy()
+            dense_bases[label] = (evecs_d, evals_d, M_np)
 
             # Sparsify with a separate kNN graph when k_sparsify is set
             if k_sparsify is not None and k_sparsify != k:
@@ -1337,8 +624,14 @@ def evaluate_pair(
                 L_sp = _sparsify_L_to_knn(L, knn_sp_t)
             else:
                 L_sp = _sparsify_L_to_knn(L, knn_t)
-            evals_sp, evecs_sp = _eigh_from_sparse_L(L_sp, M_diag_t, num_eigenvectors)
-            sparse_bases[label] = (evecs_sp, M_diag)
+            evals_sp, evecs_sp = _eigh_from_sparse_L(L_sp, M_diag, num_eigenvectors)
+            sparse_bases[label] = (evecs_sp, evals_sp, M_np)
+
+            # Isotropic Laplacian: w_ij = area_i * ||g_ij||^2 (PSD, sparse)
+            L_iso, M_iso = assemble_isotropic_laplacian(
+                fwd['grad_coeffs'], fwd['areas'], knn_t)
+            evals_iso, evecs_iso = _eigh_from_sparse_L(L_iso, M_iso, num_eigenvectors)
+            iso_bases[label] = (evecs_iso, evals_iso, M_np)
         else:
             batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
             S, M = assemble_stiffness_and_mass_matrices(
@@ -1349,861 +642,703 @@ def evaluate_pair(
                 center_indices=batch_data.center_indices,
                 batch_indices=batch_idx,
             )
-            evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
-            M_diag = np.array(M.diagonal()).flatten()
-            dense_bases[label] = (evecs, M_diag)
+            evals, evecs = compute_laplacian_eigendecomposition(
+                S, num_eigenvectors, mass_matrix=M)
+            M_np = np.array(M.diagonal()).flatten()
+            dense_bases[label] = (evecs, evals, M_np)
 
     gt_corr = _build_gt_corr_from_pair(pair)
-    evA_d, mA = dense_bases['A']
-    evB_d, mB = dense_bases['B']
-    metrics = _correspondence_metrics(evA_d, evB_d, mA, mB, pair.verts_b, n_a,
-                                      gt_corr=gt_corr)
+    evA_d, evalsA_d, mA = dense_bases['A']
+    evB_d, evalsB_d, mB = dense_bases['B']
 
+    # --- Use evaluators if provided ---
+    if evaluators is not None:
+        metrics = {}
+        for evaluator in evaluators:
+            ev_metrics = evaluator.evaluate(
+                evA_d, evB_d, evalsA_d, evalsB_d,
+                mA, mB, pair.verts_b, gt_corr=gt_corr,
+            )
+            for mk, mv in ev_metrics.items():
+                metrics[f"{evaluator.name}/{mk}"] = mv
+
+        # Also run evaluators on sparse bases
+        if is_gradient_mode and sparse_bases:
+            evA_sp, evalsA_sp, _ = sparse_bases['A']
+            evB_sp, evalsB_sp, _ = sparse_bases['B']
+            for evaluator in evaluators:
+                sp_metrics = evaluator.evaluate(
+                    evA_sp, evB_sp, evalsA_sp, evalsB_sp,
+                    mA, mB, pair.verts_b, gt_corr=gt_corr,
+                )
+                for mk, mv in sp_metrics.items():
+                    metrics[f"sp_{evaluator.name}/{mk}"] = mv
+
+        # Also run evaluators on isotropic bases (PSD, sparse)
+        if is_gradient_mode and iso_bases:
+            evA_iso, evalsA_iso, _ = iso_bases['A']
+            evB_iso, evalsB_iso, _ = iso_bases['B']
+            for evaluator in evaluators:
+                iso_metrics = evaluator.evaluate(
+                    evA_iso, evB_iso, evalsA_iso, evalsB_iso,
+                    mA, mB, pair.verts_b, gt_corr=gt_corr,
+                )
+                for mk, mv in iso_metrics.items():
+                    metrics[f"iso_{evaluator.name}/{mk}"] = mv
+
+        return metrics
+
+    # --- Legacy path (backward compatible) ---
+    metrics = _correspondence_metrics(evA_d, evB_d, mA, mB,
+                                      pair.verts_b, n_a, gt_corr=gt_corr)
     if is_gradient_mode and sparse_bases:
-        evA_sp, _ = sparse_bases['A']
-        evB_sp, _ = sparse_bases['B']
-        sp_metrics = _correspondence_metrics(evA_sp, evB_sp, mA, mB, pair.verts_b,
-                                             n_a, gt_corr=gt_corr)
-        for key, val in sp_metrics.items():
+        evA_sp, _, _ = sparse_bases['A']
+        evB_sp, _, _ = sparse_bases['B']
+        sp = _correspondence_metrics(evA_sp, evB_sp, mA, mB,
+                                     pair.verts_b, n_a, gt_corr=gt_corr)
+        for key, val in sp.items():
             metrics[f'sp_{key}'] = val
-
     return metrics
 
 
+@torch.no_grad()
+def evaluate_pair_robust(
+    pair: PairSample,
+    num_eigenvectors: int,
+    n_neighbors: int = 30,
+    evaluators: Optional[List] = None,
+) -> Dict[str, float]:
+    """Evaluate using robust Laplacian (baseline, no model).
+
+    Args:
+        evaluators: List of ShapePairEvaluator instances. When provided,
+            runs each evaluator and prefixes metrics with evaluator.name.
+            When None, uses the legacy _correspondence_metrics path.
+    """
+    import robust_laplacian
+    n_a = len(pair.verts_a)
+    bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
+        S, M     = robust_laplacian.point_cloud_laplacian(verts, n_neighbors=n_neighbors)
+        evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
+        bases[label] = (evecs, evals, np.array(M.diagonal()).flatten())
+
+    gt_corr = _build_gt_corr_from_pair(pair)
+    evA, evalsA, mA = bases['A']
+    evB, evalsB, mB = bases['B']
+
+    if evaluators is not None:
+        metrics = {}
+        for evaluator in evaluators:
+            ev_metrics = evaluator.evaluate(
+                evA, evB, evalsA, evalsB,
+                mA, mB, pair.verts_b, gt_corr=gt_corr,
+            )
+            for mk, mv in ev_metrics.items():
+                metrics[f"{evaluator.name}/{mk}"] = mv
+        return metrics
+
+    # Legacy path
+    return _correspondence_metrics(evA, evB, mA, mB,
+                                   pair.verts_b, n_a, gt_corr=gt_corr)
+
+
 # =============================================================================
-# Training loop
+# LightningModule
 # =============================================================================
 
-def train(args):
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+def cosine_flat_scheduler(
+    optimizer: torch.optim.Optimizer,
+    T_max: int,
+    eta_min: float = 1e-6,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Cosine decay from base_lr to eta_min over T_max epochs, then flat.
 
-    # --- Reproducibility: seed ALL random sources ---
-    import os
-    import random
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # deterministic cuBLAS
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Force deterministic CUDA ops (e.g. scatter_add used in Laplacian assembly).
-    # If this errors, an op lacks a deterministic impl in your PyTorch version.
-    torch.use_deterministic_algorithms(True)
+    Unlike CosineAnnealingLR this does not cycle back up after T_max.
+    The multiplier is clamped so progress never exceeds 1.0.
+    """
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    def _lambda(epoch: int, base_lr: float) -> float:
+        if base_lr < 1e-12:
+            return 1.0
+        t       = min(epoch, T_max)
+        cosine  = 0.5 * (1.0 + math.cos(math.pi * t / T_max))
+        lr      = eta_min + (base_lr - eta_min) * cosine
+        return lr / base_lr
 
-    with open(output_dir / "args.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
-
-    # Weights & Biases
-    if args.wandb:
-        import wandb
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_run_name,
-            tags=args.wandb_tags.split(",") if args.wandb_tags else None,
-            config=vars(args),
-            dir=str(output_dir),
-        )
-        print(f"  W&B run: {wandb.run.url}")
-
-    # Load model (always from checkpoint to get architecture/hparams)
-    print(f"Loading model from: {args.checkpoint}")
-    model = LaplacianTransformerModule.load_from_checkpoint(
-        args.checkpoint, map_location=device,
-        normalize_patch_features=True,
-        scale_areas_by_patch_size=True,
+    lambdas = [lambda epoch, blr=blr: _lambda(epoch, blr) for blr in base_lrs]
+    # LambdaLR accepts a list of lambdas (one per param group) or a single one
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambdas if len(lambdas) > 1 else lambdas[0],
     )
 
-    # --- Detect areas head modules (by convention: module name contains 'area') ---
-    def _find_areas_modules(mdl):
-        """Return list of (name, module) for the areas head."""
-        found = [(n, m) for n, m in mdl.named_modules() if 'area' in n.lower()]
-        if not found:
-            print("  WARNING: no modules with 'area' in name found. "
-                  "--keep_areas_head / --freeze_areas_head will have no effect.")
-        return found
 
-    # Optionally reset all weights to random initialization
-    from_scratch = getattr(args, 'random_init', False)
-    if from_scratch:
-        # Save areas head state before reset if requested
-        areas_state = None
-        if args.keep_areas_head:
-            areas_modules = _find_areas_modules(model)
-            if areas_modules:
-                areas_state = {n: {k: v.clone() for k, v in m.state_dict().items()}
-                               for n, m in areas_modules}
-                print(f"  Preserving areas head weights ({len(areas_modules)} module(s)): "
-                      f"{', '.join(n for n, _ in areas_modules)}")
 
-        print("  Resetting all weights to random initialization")
-        for module in model.modules():
-            if hasattr(module, 'reset_parameters'):
-                module.reset_parameters()
+# =============================================================================
+# Model export callback
+# =============================================================================
 
-        # Restore areas head if saved
-        if areas_state is not None:
-            for name, m in _find_areas_modules(model):
-                if name in areas_state:
-                    m.load_state_dict(areas_state[name])
-            print("  Restored areas head to pretrained weights")
+class BestModelExportCallback(lightning.pytorch.callbacks.ModelCheckpoint):
+    """ModelCheckpoint subclass that saves only the inner LaplacianTransformerModule.
 
-        # Proximity loss is meaningless without pretrained reference
-        if args.w_prox > 0:
-            print(f"  Note: --w_prox={args.w_prox} overridden to 0.0 (no pretrained reference)")
-            args.w_prox = 0.0
-    model.to(device)
-    model.train()
+    Because it inherits from ModelCheckpoint, WandbLogger (log_model=true) will
+    automatically upload its best checkpoint as a W&B artifact — identical in
+    structure and size to the input pretrained checkpoint.
 
-    # --- Freeze specific heads ---
-    if args.freeze_input_projection:
-        for name, param in model.named_parameters():
-            if 'input_projection' in name:
-                param.requires_grad_(False)
-                print(f"  Frozen: {name}")
+    Pass the same monitor/mode/dirpath as the main ModelCheckpoint so the two
+    checkpoints sit side by side and the best-model tracking is consistent.
+    """
 
-    if args.freeze_areas_head:
-        areas_modules = _find_areas_modules(model)
-        for mod_name, _ in areas_modules:
-            for name, param in model.named_parameters():
-                if name.startswith(mod_name):
-                    param.requires_grad_(False)
-                    print(f"  Frozen: {name}")
+    def _save_checkpoint(self, trainer: "lightning.pytorch.Trainer", filepath: str) -> None:
+        if not trainer.is_global_zero:
+            return
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-    # --- Optional: list all Linear modules and exit (for LoRA target discovery) ---
-    if getattr(args, 'lora_list_modules', False):
-        print("\n  All nn.Linear modules in the model:")
-        for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear):
-                print(f"    {name}: in={module.in_features}, out={module.out_features}")
-        print("\n  Use --lora_target_modules with comma-separated names (or 'all-linear').")
-        sys.exit(0)
+        pl_module: "FunctionalMapModule" = trainer.lightning_module  # type: ignore[assignment]
+        inner_model: lightning.pytorch.LightningModule = pl_module.model  # type: ignore[assignment]
+        ckpt: Dict[str, Any] = {
+            "state_dict":                    inner_model.state_dict(),
+            "hyper_parameters":              dict(inner_model.hparams),
+            "pytorch-lightning_version":     lightning.__version__,
+        }
+        torch.save(ckpt, filepath)
+        self.best_model_path = filepath
 
-    # --- Optional: LoRA adapter via PEFT ---
-    use_lora = getattr(args, 'use_lora', False)
-    if use_lora:
+        # WandbLogger only scans the *last* ModelCheckpoint in the callbacks list,
+        # so log_model='all' will never reliably upload our callback. Upload directly.
         try:
-            from peft import get_peft_model, LoraConfig, TaskType
-        except ImportError:
-            raise ImportError(
-                "LoRA requires the 'peft' package. Install with: pip install peft"
-            )
+            import wandb
+            if wandb.run is not None:
+                artifact_name = f"model-{wandb.run.id}"
+                artifact = wandb.Artifact(
+                    name=artifact_name,
+                    type="model",
+                    metadata={
+                        "score":   float(self.current_score) if self.current_score is not None else None,
+                        "epoch":   trainer.current_epoch,
+                        "monitor": self.monitor,
+                    },
+                )
+                artifact.add_file(filepath, name="model.ckpt")
+                wandb.run.log_artifact(artifact, aliases=["latest", "best"])
+                print(f"  [Export] Uploaded to W&B artifact '{artifact_name}'")
+            else:
+                print("  [Export] W&B upload skipped: no active wandb run")
+        except Exception as e:
+            import traceback
+            print(f"  [Export] W&B upload failed: {e}")
+            traceback.print_exc()
 
-        target = args.lora_target_modules
-        if target == "all-linear":
-            target_modules = "all-linear"
-        else:
-            target_modules = [m.strip() for m in target.split(',')]
+        print(f"  [Export] Saved inner model checkpoint → {filepath}")
 
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            use_dora=args.lora_dora,
-            use_rslora=args.lora_rslora,
+
+
+
+
+class FunctionalMapModule(LaplacianModuleBase):
+    """Fine-tune a pretrained LaplacianTransformerModule for shape correspondence."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        optimizer_cfg: DictConfig,
+        loss_fn: SoftCorrespondenceLoss,
+        scheduler_cfg: Optional[DictConfig] = None,
+        random_init: bool = False,
+        keep_areas_head: bool = False,
+        freeze_input_projection: bool = False,
+        freeze_areas_head: bool = False,
+        k: int = 15,
+        k_sparsify: Optional[int] = None,
+        num_eigenvectors: int = 100,
+        sparsify_laplacian: bool = False,
+        max_vertices: int = 0,
+        vertex_noise: float = 0.05,
+        w_prox: float = 20.0,
+        cross_ratio_start: float = 0.0,
+        cross_ratio_end: float = 0.5,
+        curriculum_epochs: int = 50,
+        seed: int = 42,
+        use_lora: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.0,
+        lora_target_modules: str = "all-linear",
+        lora_dora: bool = False,
+        lora_rslora: bool = False,
+        profile_steps: int = 0,   # print profiler summary every N steps (0 = off)
+        # GeomFuM evaluation (optional)
+        use_geomfum_eval: bool = False,
+        geomfum_descriptors: Optional[List[str]] = None,
+        geomfum_zoomout: bool = True,
+        geomfum_zoomout_k_init: int = 20,
+        geomfum_zoomout_k_final: int = 50,
+        geomfum_zoomout_n_iters: int = 10,
+        geomfum_fmap_lmbda: float = 1e3,
+        geomfum_fmap_resolvent_gamma: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(optimizer_cfg=optimizer_cfg,
+                         scheduler_cfg=scheduler_cfg, **kwargs)
+        self.save_hyperparameters(ignore=["loss_fn", "optimizer_cfg", "scheduler_cfg"])
+        self.loss_fn: SoftCorrespondenceLoss = loss_fn
+        self.model: Optional[nn.Module] = None
+        self._train_rng: Optional[np.random.RandomState] = None
+        self._val_outputs: List[Dict[str, float]] = []
+
+        # Validate k_sparsify
+        if k_sparsify is not None:
+            assert k_sparsify <= k, (
+                f"k_sparsify ({k_sparsify}) must be <= k ({k})")
+
+        # Build evaluators
+        self._evaluators = [SpectralNNEvaluator()]
+        if use_geomfum_eval:
+            self._evaluators.append(FunctionalMapEvaluator(
+                descriptors=geomfum_descriptors or ['hks', 'wks'],
+                use_zoomout=geomfum_zoomout,
+                zoomout_k_init=geomfum_zoomout_k_init,
+                zoomout_k_final=geomfum_zoomout_k_final,
+                zoomout_n_iters=geomfum_zoomout_n_iters,
+                fmap_lmbda=geomfum_fmap_lmbda,
+                fmap_resolvent_gamma=geomfum_fmap_resolvent_gamma,
+            ))
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def setup(self, stage: str) -> None:
+        super().setup(stage)
+        if self.model is not None:
+            return
+        hp = self.hparams
+
+        self.model = LaplacianTransformerModule.load_from_checkpoint(
+            hp.checkpoint_path, map_location="cpu",
+            normalize_patch_features=True, scale_areas_by_patch_size=True,
         )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
 
-        # LoRA already constrains updates to low-rank — proximity loss is meaningless
-        if args.w_prox > 0:
-            print(f"  Note: --w_prox={args.w_prox} overridden to 0.0 (LoRA constrains updates by design)")
-            args.w_prox = 0.0
+        if hp.random_init:
+            areas_state: Optional[dict] = None
+            if hp.keep_areas_head:
+                areas_state = {
+                    name: {k: v.clone() for k, v in mod.state_dict().items()}
+                    for name, mod in self.model.named_modules()
+                    if "area" in name.lower()
+                    and any(True for _ in mod.parameters(recurse=False))
+                }
+            for mod in self.model.modules():
+                if hasattr(mod, 'reset_parameters'):
+                    mod.reset_parameters()
+            if areas_state:
+                for name, mod in self.model.named_modules():
+                    if name in areas_state:
+                        mod.load_state_dict(areas_state[name])
 
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"  Trainable parameters: {trainable:,} / {total:,}")
+        if hp.freeze_input_projection:
+            for name, param in self.model.named_parameters():
+                if 'input_projection' in name:
+                    param.requires_grad_(False)
 
-    # --- Build pair generator based on dataset choice ---
-    pair_gen: PairGenerator
+        if hp.freeze_areas_head:
+            for name, param in self.model.named_parameters():
+                if 'area' in name.lower():
+                    param.requires_grad_(False)
 
-    if args.dataset == "smal":
-        print(f"Loading SMAL model...")
-        smal = SMALModel(args.smal_model, args.smal_data)
-        print(f"  {smal.num_families} families, {len(smal.v_template)} vertices per shape")
+        use_prox = hp.w_prox > 0 and not hp.random_init and not hp.use_lora
+        if use_prox:
+            ref = torch.cat([p.detach().flatten() for p in self.model.parameters()])
+            self.register_buffer("ref_params",  ref)
+            self.register_buffer("ref_norm_sq", ref.pow(2).sum().clamp(min=1e-8))
 
-        all_families = list(range(smal.num_families))
-        if args.val_families:
-            val_families = [int(x) for x in args.val_families.split(',')]
-        else:
-            val_families = all_families[-2:]
-        train_families = [f for f in all_families if f not in val_families]
+        if hp.use_lora:
+            try:
+                from peft import get_peft_model, LoraConfig
+            except ImportError:
+                raise ImportError("LoRA requires: pip install peft")
+            target = ("all-linear" if hp.lora_target_modules == "all-linear"
+                      else [m.strip() for m in hp.lora_target_modules.split(",")])
+            self.model = get_peft_model(self.model, LoraConfig(
+                r=hp.lora_rank, lora_alpha=hp.lora_alpha,
+                lora_dropout=hp.lora_dropout, target_modules=target,
+                bias="none", use_dora=hp.lora_dora, use_rslora=hp.lora_rslora,
+            ))
+            self.model.print_trainable_parameters()
 
-        print(f"  Train families: {train_families}")
-        print(f"  Val families: {val_families}")
+        self._train_rng = np.random.RandomState(hp.seed + self.global_rank * 10_007)
+        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.parameters())
+        print(f"  [FMModule rank={self.global_rank}] "
+              f"Trainable: {n_train:,} / {n_total:,}")
+        if self.global_rank == 0 and self._scheduler_cfg is not None:
+            # Surface the effective T_max so it appears in logs / W&B config
+            t_max = getattr(self._scheduler_cfg, 'keywords', {}).get('T_max', '?')
+            print(f"  [FMModule] Scheduler T_max={t_max} epochs")
 
-        pair_gen = SMALPairGenerator(smal, train_families, val_families, args.pose_scale)
-        print(f"  Cross-family pairs: {pair_gen.cross_pairs}")
-        print(f"  Same-family pairs: {pair_gen.same_pairs}")
-        print(f"  Val pairs: {pair_gen.val_pairs}")
+    # ------------------------------------------------------------------
+    # Optimiser
+    # ------------------------------------------------------------------
 
-    elif args.dataset == "dt4d":
-        print(f"Loading DT4D Humanoids from: {args.dt4d_root}")
+    def configure_optimizers(self):
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        optimizer = self._optimizer_cfg(params=trainable)
+        if self._scheduler_cfg is None:
+            return optimizer
+        scheduler = self._scheduler_cfg(optimizer=optimizer)
+        return {"optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
-        # Discover all categories (auto-detect nested directory)
-        dt4d_root = Path(args.dt4d_root)
-        # If root doesn't directly contain category dirs, check common subdirectory
-        if not any((d / "corres").exists() for d in dt4d_root.iterdir() if d.is_dir()):
-            for subdir_name in ["DeformingThings4DMatching", "humanoid", "Humanoid"]:
-                candidate = dt4d_root / subdir_name
-                if candidate.exists() and any(
-                    (d / "corres").exists() for d in candidate.iterdir() if d.is_dir()
-                ):
-                    print(f"  Auto-detected data subdirectory: {candidate}")
-                    dt4d_root = candidate
-                    break
-        all_categories = sorted([
-            d.name for d in dt4d_root.iterdir()
-            if d.is_dir() and (d / "corres").exists()
-        ])
-        if not all_categories:
-            raise FileNotFoundError(
-                f"No DT4D categories found under {dt4d_root}. "
-                f"Expected subdirectories like crypto/, prisoner/ each containing a corres/ folder. "
-                f"Check that --dt4d_root points to the directory containing the category folders."
-            )
-        print(f"  Available categories: {all_categories}")
+    # ------------------------------------------------------------------
+    # Shared metric aggregation + printing
+    # ------------------------------------------------------------------
 
-        if args.val_categories:
-            val_categories = [c.strip() for c in args.val_categories.split(',')]
-        else:
-            # Default: last 2 categories as validation
-            val_categories = all_categories[-2:]
-        train_categories = [c for c in all_categories if c not in val_categories]
+    def _summarise_and_print(
+        self,
+        all_metrics: List[Dict[str, float]],
+        label: str,
+        silent: bool = False,
+    ) -> Dict[str, float]:
+        """Aggregate per-pair metrics and print a summary.
 
-        print(f"  Train categories: {train_categories}")
-        print(f"  Val categories: {val_categories}")
+        Used by both on_fit_start (baselines) and on_validation_epoch_end
+        so they produce identical output format.
 
-        pair_gen = DT4DPairGenerator(str(dt4d_root), train_categories, val_categories)
+        Args:
+            all_metrics: List of per-pair metric dicts from evaluators.
+            label: Human-readable label (e.g. "Robust baseline", "Val epoch 3").
+            silent: If True, skip printing (used for non-zero DDP ranks).
 
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+        Returns:
+            summary: Dict mapping metric names to averaged values.
+        """
+        if not all_metrics:
+            return {}
 
-    # Loss and optimizer
-    loss_fn = SoftCorrespondenceLoss(
-        num_landmarks=args.num_landmarks,
-        alphas=tuple(float(a) for a in args.alphas.split(',')),
-        temperature=args.temperature,
-        num_sample_vertices=args.num_sample_vertices,
-        loss_type=args.loss_type,
-        dclw_sigma=args.dclw_sigma,
-    )
+        # Collect all keys across all pairs (some pairs may have {} from failures)
+        all_keys = set()
+        for m in all_metrics:
+            all_keys.update(m.keys())
+        all_keys = sorted(all_keys)
 
-    # Frozen copy of pretrained model for parameter-space proximity
-    # (Skip when using LoRA — base weights are frozen, proximity is meaningless)
-    if args.w_prox > 0 and not use_lora:
-        model_ref = copy.deepcopy(model)
-        model_ref.eval()
-        for p in model_ref.parameters():
-            p.requires_grad_(False)
-        ref_params = torch.cat([p.detach().flatten() for p in model_ref.parameters()])
-        ref_norm_sq = (ref_params ** 2).sum().clamp(min=1e-8)
-        del model_ref
-        print(f"  Reference params: {ref_params.numel():,} values, ||θ_ref||²={ref_norm_sq.item():.2e}")
-    else:
-        ref_params = None
-        ref_norm_sq = None
-        if use_lora:
-            print(f"  Proximity loss: disabled (using LoRA)")
-        elif from_scratch:
-            print(f"  Proximity loss: disabled (no pretrained reference)")
-        else:
-            print(f"  Proximity loss: disabled (w_prox=0)")
-
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    # Cosine decay to eta_min over lr_T_max epochs, then stay flat (no restart).
-    eta_min_ratio = 0.01  # eta_min = lr * 0.01
-    def _cosine_no_restart(epoch):
-        if epoch >= args.lr_T_max:
-            return eta_min_ratio
-        return eta_min_ratio + (1.0 - eta_min_ratio) * 0.5 * (
-            1.0 + math.cos(math.pi * epoch / args.lr_T_max))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_no_restart)
-
-    # Logging
-    log_file = open(output_dir / "train_log.csv", "w")
-    log_file.write("epoch,step,loss,loss_nce,loss_prox,train_acc,train_top3,train_top5,train_top10,cross_ratio,grad_norm,lr\n")
-
-    val_log = open(output_dir / "val_log.csv", "w")
-    val_log.write("epoch,pair,accuracy,top3_acc,top5_acc,top10_acc,"
-                  "mean_error,median_error,ortho_error,"
-                  "biject_error,corr_error,diag_ratio\n")
-
-    rng = np.random.RandomState(args.seed)
-    global_step = 0
-
-    # Compute robust Laplacian baseline (once)
-    print(f"\n  Computing robust Laplacian baseline "
-          f"({len(pair_gen.val_pairs)} category pairs × {args.val_poses_per_pair} poses "
-          f"= {len(pair_gen.val_pairs) * args.val_poses_per_pair} evaluations)...")
-    val_pairs_baseline = pair_gen.get_val_pairs(rng, args.val_poses_per_pair)
-    robust_metrics_list = []
-    for pair in val_pairs_baseline:
-        eval_pair = pair
-        if args.max_vertices > 0:
-            eval_pair = subsample_pair(pair, args.max_vertices,
-                                       np.random.RandomState(_stable_hash(pair.name)))
-        rb = evaluate_pair_robust(eval_pair, args.num_eigenvectors)
-        robust_metrics_list.append(rb)
-        print(f"    {pair.name:<78s}  {_fmt_topk(rb)}")
-    robust_mean_acc = np.mean([m['accuracy'] for m in robust_metrics_list])
-    robust_mean_err = np.mean([m['mean_error'] for m in robust_metrics_list])
-    robust_med_acc = np.median([m['accuracy'] for m in robust_metrics_list])
-    _topk_summary = "  ".join(
-        f"top{k}={np.mean([m[f'top{k}_acc'] for m in robust_metrics_list if f'top{k}_acc' in m])*100:5.1f}%"
-        for k in (3, 5, 10)
-        if any(f'top{k}_acc' in m for m in robust_metrics_list)
-    )
-    print(f"  Robust baseline:  top1={robust_mean_acc*100:5.1f}% (med={robust_med_acc*100:5.1f}%)  "
-          f"{_topk_summary}  Err={robust_mean_err:.4f}")
-
-    if args.wandb:
-        wandb.log({"baseline/val_acc": robust_mean_acc, "baseline/val_err": robust_mean_err}, step=0)
-
-    # --- Epoch 0 baseline (pretrained or random init, before any training) ---
-    init_label = "random init" if from_scratch else "pretrained model"
-    print(f"\n  Computing {init_label} baseline (epoch 0)...")
-    model.eval()
-    val_pairs_ep0 = pair_gen.get_val_pairs(rng, args.val_poses_per_pair)
-    ep0_metrics_list = []
-    for pair in val_pairs_ep0:
-        eval_pair = pair
-        if args.max_vertices > 0:
-            eval_pair = subsample_pair(pair, args.max_vertices,
-                                       np.random.RandomState(_stable_hash(pair.name)))
-        val_metrics = evaluate_pair(model, eval_pair, args.k_pred, args.num_eigenvectors, device,
-                                   k_sparsify=args.k_sparsify)
-        ep0_metrics_list.append(val_metrics)
-
-        sp_str = ""
-        if 'sp_accuracy' in val_metrics:
-            sp_str = f"  │ sp: {_fmt_topk(val_metrics, prefix='sp_')}"
-
-        val_log.write(f"0,{pair.name},"
-                      f"{val_metrics['accuracy']:.6f},"
-                      f"{val_metrics.get('top3_acc', 0):.6f},"
-                      f"{val_metrics.get('top5_acc', 0):.6f},"
-                      f"{val_metrics.get('top10_acc', 0):.6f},"
-                      f"{val_metrics['mean_error']:.6f},"
-                      f"{val_metrics['median_error']:.6f},"
-                      f"{val_metrics['ortho_error']:.6f},"
-                      f"{val_metrics['biject_error']:.6f},"
-                      f"{val_metrics['corr_error']:.6f},"
-                      f"{val_metrics['diag_ratio']:.6f}\n")
-
-        print(f"    {pair.name:<78s}  {_fmt_topk(val_metrics)}{sp_str}")
-
-    val_log.flush()
-    ep0_mean_acc = np.mean([m['accuracy'] for m in ep0_metrics_list])
-    ep0_mean_err = np.mean([m['mean_error'] for m in ep0_metrics_list])
-    ep0_med_acc = np.median([m['accuracy'] for m in ep0_metrics_list])
-    ep0_sp_summary = ""
-    if any('sp_accuracy' in m for m in ep0_metrics_list):
-        sp_ms = [m for m in ep0_metrics_list if 'sp_accuracy' in m]
-        ep0_mean_sp_acc = np.mean([m['sp_accuracy'] for m in sp_ms])
-        ep0_mean_sp_err = np.mean([m['sp_mean_error'] for m in sp_ms])
-        ep0_med_sp_acc = np.median([m['sp_accuracy'] for m in sp_ms])
-        sp_topk = "  ".join(
-            f"top{k}={np.mean([m[f'sp_top{k}_acc'] for m in sp_ms if f'sp_top{k}_acc' in m])*100:5.1f}%"
-            for k in (3, 5, 10) if any(f'sp_top{k}_acc' in m for m in sp_ms)
-        )
-        ep0_sp_summary = (f"  │ sp: top1={ep0_mean_sp_acc*100:5.1f}% (med={ep0_med_sp_acc*100:5.1f}%)"
-                          f"  {sp_topk}  Err={ep0_mean_sp_err:.4f}")
-        best_val_acc = ep0_mean_sp_acc
-    else:
-        best_val_acc = ep0_mean_acc
-    ep0_topk = "  ".join(
-        f"top{k}={np.mean([m[f'top{k}_acc'] for m in ep0_metrics_list if f'top{k}_acc' in m])*100:5.1f}%"
-        for k in (3, 5, 10) if any(f'top{k}_acc' in m for m in ep0_metrics_list)
-    )
-    ep0_label = "Random init:    " if from_scratch else "Pretrained base:"
-    print(f"  {ep0_label}  top1={ep0_mean_acc*100:5.1f}% (med={ep0_med_acc*100:5.1f}%)"
-          f"  {ep0_topk}  Err={ep0_mean_err:.4f}{ep0_sp_summary}")
-
-    if args.wandb:
-        log_dict = {"val/top1": ep0_mean_acc, "val/mean_error": ep0_mean_err}
-        for k in (3, 5, 10):
-            vals = [m[f'top{k}_acc'] for m in ep0_metrics_list if f'top{k}_acc' in m]
+        # Aggregate: mean of each key (skip NaN / missing)
+        summary: Dict[str, float] = {}
+        for mk in all_keys:
+            vals = [m[mk] for m in all_metrics
+                    if mk in m and np.isfinite(m[mk])]
             if vals:
-                log_dict[f"val/top{k}"] = np.mean(vals)
-        if any('sp_accuracy' in m for m in ep0_metrics_list):
-            log_dict["val/sp_top1"] = ep0_mean_sp_acc
-            log_dict["val/sp_mean_error"] = ep0_mean_sp_err
-        wandb.log(log_dict, step=0)
+                summary[mk] = float(np.mean(vals))
 
-    model.train()
+        # --- Identify primary metric (spectral_nn dense) ---
+        nn_prefix = "spectral_nn/"
+        has_nn = any(k.startswith(nn_prefix) for k in all_keys)
 
-    print()
-    print("=" * 80)
-    lap_mode = "sparse (kNN-masked G^TMG)" if args.sparsify_laplacian else "dense (full G^TMG)"
-    if args.sparsify_laplacian and args.k_sparsify is not None and args.k_sparsify != args.k_pred:
-        lap_mode = f"sparse (k_model={args.k_pred}, k_sparsify={args.k_sparsify})"
-    init_mode = "from scratch" if from_scratch else "fine-tuning"
-    print(f"TRAINING ({args.dataset.upper()}, {init_mode}, {args.loss_type.upper()} contrastive, "
-          f"{args.num_landmarks} landmarks, "
-          f"V={args.num_sample_vertices}, scales={args.alphas}, τ={args.temperature}, "
-          f"curriculum={args.cross_ratio_start:.0%}→{args.cross_ratio_end:.0%} over {args.curriculum_epochs}ep)")
-    print(f"  Laplacian: {lap_mode}")
-    if use_lora:
-        variant = "DoRA" if args.lora_dora else ("rsLoRA" if args.lora_rslora else "LoRA")
-        print(f"  {variant}: rank={args.lora_rank}, alpha={args.lora_alpha}, "
-              f"target={args.lora_target_modules}")
-    if args.max_vertices > 0:
-        print(f"  Vertex subsampling: {args.max_vertices} (per shape, per step)")
-    if args.vertex_noise > 0:
-        print(f"  Vertex noise: {args.vertex_noise:.4f} (relative to mean radius)")
-    if args.grad_accum_steps > 1:
-        eff_batch = args.pairs_per_step * args.grad_accum_steps
-        print(f"  Gradient accumulation: {args.grad_accum_steps} steps "
-              f"(effective batch = {args.pairs_per_step} × {args.grad_accum_steps} = {eff_batch} pairs)")
-    print("=" * 80)
+        if has_nn:
+            mean_acc = summary.get(f"{nn_prefix}accuracy", 0.0)
+            mean_err = summary.get(f"{nn_prefix}mean_error", 0.0)
+        else:
+            mean_acc = summary.get("accuracy", 0.0)
+            mean_err = summary.get("mean_error", 0.0)
 
-    for epoch in range(1, args.epochs + 1):
-        epoch_losses = []
-        epoch_start = time.time()
+        # Sparse / isotropic primary accuracy
+        sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
+        iso_key = f"iso_{nn_prefix}accuracy" if has_nn else "iso_accuracy"
+        sp_acc = summary.get(sp_key)
+        iso_acc = summary.get(iso_key)
 
-        progress = min(1.0, (epoch - 1) / max(1, args.curriculum_epochs))
-        cross_ratio = args.cross_ratio_start + progress * (args.cross_ratio_end - args.cross_ratio_start)
+        # --- Print summary ---
+        if not silent:
+            # Compute column width from evaluator names
+            ev_names = [ev.name for ev in self._evaluators
+                        if summary.get(f"{ev.name}/accuracy") is not None]
+            name_w = max((len(n) for n in ev_names), default=12)
 
-        accum = args.grad_accum_steps
-        loss_scale = args.pairs_per_step * accum
+            print(f"  {label}:", flush=True)
 
-        for step in range(args.steps_per_epoch):
-            global_step += 1
+            # Per-evaluator rows (aligned columns)
+            for ev in self._evaluators:
+                ev_acc = summary.get(f"{ev.name}/accuracy")
+                ev_err = summary.get(f"{ev.name}/mean_error", 0.0)
+                if ev_acc is None:
+                    continue
+                sp_ev = summary.get(f"sp_{ev.name}/accuracy")
+                iso_ev = summary.get(f"iso_{ev.name}/accuracy")
+                sp_col = f"  │ sp={sp_ev*100:5.1f}%" if sp_ev is not None else ""
+                iso_col = f"  │ iso={iso_ev*100:5.1f}%" if iso_ev is not None else ""
+                print(f"    {ev.name:<{name_w}}  top1={ev_acc*100:5.1f}%  "
+                      f"Err={ev_err:.4f}{sp_col}{iso_col}", flush=True)
 
-            # Zero gradients at the start of each accumulation window
-            if step % accum == 0:
-                optimizer.zero_grad()
+        return summary
 
-            step_metrics_list = []
-            valid_pairs = 0
+    # ------------------------------------------------------------------
+    # Baseline evaluation (runs once before first training epoch)
+    # ------------------------------------------------------------------
 
-            for pair_idx in range(args.pairs_per_step):
-                pair = pair_gen.sample_train_pair(rng, cross_ratio)
+    def on_fit_start(self) -> None:
+        """Log robust-Laplacian and epoch-0 model baselines to W&B at step 0.
 
-                # Subsample large meshes for O(N³) solve tractability
-                if args.max_vertices > 0:
-                    pair = subsample_pair(pair, args.max_vertices, rng)
+        Only runs on rank 0 to avoid duplicated evaluation in DDP.
+        Uses the first val dataset specification.
+        """
+        if not self.trainer.is_global_zero:
+            return
 
-                # Vertex noise augmentation (makes each pose presentation unique)
-                if args.vertex_noise > 0:
-                    for attr in ('verts_a', 'verts_b'):
-                        v = getattr(pair, attr)
-                        scale = args.vertex_noise * np.mean(np.linalg.norm(v, axis=1))
-                        setattr(pair, attr, v + rng.randn(*v.shape).astype(np.float32) * scale)
+        hp     = self.hparams
+        device = self.device
+        dm     = self.trainer.datamodule
+        if dm is None or not dm._val_dataset_specifications:
+            return
 
-                # Forward: differentiable Laplacians
-                S_A, M_A = compute_laplacian_differentiable(
-                    model, pair.verts_a, args.k_pred, device,
-                    sparsify=args.sparsify_laplacian,
-                    k_sparsify=args.k_sparsify)
-                S_B, M_B = compute_laplacian_differentiable(
-                    model, pair.verts_b, args.k_pred, device,
-                    sparsify=args.sparsify_laplacian,
-                    k_sparsify=args.k_sparsify)
+        val_dataset = dm._val_dataset_specifications[0].dataset
+        val_pairs   = [val_dataset[i] for i in range(len(val_dataset))]
+        if not val_pairs:
+            return
 
-                # InfoNCE contrastive loss (correspondence-aware)
-                loss_nce, metrics = loss_fn(
-                    S_A, S_B, M_A, M_B, rng,
-                    corr_a=pair.corr_a, corr_b=pair.corr_b)
+        def _subsample(pair):
+            if hp.max_vertices > 0:
+                return subsample_pair(pair, hp.max_vertices,
+                                      np.random.RandomState(_stable_hash(pair.name)))
+            return pair
 
-                # Parameter-space proximity (skipped when using LoRA or w_prox=0)
-                if args.w_prox > 0 and ref_params is not None:
-                    cur_params = torch.cat([p.flatten() for p in model.parameters()])
-                    loss_prox = ((cur_params - ref_params) ** 2).sum() / ref_norm_sq
-                    loss = loss_nce + args.w_prox * loss_prox
+        # ── Robust Laplacian baseline ──────────────────────────────────────────
+        try:
+            import robust_laplacian  # noqa: F401
+            print(f"\n  Computing robust Laplacian baseline ({len(val_pairs)} pairs)...",
+                  flush=True)
+            robust_metrics = []
+            n_total = len(val_pairs)
+            cw = len(str(n_total))  # counter width
+            for i, p in enumerate(val_pairs):
+                print(f"    [robust {i+1:>{cw}}/{n_total}] {p.name}...",
+                      end="", flush=True)
+                t0_ = time.perf_counter()
+                m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
+                                         evaluators=self._evaluators)
+                dt_ = time.perf_counter() - t0_
+                robust_metrics.append(m)
+                print(f" {dt_:.1f}s", flush=True)
+            rb_summary = self._summarise_and_print(robust_metrics, "Robust baseline")
+            self.logger.log_metrics(
+                {f"baseline/robust/{k}": v for k, v in rb_summary.items()}, step=0)
+        except ImportError:
+            print("  (robust_laplacian not installed — skipping robust baseline)")
+
+        # ── Epoch-0 model baseline ────────────────────────────────────────────
+        init_label = "random init" if hp.random_init else "pretrained"
+        print(f"\n  Computing {init_label} model baseline ({len(val_pairs)} pairs)...",
+              flush=True)
+        self.model.eval()
+        ep0_metrics = []
+        n_total = len(val_pairs)
+        cw = len(str(n_total))
+        with torch.no_grad():
+            for i, p in enumerate(val_pairs):
+                sub_p = _subsample(p)
+                print(f"    [model  {i+1:>{cw}}/{n_total}] {p.name}...",
+                      end="", flush=True)
+                t0_ = time.perf_counter()
+                m = evaluate_pair(self.model, sub_p,
+                                  hp.k, hp.num_eigenvectors, device,
+                                  k_sparsify=hp.k_sparsify,
+                                  evaluators=self._evaluators)
+                dt_ = time.perf_counter() - t0_
+                ep0_metrics.append(m)
+                print(f" {dt_:.1f}s", flush=True)
+        self.model.train()
+
+        ep0_summary = self._summarise_and_print(
+            ep0_metrics, f"Model baseline ({init_label})")
+        self.logger.log_metrics(
+            {f"baseline/model/{k}": v for k, v in ep0_summary.items()}, step=0)
+
+    # ------------------------------------------------------------------
+    # Curriculum
+    # ------------------------------------------------------------------
+
+    def _current_cross_ratio(self) -> float:
+        hp       = self.hparams
+        progress = min(1.0, self.current_epoch / max(1, hp.curriculum_epochs))
+        return hp.cross_ratio_start + progress * (hp.cross_ratio_end - hp.cross_ratio_start)
+
+    def on_train_epoch_start(self) -> None:
+        cross_ratio = self._current_cross_ratio()
+        dm = self.trainer.datamodule
+        if dm is not None:
+            dm._train_dataset_specification.dataset.cross_ratio = cross_ratio
+        self.log("train/cross_ratio", cross_ratio, sync_dist=True)
+
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch: List[PairSample], batch_idx: int):
+        hp, device = self.hparams, self.device
+        total_loss = torch.tensor(0.0, device=device)
+        metrics_list: List[Dict] = []
+
+        prof = _StepProfiler(enabled=(hp.profile_steps > 0 and self.global_rank == 0))
+
+        for pair in batch:
+            with prof.phase("subsample + noise"):
+                if hp.max_vertices > 0:
+                    pair = subsample_pair(pair, hp.max_vertices, self._train_rng)
+                if hp.vertex_noise > 0:
+                    for attr in ("verts_a", "verts_b"):
+                        v     = getattr(pair, attr)
+                        scale = hp.vertex_noise * float(np.linalg.norm(v, axis=1).mean())
+                        noise = self._train_rng.randn(*v.shape).astype(np.float32) * scale
+                        setattr(pair, attr, v + noise)
+
+            with prof.phase("knn (cpu)"):
+                knn_a = compute_knn(pair.verts_a, hp.k)
+                knn_b = compute_knn(pair.verts_b, hp.k)
+
+            with prof.phase("patch build + transfer"):
+                va_t = torch.from_numpy(pair.verts_a).float().to(device)
+                vb_t = torch.from_numpy(pair.verts_b).float().to(device)
+                knn_a_t = torch.from_numpy(knn_a).long().to(device)
+                knn_b_t = torch.from_numpy(knn_b).long().to(device)
+                bd_a = Batch.from_data_list([build_patch_data(va_t, knn_a, device)]).to(device)
+                bd_b = Batch.from_data_list([build_patch_data(vb_t, knn_b, device)]).to(device)
+
+            with prof.phase("transformer forward"):
+                fwd_a = self.model._forward_pass(bd_a)
+                fwd_b = self.model._forward_pass(bd_b)
+
+            with prof.phase("laplacian assembly"):
+                S_A, M_A = (assemble_anisotropic_laplacian(fwd_a['grad_coeffs'], fwd_a['areas'], knn_a_t)
+                            if fwd_a.get('grad_coeffs') is not None
+                            else assemble_dense_stiffness_and_mass(
+                                fwd_a['stiffness_weights'], fwd_a['areas'],
+                                fwd_a['attention_mask'], bd_a.vertex_indices,
+                                bd_a.center_indices, getattr(bd_a, 'patch_idx', bd_a.batch)))
+                S_B, M_B = (assemble_anisotropic_laplacian(fwd_b['grad_coeffs'], fwd_b['areas'], knn_b_t)
+                            if fwd_b.get('grad_coeffs') is not None
+                            else assemble_dense_stiffness_and_mass(
+                                fwd_b['stiffness_weights'], fwd_b['areas'],
+                                fwd_b['attention_mask'], bd_b.vertex_indices,
+                                bd_b.center_indices, getattr(bd_b, 'patch_idx', bd_b.batch)))
+                if hp.sparsify_laplacian:
+                    if hp.k_sparsify is not None and hp.k_sparsify != hp.k:
+                        knn_sp_a = compute_knn(pair.verts_a, hp.k_sparsify)
+                        knn_sp_b = compute_knn(pair.verts_b, hp.k_sparsify)
+                        knn_sp_a_t = torch.from_numpy(knn_sp_a).long().to(device)
+                        knn_sp_b_t = torch.from_numpy(knn_sp_b).long().to(device)
+                        S_A = _sparsify_L_to_knn(S_A, knn_sp_a_t)
+                        S_B = _sparsify_L_to_knn(S_B, knn_sp_b_t)
+                    else:
+                        S_A = _sparsify_L_to_knn(S_A, knn_a_t)
+                        S_B = _sparsify_L_to_knn(S_B, knn_b_t)
+
+            with prof.phase("loss (linear solves + InfoNCE)"):
+                loss_nce, m = self.loss_fn(S_A, S_B, M_A, M_B, self._train_rng,
+                                           corr_a=pair.corr_a, corr_b=pair.corr_b)
+
+            with prof.phase("prox regularization"):
+                if hp.w_prox > 0 and hasattr(self, "ref_params"):
+                    cur = torch.cat([p.flatten() for p in self.model.parameters()])
+                    loss_prox = ((cur - self.ref_params) ** 2).sum() / self.ref_norm_sq
+                    loss = loss_nce + hp.w_prox * loss_prox
                 else:
                     loss_prox = torch.tensor(0.0, device=device)
                     loss = loss_nce
 
-                metrics['loss_prox'] = loss_prox.item()
-                metrics['loss_total'] = loss.item()
-
-                if torch.isnan(loss):
-                    print(f"  [Step {global_step}, pair {pair_idx}] NaN loss! Skipping pair.")
-                    continue
-
-                if global_step == 1 and pair_idx == 0:
-                    S_A.retain_grad()
-                    S_B.retain_grad()
-
-                (loss / loss_scale).backward()
-
-                step_metrics_list.append(metrics)
-                valid_pairs += 1
-
-            if valid_pairs == 0:
-                print(f"  [Step {global_step}] All pairs failed! Skipping.")
-                # If at accumulation boundary, clear stale grads
-                if (step + 1) % accum == 0 or step == args.steps_per_epoch - 1:
-                    optimizer.zero_grad()
+            if torch.isnan(loss):
                 continue
 
-            # Clip and step at end of accumulation window (or end of epoch)
-            is_accum_boundary = ((step + 1) % accum == 0) or (step == args.steps_per_epoch - 1)
-            if is_accum_boundary:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    args.grad_clip if args.grad_clip > 0 else float('inf'))
-                optimizer.step()
-            else:
-                grad_norm = torch.tensor(0.0)  # not stepping yet
+            total_loss = total_loss + loss
+            m["loss_prox"]  = loss_prox.item()
+            m["loss_total"] = loss.item()
+            metrics_list.append(m)
 
-            avg_step = {k: np.mean([m[k] for m in step_metrics_list])
-                        for k in step_metrics_list[0]}
-            avg_step['grad_norm'] = grad_norm.item()
-            epoch_losses.append(avg_step)
+        if hp.profile_steps > 0 and self.global_rank == 0:
+            step = self.global_step
+            if step % hp.profile_steps == 0:
+                print(prof.summary_str(step=step))
+            prof.reset()
 
-            lr = optimizer.param_groups[0]['lr']
-            log_file.write(f"{epoch},{global_step},{avg_step['loss_total']:.6e},"
-                           f"{avg_step['loss_nce']:.6e},{avg_step['loss_prox']:.6e},"
-                           f"{avg_step['train_acc']:.4f},"
-                           f"{avg_step.get('train_top3', 0):.4f},"
-                           f"{avg_step.get('train_top5', 0):.4f},"
-                           f"{avg_step.get('train_top10', 0):.4f},"
-                           f"{cross_ratio:.4f},"
-                           f"{avg_step['grad_norm']:.6e},{lr:.2e}\n")
+        if not metrics_list:
+            return None
 
-        scheduler.step()
+        total_loss = total_loss / len(metrics_list)
+        avg = {k: float(np.mean([d[k] for d in metrics_list])) for k in metrics_list[0]}
 
-        # Epoch summary
-        if epoch_losses:
-            avg = {k: np.mean([m[k] for m in epoch_losses]) for k in epoch_losses[0]}
-            elapsed = time.time() - epoch_start
-            print(f"Epoch {epoch:4d} │ loss={avg['loss_total']:8.4f} │ "
-                  f"nce={avg['loss_nce']:8.4f} │ prox={avg['loss_prox']:.4f} │ "
-                  f"top1={avg['train_acc']*100:5.1f}% │ "
-                  f"top3={avg.get('train_top3', 0)*100:5.1f}% │ "
-                  f"top5={avg.get('train_top5', 0)*100:5.1f}% │ "
-                  f"top10={avg.get('train_top10', 0)*100:5.1f}% │ "
-                  f"cross={cross_ratio:4.0%} │ "
-                  f"grad={avg.get('grad_norm', 0):9.2e} │ "
-                  f"lr={optimizer.param_groups[0]['lr']:.2e} │ "
-                  f"time={elapsed:5.1f}s")
+        self.log("train/loss",      avg["loss_total"],           sync_dist=True, prog_bar=True)
+        self.log("train/loss_nce",  avg["loss_nce"],             sync_dist=True)
+        self.log("train/loss_prox", avg["loss_prox"],            sync_dist=True)
+        self.log("train/top1",      avg["train_acc"],            sync_dist=True, prog_bar=True)
+        self.log("train/top3",      avg.get("train_top3", 0.0),  sync_dist=True)
+        self.log("train/top5",      avg.get("train_top5", 0.0),  sync_dist=True)
+        self.log("train/top10",     avg.get("train_top10", 0.0), sync_dist=True)
+        self.log("train/lr",
+                 self.trainer.optimizers[0].param_groups[0]["lr"],
+                 rank_zero_only=True)
+        return total_loss
 
-            if args.wandb:
-                wandb.log({
-                    "train/loss": avg['loss_total'],
-                    "train/loss_nce": avg['loss_nce'],
-                    "train/loss_prox": avg['loss_prox'],
-                    "train/top1": avg['train_acc'],
-                    "train/top3": avg.get('train_top3', 0),
-                    "train/top5": avg.get('train_top5', 0),
-                    "train/top10": avg.get('train_top10', 0),
-                    "train/grad_norm": avg.get('grad_norm', 0),
-                    "train/cross_ratio": cross_ratio,
-                    "train/lr": optimizer.param_groups[0]['lr'],
-                    "train/epoch_time": elapsed,
-                }, step=epoch)
-        else:
-            print(f"Epoch {epoch:4d} │ all steps failed")
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
-        # Validation
-        if epoch % args.eval_every == 0:
-            model.eval()
-            val_pairs = pair_gen.get_val_pairs(rng, args.val_poses_per_pair)
-            val_metrics_list = []
+    def on_validation_epoch_start(self) -> None:
+        self._val_outputs = []
 
-            print(f"  --- Validation (epoch {epoch}) ---")
-            for pair in val_pairs:
-                eval_pair = pair
-                if args.max_vertices > 0:
-                    eval_pair = subsample_pair(pair, args.max_vertices,
-                                               np.random.RandomState(_stable_hash(pair.name)))
-                val_metrics = evaluate_pair(
-                    model, eval_pair, args.k_pred, args.num_eigenvectors, device,
-                    k_sparsify=args.k_sparsify)
-                val_metrics_list.append(val_metrics)
+    @torch.no_grad()
+    def validation_step(self, batch: List[PairSample], batch_idx: int) -> None:
+        assert len(batch) == 1
+        pair = batch[0]
+        if self.hparams.max_vertices > 0:
+            pair = subsample_pair(pair, self.hparams.max_vertices,
+                                  np.random.RandomState(_stable_hash(pair.name)))
+        self._val_outputs.append(evaluate_pair(
+            self.model, pair, self.hparams.k,
+            self.hparams.num_eigenvectors, self.device,
+            k_sparsify=self.hparams.k_sparsify,
+            evaluators=self._evaluators,
+        ))
 
-                val_log.write(f"{epoch},{pair.name},"
-                              f"{val_metrics['accuracy']:.6f},"
-                              f"{val_metrics.get('top3_acc', 0):.6f},"
-                              f"{val_metrics.get('top5_acc', 0):.6f},"
-                              f"{val_metrics.get('top10_acc', 0):.6f},"
-                              f"{val_metrics['mean_error']:.6f},"
-                              f"{val_metrics['median_error']:.6f},"
-                              f"{val_metrics['ortho_error']:.6f},"
-                              f"{val_metrics['biject_error']:.6f},"
-                              f"{val_metrics['corr_error']:.6f},"
-                              f"{val_metrics['diag_ratio']:.6f}\n")
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_outputs:
+            return
 
-                sp_str = ""
-                if 'sp_accuracy' in val_metrics:
-                    sp_str = f"  │ sp: {_fmt_topk(val_metrics, prefix='sp_')}"
+        # --- DDP gather ---
+        sample     = self._val_outputs[0]
+        float_keys = [k for k, v in sample.items()
+                      if isinstance(v, (int, float)) and not k.startswith("_")]
+        local_t = torch.tensor(
+            [[d.get(k, float("nan")) for k in float_keys] for d in self._val_outputs],
+            device=self.device, dtype=torch.float32)
 
-                print(f"    {pair.name:<78s}  {_fmt_topk(val_metrics)}{sp_str}")
+        gathered = self.all_gather(local_t)
+        if gathered.dim() == 2:
+            gathered = gathered.unsqueeze(0)
+        all_flat = gathered.reshape(-1, len(float_keys))
 
-            val_log.flush()
-            mean_acc = np.mean([m['accuracy'] for m in val_metrics_list])
-            mean_err = np.mean([m['mean_error'] for m in val_metrics_list])
-            med_acc = np.median([m['accuracy'] for m in val_metrics_list])
-            val_topk = "  ".join(
-                f"top{k}={np.mean([m[f'top{k}_acc'] for m in val_metrics_list if f'top{k}_acc' in m])*100:5.1f}%"
-                for k in (3, 5, 10) if any(f'top{k}_acc' in m for m in val_metrics_list)
-            )
-            sp_summary = ""
-            val_sp_accs = [m['sp_accuracy'] for m in val_metrics_list if 'sp_accuracy' in m]
-            if val_sp_accs:
-                sp_ms = [m for m in val_metrics_list if 'sp_accuracy' in m]
-                mean_sp_acc = np.mean(val_sp_accs)
-                mean_sp_err = np.mean([m['sp_mean_error'] for m in sp_ms])
-                med_sp_acc = np.median(val_sp_accs)
-                sp_topk = "  ".join(
-                    f"top{k}={np.mean([m[f'sp_top{k}_acc'] for m in sp_ms if f'sp_top{k}_acc' in m])*100:5.1f}%"
-                    for k in (3, 5, 10) if any(f'sp_top{k}_acc' in m for m in sp_ms)
-                )
-                sp_summary = (f"  │ sp: top1={mean_sp_acc*100:5.1f}% (med={med_sp_acc*100:5.1f}%)"
-                              f"  {sp_topk}  Err={mean_sp_err:.4f}")
-            print(f"  Summary:          top1={mean_acc*100:5.1f}% (med={med_acc*100:5.1f}%)"
-                  f"  {val_topk}  Err={mean_err:.4f}{sp_summary}")
+        true_val_size = len(self.trainer.datamodule._val_dataset_specifications[0].dataset)
+        all_flat = all_flat[:true_val_size]
 
-            if args.wandb:
-                log_dict = {
-                    "val/top1": mean_acc,
-                    "val/median_top1": med_acc,
-                    "val/mean_error": mean_err,
-                }
-                for k in (3, 5, 10):
-                    vals = [m[f'top{k}_acc'] for m in val_metrics_list if f'top{k}_acc' in m]
-                    if vals:
-                        log_dict[f"val/top{k}"] = np.mean(vals)
-                if val_sp_accs:
-                    log_dict["val/sp_top1"] = mean_sp_acc
-                    log_dict["val/sp_median_top1"] = med_sp_acc
-                    log_dict["val/sp_mean_error"] = mean_sp_err
-                    for k in (3, 5, 10):
-                        sp_vals = [m[f'sp_top{k}_acc'] for m in sp_ms if f'sp_top{k}_acc' in m]
-                        if sp_vals:
-                            log_dict[f"val/sp_top{k}"] = np.mean(sp_vals)
-                wandb.log(log_dict, step=epoch)
+        all_metrics = [{k: all_flat[i, j].item() for j, k in enumerate(float_keys)}
+                       for i in range(all_flat.shape[0])]
 
-            # Use sparse acc for best-model when sparsified training
-            track_acc = mean_sp_acc if val_sp_accs else mean_acc
-            if track_acc > best_val_acc:
-                best_val_acc = track_acc
-                if use_lora:
-                    model.save_pretrained(output_dir / "best_lora_adapter")
-                else:
-                    torch.save(model.state_dict(), output_dir / "best_model.ckpt")
-                print(f"  ★ New best: {best_val_acc*100:5.1f}%")
+        # --- Summarise + print (shared code path) ---
+        summary = self._summarise_and_print(
+            all_metrics, f"Val epoch {self.current_epoch}",
+            silent=not self.trainer.is_global_zero)
 
-            model.train()
+        # --- Log to W&B / Lightning ---
+        for mk, mv in summary.items():
+            self.log(f"val/{mk}", mv, sync_dist=True)
 
-        # Periodic checkpoint
-        if hasattr(args, 'save_every') and epoch % args.save_every == 0:
-            if use_lora:
-                model.save_pretrained(output_dir / "last_lora_adapter")
-            else:
-                torch.save(model.state_dict(), output_dir / "last_model.ckpt")
+        # Prog-bar shortcuts
+        nn_prefix = "spectral_nn/"
+        has_nn = any(k.startswith(nn_prefix) for k in summary)
+        acc_key = f"{nn_prefix}accuracy" if has_nn else "accuracy"
+        self.log("val/top1", summary.get(acc_key, 0.0), prog_bar=True, sync_dist=True)
 
-    # Final save
-    if use_lora:
-        model.save_pretrained(output_dir / "last_lora_adapter")
-        # Also save merged model for convenient standalone loading
-        print("  Merging LoRA adapter into base model for standalone checkpoint...")
-        merged_model = model.merge_and_unload()
-        torch.save(merged_model.state_dict(), output_dir / "last_model_merged.ckpt")
-        # Re-merge best adapter too
-        best_adapter_dir = output_dir / "best_lora_adapter"
-        if best_adapter_dir.exists():
-            from peft import PeftModel
-            # Reload base model fresh, apply best adapter, merge
-            base_model = LaplacianTransformerModule.load_from_checkpoint(
-                args.checkpoint, map_location=device,
-                normalize_patch_features=True,
-                scale_areas_by_patch_size=True,
-            )
-            best_peft = PeftModel.from_pretrained(base_model, str(best_adapter_dir))
-            best_merged = best_peft.merge_and_unload()
-            torch.save(best_merged.state_dict(), output_dir / "best_model_merged.ckpt")
-            print(f"  Saved merged best model to: {output_dir / 'best_model_merged.ckpt'}")
-            del base_model, best_peft, best_merged
-    else:
-        torch.save(model.state_dict(), output_dir / "last_model.ckpt")
-    log_file.close()
-    val_log.close()
+        sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
+        if sp_key in summary:
+            self.log("val/sp_top1", summary[sp_key], prog_bar=True, sync_dist=True)
 
-    print(f"\nDone! Best val accuracy: {best_val_acc*100:5.1f}%")
-    print(f"Results in: {output_dir}")
-
-    if args.wandb:
-        artifact = wandb.Artifact(
-            name=f"best-model-{wandb.run.id}",
-            type="model",
-            description=f"Best finetuned model (val_acc={best_val_acc*100:.1f}%)"
-                        + (" [LoRA]" if use_lora else ""),
-        )
-        if use_lora:
-            best_merged = output_dir / "best_model_merged.ckpt"
-            if best_merged.exists():
-                artifact.add_file(str(best_merged))
-            best_adapter = output_dir / "best_lora_adapter"
-            if best_adapter.exists():
-                artifact.add_dir(str(best_adapter), name="lora_adapter")
-        else:
-            best_path = output_dir / "best_model.ckpt"
-            if best_path.exists():
-                artifact.add_file(str(best_path))
-        wandb.log_artifact(artifact)
-        wandb.finish()
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Fine-tune neural Laplacian for functional map correspondence",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    # Dataset choice
-    parser.add_argument("--dataset", type=str, default="smal",
-                        choices=["smal", "dt4d"],
-                        help="Dataset to use for training")
-
-    # SMAL-specific
-    parser.add_argument("--smal_model", type=str, default=None,
-                        help="Path to smal_CVPR2017.pkl (required for --dataset smal)")
-    parser.add_argument("--smal_data", type=str, default=None,
-                        help="Path to smal_CVPR2017_data.pkl (required for --dataset smal)")
-    parser.add_argument("--val_families", type=str, default=None,
-                        help="[SMAL] Comma-separated family indices for validation")
-
-    # DT4D-specific
-    parser.add_argument("--dt4d_root", type=str, default=None,
-                        help="Path to DeformingThings4DMatching root (required for --dataset dt4d)")
-    parser.add_argument("--val_categories", type=str, default=None,
-                        help="[DT4D] Comma-separated category names for validation")
-    parser.add_argument("--val_poses_per_pair", type=int, default=2,
-                        help="Number of pose combinations to evaluate per val category pair "
-                             "(default: 1). E.g. 5 → 13 pairs × 5 = 65 val evaluations.")
-
-    # Model
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to pretrained model checkpoint (also used for architecture when --random_init)")
-    parser.add_argument("--random_init", action="store_true",
-                        help="Reset all weights to random initialization after loading checkpoint architecture")
-    parser.add_argument("--keep_areas_head", action="store_true",
-                        help="[with --random_init] Preserve pretrained areas head weights during reset")
-    parser.add_argument("--k_pred", type=int, default=15)
-    parser.add_argument("--k_sparsify", type=int, default=None,
-                        help="kNN for sparsification mask (default: same as --k_pred). "
-                             "Must be <= --k_pred. Decouples the model's receptive field "
-                             "from the assembled operator's sparsity pattern.")
-    parser.add_argument("--num_eigenvectors", type=int, default=100)
-    parser.add_argument("--freeze_input_projection", action="store_true")
-    parser.add_argument("--freeze_areas_head", action="store_true",
-                        help="Freeze the areas head (keep pretrained weights, no gradient updates)")
-
-    # LoRA (Low-Rank Adaptation)
-    parser.add_argument("--use_lora", action="store_true",
-                        help="Fine-tune with LoRA adapters (requires: pip install peft)")
-    parser.add_argument("--lora_rank", type=int, default=8,
-                        help="LoRA rank (lower = fewer params, more constrained)")
-    parser.add_argument("--lora_alpha", type=int, default=16,
-                        help="LoRA alpha (scaling factor, typically 2x rank)")
-    parser.add_argument("--lora_dropout", type=float, default=0.0,
-                        help="Dropout applied to LoRA layers")
-    parser.add_argument("--lora_dora", action="store_true",
-                        help="Use DoRA (Weight-Decomposed LoRA) — decomposes into magnitude + direction")
-    parser.add_argument("--lora_rslora", action="store_true",
-                        help="Use rsLoRA (Rank-Stabilized) — scales by 1/√r, better for higher ranks")
-    parser.add_argument("--lora_target_modules", type=str, default="all-linear",
-                        help="Comma-separated module names to apply LoRA, or 'all-linear'")
-    parser.add_argument("--lora_list_modules", action="store_true",
-                        help="Print all nn.Linear module names and exit (for target discovery)")
-
-    # Training
-    parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--steps_per_epoch", type=int, default=10)
-    parser.add_argument("--pairs_per_step", type=int, default=1)
-    parser.add_argument("--grad_accum_steps", type=int, default=1,
-                        help="Accumulate gradients over this many steps before optimizer.step(). "
-                             "Effective batch = pairs_per_step * grad_accum_steps.")
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lr_T_max", type=int, default=200,
-                        help="T_max for CosineAnnealingLR (default: 200)")
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=10.0)
-    parser.add_argument("--max_vertices", type=int, default=0,
-                        help="Subsample shapes to this many vertices during training "
-                             "(0 = no subsampling). Useful for large meshes (e.g. DT4D ~8000).")
-    parser.add_argument("--vertex_noise", type=float, default=0.05,
-                        help="Gaussian noise scale relative to mean vertex radius "
-                             "(e.g. 0.005 = 0.5%%). Augments training poses for diversity.")
-    parser.add_argument("--pose_scale", type=float, default=0.3,
-                        help="[SMAL] Pose variation scale")
-    parser.add_argument("--seed", type=int, default=42)
-
-    # InfoNCE loss
-    parser.add_argument("--num_landmarks", type=int, default=512)
-    parser.add_argument("--alphas", type=str, default="1.0,10.0,100.0")
-    parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--num_sample_vertices", type=int, default=1024)
-    parser.add_argument("--loss_type", type=str, default="infonce",
-                        choices=["infonce", "dcl", "dclw"],
-                        help="Contrastive loss: infonce, dcl (decoupled), dclw (weighted decoupled)")
-    parser.add_argument("--dclw_sigma", type=float, default=0.5,
-                        help="[DCLW] Sigma for positive reweighting")
-    parser.add_argument("--w_prox", type=float, default=20.0)
-    parser.add_argument("--sparsify_laplacian", action="store_true")
-
-    # Curriculum
-    parser.add_argument("--cross_ratio_start", type=float, default=0.0)
-    parser.add_argument("--cross_ratio_end", type=float, default=0.5)
-    parser.add_argument("--curriculum_epochs", type=int, default=50)
-
-    # Evaluation & checkpointing
-    parser.add_argument("--eval_every", type=int, default=10)
-    parser.add_argument("--save_every", type=int, default=50)
-    parser.add_argument("--output_dir", type=str, default="fmap_finetune_runs")
-
-    # Device
-    parser.add_argument("--device", type=str, default="cuda")
-
-    # Weights & Biases
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="neural-laplacian-finetune")
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--wandb_tags", type=str, default=None)
-
-    args = parser.parse_args()
-
-    # Validate dataset-specific args
-    if args.dataset == "smal":
-        if not args.smal_model or not args.smal_data:
-            parser.error("--dataset smal requires --smal_model and --smal_data")
-    elif args.dataset == "dt4d":
-        if not args.dt4d_root:
-            parser.error("--dataset dt4d requires --dt4d_root")
-
-    if args.keep_areas_head and not args.random_init:
-        parser.error("--keep_areas_head only makes sense with --random_init")
-
-    if args.k_sparsify is not None:
-        if args.k_sparsify > args.k_pred:
-            parser.error(f"--k_sparsify ({args.k_sparsify}) must be <= --k_pred ({args.k_pred})")
-        if not args.sparsify_laplacian:
-            parser.error("--k_sparsify requires --sparsify_laplacian")
-
-    train(args)
-
-
-if __name__ == "__main__":
-    main()
+        primary = summary.get(sp_key, summary.get(acc_key, 0.0))
+        self.log("val/best_acc", primary, prog_bar=True, sync_dist=True)
