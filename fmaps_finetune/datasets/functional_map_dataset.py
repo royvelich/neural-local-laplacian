@@ -11,7 +11,7 @@ import pickle
 import sys
 import types
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -47,6 +47,14 @@ class PairSample:
     corr_a:  np.ndarray   # (C,) int
     corr_b:  np.ndarray   # (C,) int
     name:    str
+
+    # Optional: mesh faces for geodesic error computation.
+    # Set by the dataset loader when OBJ files provide faces.
+    faces_b: Optional[np.ndarray] = field(default=None, repr=False)  # (F, 3) int
+
+    # Set by subsample_pair when subsampling B:
+    _verts_b_full: Optional[np.ndarray] = field(default=None, repr=False)  # (N_B_orig, 3)
+    _idx_b: Optional[np.ndarray] = field(default=None, repr=False)         # (N_B_sub,) int
 
 
 class PairGenerator(ABC):
@@ -86,6 +94,10 @@ def subsample_pair(
     corr_a, corr_b   = pair.corr_a,  pair.corr_b
     n_a, n_b = len(verts_a), len(verts_b)
 
+    # Track original B data for geodesic computation
+    verts_b_full = pair._verts_b_full if pair._verts_b_full is not None else verts_b
+    idx_b_prev = pair._idx_b  # may already be set from a previous subsample
+
     if n_a > max_vertices:
         idx_a   = np.sort(rng.choice(n_a, max_vertices, replace=False))
         verts_a = verts_a[idx_a]
@@ -99,13 +111,21 @@ def subsample_pair(
         verts_b = verts_b[idx_b]
         remap_b = np.full(n_b, -1, dtype=np.int64)
         remap_b[idx_b] = np.arange(max_vertices)
+        # Compose with previous index map if it exists
+        idx_b_orig = idx_b_prev[idx_b] if idx_b_prev is not None else idx_b
     else:
         remap_b = np.arange(n_b, dtype=np.int64)
+        idx_b_orig = idx_b_prev  # unchanged
 
     new_ca = remap_a[corr_a]
     new_cb = remap_b[corr_b]
     valid  = (new_ca >= 0) & (new_cb >= 0)
-    return PairSample(verts_a, verts_b, new_ca[valid], new_cb[valid], pair.name)
+    return PairSample(
+        verts_a, verts_b, new_ca[valid], new_cb[valid], pair.name,
+        faces_b=pair.faces_b,
+        _verts_b_full=verts_b_full,
+        _idx_b=idx_b_orig,
+    )
 
 
 # =============================================================================
@@ -327,6 +347,30 @@ def _load_obj_vertices(path: str) -> np.ndarray:
     return np.array(verts, dtype=np.float32)
 
 
+def _load_obj(path: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Load vertices and faces from an OBJ file.
+
+    Returns:
+        vertices: (N, 3) float32
+        faces: (F, 3) int32 (0-indexed), or None if no faces found.
+    """
+    verts = []
+    faces = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('v '):
+                verts.append([float(x) for x in line.split()[1:4]])
+            elif line.startswith('f '):
+                # OBJ face indices are 1-based, may contain v/vt/vn
+                parts = line.split()[1:]
+                if len(parts) >= 3:
+                    idx = [int(p.split('/')[0]) - 1 for p in parts[:3]]
+                    faces.append(idx)
+    vertices = np.array(verts, dtype=np.float32)
+    face_arr = np.array(faces, dtype=np.int32) if faces else None
+    return vertices, face_arr
+
+
 def _load_vts(path: str) -> np.ndarray:
     """Load VTS file. Returns 0-indexed (R,) int32 array."""
     return np.loadtxt(path, dtype=np.int32) - 1
@@ -341,15 +385,17 @@ class DT4DCategory:
         corres_dir   = cat_dir / "corres"
         self.poses:    List[str]        = []
         self.vertices: List[np.ndarray] = []
+        self.faces:    List[Optional[np.ndarray]] = []
         self.vts:      List[np.ndarray] = []
 
         for obj_path in sorted(cat_dir.glob("*.obj")):
             vts_path = corres_dir / f"{obj_path.stem}.vts"
             if not vts_path.exists():
                 continue
+            verts, faces = _load_obj(str(obj_path))
             self.poses.append(obj_path.stem)
-            self.vertices.append(normalize_mesh_vertices(
-                _load_obj_vertices(str(obj_path))))
+            self.vertices.append(normalize_mesh_vertices(verts))
+            self.faces.append(faces)
             self.vts.append(_load_vts(str(vts_path)))
 
         self.num_poses = len(self.poses)
@@ -484,6 +530,7 @@ class DT4DPairGeneratorBase(PairGenerator):
                     verts_a=c_a.vertices[pa], verts_b=c_b.vertices[pb],
                     corr_a=corr_a, corr_b=corr_b,
                     name=f"val_{cat_a}:{c_a.poses[pa]}_vs_{cat_b}:{c_b.poses[pb]}",
+                    faces_b=c_b.faces[pb],
                 ))
         return pairs
 
@@ -615,6 +662,7 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
             verts_a=c_a.vertices[pose_a], verts_b=c_b.vertices[pose_b],
             corr_a=corr_a, corr_b=corr_b,
             name=f"{pair_type}_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
+            faces_b=c_b.faces[pose_b],
         )
 
     def _get_val_pair_list(self) -> List[Tuple[str, str]]:
@@ -661,6 +709,7 @@ class DT4DAnimalsPairGenerator(DT4DPairGeneratorBase):
             verts_a=cat.vertices[pose_a], verts_b=cat.vertices[pose_b],
             corr_a=corr_a, corr_b=corr_b,
             name=f"same_{cat_name}:{cat.poses[pose_a]}_vs_{cat_name}:{cat.poses[pose_b]}",
+            faces_b=cat.faces[pose_b],
         )
 
 

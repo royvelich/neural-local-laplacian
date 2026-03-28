@@ -47,6 +47,7 @@ class ShapePairEvaluator(ABC):
         mass_b: np.ndarray,          # (N_B,)
         vertices_b: np.ndarray,      # (N_B, 3)
         gt_corr: Optional[np.ndarray] = None,  # (N_A,) or None for identity
+        geo_dists: Optional[np.ndarray] = None, # (N_B, N_B) normalised geodesic dists
     ) -> Dict[str, float]:
         """Evaluate correspondence quality.
 
@@ -77,6 +78,7 @@ class ShapePairEvaluator(ABC):
         nn_indices: np.ndarray,
         gt_corr: np.ndarray,
         vertices_b: np.ndarray,
+        geo_dists: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         """Compute standard correspondence metrics from predicted map.
 
@@ -85,9 +87,13 @@ class ShapePairEvaluator(ABC):
             nn_indices: (N_A, n_query) top-k NN indices.
             gt_corr: (N_A,) ground-truth correspondence.
             vertices_b: (N_B, 3) vertex positions for error computation.
+            geo_dists: (N_B, N_B) pairwise geodesic distances on mesh B,
+                normalised by sqrt(surface area). If provided, geodesic
+                error metrics are added.
 
         Returns:
-            Dict with accuracy, top-k accuracy, mean/median error.
+            Dict with accuracy, top-k accuracy, mean/median error,
+            and geodesic metrics when geo_dists is available.
         """
         metrics: Dict[str, float] = {}
 
@@ -108,6 +114,14 @@ class ShapePairEvaluator(ABC):
         bb_diag = np.linalg.norm(vertices_b.max(0) - vertices_b.min(0))
         metrics['mean_error'] = float(errors.mean() / bb_diag)
         metrics['median_error'] = float(np.median(errors) / bb_diag)
+
+        # Geodesic error (Princeton benchmark)
+        if geo_dists is not None:
+            geo_err = geo_dists[pred_corr, gt_corr]
+            metrics['geo_mean_error'] = float(geo_err.mean())
+            for thresh in (0.01, 0.05, 0.10, 0.25):
+                pct_label = f"geo_at_{int(thresh*100):02d}pct"
+                metrics[pct_label] = float((geo_err <= thresh).mean())
 
         return metrics
 
@@ -188,6 +202,7 @@ class SpectralNNEvaluator(ShapePairEvaluator):
         mass_b: np.ndarray,
         vertices_b: np.ndarray,
         gt_corr: Optional[np.ndarray] = None,
+        geo_dists: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         n_a = eigvecs_a.shape[0]
         if gt_corr is None:
@@ -205,7 +220,8 @@ class SpectralNNEvaluator(ShapePairEvaluator):
             C, eigvecs_a[:n_a], eigvecs_b
         )
         metrics.update(self._pointwise_metrics(
-            pred_corr, nn_indices, gt_corr[:n_a], vertices_b
+            pred_corr, nn_indices, gt_corr[:n_a], vertices_b,
+            geo_dists=geo_dists,
         ))
 
         return metrics
@@ -361,6 +377,7 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
         mass_b: np.ndarray,
         vertices_b: np.ndarray,
         gt_corr: Optional[np.ndarray] = None,
+        geo_dists: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         """Evaluate via GeomFuM functional map pipeline.
 
@@ -372,7 +389,7 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
         try:
             return self._evaluate_impl(
                 eigvecs_a, eigvecs_b, eigvals_a, eigvals_b,
-                mass_a, mass_b, vertices_b, gt_corr,
+                mass_a, mass_b, vertices_b, gt_corr, geo_dists,
             )
         except Exception as e:
             print(f"    [FunctionalMapEvaluator] FAILED: {type(e).__name__}: {e}",
@@ -390,6 +407,7 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
         mass_b: np.ndarray,
         vertices_b: np.ndarray,
         gt_corr: Optional[np.ndarray] = None,
+        geo_dists: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         from geomfum.refine import ZoomOut
         from geomfum.forward_functional_map import ForwardFunctionalMap
@@ -467,7 +485,8 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
             fmap_np, eigvecs_a[:, :k_eval_a], eigvecs_b[:, :k_eval_b]
         )
         metrics.update(self._pointwise_metrics(
-            pred_corr, nn_indices, gt_corr[:n_a], vertices_b
+            pred_corr, nn_indices, gt_corr[:n_a], vertices_b,
+            geo_dists=geo_dists,
         ))
 
         # GeomFuM's P2pFromFmConverter sanity check.

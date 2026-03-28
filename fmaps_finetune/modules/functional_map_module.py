@@ -544,6 +544,51 @@ def _build_gt_corr_from_pair(pair: PairSample) -> Optional[np.ndarray]:
     return gt_corr
 
 
+def _compute_geodesic_dists(pair: PairSample) -> Optional[np.ndarray]:
+    """Compute normalised geodesic distance matrix on (subsampled) mesh B.
+
+    Uses the heat method (potpourri3d) on the original mesh for accurate
+    geodesics that can cut across face interiors. Distances are normalised
+    by sqrt(total surface area).
+
+    Returns:
+        (N_B_sub, N_B_sub) matrix, or None if faces are not available.
+    """
+    if pair.faces_b is None:
+        return None
+
+    try:
+        import potpourri3d as pp3d
+    except ImportError:
+        print("    [geodesic] potpourri3d not installed — skipping geodesic metrics",
+              flush=True)
+        return None
+
+    verts_full = pair._verts_b_full if pair._verts_b_full is not None else pair.verts_b
+    faces = pair.faces_b
+    idx_b = pair._idx_b if pair._idx_b is not None else np.arange(len(pair.verts_b))
+    n_sub = len(idx_b)
+
+    # Heat method solver on the full mesh
+    solver = pp3d.MeshHeatMethodDistanceSolver(verts_full, faces)
+
+    # Compute geodesic distances from each subsampled vertex
+    geo_sub = np.zeros((n_sub, n_sub), dtype=np.float32)
+    for i, src in enumerate(idx_b):
+        dists_from_src = solver.compute_distance(int(src))  # (N_full,)
+        geo_sub[i] = dists_from_src[idx_b]
+
+    # Normalise by sqrt(surface area)
+    v0 = verts_full[faces[:, 0]]
+    v1 = verts_full[faces[:, 1]]
+    v2 = verts_full[faces[:, 2]]
+    area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum()
+    sqrt_area = np.sqrt(max(area, 1e-12))
+    geo_sub /= sqrt_area
+
+    return geo_sub
+
+
 @torch.no_grad()
 def _eigh_from_dense_L(
     L: torch.Tensor, M_diag_t: torch.Tensor, num_eigenvectors: int,
@@ -586,6 +631,7 @@ def evaluate_pair(
     device: torch.device,
     k_sparsify: Optional[int] = None,
     evaluators: Optional[List] = None,
+    geo_dists: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Evaluate correspondence quality using functional maps (non-differentiable).
 
@@ -594,6 +640,8 @@ def evaluate_pair(
         evaluators: List of ShapePairEvaluator instances. When provided,
             runs each evaluator and prefixes metrics with evaluator.name.
             When None, uses the legacy _correspondence_metrics path.
+        geo_dists: Precomputed normalised geodesic distance matrix on B.
+            If None and pair has faces_b, computes on the fly.
     """
     n_a             = len(pair.verts_a)
     is_gradient_mode = False
@@ -648,6 +696,8 @@ def evaluate_pair(
             dense_bases[label] = (evecs, evals, M_np)
 
     gt_corr = _build_gt_corr_from_pair(pair)
+    if geo_dists is None:
+        geo_dists = _compute_geodesic_dists(pair)
     evA_d, evalsA_d, mA = dense_bases['A']
     evB_d, evalsB_d, mB = dense_bases['B']
 
@@ -658,6 +708,7 @@ def evaluate_pair(
             ev_metrics = evaluator.evaluate(
                 evA_d, evB_d, evalsA_d, evalsB_d,
                 mA, mB, pair.verts_b, gt_corr=gt_corr,
+                geo_dists=geo_dists,
             )
             for mk, mv in ev_metrics.items():
                 metrics[f"{evaluator.name}/{mk}"] = mv
@@ -670,6 +721,7 @@ def evaluate_pair(
                 sp_metrics = evaluator.evaluate(
                     evA_sp, evB_sp, evalsA_sp, evalsB_sp,
                     mA, mB, pair.verts_b, gt_corr=gt_corr,
+                    geo_dists=geo_dists,
                 )
                 for mk, mv in sp_metrics.items():
                     metrics[f"sp_{evaluator.name}/{mk}"] = mv
@@ -682,6 +734,7 @@ def evaluate_pair(
                 iso_metrics = evaluator.evaluate(
                     evA_iso, evB_iso, evalsA_iso, evalsB_iso,
                     mA, mB, pair.verts_b, gt_corr=gt_corr,
+                    geo_dists=geo_dists,
                 )
                 for mk, mv in iso_metrics.items():
                     metrics[f"iso_{evaluator.name}/{mk}"] = mv
@@ -707,6 +760,7 @@ def evaluate_pair_robust(
     num_eigenvectors: int,
     n_neighbors: int = 30,
     evaluators: Optional[List] = None,
+    geo_dists: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Evaluate using robust Laplacian (baseline, no model).
 
@@ -714,6 +768,8 @@ def evaluate_pair_robust(
         evaluators: List of ShapePairEvaluator instances. When provided,
             runs each evaluator and prefixes metrics with evaluator.name.
             When None, uses the legacy _correspondence_metrics path.
+        geo_dists: Precomputed normalised geodesic distance matrix on B.
+            If None and pair has faces_b, computes on the fly.
     """
     import robust_laplacian
     n_a = len(pair.verts_a)
@@ -724,6 +780,8 @@ def evaluate_pair_robust(
         bases[label] = (evecs, evals, np.array(M.diagonal()).flatten())
 
     gt_corr = _build_gt_corr_from_pair(pair)
+    if geo_dists is None:
+        geo_dists = _compute_geodesic_dists(pair)
     evA, evalsA, mA = bases['A']
     evB, evalsB, mB = bases['B']
 
@@ -733,6 +791,7 @@ def evaluate_pair_robust(
             ev_metrics = evaluator.evaluate(
                 evA, evB, evalsA, evalsB,
                 mA, mB, pair.verts_b, gt_corr=gt_corr,
+                geo_dists=geo_dists,
             )
             for mk, mv in ev_metrics.items():
                 metrics[f"{evaluator.name}/{mk}"] = mv
@@ -906,6 +965,10 @@ class FunctionalMapModule(LaplacianModuleBase):
                 fmap_lmbda=geomfum_fmap_lmbda,
                 fmap_resolvent_gamma=geomfum_fmap_resolvent_gamma,
             ))
+
+        # Cache for geodesic distance matrices (pair_name → (N_sub, N_sub) array)
+        # Precomputed in on_fit_start, reused in validation_step.
+        self._geo_cache: Dict[str, Optional[np.ndarray]] = {}
 
     # ------------------------------------------------------------------
     # Setup
@@ -1094,6 +1157,15 @@ class FunctionalMapModule(LaplacianModuleBase):
                 if gfm_acc is not None:
                     parts.append(f"  gfm={gfm_acc*100:5.1f}%")
 
+                # Geodesic metrics (Princeton benchmark)
+                geo_err = summary.get(f"{full_prefix}/geo_mean_error")
+                if geo_err is not None:
+                    geo_parts = []
+                    for thresh in (1, 5, 10, 25):
+                        val = summary.get(f"{full_prefix}/geo_at_{thresh:02d}pct", 0.0)
+                        geo_parts.append(f"@{thresh}%={val*100:5.1f}%")
+                    parts.append(f"  │ {'  '.join(geo_parts)}  gErr={geo_err:.4f}")
+
                 parts.append(fail_str)
 
                 print("".join(parts), flush=True)
@@ -1131,6 +1203,17 @@ class FunctionalMapModule(LaplacianModuleBase):
                                       np.random.RandomState(_stable_hash(pair.name)))
             return pair
 
+        # Precompute geodesic distances for all val pairs (once)
+        print("\n  Precomputing geodesic distances on mesh B...", flush=True)
+        t0_geo = time.perf_counter()
+        for p in val_pairs:
+            sub_p = _subsample(p)
+            self._geo_cache[p.name] = _compute_geodesic_dists(sub_p)
+        dt_geo = time.perf_counter() - t0_geo
+        n_with_geo = sum(1 for v in self._geo_cache.values() if v is not None)
+        print(f"    Done: {n_with_geo}/{len(val_pairs)} pairs with faces "
+              f"({dt_geo:.1f}s)", flush=True)
+
         # ── Robust Laplacian baseline ──────────────────────────────────────────
         try:
             import robust_laplacian  # noqa: F401
@@ -1144,7 +1227,8 @@ class FunctionalMapModule(LaplacianModuleBase):
                       end="", flush=True)
                 t0_ = time.perf_counter()
                 m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
-                                         evaluators=self._evaluators)
+                                         evaluators=self._evaluators,
+                                         geo_dists=self._geo_cache.get(p.name))
                 dt_ = time.perf_counter() - t0_
                 robust_metrics.append(m)
                 print(f" {dt_:.1f}s", flush=True)
@@ -1171,7 +1255,8 @@ class FunctionalMapModule(LaplacianModuleBase):
                 m = evaluate_pair(self.model, sub_p,
                                   hp.k, hp.num_eigenvectors, device,
                                   k_sparsify=hp.k_sparsify,
-                                  evaluators=self._evaluators)
+                                  evaluators=self._evaluators,
+                                  geo_dists=self._geo_cache.get(p.name))
                 dt_ = time.perf_counter() - t0_
                 ep0_metrics.append(m)
                 print(f" {dt_:.1f}s", flush=True)
@@ -1326,6 +1411,7 @@ class FunctionalMapModule(LaplacianModuleBase):
             self.hparams.num_eigenvectors, self.device,
             k_sparsify=self.hparams.k_sparsify,
             evaluators=self._evaluators,
+            geo_dists=self._geo_cache.get(pair.name),
         ))
 
     def on_validation_epoch_end(self) -> None:

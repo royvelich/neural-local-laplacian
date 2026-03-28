@@ -32,8 +32,8 @@ module:
   k_sparsify: ${globals.k_sparsify}  # null = reuse k; integer < k = separate kNN for mask
 
   # ── Training augmentation ───────────────────────────────────────────────
-  max_vertices: 2000               # 0 = no subsampling; lower → faster O(N³) solve
-  max_vertices_val: 5000              # 0 = use max_vertices; set higher for better val quality
+  max_vertices: 3000               # 0 = no subsampling; lower → faster O(N³) solve
+  max_vertices_val: 4000              # 0 = use max_vertices; set higher for better val quality
   vertex_noise: 0.0               # Gaussian noise scale relative to mean vertex radius
 
   # ── Proximity regularisation ────────────────────────────────────────────
