@@ -387,6 +387,7 @@ class SoftCorrespondenceLoss(nn.Module):
         landmark_seed: int = 0,
         loss_type: str = "infonce",
         dclw_sigma: float = 0.5,
+        weight: float = 1.0,
     ):
         super().__init__()
         self.num_landmarks       = num_landmarks
@@ -396,6 +397,7 @@ class SoftCorrespondenceLoss(nn.Module):
         self.landmark_seed       = landmark_seed
         self.loss_type           = loss_type
         self.dclw_sigma          = dclw_sigma
+        self.weight              = weight
 
     def _compute_descriptors(self, S, M, E) -> torch.Tensor:
         parts = []
@@ -474,6 +476,46 @@ class SoftCorrespondenceLoss(nn.Module):
         metrics = {'loss_total': loss_nce.item(), 'loss_nce': loss_nce.item(),
                    'train_acc': train_acc, **topk_accs}
         return loss_nce, metrics
+
+
+class IsospectralityLoss(nn.Module):
+    """Isospectrality loss: penalise eigenvalue mismatch between two Laplacians.
+
+    Two shapes from the same category should have similar LBO spectra
+    (isometry invariance). Differentiable via torch.linalg.eigvalsh —
+    eigenvalue gradients are stable even for repeated eigenvalues.
+
+    This is an unsupervised loss — it does not require GT correspondences.
+    """
+
+    def __init__(self, num_eigenvalues: int = 30, weight: float = 1.0):
+        super().__init__()
+        self.num_eigenvalues = num_eigenvalues
+        self.weight = weight
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        k = min(self.num_eigenvalues, S_A.shape[0] - 1, S_B.shape[0] - 1)
+        if k < 1:
+            zero = torch.tensor(0.0, device=S_A.device)
+            return zero, {'loss_iso': 0.0}
+
+        eigs = []
+        for S, M_diag in [(S_A, M_A), (S_B, M_B)]:
+            M_inv_sqrt = 1.0 / M_diag.sqrt().clamp(min=1e-8)
+            L_std = S * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
+            L_std = 0.5 * (L_std + L_std.T)
+            all_eigs = torch.linalg.eigvalsh(L_std)
+            eigs.append(all_eigs[1:k+1])  # skip λ_0 ≈ 0
+
+        loss = F.mse_loss(eigs[0], eigs[1])
+        return loss, {'loss_iso': loss.item()}
 
 
 # =============================================================================
@@ -675,6 +717,7 @@ def evaluate_pair(
     k_sparsify: Optional[int] = None,
     evaluators: Optional[List] = None,
     geo_cache = None,
+    eval_variants: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """Evaluate correspondence quality using functional maps (non-differentiable).
 
@@ -685,7 +728,14 @@ def evaluate_pair(
             When None, uses the legacy _correspondence_metrics path.
         geo_cache: Precomputed GeodesicCache for mesh B.
             If None and pair has faces_b, builds on the fly.
+        eval_variants: Which eigenbasis variants to evaluate.
+            Subset of ['dense', 'sp', 'iso']. None = all three.
     """
+    if eval_variants is None:
+        eval_variants = ['dense', 'sp', 'iso']
+    do_dense = 'dense' in eval_variants
+    do_sp    = 'sp' in eval_variants
+    do_iso   = 'iso' in eval_variants
     n_a             = len(pair.verts_a)
     is_gradient_mode = False
     dense_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}   # (evecs, evals, mass)
@@ -704,25 +754,27 @@ def evaluate_pair(
             knn_t     = torch.from_numpy(knn_np).long().to(device)
             L, M_diag = assemble_anisotropic_laplacian(fwd['grad_coeffs'],
                                                        fwd['areas'], knn_t)
-            evals_d, evecs_d = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
             M_np = M_diag.cpu().numpy()
-            dense_bases[label] = (evecs_d, evals_d, M_np)
 
-            # Sparsify with a separate kNN graph when k_sparsify is set
-            if k_sparsify is not None and k_sparsify != k:
-                knn_sp_np = compute_knn(verts, k_sparsify)
-                knn_sp_t = torch.from_numpy(knn_sp_np).long().to(device)
-                L_sp = _sparsify_L_to_knn(L, knn_sp_t)
-            else:
-                L_sp = _sparsify_L_to_knn(L, knn_t)
-            evals_sp, evecs_sp = _eigh_from_sparse_L(L_sp, M_diag, num_eigenvectors)
-            sparse_bases[label] = (evecs_sp, evals_sp, M_np)
+            if do_dense:
+                evals_d, evecs_d = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
+                dense_bases[label] = (evecs_d, evals_d, M_np)
 
-            # Isotropic Laplacian: w_ij = area_i * ||g_ij||^2 (PSD, sparse)
-            L_iso, M_iso = assemble_isotropic_laplacian(
-                fwd['grad_coeffs'], fwd['areas'], knn_t)
-            evals_iso, evecs_iso = _eigh_from_sparse_L(L_iso, M_iso, num_eigenvectors)
-            iso_bases[label] = (evecs_iso, evals_iso, M_np)
+            if do_sp:
+                if k_sparsify is not None and k_sparsify != k:
+                    knn_sp_np = compute_knn(verts, k_sparsify)
+                    knn_sp_t = torch.from_numpy(knn_sp_np).long().to(device)
+                    L_sp = _sparsify_L_to_knn(L, knn_sp_t)
+                else:
+                    L_sp = _sparsify_L_to_knn(L, knn_t)
+                evals_sp, evecs_sp = _eigh_from_sparse_L(L_sp, M_diag, num_eigenvectors)
+                sparse_bases[label] = (evecs_sp, evals_sp, M_np)
+
+            if do_iso:
+                L_iso, M_iso = assemble_isotropic_laplacian(
+                    fwd['grad_coeffs'], fwd['areas'], knn_t)
+                evals_iso, evecs_iso = _eigh_from_sparse_L(L_iso, M_iso, num_eigenvectors)
+                iso_bases[label] = (evecs_iso, evals_iso, M_np)
         else:
             batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
             S, M = assemble_stiffness_and_mass_matrices(
@@ -741,22 +793,30 @@ def evaluate_pair(
     gt_corr = _build_gt_corr_from_pair(pair)
     if geo_cache is None:
         geo_cache = _build_geo_cache(pair)
-    evA_d, evalsA_d, mA = dense_bases['A']
-    evB_d, evalsB_d, mB = dense_bases['B']
+
+    # Get mass from whichever variant is available
+    first_bases = dense_bases or sparse_bases or iso_bases
+    mA = first_bases['A'][2]
+    mB = first_bases['B'][2]
 
     # --- Use evaluators if provided ---
     if evaluators is not None:
         metrics = {}
-        for evaluator in evaluators:
-            ev_metrics = evaluator.evaluate(
-                evA_d, evB_d, evalsA_d, evalsB_d,
-                mA, mB, pair.verts_b, gt_corr=gt_corr,
-                geo_cache=geo_cache,
-            )
-            for mk, mv in ev_metrics.items():
-                metrics[f"{evaluator.name}/{mk}"] = mv
 
-        # Also run evaluators on sparse bases
+        # Dense variant
+        if dense_bases:
+            evA_d, evalsA_d, _ = dense_bases['A']
+            evB_d, evalsB_d, _ = dense_bases['B']
+            for evaluator in evaluators:
+                ev_metrics = evaluator.evaluate(
+                    evA_d, evB_d, evalsA_d, evalsB_d,
+                    mA, mB, pair.verts_b, gt_corr=gt_corr,
+                    geo_cache=geo_cache,
+                )
+                for mk, mv in ev_metrics.items():
+                    metrics[f"{evaluator.name}/{mk}"] = mv
+
+        # Sparse variant
         if is_gradient_mode and sparse_bases:
             evA_sp, evalsA_sp, _ = sparse_bases['A']
             evB_sp, evalsB_sp, _ = sparse_bases['B']
@@ -769,7 +829,7 @@ def evaluate_pair(
                 for mk, mv in sp_metrics.items():
                     metrics[f"sp_{evaluator.name}/{mk}"] = mv
 
-        # Also run evaluators on isotropic bases (PSD, sparse)
+        # Isotropic variant
         if is_gradient_mode and iso_bases:
             evA_iso, evalsA_iso, _ = iso_bases['A']
             evB_iso, evalsB_iso, _ = iso_bases['B']
@@ -785,8 +845,13 @@ def evaluate_pair(
         return metrics
 
     # --- Legacy path (backward compatible) ---
-    metrics = _correspondence_metrics(evA_d, evB_d, mA, mB,
-                                      pair.verts_b, n_a, gt_corr=gt_corr)
+    if dense_bases:
+        evA_d, evalsA_d, _ = dense_bases['A']
+        evB_d, evalsB_d, _ = dense_bases['B']
+        metrics = _correspondence_metrics(evA_d, evB_d, mA, mB,
+                                          pair.verts_b, n_a, gt_corr=gt_corr)
+    else:
+        metrics = {}
     if is_gradient_mode and sparse_bases:
         evA_sp, _, _ = sparse_bases['A']
         evB_sp, _, _ = sparse_bases['B']
@@ -946,7 +1011,8 @@ class FunctionalMapModule(LaplacianModuleBase):
         self,
         checkpoint_path: str,
         optimizer_cfg: DictConfig,
-        loss_fn: SoftCorrespondenceLoss,
+        losses: Optional[List[nn.Module]] = None,
+        loss_fn: Optional[SoftCorrespondenceLoss] = None,  # backward compat
         scheduler_cfg: Optional[DictConfig] = None,
         random_init: bool = False,
         keep_areas_head: bool = False,
@@ -972,6 +1038,9 @@ class FunctionalMapModule(LaplacianModuleBase):
         lora_dora: bool = False,
         lora_rslora: bool = False,
         profile_steps: int = 0,   # print profiler summary every N steps (0 = off)
+        # Evaluation control
+        eval_only: bool = False,       # run baselines only, then stop (no training)
+        eval_variants: Optional[List[str]] = None,  # ['dense', 'sp', 'iso'] or subset
         # GeomFuM evaluation (optional)
         use_geomfum_eval: bool = False,
         geomfum_descriptors: Optional[List[str]] = None,
@@ -985,8 +1054,18 @@ class FunctionalMapModule(LaplacianModuleBase):
     ):
         super().__init__(optimizer_cfg=optimizer_cfg,
                          scheduler_cfg=scheduler_cfg, **kwargs)
-        self.save_hyperparameters(ignore=["loss_fn", "optimizer_cfg", "scheduler_cfg"])
-        self.loss_fn: SoftCorrespondenceLoss = loss_fn
+        self.save_hyperparameters(ignore=["losses", "loss_fn", "optimizer_cfg", "scheduler_cfg"])
+
+        # Build loss list: prefer explicit `losses`, fall back to `loss_fn`
+        if losses is not None:
+            self._losses = nn.ModuleList(losses)
+        elif loss_fn is not None:
+            if not hasattr(loss_fn, 'weight'):
+                loss_fn.weight = 1.0
+            self._losses = nn.ModuleList([loss_fn])
+        else:
+            raise ValueError("Must provide either `losses` or `loss_fn`")
+
         self.model: Optional[nn.Module] = None
         self._train_rng: Optional[np.random.RandomState] = None
         self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
@@ -1323,7 +1402,8 @@ class FunctionalMapModule(LaplacianModuleBase):
                                       hp.k, hp.num_eigenvectors, device,
                                       k_sparsify=hp.k_sparsify,
                                       evaluators=self._evaluators,
-                                      geo_cache=self._geo_cache.get(p.name))
+                                      geo_cache=self._geo_cache.get(p.name),
+                                      eval_variants=hp.eval_variants)
                     dt_ = time.perf_counter() - t0_
                     ep0_metrics.append(m)
                     print(f" {dt_:.1f}s", flush=True)
@@ -1334,6 +1414,11 @@ class FunctionalMapModule(LaplacianModuleBase):
             self.logger.log_metrics(
                 {f"baseline/model/{ds_name}/{k}": v
                  for k, v in ep0_summary.items()}, step=0)
+
+        # ── Eval-only mode: stop after baselines ──────────────────────────
+        if hp.eval_only:
+            print("\n  [eval_only=true] Baselines complete — stopping.", flush=True)
+            self.trainer.should_stop = True
 
     # ------------------------------------------------------------------
     # Curriculum
@@ -1414,18 +1499,23 @@ class FunctionalMapModule(LaplacianModuleBase):
                         S_A = _sparsify_L_to_knn(S_A, knn_a_t)
                         S_B = _sparsify_L_to_knn(S_B, knn_b_t)
 
-            with prof.phase("loss (linear solves + InfoNCE)"):
-                loss_nce, m = self.loss_fn(S_A, S_B, M_A, M_B, self._train_rng,
-                                           corr_a=pair.corr_a, corr_b=pair.corr_b)
+            with prof.phase("losses"):
+                pair_loss = torch.tensor(0.0, device=device)
+                m: Dict[str, float] = {}
+                for loss_fn in self._losses:
+                    l, lm = loss_fn(S_A, S_B, M_A, M_B, self._train_rng,
+                                    corr_a=pair.corr_a, corr_b=pair.corr_b)
+                    pair_loss = pair_loss + loss_fn.weight * l
+                    m.update(lm)
 
             with prof.phase("prox regularization"):
                 if hp.w_prox > 0 and hasattr(self, "ref_params"):
                     cur = torch.cat([p.flatten() for p in self.model.parameters()])
                     loss_prox = ((cur - self.ref_params) ** 2).sum() / self.ref_norm_sq
-                    loss = loss_nce + hp.w_prox * loss_prox
+                    loss = pair_loss + hp.w_prox * loss_prox
                 else:
                     loss_prox = torch.tensor(0.0, device=device)
-                    loss = loss_nce
+                    loss = pair_loss
 
             if torch.isnan(loss):
                 continue
@@ -1448,9 +1538,12 @@ class FunctionalMapModule(LaplacianModuleBase):
         avg = {k: float(np.mean([d[k] for d in metrics_list])) for k in metrics_list[0]}
 
         self.log("train/loss",      avg["loss_total"],           sync_dist=True, prog_bar=True)
-        self.log("train/loss_nce",  avg["loss_nce"],             sync_dist=True)
         self.log("train/loss_prox", avg["loss_prox"],            sync_dist=True)
-        self.log("train/top1",      avg["train_acc"],            sync_dist=True, prog_bar=True)
+        # Log all loss-specific metrics (loss_nce, loss_iso, etc.)
+        for mk in avg:
+            if mk.startswith("loss_") and mk not in ("loss_total", "loss_prox"):
+                self.log(f"train/{mk}", avg[mk], sync_dist=True)
+        self.log("train/top1",      avg.get("train_acc", 0.0),   sync_dist=True, prog_bar=True)
         self.log("train/top3",      avg.get("train_top3", 0.0),  sync_dist=True)
         self.log("train/top5",      avg.get("train_top5", 0.0),  sync_dist=True)
         self.log("train/top10",     avg.get("train_top10", 0.0), sync_dist=True)
@@ -1483,6 +1576,7 @@ class FunctionalMapModule(LaplacianModuleBase):
             k_sparsify=self.hparams.k_sparsify,
             evaluators=self._evaluators,
             geo_cache=self._geo_cache.get(pair.name),
+            eval_variants=self.hparams.eval_variants,
         ))
 
     def on_validation_epoch_end(self) -> None:
