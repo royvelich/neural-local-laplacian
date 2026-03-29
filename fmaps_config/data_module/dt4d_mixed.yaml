@@ -38,7 +38,7 @@ module:
           _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
           root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
           categories: [bear3EP, crocodileOPW, duck, foxXAT, hippoDG, rabbit7L6, tigerD8H, zebraBM]
-        val_poses_per_pair: 5
+        val_poses_per_pair: 4
         seed: ${globals.training_seed}
       batch_size: 1
       num_workers: 0
@@ -48,20 +48,20 @@ module:
         _partial_: true
 
     # [1] Humanoids — cross-category pairs
-    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
-      dataset:
-        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
-        pair_generator:
-          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
-          root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching"
-          categories: null              # discover all humanoid categories
-          exclude_categories: null
-          enable_cross_category: true
-        val_poses_per_pair: 2
-        seed: ${globals.training_seed}
-      batch_size: 1
-      num_workers: 0
-      shuffle: false
-      collate_fn:
-        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
-        _partial_: true
+#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+#      dataset:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+#        pair_generator:
+#          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+#          root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching"
+#          categories: null              # discover all humanoid categories
+#          exclude_categories: null
+#          enable_cross_category: true
+#        val_poses_per_pair: 2
+#        seed: ${globals.training_seed}
+#      batch_size: 1
+#      num_workers: 0
+#      shuffle: false
+#      collate_fn:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+#        _partial_: true

@@ -10,16 +10,23 @@ module:
   num_eigenvectors: ${globals.num_eigenvectors}
   seed: ${globals.training_seed}
 
-  # ── Contrastive loss ────────────────────────────────────────────────────
-  # Hydra recursively instantiates this before passing to __init__.
-  loss_fn:
-    _target_: fmaps_finetune.modules.functional_map_module.SoftCorrespondenceLoss
-    num_landmarks: 128
-    alphas: [1.0, 10.0, 100.0]    # diffusion scales α for fingerprint descriptors
-    temperature: 0.1
-    num_sample_vertices: 512      # vertices subsampled for contrastive ranking per step
-    loss_type: infonce             # infonce | dcl | dclw
-    dclw_sigma: 0.1                # only used when loss_type=dclw
+  # ── Losses ──────────────────────────────────────────────────────────────
+  # List of loss modules, each with its own weight. The training step
+  # computes: total_loss = Σ loss_i.weight * loss_i(S_A, S_B, M_A, M_B, ...)
+  losses:
+    - _target_: fmaps_finetune.modules.functional_map_module.SoftCorrespondenceLoss
+      weight: 1.0
+      num_landmarks: 256
+      alphas: [0.1, 1.0, 10.0]    # diffusion scales α for fingerprint descriptors
+      temperature: 0.1
+      num_sample_vertices: 1024      # vertices subsampled for contrastive ranking per step
+      loss_type: infonce             # infonce | dcl | dclw
+      dclw_sigma: 0.1                # only used when loss_type=dclw
+
+    # Uncomment to add isospectrality loss (unsupervised, no GT needed):
+#     - _target_: fmaps_finetune.modules.functional_map_module.IsospectralityLoss
+#       weight: 1.0
+#       num_eigenvalues: 60
 
   # ── Model initialisation ────────────────────────────────────────────────
   random_init: false               # reset all weights after loading architecture
@@ -28,16 +35,16 @@ module:
   freeze_areas_head: false
 
   # ── Laplacian assembly ──────────────────────────────────────────────────
-  sparsify_laplacian: false        # zero out off-kNN entries in the dense G^TMG
+  sparsify_laplacian: true        # zero out off-kNN entries in the dense G^TMG
   k_sparsify: ${globals.k_sparsify}  # null = reuse k; integer < k = separate kNN for mask
 
   # ── Training augmentation ───────────────────────────────────────────────
-  max_vertices: 3000               # 0 = no subsampling; lower → faster O(N³) solve
-  max_vertices_val: 4000              # 0 = use max_vertices; set higher for better val quality
+  max_vertices: 2000               # 0 = no subsampling; lower → faster O(N³) solve
+  max_vertices_val: 0              # 0 = use max_vertices; set higher for better val quality
   vertex_noise: 0.0               # Gaussian noise scale relative to mean vertex radius
 
   # ── Proximity regularisation ────────────────────────────────────────────
-  w_prox: 10.0                     # 0.0 to disable; ignored with random_init or use_lora
+  w_prox: 0.0                     # 0.0 to disable; ignored with random_init or use_lora
 
   # ── Cross-pair curriculum ───────────────────────────────────────────────
   # Linearly ramps the fraction of cross-category pairs from start → end
