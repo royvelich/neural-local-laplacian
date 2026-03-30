@@ -922,31 +922,30 @@ def get_mesh_geometry_info(
     AND the mesh forms a single connected component. Boundary edges (shared
     by 1 face) are allowed (manifold with boundary).
 
+    Uses load_mesh() for loading consistency, then reconstructs a trimesh
+    object for the topology checks.
+
     Returns None if the mesh could not be loaded.
     """
-    import trimesh
     try:
-        loaded = trimesh.load(str(file_path), process=False, force='mesh')
+        vertices, faces, _ = load_mesh(str(file_path))
     except Exception as e:
         print(f"  Warning: could not load {file_path.name}: {e}")
         return None
 
-    if not isinstance(loaded, trimesh.Trimesh):
-        print(f"  Warning: unsupported mesh type {type(loaded).__name__} "
-              f"for {file_path.name}")
-        return None
+    num_vertices = len(vertices)
+    num_faces = len(faces)
 
-    num_vertices = len(loaded.vertices)
-    num_faces = len(loaded.faces)
+    # Reconstruct trimesh for topology checks (no processing — already done by load_mesh)
+    mesh = _trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
     # Manifold check: no edge shared by 3+ faces.
     # edges_sorted is (3*F, 2) — each face contributes 3 half-edges.
-    # Count occurrences of each unique edge.
-    _, counts = np.unique(loaded.edges_sorted, axis=0, return_counts=True)
+    _, counts = np.unique(mesh.edges_sorted, axis=0, return_counts=True)
     no_nonmanifold = bool((counts <= 2).all())
 
     # Connectivity check: single connected component
-    n_components = len(loaded.split(only_watertight=False))
+    n_components = len(mesh.split(only_watertight=False))
     single_component = n_components == 1
 
     is_manifold = no_nonmanifold and single_component
