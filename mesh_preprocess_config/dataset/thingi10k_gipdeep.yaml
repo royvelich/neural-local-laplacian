@@ -1,5 +1,5 @@
 folder: "/mnt/gipnetapp_public/neural-cotangent-weights/thingi10k"
-vertices_count_range: [0, 12000]
+vertices_count_range: [0, 20000]
 num_components_range: [1, 1]
 num_sources: 15
 seed: 42
