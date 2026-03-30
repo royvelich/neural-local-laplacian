@@ -375,6 +375,23 @@ def differentiable_eigh(
 # Shared diffusion descriptor computation
 # =============================================================================
 
+def _diffusion_solve(
+    S: torch.Tensor, M: torch.Tensor, E: torch.Tensor, alpha: float,
+) -> torch.Tensor:
+    """Solve (S + αM) x = M·E for raw diffusion values.
+
+    Args:
+        S: (N, N) stiffness matrix.
+        M: (N,) mass diagonal.
+        E: (N, L) indicator matrix (one-hot columns for landmarks).
+        alpha: diffusion scale.
+
+    Returns:
+        (N, L) raw diffusion values (unnormalised).
+    """
+    return torch.linalg.solve(S + alpha * torch.diag(M), M[:, None] * E)
+
+
 def _diffusion_descriptors(
     S: torch.Tensor, M: torch.Tensor, E: torch.Tensor,
     alphas: Tuple[float, ...],
@@ -394,10 +411,7 @@ def _diffusion_descriptors(
     Returns:
         (N, L*len(alphas)) L2-normalised descriptors.
     """
-    parts = []
-    for alpha in alphas:
-        D = torch.linalg.solve(S + alpha * torch.diag(M), M[:, None] * E)
-        parts.append(D)
+    parts = [_diffusion_solve(S, M, E, a) for a in alphas]
     return F.normalize(torch.cat(parts, dim=1), p=2, dim=1)
 
 
@@ -630,6 +644,104 @@ class DiffusionDistributionLoss(nn.Module):
         loss = F.mse_loss(vals_A_sorted, vals_B_sorted)
 
         return loss, {'loss_dist': loss.item()}
+
+
+class GeodesicDiffusionLoss(nn.Module):
+    """Geodesic transfer loss via diffusion distances (supervised).
+
+    Computes diffusion distances from landmark vertices on both shapes using
+    the learned Laplacian, transfers via GT correspondence, and penalises the
+    area-weighted L2 mismatch. This is a direct regression signal — stronger
+    than contrastive ranking (InfoNCE) because it penalises the actual distance
+    values, not just the relative ordering.
+
+    For each landmark l on A with correspondent corr(l) on B:
+        loss_l = Σ_v area_B(corr(v)) · (d_A(l, v) - d_B(corr(l), corr(v)))²
+
+    where d_X(s, ·) = (S_X + αM_X)⁻¹ M_X δ_s are diffusion distances from the
+    learned Laplacian. Averaged over landmarks and diffusion scales α.
+
+    Reuses _diffusion_solve() — same linear system as SoftCorrespondenceLoss.
+    """
+
+    def __init__(
+        self,
+        num_landmarks: int = 128,
+        alphas: Tuple[float, ...] = (0.1, 1.0, 10.0),
+        num_sample_vertices: int = 512,
+        landmark_seed: int = 0,
+        weight: float = 1.0,
+    ):
+        super().__init__()
+        self.num_landmarks       = num_landmarks
+        self.alphas              = alphas
+        self.num_sample_vertices = num_sample_vertices
+        self.landmark_seed       = landmark_seed
+        self.weight              = weight
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device = S_A.device
+
+        if corr_a is None or corr_b is None:
+            assert N_A == N_B
+            pool = np.arange(N_A); ca = pool; cb = pool
+        else:
+            pool = _compute_bijective_refs(corr_a, corr_b)
+            if len(pool) < self.num_landmarks + self.num_sample_vertices:
+                pool = np.arange(len(corr_a))
+            ca, cb = corr_a, corr_b
+
+        # Pick fixed landmarks (same seed every step for stability)
+        lm_rng = np.random.RandomState(self.landmark_seed)
+        L = min(self.num_landmarks, len(pool))
+        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
+
+        # Pick random sample vertices for evaluation
+        V = min(self.num_sample_vertices, len(pool))
+        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+
+        # Build indicator matrices for landmarks
+        E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
+        E_A[ca[lm_refs], torch.arange(L, device=device)] = 1.0
+        E_B = torch.zeros(N_B, L, device=device, dtype=S_B.dtype)
+        E_B[cb[lm_refs], torch.arange(L, device=device)] = 1.0
+
+        # Area weights at sample vertices on B (for area-weighted L2)
+        area_B = M_B[cb[sample_refs]]                  # (V,)
+        area_B = area_B / area_B.sum()                  # normalise to sum to 1
+
+        # Accumulate loss over diffusion scales
+        total_loss = torch.tensor(0.0, device=device)
+        for alpha in self.alphas:
+            # Raw diffusion distances: (N_X, L) — column l is distance from landmark l
+            D_A = _diffusion_solve(S_A, M_A, E_A, alpha)   # (N_A, L)
+            D_B = _diffusion_solve(S_B, M_B, E_B, alpha)   # (N_B, L)
+
+            # Sample corresponding vertices
+            d_A = D_A[ca[sample_refs]]                      # (V, L)
+            d_B = D_B[cb[sample_refs]]                      # (V, L)
+
+            # Normalise each landmark's profile to unit norm so the loss
+            # compares profile *shape*, not absolute scale (which is tiny
+            # and produces negligible gradients without normalisation).
+            d_A = F.normalize(d_A, p=2, dim=0)              # (V, L)
+            d_B = F.normalize(d_B, p=2, dim=0)              # (V, L)
+
+            # Area-weighted L2 per landmark, averaged over landmarks
+            sq_diff = (d_A - d_B) ** 2                      # (V, L)
+            total_loss = total_loss + (area_B[:, None] * sq_diff).sum(dim=0).mean()
+
+        loss = total_loss / len(self.alphas)
+
+        return loss, {'loss_geodiff': loss.item()}
 
 
 # =============================================================================

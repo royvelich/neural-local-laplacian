@@ -11,7 +11,7 @@ module:
   seed: ${globals.training_seed}
 
   # ── Evaluation control ────────────────────────────────────────────────
-  eval_only: true                 # true = run baselines only, then stop (no training)
+  eval_only: false                 # true = run baselines only, then stop (no training)
   eval_variants:                   # which Laplacian variants to evaluate
 #    - dense                        # G^T M_3 G (full Gram, 2-hop fill-in)
 #    - sp                           # sparsified to kNN (not PSD)
@@ -23,24 +23,31 @@ module:
   losses:
 #    - _target_: fmaps_finetune.modules.functional_map_module.SoftCorrespondenceLoss
 #      weight: 1.0
-#      num_landmarks: 256
-#      alphas: [0.1, 1.0, 10.0]    # diffusion scales α for fingerprint descriptors
+#      num_landmarks: 128
+#      alphas: [0.01, 0.1, 1.0]    # diffusion scales α for fingerprint descriptors
 #      temperature: 0.1
-#      num_sample_vertices: 1024      # vertices subsampled for contrastive ranking per step
+#      num_sample_vertices: 512      # vertices subsampled for contrastive ranking per step
 #      loss_type: infonce             # infonce | dcl | dclw
 #      dclw_sigma: 0.1                # only used when loss_type=dclw
 
     # Uncomment to add isospectrality loss (unsupervised, no GT needed):
-     - _target_: fmaps_finetune.modules.functional_map_module.IsospectralityLoss
-       weight: 1.0
-       num_eigenvalues: 100
+    # - _target_: fmaps_finetune.modules.functional_map_module.IsospectralityLoss
+    #   weight: 1.0
+    #   num_eigenvalues: 30
 
     # Uncomment to add diffusion distribution matching loss (unsupervised, no GT needed):
-#     - _target_: fmaps_finetune.modules.functional_map_module.DiffusionDistributionLoss
-#       weight: 1.0
-#       num_landmarks: 256
-#       alphas: [0.01, 0.1, 1.0]
-#       num_sample_vertices: 1024
+    # - _target_: fmaps_finetune.modules.functional_map_module.DiffusionDistributionLoss
+    #   weight: 1.0
+    #   num_landmarks: 128
+    #   alphas: [0.01, 0.1, 1.0]
+    #   num_sample_vertices: 256
+
+    # Uncomment to add geodesic diffusion transfer loss (supervised, needs GT):
+     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+       weight: 1.0
+       num_landmarks: 256
+       alphas: [0.1, 1.0, 10.0]
+       num_sample_vertices: 1024
 
   # ── Model initialisation ────────────────────────────────────────────────
   random_init: false               # reset all weights after loading architecture
@@ -53,7 +60,7 @@ module:
   k_sparsify: ${globals.k_sparsify}  # null = reuse k; integer < k = separate kNN for mask
 
   # ── Training augmentation ───────────────────────────────────────────────
-  max_vertices: 8000               # 0 = no subsampling; lower → faster O(N³) solve
+  max_vertices: 3000               # 0 = no subsampling; lower → faster O(N³) solve
   max_vertices_val: 0              # 0 = use max_vertices; set higher for better val quality
   vertex_noise: 0.0               # Gaussian noise scale relative to mean vertex radius
 
