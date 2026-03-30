@@ -63,7 +63,7 @@ class MeshDataset(Dataset):
             file_size_range_mb: Optional[Tuple[float, float]] = None,
             vertices_count_range: Optional[Tuple[int, int]] = None,
             faces_count_range: Optional[Tuple[int, int]] = None,
-            num_components_range: Optional[Tuple[int, int]] = None,
+            require_manifold: bool = False,
             shuffle: bool = False,
             require_complete_geodesics: bool = False,
             verbose_diagnostics: bool = False,
@@ -94,10 +94,10 @@ class MeshDataset(Dataset):
             faces_count_range: Optional (min_faces, max_faces) tuple. Meshes with face count
                 outside this range are skipped. Requires loading each mesh. Use None for no
                 filtering.
-            num_components_range: Optional (min_components, max_components) tuple. Meshes
-                whose number of connected components falls outside this range are skipped.
-                E.g., (1, 1) keeps only single-component meshes. Requires loading each mesh.
-                Use None for no filtering.
+            require_manifold: If True, skip non-manifold meshes (meshes with
+                non-manifold edges/vertices or multiple connected components).
+                Manifolds with boundary are allowed. Requires the lookup table
+                to contain 'is_manifold' (run preprocess_mesh_folder.py first).
             shuffle: If True, shuffle the mesh file list before applying max_meshes cap.
                 Useful for random subsampling from a large collection.
             require_complete_geodesics: If True, skip meshes where precomputed exact
@@ -128,7 +128,7 @@ class MeshDataset(Dataset):
         self._file_size_range_mb = file_size_range_mb
         self._vertices_count_range = vertices_count_range
         self._faces_count_range = faces_count_range
-        self._num_components_range = num_components_range
+        self._require_manifold = require_manifold
         self._shuffle = shuffle
         self._require_complete_geodesics = require_complete_geodesics
         self._verbose = verbose_diagnostics
@@ -142,7 +142,7 @@ class MeshDataset(Dataset):
             file_size_range_mb=self._file_size_range_mb,
             vertices_count_range=self._vertices_count_range,
             faces_count_range=self._faces_count_range,
-            num_components_range=self._num_components_range,
+            require_manifold=self._require_manifold,
             max_meshes=self._max_meshes,
             shuffle=self._shuffle,
             require_complete_geodesics=self._require_complete_geodesics,
@@ -192,13 +192,6 @@ class MeshDataset(Dataset):
                 raise ValueError(f"faces_count_range min must be >= 0, got {min_f}")
             if max_f <= min_f:
                 raise ValueError(f"faces_count_range max ({max_f}) must be > min ({min_f})")
-
-        if self._num_components_range is not None:
-            min_c, max_c = self._num_components_range
-            if min_c < 1:
-                raise ValueError(f"num_components_range min must be >= 1, got {min_c}")
-            if max_c < min_c:
-                raise ValueError(f"num_components_range max ({max_c}) must be >= min ({min_c})")
 
     def len(self) -> int:
         """Return the number of mesh files in the dataset."""

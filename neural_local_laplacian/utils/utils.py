@@ -860,7 +860,7 @@ def load_mesh_lookup_table(
 
     Each folder may contain a .mesh_properties_cache.json with entries:
         { "relative/path.obj": { "size_bytes": ..., "num_vertices": ...,
-          "num_faces": ..., "num_components": ... } }
+          "num_faces": ..., "is_manifold": ... } }
 
     Returns:
         Dict mapping absolute file path (str) -> properties dict.
@@ -914,53 +914,55 @@ def save_mesh_lookup_table(
 
 def get_mesh_geometry_info(
     file_path: Path,
-) -> Optional[Tuple[int, int, int]]:
+) -> Optional[Tuple[int, int, bool]]:
     """
-    Load a mesh and return (num_vertices, num_faces, num_components).
+    Load a mesh and return (num_vertices, num_faces, is_manifold).
+
+    A mesh is considered manifold if it has no non-manifold edges/vertices
+    AND forms a single connected component. Boundary edges (shared by 1 face)
+    are allowed (manifold with boundary).
 
     Returns None if the mesh could not be loaded.
     """
     import trimesh
     try:
-        loaded = trimesh.load(str(file_path))
+        loaded = trimesh.load(str(file_path), process=False, force='mesh')
     except Exception as e:
         print(f"  Warning: could not load {file_path.name}: {e}")
         return None
 
-    if isinstance(loaded, trimesh.Scene):
-        num_components = len(loaded.geometry)
-        num_vertices = sum(
-            len(g.vertices) for g in loaded.geometry.values()
-            if hasattr(g, 'vertices')
-        )
-        num_faces = sum(
-            len(g.faces) for g in loaded.geometry.values()
-            if hasattr(g, 'faces')
-        )
-    elif isinstance(loaded, trimesh.Trimesh):
-        num_vertices = len(loaded.vertices)
-        num_faces = len(loaded.faces)
-        num_components = len(loaded.split())
-    else:
+    if not isinstance(loaded, trimesh.Trimesh):
         print(f"  Warning: unsupported mesh type {type(loaded).__name__} "
               f"for {file_path.name}")
         return None
 
-    return num_vertices, num_faces, num_components
+    num_vertices = len(loaded.vertices)
+    num_faces = len(loaded.faces)
+
+    # Manifold check: no non-manifold edges/vertices
+    no_nonmanifold = len(loaded.nonmanifold_faces()) == 0
+
+    # Connectivity check: single connected component
+    n_components = len(loaded.split(only_watertight=False))
+    single_component = n_components == 1
+
+    is_manifold = no_nonmanifold and single_component
+
+    return num_vertices, num_faces, is_manifold
 
 
-def _get_mesh_geometry_info_worker(file_path_str: str) -> Optional[Tuple[str, int, int, int, int]]:
-    """Pool worker: load mesh, return (path, size_bytes, num_v, num_f, num_c) or None."""
+def _get_mesh_geometry_info_worker(file_path_str: str) -> Optional[Tuple[str, int, int, int, bool]]:
+    """Pool worker: load mesh, return (path, size_bytes, num_v, num_f, is_manifold) or None."""
     file_path = Path(file_path_str)
     info = get_mesh_geometry_info(file_path)
     if info is None:
         return None
-    num_v, num_f, num_c = info
+    num_v, num_f, is_manifold = info
     try:
         size_bytes = file_path.stat().st_size
     except OSError:
         size_bytes = 0
-    return file_path_str, size_bytes, num_v, num_f, num_c
+    return file_path_str, size_bytes, num_v, num_f, is_manifold
 
 
 def scan_mesh_folders(
@@ -968,7 +970,7 @@ def scan_mesh_folders(
     file_size_range_mb: Optional[Tuple[float, float]] = None,
     vertices_count_range: Optional[Tuple[int, int]] = None,
     faces_count_range: Optional[Tuple[int, int]] = None,
-    num_components_range: Optional[Tuple[int, int]] = None,
+    require_manifold: bool = False,
     max_meshes: Optional[int] = None,
     shuffle: bool = False,
     seed: Optional[int] = None,
@@ -988,7 +990,8 @@ def scan_mesh_folders(
         file_size_range_mb: (min_mb, max_mb) or None
         vertices_count_range: (min_verts, max_verts) or None
         faces_count_range: (min_faces, max_faces) or None
-        num_components_range: (min_comp, max_comp) or None
+        require_manifold: If True, skip non-manifold meshes (non-manifold
+            edges/vertices or multiple connected components)
         max_meshes: Cap on number of meshes (applied after shuffle)
         shuffle: Shuffle before capping
         seed: Random seed for shuffle
@@ -1019,12 +1022,12 @@ def scan_mesh_folders(
     # Geometry filter (uses lookup table, loads mesh on cache miss)
     has_geo_filters = (vertices_count_range is not None
                        or faces_count_range is not None
-                       or num_components_range is not None)
+                       or require_manifold)
 
     if has_geo_filters and mesh_files:
         lookup = load_mesh_lookup_table(folder_paths)
         cache_hits = 0
-        cached_info = {}    # key -> (num_v, num_f, num_c)
+        cached_info = {}    # key -> (num_v, num_f, is_manifold)
         miss_paths = []     # paths needing trimesh.load
 
         filter_parts = []
@@ -1032,8 +1035,8 @@ def scan_mesh_folders(
             filter_parts.append(f"vertices in [{vertices_count_range[0]}, {vertices_count_range[1]}]")
         if faces_count_range is not None:
             filter_parts.append(f"faces in [{faces_count_range[0]}, {faces_count_range[1]}]")
-        if num_components_range is not None:
-            filter_parts.append(f"components in [{num_components_range[0]}, {num_components_range[1]}]")
+        if require_manifold:
+            filter_parts.append("manifold only")
         print(f"Geometry filter ({', '.join(filter_parts)}): checking {len(mesh_files)} meshes "
               f"({len(lookup)} cached entries) ...")
 
@@ -1044,8 +1047,8 @@ def scan_mesh_folders(
                 props = lookup[key]
                 try:
                     current_size = file_path.stat().st_size
-                    if current_size == props.get('size_bytes'):
-                        cached_info[key] = (props['num_vertices'], props['num_faces'], props['num_components'])
+                    if current_size == props.get('size_bytes') and 'is_manifold' in props:
+                        cached_info[key] = (props['num_vertices'], props['num_faces'], props['is_manifold'])
                         cache_hits += 1
                         continue
                 except (OSError, KeyError):
@@ -1066,13 +1069,13 @@ def scan_mesh_folders(
 
             for result in miss_results:
                 if result is not None:
-                    fpath_str, size_bytes, num_v, num_f, num_c = result
-                    cached_info[fpath_str] = (num_v, num_f, num_c)
+                    fpath_str, size_bytes, num_v, num_f, is_mf = result
+                    cached_info[fpath_str] = (num_v, num_f, is_mf)
                     lookup[fpath_str] = {
                         'size_bytes': size_bytes,
                         'num_vertices': num_v,
                         'num_faces': num_f,
-                        'num_components': num_c,
+                        'is_manifold': is_mf,
                     }
 
         # Pass 3: apply filters
@@ -1085,7 +1088,7 @@ def scan_mesh_folders(
                 skipped += 1
                 continue
 
-            num_v, num_f, num_c = info
+            num_v, num_f, is_mf = info
             if vertices_count_range is not None:
                 if not (vertices_count_range[0] <= num_v <= vertices_count_range[1]):
                     skipped += 1
@@ -1094,8 +1097,8 @@ def scan_mesh_folders(
                 if not (faces_count_range[0] <= num_f <= faces_count_range[1]):
                     skipped += 1
                     continue
-            if num_components_range is not None:
-                if not (num_components_range[0] <= num_c <= num_components_range[1]):
+            if require_manifold:
+                if not is_mf:
                     skipped += 1
                     continue
 
@@ -1129,7 +1132,7 @@ def load_mesh_list_from_lookup(
     file_size_range_mb: Optional[Tuple[float, float]] = None,
     vertices_count_range: Optional[Tuple[int, int]] = None,
     faces_count_range: Optional[Tuple[int, int]] = None,
-    num_components_range: Optional[Tuple[int, int]] = None,
+    require_manifold: bool = False,
     max_meshes: Optional[int] = None,
     shuffle: bool = False,
     seed: Optional[int] = None,
@@ -1142,6 +1145,7 @@ def load_mesh_list_from_lookup(
 
     Args:
         folder_paths: List of dataset folder paths
+        require_manifold: If True, skip non-manifold meshes.
         require_complete_geodesics: If True, skip meshes where
             geodesics_num_ok < geodesics_num_sources in the lookup table.
         (remaining args same as scan_mesh_folders)
@@ -1178,7 +1182,7 @@ def load_mesh_list_from_lookup(
         # Geometry filters
         num_v = props.get('num_vertices', 0)
         num_f = props.get('num_faces', 0)
-        num_c = props.get('num_components', 0)
+        is_mf = props.get('is_manifold', False)
 
         if vertices_count_range is not None:
             if not (vertices_count_range[0] <= num_v <= vertices_count_range[1]):
@@ -1186,8 +1190,8 @@ def load_mesh_list_from_lookup(
         if faces_count_range is not None:
             if not (faces_count_range[0] <= num_f <= faces_count_range[1]):
                 continue
-        if num_components_range is not None:
-            if not (num_components_range[0] <= num_c <= num_components_range[1]):
+        if require_manifold:
+            if not is_mf:
                 continue
 
         # Geodesic completeness filter

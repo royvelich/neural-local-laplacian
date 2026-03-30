@@ -135,7 +135,7 @@ def main(cfg: DictConfig) -> None:
     file_size_range_mb = tuple(ds.file_size_range_mb) if getattr(ds, 'file_size_range_mb', None) is not None else None
     vertices_count_range = tuple(ds.vertices_count_range) if getattr(ds, 'vertices_count_range', None) is not None else None
     faces_count_range = tuple(ds.faces_count_range) if getattr(ds, 'faces_count_range', None) is not None else None
-    num_components_range = tuple(ds.num_components_range) if getattr(ds, 'num_components_range', None) is not None else None
+    require_manifold = getattr(ds, 'require_manifold', False)
 
     print(f"\n{'=' * 70}")
     print(f"PREPROCESS MESH FOLDER")
@@ -147,8 +147,8 @@ def main(cfg: DictConfig) -> None:
         print(f"Vertices:    {vertices_count_range[0]} - {vertices_count_range[1]}")
     if faces_count_range:
         print(f"Faces:       {faces_count_range[0]} - {faces_count_range[1]}")
-    if num_components_range:
-        print(f"Components:  {num_components_range[0]} - {num_components_range[1]}")
+    if require_manifold:
+        print(f"Manifold:    required")
     print(f"Sources:     {num_sources}")
     print(f"Timeout:     {timeout_per_source}s per source")
     print(f"Seed:        {seed}")
@@ -169,7 +169,7 @@ def main(cfg: DictConfig) -> None:
         file_size_range_mb=file_size_range_mb,
         vertices_count_range=vertices_count_range,
         faces_count_range=faces_count_range,
-        num_components_range=num_components_range,
+        require_manifold=require_manifold,
         max_meshes=None,
         shuffle=False,
         num_workers=num_workers,
