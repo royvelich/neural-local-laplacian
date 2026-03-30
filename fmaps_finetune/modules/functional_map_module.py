@@ -372,7 +372,45 @@ def differentiable_eigh(
 
 
 # =============================================================================
-# InfoNCE / DCL contrastive loss
+# Shared diffusion descriptor computation
+# =============================================================================
+
+def _diffusion_descriptors(
+    S: torch.Tensor, M: torch.Tensor, E: torch.Tensor,
+    alphas: Tuple[float, ...],
+) -> torch.Tensor:
+    """Compute L2-normalised diffusion fingerprint descriptors.
+
+    For each diffusion scale α, solves (S + αM) x = M·E and concatenates.
+    The result is a per-vertex descriptor of dimension L * len(alphas),
+    where L is the number of landmark columns in E.
+
+    Args:
+        S: (N, N) stiffness matrix.
+        M: (N,) mass diagonal.
+        E: (N, L) indicator matrix (one-hot columns for landmarks).
+        alphas: tuple of diffusion scales.
+
+    Returns:
+        (N, L*len(alphas)) L2-normalised descriptors.
+    """
+    parts = []
+    for alpha in alphas:
+        D = torch.linalg.solve(S + alpha * torch.diag(M), M[:, None] * E)
+        parts.append(D)
+    return F.normalize(torch.cat(parts, dim=1), p=2, dim=1)
+
+
+# =============================================================================
+# Loss modules — share forward signature:
+#   forward(S_A, S_B, M_A, M_B, rng, *, corr_a=None, corr_b=None)
+#   → (loss: Tensor, metrics: Dict[str, float])
+# Each has a `weight` attribute for the weighted sum in training_step.
+# =============================================================================
+
+
+# =============================================================================
+# InfoNCE / DCL contrastive loss (supervised)
 # =============================================================================
 
 class SoftCorrespondenceLoss(nn.Module):
@@ -399,12 +437,9 @@ class SoftCorrespondenceLoss(nn.Module):
         self.dclw_sigma          = dclw_sigma
         self.weight              = weight
 
-    def _compute_descriptors(self, S, M, E) -> torch.Tensor:
-        parts = []
-        for alpha in self.alphas:
-            D = torch.linalg.solve(S + alpha * torch.diag(M), M[:, None] * E)
-            parts.append(D)
-        return F.normalize(torch.cat(parts, dim=1), p=2, dim=1)
+    @staticmethod
+    def _compute_descriptors(S, M, E, alphas) -> torch.Tensor:
+        return _diffusion_descriptors(S, M, E, alphas)
 
     def forward(
         self,
@@ -435,8 +470,8 @@ class SoftCorrespondenceLoss(nn.Module):
         E_B = torch.zeros(N_B, L, device=device, dtype=S_B.dtype)
         E_B[cb[lm_refs], torch.arange(L, device=device)] = 1.0
 
-        desc_A = self._compute_descriptors(S_A, M_A, E_A)
-        desc_B = self._compute_descriptors(S_B, M_B, E_B)
+        desc_A = self._compute_descriptors(S_A, M_A, E_A, self.alphas)
+        desc_B = self._compute_descriptors(S_B, M_B, E_B, self.alphas)
 
         V           = min(self.num_sample_vertices, len(pool))
         sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
@@ -516,6 +551,85 @@ class IsospectralityLoss(nn.Module):
 
         loss = F.mse_loss(eigs[0], eigs[1])
         return loss, {'loss_iso': loss.item()}
+
+
+class DiffusionDistributionLoss(nn.Module):
+    """Distributional matching of diffusion distances (unsupervised).
+
+    Requires that the distribution of pairwise diffusion descriptor distances
+    within shape A matches that within shape B. No GT correspondences needed —
+    just the assumption that same-category shapes have similar intrinsic geometry.
+
+    Computes diffusion fingerprints using the shared _diffusion_descriptors(),
+    samples random vertex pairs on each shape independently, computes pairwise
+    cosine similarities, sorts them, and penalises the L2 difference between
+    sorted distributions (1D Wasserstein / Earth Mover's Distance).
+    """
+
+    def __init__(
+        self,
+        num_landmarks: int = 128,
+        alphas: Tuple[float, ...] = (1.0, 10.0, 100.0),
+        num_sample_vertices: int = 256,
+        landmark_seed: int = 0,
+        weight: float = 1.0,
+    ):
+        super().__init__()
+        self.num_landmarks       = num_landmarks
+        self.alphas              = alphas
+        self.num_sample_vertices = num_sample_vertices
+        self.landmark_seed       = landmark_seed
+        self.weight              = weight
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device = S_A.device
+
+        # Place landmarks independently on each shape (no correspondences needed)
+        lm_rng = np.random.RandomState(self.landmark_seed)
+        L = min(self.num_landmarks, N_A, N_B)
+
+        lm_A = lm_rng.choice(N_A, size=L, replace=False)
+        lm_B = lm_rng.choice(N_B, size=L, replace=False)
+
+        E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
+        E_A[lm_A, torch.arange(L, device=device)] = 1.0
+        E_B = torch.zeros(N_B, L, device=device, dtype=S_B.dtype)
+        E_B[lm_B, torch.arange(L, device=device)] = 1.0
+
+        desc_A = _diffusion_descriptors(S_A, M_A, E_A, self.alphas)
+        desc_B = _diffusion_descriptors(S_B, M_B, E_B, self.alphas)
+
+        # Sample random vertices on each shape independently
+        V = min(self.num_sample_vertices, N_A, N_B)
+        sample_A = rng.choice(N_A, size=V, replace=False)
+        sample_B = rng.choice(N_B, size=V, replace=False)
+
+        dA = desc_A[sample_A]  # (V, D)
+        dB = desc_B[sample_B]  # (V, D)
+
+        # Pairwise cosine similarities within each shape
+        sim_A = dA @ dA.T  # (V, V) — descriptors are L2-normalised
+        sim_B = dB @ dB.T  # (V, V)
+
+        # Extract upper triangle (exclude diagonal = self-similarity)
+        triu_idx = torch.triu_indices(V, V, offset=1, device=device)
+        vals_A = sim_A[triu_idx[0], triu_idx[1]]
+        vals_B = sim_B[triu_idx[0], triu_idx[1]]
+
+        # Sort and compare: 1D Wasserstein distance approximation
+        vals_A_sorted = vals_A.sort().values
+        vals_B_sorted = vals_B.sort().values
+        loss = F.mse_loss(vals_A_sorted, vals_B_sorted)
+
+        return loss, {'loss_dist': loss.item()}
 
 
 # =============================================================================
@@ -1418,7 +1532,14 @@ class FunctionalMapModule(LaplacianModuleBase):
         # ── Eval-only mode: stop after baselines ──────────────────────────
         if hp.eval_only:
             print("\n  [eval_only=true] Baselines complete — stopping.", flush=True)
-            self.trainer.should_stop = True
+            # Finalize W&B logging before exit
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.finish()
+            except Exception:
+                pass
+            raise SystemExit(0)
 
     # ------------------------------------------------------------------
     # Curriculum
