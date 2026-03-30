@@ -918,9 +918,9 @@ def get_mesh_geometry_info(
     """
     Load a mesh and return (num_vertices, num_faces, is_manifold).
 
-    A mesh is considered manifold if it has no non-manifold edges/vertices
-    AND forms a single connected component. Boundary edges (shared by 1 face)
-    are allowed (manifold with boundary).
+    A mesh is considered manifold if no edge is shared by more than 2 faces
+    AND the mesh forms a single connected component. Boundary edges (shared
+    by 1 face) are allowed (manifold with boundary).
 
     Returns None if the mesh could not be loaded.
     """
@@ -939,8 +939,11 @@ def get_mesh_geometry_info(
     num_vertices = len(loaded.vertices)
     num_faces = len(loaded.faces)
 
-    # Manifold check: no non-manifold edges/vertices
-    no_nonmanifold = len(loaded.nonmanifold_faces()) == 0
+    # Manifold check: no edge shared by 3+ faces.
+    # edges_sorted is (3*F, 2) — each face contributes 3 half-edges.
+    # Count occurrences of each unique edge.
+    _, counts = np.unique(loaded.edges_sorted, axis=0, return_counts=True)
+    no_nonmanifold = bool((counts <= 2).all())
 
     # Connectivity check: single connected component
     n_components = len(loaded.split(only_watertight=False))
