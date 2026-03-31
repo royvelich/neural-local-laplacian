@@ -1072,9 +1072,23 @@ class GeodesicCache:
         # Cache: subsampled B index → normalised distance to all subsampled B vertices
         self._dist_cache: Dict[int, np.ndarray] = {}
 
+    @classmethod
+    def from_precomputed(cls, dist_cache: Dict[int, np.ndarray],
+                         sqrt_area: float, idx_b: np.ndarray) -> 'GeodesicCache':
+        """Create a cache from precomputed distances (no solver needed)."""
+        obj = object.__new__(cls)
+        obj._dist_cache = dist_cache
+        obj._sqrt_area = sqrt_area
+        obj._idx_b = idx_b
+        obj._solver = None
+        return obj
+
     def _get_dists_from(self, sub_idx: int) -> np.ndarray:
         """Get normalised geodesic distances from subsampled vertex sub_idx to all others."""
         if sub_idx not in self._dist_cache:
+            if self._solver is None:
+                raise RuntimeError(
+                    f"GeodesicCache: no solver and vertex {sub_idx} not precomputed")
             full_idx = int(self._idx_b[sub_idx])
             full_dists = self._solver.compute_distance(full_idx)  # (N_full,)
             self._dist_cache[sub_idx] = full_dists[self._idx_b] / self._sqrt_area
@@ -1089,6 +1103,10 @@ class GeodesicCache:
         unique_gt = np.unique(gt_corr)
         for g in unique_gt:
             self._get_dists_from(int(g))
+
+    def drop_solver(self) -> None:
+        """Release the pp3d solver to free memory (after precomputation)."""
+        self._solver = None
 
     def compute_errors(self, pred_corr: np.ndarray, gt_corr: np.ndarray) -> np.ndarray:
         """Compute normalised geodesic error for each (pred, gt) pair.
@@ -1114,6 +1132,36 @@ class GeodesicCache:
             mask = gt_corr == g
             errors[mask] = self._dist_cache[int(g)][pred_corr[mask]]
         return errors
+
+
+def _precompute_geo_cache_worker(args):
+    """Multiprocessing worker: build solver, compute distances, return cache data.
+
+    Runs in a separate process. The solver is discarded after computation —
+    only the distance dict (numpy arrays) is returned.
+
+    Returns:
+        (name, dist_cache, sqrt_area, idx_b) or (name, None, None, None) on failure.
+    """
+    import potpourri3d as pp3d
+
+    name, verts_full, faces, idx_b, unique_targets = args
+    try:
+        solver = pp3d.MeshHeatMethodDistanceSolver(verts_full, faces)
+
+        v0, v1, v2 = verts_full[faces[:, 0]], verts_full[faces[:, 1]], verts_full[faces[:, 2]]
+        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum()
+        sqrt_area = np.sqrt(max(area, 1e-12))
+
+        dist_cache = {}
+        for g in unique_targets:
+            full_idx = int(idx_b[g])
+            full_dists = solver.compute_distance(full_idx)
+            dist_cache[int(g)] = full_dists[idx_b] / sqrt_area
+
+        return name, dist_cache, sqrt_area, idx_b
+    except Exception as e:
+        return name, None, None, None
 
 
 def _build_geo_cache(pair: PairSample) -> Optional['GeodesicCache']:
@@ -1791,21 +1839,78 @@ class FunctionalMapModule(LaplacianModuleBase):
         all_pairs = [(name, p) for name, pairs in all_val_datasets for p in pairs]
         print(f"\n  Precomputing geodesic caches ({len(all_pairs)} pairs)...", flush=True)
         t0_geo = time.perf_counter()
-        n_total_pairs = len(all_pairs)
-        cw_geo = len(str(n_total_pairs))
-        for i, (_, p) in enumerate(all_pairs):
-            if p.name not in self._geo_cache:
-                sub_p = _subsample(p)
-                cache = _build_geo_cache(sub_p)
-                if cache is not None:
-                    gt_corr = _build_gt_corr_from_pair(sub_p)
-                    if gt_corr is not None:
-                        cache.precompute_from_gt(gt_corr)
-                self._geo_cache[p.name] = cache
-            if (i + 1) % 10 == 0 or (i + 1) == n_total_pairs:
-                dt_so_far = time.perf_counter() - t0_geo
-                print(f"    [{i+1:>{cw_geo}}/{n_total_pairs}] {dt_so_far:.1f}s",
-                      flush=True)
+
+        # Prepare worker args: subsample, extract gt, collect serialisable data
+        worker_args = []
+        pair_meta = []   # (pair_name, sent_to_worker) — to reconstruct caches later
+        for _, p in all_pairs:
+            if p.name in self._geo_cache:
+                pair_meta.append((p.name, False))
+                continue
+            sub_p = _subsample(p)
+            if sub_p.faces_b is None:
+                pair_meta.append((p.name, False))
+                continue
+            gt_corr = _build_gt_corr_from_pair(sub_p)
+
+            verts_full = sub_p._verts_b_full if sub_p._verts_b_full is not None else sub_p.verts_b
+            idx_b = sub_p._idx_b if sub_p._idx_b is not None else np.arange(len(sub_p.verts_b))
+
+            if gt_corr is not None:
+                unique_targets = np.unique(gt_corr)
+            else:
+                # Identity correspondence: every B vertex is a GT target
+                unique_targets = np.arange(len(sub_p.verts_b))
+
+            worker_args.append((
+                p.name, verts_full, sub_p.faces_b, idx_b, unique_targets,
+            ))
+            pair_meta.append((p.name, True))
+
+        # Run workers in parallel
+        n_workers = min(len(worker_args), max(1, (os.cpu_count() or 1) - 1))
+        if worker_args:
+            if n_workers > 1:
+                import multiprocessing as _mp
+                print(f"    Parallel precomputation: {len(worker_args)} pairs, "
+                      f"{n_workers} workers", flush=True)
+                with _mp.Pool(n_workers) as pool:
+                    results = {}
+                    for i, r in enumerate(pool.imap_unordered(
+                            _precompute_geo_cache_worker, worker_args)):
+                        results[r[0]] = r[1:]
+                        done = i + 1
+                        if done % 10 == 0 or done == len(worker_args):
+                            dt = time.perf_counter() - t0_geo
+                            print(f"    [{done}/{len(worker_args)}] {dt:.1f}s",
+                                  flush=True)
+            else:
+                results = {}
+                for i, args in enumerate(worker_args):
+                    r = _precompute_geo_cache_worker(args)
+                    results[r[0]] = r[1:]
+                    done = i + 1
+                    if done % 10 == 0 or done == len(worker_args):
+                        dt = time.perf_counter() - t0_geo
+                        print(f"    [{done}/{len(worker_args)}] {dt:.1f}s",
+                              flush=True)
+        else:
+            results = {}
+
+        # Reconstruct GeodesicCache objects from worker results
+        for pair_name, sent_to_worker in pair_meta:
+            if pair_name in self._geo_cache:
+                continue
+            if sent_to_worker and pair_name in results:
+                dist_cache, sqrt_area, idx_b = results[pair_name]
+                if dist_cache is not None:
+                    self._geo_cache[pair_name] = GeodesicCache.from_precomputed(
+                        dist_cache, sqrt_area, idx_b)
+                else:
+                    self._geo_cache[pair_name] = None
+            else:
+                self._geo_cache[pair_name] = None
+
         dt_geo = time.perf_counter() - t0_geo
         n_with_geo = sum(1 for v in self._geo_cache.values() if v is not None)
         print(f"    Done: {n_with_geo}/{len(all_pairs)} pairs with faces "
