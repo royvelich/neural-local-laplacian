@@ -181,7 +181,7 @@ parameters:
             pair_generator:
               _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
               root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-              exclude_categories: [bear3EP, crocodileOPW, duck, foxXAT, hippoDG, rabbit7L6, tigerD8H, zebraBM]
+              exclude_categories: [bear3EP, crocodileOPW, duck, foxXAT, hippoDG]
             num_samples: 200
             cross_ratio: 0.0
           batch_size: 10
@@ -199,8 +199,8 @@ parameters:
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-                categories: [bear3EP, crocodileOPW, duck, foxXAT, hippoDG, rabbit7L6, tigerD8H, zebraBM]
-              val_poses_per_pair: 5
+                categories: [bear3EP, crocodileOPW, duck, foxXAT, hippoDG]
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -219,7 +219,7 @@ parameters:
                 categories: null
                 exclude_categories: null
                 enable_cross_category: true
-              val_poses_per_pair: 5
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -235,7 +235,7 @@ parameters:
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                 root: '/workspace/datasets/faust'
-              val_poses_per_pair: 5
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -274,7 +274,7 @@ parameters:
         k_sparsify: ${globals.k_sparsify}
 
         # ── Training augmentation ───────────────────────────────────────────
-        max_vertices: 6000
+        max_vertices: 4000
         max_vertices_val: 0
         vertex_noise: ${globals.vertex_noise}
 

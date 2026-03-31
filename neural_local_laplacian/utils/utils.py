@@ -813,16 +813,19 @@ import trimesh as _trimesh
 
 def load_mesh(
     path: str,
+    process: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load a mesh file, merge duplicate vertices, normalize, compute normals.
+    Load a mesh file, normalize, compute normals.
 
     This is the single shared mesh loader used across the codebase.
-    Uses trimesh with default processing (merges duplicates, removes
-    degenerate faces, fixes winding).
 
     Args:
         path: Path to mesh file (.obj, .ply, .off, .stl)
+        process: If True (default), trimesh merges duplicate vertices,
+            removes degenerate faces, and fixes winding. Set to False
+            to preserve original vertex ordering (needed when external
+            correspondence files reference vertices by index, e.g. VTS).
 
     Returns:
         (vertices, faces, vertex_normals) where:
@@ -830,7 +833,7 @@ def load_mesh(
         - faces: (F, 3) int32
         - vertex_normals: (N, 3) float32
     """
-    mesh = _trimesh.load(str(path), force='mesh')
+    mesh = _trimesh.load(str(path), force='mesh', process=process)
     vertices = normalize_mesh_vertices(
         np.array(mesh.vertices, dtype=np.float64)
     ).astype(np.float32)

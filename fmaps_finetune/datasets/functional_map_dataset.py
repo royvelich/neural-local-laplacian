@@ -338,37 +338,19 @@ class SMALPairGenerator(PairGenerator):
 # DT4D loading utilities
 # =============================================================================
 
-def _load_obj_vertices(path: str) -> np.ndarray:
-    verts = []
-    with open(path) as f:
-        for line in f:
-            if line.startswith('v '):
-                verts.append([float(x) for x in line.split()[1:4]])
-    return np.array(verts, dtype=np.float32)
-
-
 def _load_obj(path: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Load vertices and faces from an OBJ file.
+    """Load vertices and faces from a mesh file using the shared loader.
+
+    Uses process=False to preserve original vertex ordering (required for
+    VTS-based correspondence in DT4D).
 
     Returns:
-        vertices: (N, 3) float32
+        vertices: (N, 3) float32 (normalized to unit sphere)
         faces: (F, 3) int32 (0-indexed), or None if no faces found.
     """
-    verts = []
-    faces = []
-    with open(path) as f:
-        for line in f:
-            if line.startswith('v '):
-                verts.append([float(x) for x in line.split()[1:4]])
-            elif line.startswith('f '):
-                # OBJ face indices are 1-based, may contain v/vt/vn
-                parts = line.split()[1:]
-                if len(parts) >= 3:
-                    idx = [int(p.split('/')[0]) - 1 for p in parts[:3]]
-                    faces.append(idx)
-    vertices = np.array(verts, dtype=np.float32)
-    face_arr = np.array(faces, dtype=np.int32) if faces else None
-    return vertices, face_arr
+    from neural_local_laplacian.utils.utils import load_mesh
+    vertices, faces, _ = load_mesh(path, process=False)
+    return vertices, faces if len(faces) > 0 else None
 
 
 def _load_vts(path: str) -> np.ndarray:
@@ -394,7 +376,7 @@ class DT4DCategory:
                 continue
             verts, faces = _load_obj(str(obj_path))
             self.poses.append(obj_path.stem)
-            self.vertices.append(normalize_mesh_vertices(verts))
+            self.vertices.append(verts)  # already normalized by _load_obj → load_mesh
             self.faces.append(faces)
             self.vts.append(_load_vts(str(vts_path)))
 
@@ -453,6 +435,12 @@ def _resolve_categories(
 
 # ── Base pair generator ──────────────────────────────────────────────────────
 
+def _load_category_worker(args):
+    """Multiprocessing worker: load one DT4DCategory and return it."""
+    root, name = args
+    return DT4DCategory(root, name)
+
+
 class DT4DPairGeneratorBase(PairGenerator):
     """Shared DT4D logic: category loading, same-category pairs, val pairs."""
 
@@ -470,10 +458,22 @@ class DT4DPairGeneratorBase(PairGenerator):
 
         self.category_names: List[str] = resolved
         self.categories: Dict[str, DT4DCategory] = {}
-        for i, name in enumerate(resolved):
-            cat = DT4DCategory(self.root, name)
-            self.categories[name] = cat
-            print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
+
+        import os
+        n_workers = min(len(resolved), max(1, (os.cpu_count() or 1) - 1))
+        if n_workers > 1 and len(resolved) > 1:
+            import multiprocessing as _mp
+            worker_args = [(self.root, name) for name in resolved]
+            with _mp.Pool(n_workers) as pool:
+                for i, cat in enumerate(pool.imap(
+                        _load_category_worker, worker_args)):
+                    self.categories[cat.name] = cat
+                    print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
+        else:
+            for i, name in enumerate(resolved):
+                cat = DT4DCategory(self.root, name)
+                self.categories[name] = cat
+                print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
 
         self.same_pairs = [(c, c) for c in self.category_names]
         print(f"  [{self.__class__.__name__}] Loading complete.", flush=True)
@@ -763,7 +763,7 @@ class FAUSTPairGenerator(PairGenerator):
         print(f"  [FAUSTPairGenerator] Loading subjects: {self.subject_ids}")
 
         # Load all registrations, grouped by subject
-        import trimesh
+        from neural_local_laplacian.utils.utils import load_mesh
         self.subject_poses: Dict[int, List[str]] = {}     # subject -> [pose_name, ...]
         self.vertices: Dict[int, List[np.ndarray]] = {}    # subject -> [verts, ...]
         self.faces: Optional[np.ndarray] = None            # shared across all meshes
@@ -776,12 +776,9 @@ class FAUSTPairGenerator(PairGenerator):
                 ply_path = reg_dir / f"tr_reg_{reg_id:03d}.ply"
                 if not ply_path.exists():
                     continue
-                mesh = trimesh.load(str(ply_path), process=False, force='mesh')
-                verts = normalize_mesh_vertices(
-                    np.array(mesh.vertices, dtype=np.float64)
-                ).astype(np.float32)
+                verts, faces, _ = load_mesh(str(ply_path), process=False)
                 if self.faces is None:
-                    self.faces = np.array(mesh.faces, dtype=np.int32)
+                    self.faces = faces
                 self.subject_poses[subj_id].append(f"s{subj_id}_p{pose_idx}")
                 self.vertices[subj_id].append(verts)
 
