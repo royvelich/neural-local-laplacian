@@ -713,6 +713,157 @@ class DT4DAnimalsPairGenerator(DT4DPairGeneratorBase):
         )
 
 
+# ── FAUST pair generator ──────────────────────────────────────────────────────
+
+class FAUSTPairGenerator(PairGenerator):
+    """MPI-FAUST registration pairs with identity correspondence.
+
+    FAUST provides 100 registered meshes: 10 subjects × 10 poses.
+    All share the same template topology (same vertex count and faces),
+    so correspondence between any pair is the identity mapping.
+
+    Supports intra-subject (same person, different pose) and optionally
+    inter-subject (different person) pairs.
+
+    Args:
+        root: Path to FAUST root directory (contains training/registrations/).
+        subjects: Explicit list of subject IDs (0–9) to use. None = all.
+        exclude_subjects: Subject IDs to exclude. None = exclude none.
+        enable_cross_subject: If True, include inter-subject pairs in
+            training and validation.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        subjects: Optional[List[int]] = None,
+        exclude_subjects: Optional[List[int]] = None,
+        enable_cross_subject: bool = False,
+    ):
+        self.root = Path(root)
+        reg_dir = self.root / "training" / "registrations"
+        if not reg_dir.exists():
+            raise FileNotFoundError(
+                f"FAUST registrations not found at {reg_dir}")
+
+        self.enable_cross_subject = enable_cross_subject
+
+        # Resolve subject list
+        all_subjects = list(range(10))
+        if subjects is not None and exclude_subjects is not None:
+            raise ValueError("Specify 'subjects' OR 'exclude_subjects', not both.")
+        if subjects is not None:
+            self.subject_ids = sorted(subjects)
+        elif exclude_subjects is not None:
+            self.subject_ids = [s for s in all_subjects if s not in exclude_subjects]
+        else:
+            self.subject_ids = all_subjects
+
+        print(f"  [FAUSTPairGenerator] root: {self.root}")
+        print(f"  [FAUSTPairGenerator] Loading subjects: {self.subject_ids}")
+
+        # Load all registrations, grouped by subject
+        import trimesh
+        self.subject_poses: Dict[int, List[str]] = {}     # subject -> [pose_name, ...]
+        self.vertices: Dict[int, List[np.ndarray]] = {}    # subject -> [verts, ...]
+        self.faces: Optional[np.ndarray] = None            # shared across all meshes
+
+        for subj_id in self.subject_ids:
+            self.subject_poses[subj_id] = []
+            self.vertices[subj_id] = []
+            for pose_idx in range(10):
+                reg_id = subj_id * 10 + pose_idx
+                ply_path = reg_dir / f"tr_reg_{reg_id:03d}.ply"
+                if not ply_path.exists():
+                    continue
+                mesh = trimesh.load(str(ply_path), process=False, force='mesh')
+                verts = normalize_mesh_vertices(
+                    np.array(mesh.vertices, dtype=np.float64)
+                ).astype(np.float32)
+                if self.faces is None:
+                    self.faces = np.array(mesh.faces, dtype=np.int32)
+                self.subject_poses[subj_id].append(f"s{subj_id}_p{pose_idx}")
+                self.vertices[subj_id].append(verts)
+
+        self.num_vertices = len(self.vertices[self.subject_ids[0]][0])
+
+        # Build pair lists
+        self.same_pairs = [(s, s) for s in self.subject_ids]
+        if enable_cross_subject:
+            self.cross_pairs = list(combinations(self.subject_ids, 2))
+        else:
+            self.cross_pairs = []
+
+        total_meshes = sum(len(v) for v in self.vertices.values())
+        print(f"  [FAUSTPairGenerator] Loaded {total_meshes} meshes "
+              f"({len(self.subject_ids)} subjects, {self.num_vertices} verts each)")
+        print(f"  Same-subject pairs: {len(self.same_pairs)}, "
+              f"cross-subject pairs: {len(self.cross_pairs)}")
+
+    def sample_train_pair(
+        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
+    ) -> PairSample:
+        if rng.rand() < cross_ratio and self.cross_pairs:
+            subj_a, subj_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
+            pair_type = "cross"
+        else:
+            subj_a, subj_b = self.same_pairs[rng.randint(len(self.same_pairs))]
+            pair_type = "same"
+
+        poses_a = self.vertices[subj_a]
+        poses_b = self.vertices[subj_b]
+        pa = rng.randint(len(poses_a))
+        pb = rng.randint(len(poses_b))
+        if subj_a == subj_b and len(poses_a) > 1:
+            while pb == pa:
+                pb = rng.randint(len(poses_b))
+
+        corr_a, corr_b = identity_correspondence(self.num_vertices)
+        name_a = self.subject_poses[subj_a][pa]
+        name_b = self.subject_poses[subj_b][pb]
+        return PairSample(
+            verts_a=poses_a[pa], verts_b=poses_b[pb],
+            corr_a=corr_a, corr_b=corr_b,
+            name=f"{pair_type}_{name_a}_vs_{name_b}",
+            faces_b=self.faces,
+        )
+
+    def get_val_pairs(
+        self, rng: np.random.RandomState, poses_per_pair: int = 1,
+    ) -> List[PairSample]:
+        pair_list = self.same_pairs[:]
+        if self.enable_cross_subject:
+            pair_list.extend(self.cross_pairs)
+
+        pairs = []
+        for subj_a, subj_b in pair_list:
+            pair_rng = np.random.RandomState(_stable_hash((subj_a, subj_b)))
+            poses_a = self.vertices[subj_a]
+            poses_b = self.vertices[subj_b]
+            seen: set = set()
+            for _ in range(poses_per_pair):
+                for _attempt in range(200):
+                    pa = pair_rng.randint(len(poses_a))
+                    pb = pair_rng.randint(len(poses_b))
+                    if subj_a == subj_b and pa == pb and len(poses_a) > 1:
+                        continue
+                    if (pa, pb) not in seen:
+                        break
+                else:
+                    break
+                seen.add((pa, pb))
+                corr_a, corr_b = identity_correspondence(self.num_vertices)
+                name_a = self.subject_poses[subj_a][pa]
+                name_b = self.subject_poses[subj_b][pb]
+                pairs.append(PairSample(
+                    verts_a=poses_a[pa], verts_b=poses_b[pb],
+                    corr_a=corr_a, corr_b=corr_b,
+                    name=f"val_{name_a}_vs_{name_b}",
+                    faces_b=self.faces,
+                ))
+        return pairs
+
+
 # ── Composite pair generator ─────────────────────────────────────────────────
 
 class CompositePairGenerator(PairGenerator):

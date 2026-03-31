@@ -1,966 +1,2117 @@
 """
-Data primitives for functional map fine-tuning.
+LightningModule for functional map fine-tuning of the neural Laplacian.
 
-Pair generators (SMAL, DT4D) and torch Datasets live here.
-Nothing in this file depends on PyTorch model code or the Lightning module.
+All Laplacian assembly, loss, and evaluation utilities live here alongside
+FunctionalMapModule so this file is self-contained on the model side.
 """
 from __future__ import annotations
+import os
+import contextlib
+import time
 
-import hashlib
-import pickle
-import sys
-import types
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from itertools import combinations
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import scipy.sparse
+import scipy.sparse.linalg
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import scipy.sparse
-from torch.utils.data import Dataset
+import torch
+import lightning
+import torch.nn as nn
+import torch.nn.functional as F
+from omegaconf import DictConfig
+from sklearn.neighbors import NearestNeighbors
+from torch_geometric.data import Batch
 
-from neural_local_laplacian.utils.utils import normalize_mesh_vertices
+from neural_local_laplacian.modules.laplacian_modules import (
+    LaplacianModuleBase,
+    LaplacianTransformerModule,
+)
+from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
+from neural_local_laplacian.utils.utils import (
+    normalize_mesh_vertices,
+    assemble_stiffness_and_mass_matrices,
+    compute_laplacian_eigendecomposition,
+)
+
+from fmaps_finetune.datasets.functional_map_dataset import (
+    PairSample,
+    _compute_bijective_refs,
+    subsample_pair,
+    _stable_hash,
+)
+
+from fmaps_finetune.modules.evaluators import SpectralNNEvaluator, FunctionalMapEvaluator, fmt_topk
+
 
 
 # =============================================================================
-# Stable hash (deterministic across Python runs / processes)
+# Step profiler (optional, activated by profile_steps > 0)
 # =============================================================================
 
-def _stable_hash(obj) -> int:
-    return int(hashlib.sha256(str(obj).encode()).hexdigest(), 16) % (2 ** 31)
+class _StepProfiler:
+    """Lightweight per-phase CUDA wall-time profiler.
 
+    Wraps major training_step phases with CUDA-synchronized wall timings.
+    Activated when hparams.profile_steps > 0; prints a summary every
+    profile_steps steps then resets accumulators.
 
-# =============================================================================
-# Pair protocol
-# =============================================================================
-
-@dataclass
-class PairSample:
-    """A shape pair with known vertex-to-vertex correspondence.
-
-    corr_a[i] on mesh A corresponds to corr_b[i] on mesh B.
-    For identity correspondence (SMAL) corr_a = corr_b = arange(N).
+    Usage::
+        with prof.phase("knn"):        ...
+        with prof.phase("transformer"): ...
+        with prof.phase("assembly"):   ...
     """
-    verts_a: np.ndarray   # (N_A, 3)
-    verts_b: np.ndarray   # (N_B, 3)
-    corr_a:  np.ndarray   # (C,) int
-    corr_b:  np.ndarray   # (C,) int
-    name:    str
 
-    # Optional: mesh faces for geodesic error computation.
-    # Set by the dataset loader when OBJ files provide faces.
-    faces_b: Optional[np.ndarray] = field(default=None, repr=False)  # (F, 3) int
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._times:  Dict[str, float] = {}
+        self._counts: Dict[str, int]   = {}
 
-    # Set by subsample_pair when subsampling B:
-    _verts_b_full: Optional[np.ndarray] = field(default=None, repr=False)  # (N_B_orig, 3)
-    _idx_b: Optional[np.ndarray] = field(default=None, repr=False)         # (N_B_sub,) int
+    def __enter__(self):
+        return self
 
+    def __exit__(self, *_):
+        pass
 
-class PairGenerator(ABC):
-    @abstractmethod
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float,
-    ) -> PairSample: ...
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        yield
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        self._times[name]  = self._times.get(name, 0.0)  + dt
+        self._counts[name] = self._counts.get(name, 0)    + 1
 
-    @abstractmethod
-    def get_val_pairs(
-        self, rng: np.random.RandomState, poses_per_pair: int = 1,
-    ) -> List[PairSample]: ...
+    def summary_str(self, step: int) -> str:
+        if not self._times:
+            return ""
+        total = sum(self._times.values())
+        lines = [f"  [Profiler step={step}]  total={total*1e3:.1f}ms"]
+        for name, t in self._times.items():
+            n   = self._counts[name]
+            pct = 100.0 * t / total if total > 0 else 0.0
+            lines.append(
+                f"    {name:<28s}  {t/n*1e3:7.2f}ms/call  "
+                f"{t*1e3:8.2f}ms total  {pct:5.1f}%  (n={n})")
+        return "\n".join(lines)
+
+    def reset(self):
+        self._times.clear()
+        self._counts.clear()
 
 
 # =============================================================================
-# Correspondence utilities
+# kNN + patch building
 # =============================================================================
 
-def _compute_bijective_refs(corr_a: np.ndarray, corr_b: np.ndarray) -> np.ndarray:
-    """Indices where the mapping is injective on both sides."""
-    counts_a = np.bincount(corr_a, minlength=corr_a.max() + 1)
-    counts_b = np.bincount(corr_b, minlength=corr_b.max() + 1)
-    mask = (counts_a[corr_a] == 1) & (counts_b[corr_b] == 1)
-    return np.where(mask)[0]
+def compute_knn(vertices_np: np.ndarray, k: int) -> np.ndarray:
+    """Compute k-nearest neighbors excluding self. Returns (N, k) indices."""
+    n    = len(vertices_np)
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(vertices_np)
+    _, indices = nbrs.kneighbors(vertices_np)
+    center     = np.arange(n)[:, np.newaxis]
+    keep       = ~(indices == center)
+    keep_pos   = np.cumsum(keep, axis=1)
+    final      = (keep_pos <= k) & keep
+    return indices[final].reshape(n, k)
 
 
-def identity_correspondence(n: int) -> Tuple[np.ndarray, np.ndarray]:
-    c = np.arange(n)
-    return c, c
-
-
-def subsample_pair(
-    pair: PairSample, max_vertices: int, rng: np.random.RandomState,
-) -> PairSample:
-    """Randomly subsample both shapes to at most max_vertices, remapping correspondence."""
-    verts_a, verts_b = pair.verts_a, pair.verts_b
-    corr_a, corr_b   = pair.corr_a,  pair.corr_b
-    n_a, n_b = len(verts_a), len(verts_b)
-
-    # Track original B data for geodesic computation
-    verts_b_full = pair._verts_b_full if pair._verts_b_full is not None else verts_b
-    idx_b_prev = pair._idx_b  # may already be set from a previous subsample
-
-    if n_a > max_vertices:
-        idx_a   = np.sort(rng.choice(n_a, max_vertices, replace=False))
-        verts_a = verts_a[idx_a]
-        remap_a = np.full(n_a, -1, dtype=np.int64)
-        remap_a[idx_a] = np.arange(max_vertices)
-    else:
-        remap_a = np.arange(n_a, dtype=np.int64)
-
-    if n_b > max_vertices:
-        idx_b   = np.sort(rng.choice(n_b, max_vertices, replace=False))
-        verts_b = verts_b[idx_b]
-        remap_b = np.full(n_b, -1, dtype=np.int64)
-        remap_b[idx_b] = np.arange(max_vertices)
-        # Compose with previous index map if it exists
-        idx_b_orig = idx_b_prev[idx_b] if idx_b_prev is not None else idx_b
-    else:
-        remap_b = np.arange(n_b, dtype=np.int64)
-        idx_b_orig = idx_b_prev  # unchanged
-
-    new_ca = remap_a[corr_a]
-    new_cb = remap_b[corr_b]
-    valid  = (new_ca >= 0) & (new_cb >= 0)
-    return PairSample(
-        verts_a, verts_b, new_ca[valid], new_cb[valid], pair.name,
-        faces_b=pair.faces_b,
-        _verts_b_full=verts_b_full,
-        _idx_b=idx_b_orig,
+def build_patch_data(vertices_t: torch.Tensor, knn: np.ndarray, device: torch.device):
+    """Build MeshPatchData from vertices and precomputed kNN indices."""
+    N   = vertices_t.shape[0]
+    k   = knn.shape[1]
+    knn_t     = torch.from_numpy(knn).long().to(device)
+    patch_pos = vertices_t[knn_t] - vertices_t[:, None, :]   # (N, k, 3)
+    all_pos   = patch_pos.reshape(-1, 3)
+    return MeshPatchData(
+        pos=all_pos,
+        x=all_pos,
+        patch_idx=torch.arange(N, device=device).repeat_interleave(k),
+        vertex_indices=knn_t.flatten(),
+        center_indices=torch.arange(N, device=device),
     )
 
 
 # =============================================================================
-# SMAL loading utilities
+# Laplacian assembly
 # =============================================================================
 
-def _install_fake_chumpy():
-    if 'chumpy' in sys.modules:
-        return
-    chumpy             = types.ModuleType('chumpy')
-    chumpy_ch          = types.ModuleType('chumpy.ch')
-    chumpy_ch_ops      = types.ModuleType('chumpy.ch_ops')
-    chumpy_reordering  = types.ModuleType('chumpy.reordering')
-    chumpy_utils       = types.ModuleType('chumpy.utils')
-    chumpy_logic       = types.ModuleType('chumpy.logic')
+def assemble_dense_stiffness_and_mass(
+    stiffness_weights, areas, attention_mask,
+    vertex_indices, center_indices, batch_indices,
+):
+    """Differentiable dense S and M from scalar edge weights."""
+    device       = stiffness_weights.device
+    num_patches  = stiffness_weights.shape[0]
+    max_k        = stiffness_weights.shape[1]
+    num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
+
+    weights_flat      = stiffness_weights.flatten()
+    mask_flat         = attention_mask.flatten()
+    patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)
+
+    valid_weights       = weights_flat[mask_flat]
+    valid_patch_indices = patch_indices_flat[mask_flat]
+    num_valid           = len(valid_patch_indices)
+
+    if num_valid > 0:
+        patch_changes = torch.ones(num_valid, dtype=torch.bool, device=device)
+        if num_valid > 1:
+            patch_changes[1:] = valid_patch_indices[1:] != valid_patch_indices[:-1]
+        group_ids    = torch.cumsum(patch_changes.long(), dim=0) - 1
+        change_indices = torch.where(patch_changes)[0]
+        group_starts = change_indices[group_ids]
+        positions_in_patch = torch.arange(num_valid, device=device, dtype=torch.long) - group_starts
+    else:
+        positions_in_patch = torch.tensor([], device=device, dtype=torch.long)
+
+    batch_sizes   = batch_indices.bincount(minlength=num_patches)
+    cumsum_sizes  = torch.cumsum(batch_sizes, dim=0)
+    starts        = torch.cat([torch.tensor([0], device=device, dtype=torch.long),
+                               cumsum_sizes[:-1]])
+
+    valid_centers   = center_indices[valid_patch_indices]
+    valid_neighbors = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
+
+    all_rows = torch.cat([valid_centers, valid_neighbors])
+    all_cols = torch.cat([valid_neighbors, valid_centers])
+    all_vals = torch.cat([-valid_weights, -valid_weights])
+
+    flat_indices = all_rows * num_vertices + all_cols
+    S_flat = torch.zeros(num_vertices * num_vertices, device=device,
+                         dtype=stiffness_weights.dtype)
+    S_flat = S_flat.scatter_add(0, flat_indices, all_vals)
+    S      = S_flat.view(num_vertices, num_vertices)
+    S      = 0.5 * (S + S.T)
+    S      = S - torch.diag(S.sum(dim=1))
+
+    M_diag  = torch.zeros(num_vertices, device=device, dtype=areas.dtype)
+    M_diag  = M_diag.scatter_add(0, center_indices, areas)
+    M_count = torch.zeros(num_vertices, device=device, dtype=areas.dtype)
+    M_count = M_count.scatter_add(0, center_indices, torch.ones_like(areas))
+    M_diag  = M_diag / M_count.clamp(min=1.0)
+    M_diag  = M_diag.clamp(min=1e-8)
+    return S, M_diag
+
+
+def assemble_anisotropic_laplacian(
+    grad_coeffs: torch.Tensor,
+    areas: torch.Tensor,
+    knn: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable L = G^T M_3 G from gradient coefficients."""
+    N, k, _ = grad_coeffs.shape
+    device   = grad_coeffs.device
+
+    center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)
+    ext_coeffs    = torch.cat([center_coeffs, grad_coeffs], dim=1)
+    sqrt_a        = areas.sqrt()[:, None, None]
+    scaled        = sqrt_a * ext_coeffs
+    gram          = torch.bmm(scaled, scaled.transpose(1, 2))
+
+    center_idx  = torch.arange(N, device=device).unsqueeze(1)
+    ext_indices = torch.cat([center_idx, knn], dim=1)
+    kp1         = k + 1
+    row_idx     = ext_indices[:, :, None].expand(-1, -1, kp1)
+    col_idx     = ext_indices[:, None, :].expand(-1, kp1, -1)
+    flat_idx    = (row_idx * N + col_idx).reshape(-1)
+
+    L_flat = torch.zeros(N * N, device=device, dtype=grad_coeffs.dtype)
+    L_flat = L_flat.scatter_add(0, flat_idx, gram.reshape(-1))
+    L      = L_flat.view(N, N)
+    L      = 0.5 * (L + L.T)
+    return L, areas.detach()
+
+
+def _sparsify_L_to_knn(L: torch.Tensor, knn_t: torch.Tensor) -> torch.Tensor:
+    """Zero out entries of L not in the 1-hop kNN graph, fix diagonal."""
+    N      = L.shape[0]
+    device = L.device
+    mask   = torch.zeros(N, N, dtype=torch.bool, device=device)
+    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn_t)
+    mask[row_idx, knn_t] = True
+    mask   = mask | mask.T
+    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+    L_sp   = L * (mask | diag_mask).float()
+    off    = L_sp * (1.0 - diag_mask.float())
+    L_sp   = off - torch.diag(off.sum(dim=1))
+    return L_sp
+
 
-    class FakeCh:
-        def __init__(self, *args, **kwargs):
-            self._data = None
-            if args and isinstance(args[0], np.ndarray):
-                self._data = args[0]
-        def __setstate__(self, state):
-            if isinstance(state, dict):
-                self.__dict__.update(state)
-                for key in ['x', 'a', '_data']:
-                    if key in state and isinstance(state[key], np.ndarray):
-                        self._data = state[key]; break
-        @property
-        def r(self):
-            return np.array(self._data) if self._data is not None else np.array([])
-        def __array__(self, dtype=None):
-            arr = self.r
-            return arr.astype(dtype) if dtype else arr
+def assemble_isotropic_laplacian(
+    grad_coeffs: torch.Tensor,
+    areas: torch.Tensor,
+    knn: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Isotropic graph Laplacian from gradient coefficients.
 
-    sys.modules['chumpy']            = chumpy
-    sys.modules['chumpy.ch']         = chumpy_ch
-    sys.modules['chumpy.ch_ops']     = chumpy_ch_ops
-    sys.modules['chumpy.reordering'] = chumpy_reordering
-    sys.modules['chumpy.utils']      = chumpy_utils
-    sys.modules['chumpy.logic']      = chumpy_logic
-    chumpy.ch = chumpy_ch; chumpy.ch_ops = chumpy_ch_ops
-    chumpy.reordering = chumpy_reordering; chumpy.utils = chumpy_utils
-    chumpy.logic = chumpy_logic; chumpy.Ch = FakeCh
-    chumpy_ch.Ch = FakeCh
-    for attr in ['add', 'subtract', 'multiply', 'divide']:
-        setattr(chumpy_ch_ops, attr, FakeCh)
-    chumpy_reordering.transpose    = FakeCh
-    chumpy_reordering.concatenate = FakeCh
-
-
-def _to_numpy(x):
-    if hasattr(x, 'r'):          return np.array(x.r)
-    elif isinstance(x, np.ndarray): return x
-    elif scipy.sparse.issparse(x):  return x
-    return np.array(x)
-
-
-def _rodrigues(axis_angle):
-    N     = axis_angle.shape[0]
-    theta = np.clip(np.linalg.norm(axis_angle, axis=1, keepdims=True), 1e-8, None)
-    k     = axis_angle / theta
-    K     = np.zeros((N, 3, 3))
-    K[:, 0, 1] = -k[:, 2]; K[:, 0, 2] =  k[:, 1]
-    K[:, 1, 0] =  k[:, 2]; K[:, 1, 2] = -k[:, 0]
-    K[:, 2, 0] = -k[:, 1]; K[:, 2, 1] =  k[:, 0]
-    s = np.sin(theta)[:, :, np.newaxis]
-    c = np.cos(theta)[:, :, np.newaxis]
-    I = np.broadcast_to(np.eye(3), (N, 3, 3)).copy()
-    return I + s * K + (1 - c) * np.einsum('nij,njk->nik', K, K)
-
-
-# =============================================================================
-# SMAL model + pair generator
-# =============================================================================
-
-class SMALModel:
-    """Cached SMAL model — load once, generate shapes quickly."""
-
-    def __init__(self, model_path: str, data_path: str):
-        _install_fake_chumpy()
-        with open(model_path, 'rb') as f:
-            params = pickle.load(f, encoding='latin1')
-        with open(data_path, 'rb') as f:
-            smal_data = pickle.load(f, encoding='latin1')
-
-        self.v_template  = _to_numpy(params['v_template']).astype(np.float64)
-        self.shapedirs   = _to_numpy(params['shapedirs']).astype(np.float64)
-        self.posedirs    = _to_numpy(params['posedirs']).astype(np.float64)
-        J_reg            = params['J_regressor']
-        self.J_regressor = (J_reg.toarray().astype(np.float64)
-                            if scipy.sparse.issparse(J_reg)
-                            else _to_numpy(J_reg).astype(np.float64))
-        self.weights       = _to_numpy(params['weights']).astype(np.float64)
-        self.kintree_table = _to_numpy(params['kintree_table']).astype(np.int64)
-        self.faces         = _to_numpy(params['f']).astype(np.int32)
-        self.num_joints    = self.kintree_table.shape[1]
-        self.num_betas     = self.shapedirs.shape[2]
-        self.cluster_means = smal_data['cluster_means']
-        self.num_families  = len(self.cluster_means)
-
-    def generate(
-        self, family_idx: int, pose_scale: float = 0.2,
-        rng: Optional[np.random.RandomState] = None,
-    ) -> np.ndarray:
-        """Generate a normalized SMAL shape. Returns (N, 3) float32 vertices."""
-        if rng is None:
-            rng = np.random.RandomState(0)
-        betas = np.zeros(self.num_betas)
-        family_betas = self.cluster_means[family_idx]
-        n = min(len(family_betas), self.num_betas)
-        betas[:n] = family_betas[:n]
-
-        pose     = rng.randn(self.num_joints * 3) * pose_scale
-        pose[:3] *= 0.1
-
-        v_shaped  = self.v_template + self.shapedirs.dot(betas)
-        J         = self.J_regressor.dot(v_shaped)
-        pose_vec  = pose.reshape(-1, 3)
-        R         = _rodrigues(pose_vec)
-        I_cube    = np.broadcast_to(np.eye(3), (self.num_joints - 1, 3, 3))
-        lrotmin   = (R[1:] - I_cube).ravel()
-        v_posed   = v_shaped + self.posedirs.dot(lrotmin)
-
-        parent = {i: self.kintree_table[0, i] for i in range(1, self.num_joints)}
-
-        def with_zeros(x):
-            return np.vstack([x, [0, 0, 0, 1]])
-
-        G = np.empty((self.num_joints, 4, 4))
-        G[0] = with_zeros(np.hstack([R[0], J[0].reshape(3, 1)]))
-        for i in range(1, self.num_joints):
-            G[i] = G[parent[i]].dot(
-                with_zeros(np.hstack([R[i], (J[i] - J[parent[i]]).reshape(3, 1)])))
-
-        G_rest   = np.matmul(G,
-                             np.hstack([J, np.zeros((self.num_joints, 1))
-                                        ]).reshape(self.num_joints, 4, 1))
-        G_packed = np.zeros((self.num_joints, 4, 4))
-        G_packed[:, :, 3] = G_rest.squeeze(-1)
-        G = G - G_packed
-
-        T       = np.tensordot(self.weights, G, axes=[[1], [0]])
-        v_homo  = np.hstack([v_posed, np.ones((len(v_posed), 1))])
-        v_final = np.einsum('vij,vj->vi', T, v_homo)[:, :3]
-        return normalize_mesh_vertices(v_final.astype(np.float32))
-
-
-class SMALPairGenerator(PairGenerator):
-    """Generate SMAL shape pairs with identity correspondence.
-
-    train_families / val_families: null → auto (val = last 2, train = rest).
-    """
-
-    def __init__(
-        self,
-        smal: SMALModel,
-        train_families: Optional[List[int]] = None,
-        val_families:   Optional[List[int]] = None,
-        pose_scale: float = 0.2,
-    ):
-        self.smal       = smal
-        self.pose_scale = pose_scale
-
-        all_families = list(range(smal.num_families))
-        if val_families is None:
-            val_families = all_families[-2:]
-        if train_families is None:
-            train_families = [f for f in all_families if f not in val_families]
-
-        self.train_families = train_families
-        self.val_families   = val_families
-        self.cross_pairs    = list(combinations(train_families, 2))
-        self.same_pairs     = [(f, f) for f in train_families]
-        self.val_pairs      = list(combinations(val_families, 2))
-        for t in train_families:
-            for v in val_families:
-                self.val_pairs.append((t, v))
-
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.5,
-    ) -> PairSample:
-        if rng.rand() < cross_ratio and self.cross_pairs:
-            fam_a, fam_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
-        else:
-            fam_a, fam_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
-        verts_a = self.smal.generate(fam_a, self.pose_scale, rng)
-        verts_b = self.smal.generate(fam_b, self.pose_scale, rng)
-        corr_a, corr_b = identity_correspondence(len(verts_a))
-        return PairSample(verts_a, verts_b, corr_a, corr_b,
-                          f"{pair_type}_{fam_a}_vs_{fam_b}")
-
-    def get_val_pairs(
-        self, rng: np.random.RandomState, poses_per_pair: int = 1,
-    ) -> List[PairSample]:
-        pairs = []
-        for fam_a, fam_b in self.val_pairs:
-            for pose_idx in range(poses_per_pair):
-                pair_rng = np.random.RandomState(fam_a * 100 + fam_b + pose_idx * 10000)
-                verts_a  = self.smal.generate(fam_a, self.pose_scale, pair_rng)
-                verts_b  = self.smal.generate(fam_b, self.pose_scale, pair_rng)
-                corr_a, corr_b = identity_correspondence(len(verts_a))
-                pairs.append(PairSample(verts_a, verts_b, corr_a, corr_b,
-                                        f"val_{fam_a}_vs_{fam_b}_p{pose_idx}"))
-        return pairs
-
-
-# =============================================================================
-# DT4D loading utilities
-# =============================================================================
-
-def _load_obj_vertices(path: str) -> np.ndarray:
-    verts = []
-    with open(path) as f:
-        for line in f:
-            if line.startswith('v '):
-                verts.append([float(x) for x in line.split()[1:4]])
-    return np.array(verts, dtype=np.float32)
-
-
-def _load_obj(path: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Load vertices and faces from an OBJ file.
-
-    Returns:
-        vertices: (N, 3) float32
-        faces: (F, 3) int32 (0-indexed), or None if no faces found.
-    """
-    verts = []
-    faces = []
-    with open(path) as f:
-        for line in f:
-            if line.startswith('v '):
-                verts.append([float(x) for x in line.split()[1:4]])
-            elif line.startswith('f '):
-                # OBJ face indices are 1-based, may contain v/vt/vn
-                parts = line.split()[1:]
-                if len(parts) >= 3:
-                    idx = [int(p.split('/')[0]) - 1 for p in parts[:3]]
-                    faces.append(idx)
-    vertices = np.array(verts, dtype=np.float32)
-    face_arr = np.array(faces, dtype=np.int32) if faces else None
-    return vertices, face_arr
-
-
-def _load_vts(path: str) -> np.ndarray:
-    """Load VTS file. Returns 0-indexed (R,) int32 array."""
-    return np.loadtxt(path, dtype=np.int32) - 1
-
-
-class DT4DCategory:
-    """One DT4D category (humanoid or animal) with all poses pre-loaded."""
-
-    def __init__(self, root: Path, name: str):
-        self.name    = name
-        cat_dir      = root / name
-        corres_dir   = cat_dir / "corres"
-        self.poses:    List[str]        = []
-        self.vertices: List[np.ndarray] = []
-        self.faces:    List[Optional[np.ndarray]] = []
-        self.vts:      List[np.ndarray] = []
-
-        for obj_path in sorted(cat_dir.glob("*.obj")):
-            vts_path = corres_dir / f"{obj_path.stem}.vts"
-            if not vts_path.exists():
-                continue
-            verts, faces = _load_obj(str(obj_path))
-            self.poses.append(obj_path.stem)
-            self.vertices.append(normalize_mesh_vertices(verts))
-            self.faces.append(faces)
-            self.vts.append(_load_vts(str(vts_path)))
-
-        self.num_poses = len(self.poses)
-        self.ref_size  = len(self.vts[0]) if self.vts else 0
-
-    def __repr__(self):
-        return f"DT4DCategory({self.name}, {self.num_poses} poses, ref={self.ref_size})"
-
-
-# ── Category discovery helpers ────────────────────────────────────────────────
-
-def _discover_categories(root: Path) -> List[str]:
-    """Discover all valid category directories under *root*."""
-    cats = []
-    for d in sorted(root.iterdir()):
-        if not d.is_dir() or d.name.startswith('.'):
-            continue
-        corres_dir = d / "corres"
-        if not corres_dir.exists():
-            continue
-        if any((corres_dir / f"{o.stem}.vts").exists() for o in d.glob("*.obj")):
-            cats.append(d.name)
-    return cats
-
-
-def _resolve_categories(
-    root: Path,
-    categories: Optional[List[str]],
-    exclude_categories: Optional[List[str]],
-) -> List[str]:
-    """Resolve category specification to a concrete list.
-
-    Exactly one of *categories* / *exclude_categories* may be non-None.
-    Both None → use all categories discovered from *root*.
-    """
-    if categories is not None and exclude_categories is not None:
-        raise ValueError(
-            "Specify 'categories' OR 'exclude_categories', not both.")
-    all_cats = _discover_categories(root)
-    if not all_cats:
-        raise FileNotFoundError(
-            f"No valid DT4D categories found in {root}.")
-    if categories is not None:
-        missing = [c for c in categories if c not in all_cats]
-        if missing:
-            raise ValueError(f"Categories not found in {root}: {missing}")
-        return sorted(categories)
-    if exclude_categories is not None:
-        result = [c for c in all_cats if c not in exclude_categories]
-        if not result:
-            raise ValueError("All categories excluded.")
-        return result
-    return all_cats
-
-
-# ── Base pair generator ──────────────────────────────────────────────────────
-
-class DT4DPairGeneratorBase(PairGenerator):
-    """Shared DT4D logic: category loading, same-category pairs, val pairs."""
-
-    def __init__(
-        self,
-        root: str,
-        categories: Optional[List[str]] = None,
-        exclude_categories: Optional[List[str]] = None,
-    ):
-        self.root = Path(root)
-        resolved = _resolve_categories(self.root, categories, exclude_categories)
-        print(f"  [{self.__class__.__name__}] root: {self.root}")
-        print(f"  [{self.__class__.__name__}] Loading {len(resolved)} categories...",
-              flush=True)
-
-        self.category_names: List[str] = resolved
-        self.categories: Dict[str, DT4DCategory] = {}
-        for i, name in enumerate(resolved):
-            cat = DT4DCategory(self.root, name)
-            self.categories[name] = cat
-            print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
-
-        self.same_pairs = [(c, c) for c in self.category_names]
-        print(f"  [{self.__class__.__name__}] Loading complete.", flush=True)
-
-    def _build_same_category_correspondence(
-        self, cat_name: str, pose_a: int, pose_b: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        cat = self.categories[cat_name]
-        vts_a, vts_b = cat.vts[pose_a], cat.vts[pose_b]
-        n_a = len(cat.vertices[pose_a])
-        n_b = len(cat.vertices[pose_b])
-
-        # VTS files may differ in length across poses (independently remeshed).
-        # Use only the shared reference range.
-        n_ref = min(len(vts_a), len(vts_b))
-        vts_a = vts_a[:n_ref]
-        vts_b = vts_b[:n_ref]
-
-        mask = (vts_a >= 0) & (vts_a < n_a) & (vts_b >= 0) & (vts_b < n_b)
-        return vts_a[mask], vts_b[mask]
-
-    def _build_correspondence(
-        self, cat_a: str, pose_a: int, cat_b: str, pose_b: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        if cat_a == cat_b:
-            return self._build_same_category_correspondence(cat_a, pose_a, pose_b)
-        raise NotImplementedError(
-            f"Cross-category correspondence not supported in {self.__class__.__name__}")
-
-    def _get_val_pair_list(self) -> List[Tuple[str, str]]:
-        return self.same_pairs
-
-    def get_val_pairs(
-        self, rng: np.random.RandomState, poses_per_pair: int = 1,
-    ) -> List[PairSample]:
-        pairs = []
-        for cat_a, cat_b in self._get_val_pair_list():
-            pair_rng = np.random.RandomState(_stable_hash((cat_a, cat_b)))
-            c_a, c_b = self.categories[cat_a], self.categories[cat_b]
-            seen: set = set()
-            for _ in range(poses_per_pair):
-                for _attempt in range(200):
-                    pa = pair_rng.randint(c_a.num_poses)
-                    pb = pair_rng.randint(c_b.num_poses)
-                    if cat_a == cat_b and pa == pb and c_a.num_poses > 1:
-                        continue
-                    if (pa, pb) not in seen:
-                        break
-                else:
-                    break
-                seen.add((pa, pb))
-                corr_a, corr_b = self._build_correspondence(cat_a, pa, cat_b, pb)
-                pairs.append(PairSample(
-                    verts_a=c_a.vertices[pa], verts_b=c_b.vertices[pb],
-                    corr_a=corr_a, corr_b=corr_b,
-                    name=f"val_{cat_a}:{c_a.poses[pa]}_vs_{cat_b}:{c_b.poses[pb]}",
-                    faces_b=c_b.faces[pb],
-                ))
-        return pairs
-
-
-# ── Humanoid pair generator (with cross-category bridges) ────────────────────
-
-class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
-    """DT4D Humanoid pairs with optional cross-category bridge support."""
-
-    def __init__(
-        self,
-        root: str,
-        categories: Optional[List[str]] = None,
-        exclude_categories: Optional[List[str]] = None,
-        enable_cross_category: bool = True,
-        # Legacy compat: accept old-style args, ignore them with a warning
-        train_categories: Optional[List[str]] = None,
-        val_categories: Optional[List[str]] = None,
-    ):
-        # Legacy compat shim
-        if train_categories is not None or val_categories is not None:
-            import warnings
-            warnings.warn(
-                "train_categories / val_categories are deprecated. "
-                "Use categories / exclude_categories instead.",
-                DeprecationWarning, stacklevel=2,
-            )
-            if categories is None and exclude_categories is None:
-                merged = sorted(set((train_categories or []) + (val_categories or [])))
-                categories = merged if merged else None
-
-        super().__init__(root, categories, exclude_categories)
-        self.enable_cross_category = enable_cross_category
-
-        self.bridges: Dict[Tuple[str, str], np.ndarray] = {}
-        if enable_cross_category:
-            bridge_dir = self.root / "cross_category_corres"
-            if bridge_dir.exists():
-                for f in bridge_dir.glob("*.vts"):
-                    parts = f.stem.split("_", 1)
-                    if len(parts) == 2:
-                        src, dst = parts
-                        if src in self.categories and dst in self.categories:
-                            self.bridges[(src, dst)] = _load_vts(str(f))
-                print(f"  Loaded {len(self.bridges)} cross-category bridges")
-
-        self.cross_pairs = []
-        if enable_cross_category:
-            self.cross_pairs = [
-                (a, b) for a, b in combinations(self.category_names, 2)
-                if self._can_bridge(a, b)
-            ]
-        print(f"  Same-category pairs:  {len(self.same_pairs)}")
-        print(f"  Cross-category pairs: {len(self.cross_pairs)}")
-
-    def _can_bridge(self, a: str, b: str) -> bool:
-        if a == b: return True
-        if (a, b) in self.bridges or (b, a) in self.bridges: return True
-        for hub in self.categories:
-            if hub in (a, b): continue
-            if ((a, hub) in self.bridges or (hub, a) in self.bridges) and \
-               ((hub, b) in self.bridges or (b, hub) in self.bridges):
-                return True
-        return False
-
-    def _get_bridge(self, a: str, b: str) -> np.ndarray:
-        if (a, b) in self.bridges: return self.bridges[(a, b)]
-        if (b, a) in self.bridges:
-            return self._invert_bridge(self.bridges[(b, a)],
-                                       self.categories[a].ref_size)
-        for hub in self.categories:
-            if hub in (a, b): continue
-            if ((a, hub) in self.bridges or (hub, a) in self.bridges) and \
-               ((hub, b) in self.bridges or (b, hub) in self.bridges):
-                ab_hub = self._get_bridge(a, hub)
-                hub_b  = self._get_bridge(hub, b)
-                result = np.full(len(ab_hub), -1, dtype=np.int32)
-                valid  = (ab_hub >= 0) & (ab_hub < len(hub_b))
-                result[valid] = hub_b[ab_hub[valid]]
-                return result
-        raise ValueError(f"No bridge between {a} and {b}")
-
-    @staticmethod
-    def _invert_bridge(fwd: np.ndarray, target_size: int) -> np.ndarray:
-        inv = np.full(target_size, -1, dtype=np.int32)
-        for r_src, r_dst in enumerate(fwd):
-            if 0 <= r_dst < target_size:
-                inv[r_dst] = r_src
-        return inv
-
-    def _build_correspondence(
-        self, cat_a: str, pose_a: int, cat_b: str, pose_b: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        if cat_a == cat_b:
-            return self._build_same_category_correspondence(cat_a, pose_a, pose_b)
-
-        vts_a = self.categories[cat_a].vts[pose_a]
-        vts_b = self.categories[cat_b].vts[pose_b]
-        n_a   = len(self.categories[cat_a].vertices[pose_a])
-        n_b   = len(self.categories[cat_b].vertices[pose_b])
-
-        bridge = self._get_bridge(cat_a, cat_b)
-        valid  = (bridge >= 0) & (bridge < len(vts_b))
-        ref    = np.where(valid)[0]
-        # Ensure ref indices are within vts_a range
-        ref    = ref[ref < len(vts_a)]
-        corr_a = vts_a[ref]
-        corr_b = vts_b[bridge[ref]]
-        mask = (corr_a >= 0) & (corr_a < n_a) & (corr_b >= 0) & (corr_b < n_b)
-        return corr_a[mask], corr_b[mask]
-
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.5,
-    ) -> PairSample:
-        if self.enable_cross_category and rng.rand() < cross_ratio and self.cross_pairs:
-            cat_a, cat_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
-        else:
-            cat_a, cat_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
-        c_a, c_b = self.categories[cat_a], self.categories[cat_b]
-        pose_a = rng.randint(c_a.num_poses)
-        pose_b = rng.randint(c_b.num_poses)
-        if cat_a == cat_b and c_a.num_poses > 1:
-            while pose_b == pose_a:
-                pose_b = rng.randint(c_b.num_poses)
-        corr_a, corr_b = self._build_correspondence(cat_a, pose_a, cat_b, pose_b)
-        return PairSample(
-            verts_a=c_a.vertices[pose_a], verts_b=c_b.vertices[pose_b],
-            corr_a=corr_a, corr_b=corr_b,
-            name=f"{pair_type}_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
-            faces_b=c_b.faces[pose_b],
-        )
-
-    def _get_val_pair_list(self) -> List[Tuple[str, str]]:
-        val_pairs = list(self.same_pairs)
-        if self.enable_cross_category:
-            for a, b in combinations(self.category_names, 2):
-                if self._can_bridge(a, b):
-                    val_pairs.append((a, b))
-        return val_pairs
-
-
-# Backward compatibility alias
-DT4DPairGenerator = DT4DHumanoidPairGenerator
-
-
-# ── Animals pair generator (inter-category only) ─────────────────────────────
-
-class DT4DAnimalsPairGenerator(DT4DPairGeneratorBase):
-    """DT4D Animals — same-category pairs only (no cross-category bridges)."""
-
-    def __init__(
-        self,
-        root: str,
-        categories: Optional[List[str]] = None,
-        exclude_categories: Optional[List[str]] = None,
-    ):
-        super().__init__(root, categories, exclude_categories)
-        print(f"  Same-category pairs: {len(self.same_pairs)} "
-              f"(cross-category not available)")
-
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
-    ) -> PairSample:
-        cat_name = self.category_names[rng.randint(len(self.category_names))]
-        cat = self.categories[cat_name]
-        pose_a = rng.randint(cat.num_poses)
-        pose_b = rng.randint(cat.num_poses)
-        if cat.num_poses > 1:
-            while pose_b == pose_a:
-                pose_b = rng.randint(cat.num_poses)
-        corr_a, corr_b = self._build_same_category_correspondence(
-            cat_name, pose_a, pose_b)
-        return PairSample(
-            verts_a=cat.vertices[pose_a], verts_b=cat.vertices[pose_b],
-            corr_a=corr_a, corr_b=corr_b,
-            name=f"same_{cat_name}:{cat.poses[pose_a]}_vs_{cat_name}:{cat.poses[pose_b]}",
-            faces_b=cat.faces[pose_b],
-        )
-
-
-# ── FAUST pair generator ──────────────────────────────────────────────────────
-
-class FAUSTPairGenerator(PairGenerator):
-    """MPI-FAUST registration pairs with identity correspondence.
-
-    FAUST provides 100 registered meshes: 10 subjects × 10 poses.
-    All share the same template topology (same vertex count and faces),
-    so correspondence between any pair is the identity mapping.
-
-    Supports intra-subject (same person, different pose) and optionally
-    inter-subject (different person) pairs.
+    Uses scalar edge weights w_ij = area_i * ||g_ij||^2, producing a
+    standard graph Laplacian L = D - W with non-negative weights.
+    This is guaranteed PSD and sparse (kNN only, no 2-hop fill-in).
 
     Args:
-        root: Path to FAUST root directory (contains training/registrations/).
-        subjects: Explicit list of subject IDs (0–9) to use. None = all.
-        exclude_subjects: Subject IDs to exclude. None = exclude none.
-        enable_cross_subject: If True, include inter-subject pairs in
-            training and validation.
+        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
+        areas: (N,) per-vertex areas.
+        knn: (N, k) kNN indices.
+
+    Returns:
+        L: (N, N) isotropic Laplacian (PSD, sparse).
+        M_diag: (N,) mass diagonal (same as areas).
     """
+    N, k, _ = grad_coeffs.shape
+    device  = grad_coeffs.device
 
-    def __init__(
-        self,
-        root: str,
-        subjects: Optional[List[int]] = None,
-        exclude_subjects: Optional[List[int]] = None,
-        enable_cross_subject: bool = False,
-    ):
-        self.root = Path(root)
-        reg_dir = self.root / "training" / "registrations"
-        if not reg_dir.exists():
-            raise FileNotFoundError(
-                f"FAUST registrations not found at {reg_dir}")
+    # w_ij = area_i * ||g_ij||^2  — scalar weight per edge (i, j)
+    edge_weights = areas[:, None] * (grad_coeffs ** 2).sum(dim=2)  # (N, k)
 
-        self.enable_cross_subject = enable_cross_subject
+    # Build sparse graph Laplacian: L_ij = -w_ij, L_ii = sum_j w_ij
+    # Symmetrise: w_ij_sym = 0.5 * (w_ij + w_ji)
+    L = torch.zeros(N, N, device=device, dtype=grad_coeffs.dtype)
+    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn)
+    L[row_idx, knn] -= edge_weights
+    L[knn, row_idx] -= edge_weights
+    L = 0.5 * L  # average the two directions
+    # Fix diagonal: L_ii = -sum of off-diagonal in row i
+    L.fill_diagonal_(0.0)
+    L.diagonal().copy_(-L.sum(dim=1))
 
-        # Resolve subject list
-        all_subjects = list(range(10))
-        if subjects is not None and exclude_subjects is not None:
-            raise ValueError("Specify 'subjects' OR 'exclude_subjects', not both.")
-        if subjects is not None:
-            self.subject_ids = sorted(subjects)
-        elif exclude_subjects is not None:
-            self.subject_ids = [s for s in all_subjects if s not in exclude_subjects]
-        else:
-            self.subject_ids = all_subjects
+    return L, areas.detach()
 
-        print(f"  [FAUSTPairGenerator] root: {self.root}")
-        print(f"  [FAUSTPairGenerator] Loading subjects: {self.subject_ids}")
 
-        # Load all registrations, grouped by subject
-        import trimesh
-        self.subject_poses: Dict[int, List[str]] = {}     # subject -> [pose_name, ...]
-        self.vertices: Dict[int, List[np.ndarray]] = {}    # subject -> [verts, ...]
-        self.faces: Optional[np.ndarray] = None            # shared across all meshes
+def compute_laplacian_differentiable(
+    model: LaplacianTransformerModule,
+    vertices_np: np.ndarray,
+    k: int,
+    device: torch.device,
+    sparsify: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Full forward pass: vertices → dense differentiable (S, M)."""
+    vertices_t = torch.from_numpy(vertices_np).float().to(device)
+    knn        = compute_knn(vertices_np, k)
+    knn_t      = torch.from_numpy(knn).long().to(device)
+    batch_data = Batch.from_data_list([build_patch_data(vertices_t, knn, device)]).to(device)
+    fwd        = model._forward_pass(batch_data)
 
-        for subj_id in self.subject_ids:
-            self.subject_poses[subj_id] = []
-            self.vertices[subj_id] = []
-            for pose_idx in range(10):
-                reg_id = subj_id * 10 + pose_idx
-                ply_path = reg_dir / f"tr_reg_{reg_id:03d}.ply"
-                if not ply_path.exists():
-                    continue
-                mesh = trimesh.load(str(ply_path), process=False, force='mesh')
-                verts = normalize_mesh_vertices(
-                    np.array(mesh.vertices, dtype=np.float64)
-                ).astype(np.float32)
-                if self.faces is None:
-                    self.faces = np.array(mesh.faces, dtype=np.int32)
-                self.subject_poses[subj_id].append(f"s{subj_id}_p{pose_idx}")
-                self.vertices[subj_id].append(verts)
-
-        self.num_vertices = len(self.vertices[self.subject_ids[0]][0])
-
-        # Build pair lists
-        self.same_pairs = [(s, s) for s in self.subject_ids]
-        if enable_cross_subject:
-            self.cross_pairs = list(combinations(self.subject_ids, 2))
-        else:
-            self.cross_pairs = []
-
-        total_meshes = sum(len(v) for v in self.vertices.values())
-        print(f"  [FAUSTPairGenerator] Loaded {total_meshes} meshes "
-              f"({len(self.subject_ids)} subjects, {self.num_vertices} verts each)")
-        print(f"  Same-subject pairs: {len(self.same_pairs)}, "
-              f"cross-subject pairs: {len(self.cross_pairs)}")
-
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
-    ) -> PairSample:
-        if rng.rand() < cross_ratio and self.cross_pairs:
-            subj_a, subj_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
-        else:
-            subj_a, subj_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
-
-        poses_a = self.vertices[subj_a]
-        poses_b = self.vertices[subj_b]
-        pa = rng.randint(len(poses_a))
-        pb = rng.randint(len(poses_b))
-        if subj_a == subj_b and len(poses_a) > 1:
-            while pb == pa:
-                pb = rng.randint(len(poses_b))
-
-        corr_a, corr_b = identity_correspondence(self.num_vertices)
-        name_a = self.subject_poses[subj_a][pa]
-        name_b = self.subject_poses[subj_b][pb]
-        return PairSample(
-            verts_a=poses_a[pa], verts_b=poses_b[pb],
-            corr_a=corr_a, corr_b=corr_b,
-            name=f"{pair_type}_{name_a}_vs_{name_b}",
-            faces_b=self.faces,
+    if fwd.get('grad_coeffs') is not None:
+        L, M_diag = assemble_anisotropic_laplacian(fwd['grad_coeffs'], fwd['areas'], knn_t)
+        if sparsify:
+            L = _sparsify_L_to_knn(L, knn_t)
+        return L, M_diag
+    else:
+        batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
+        return assemble_dense_stiffness_and_mass(
+            stiffness_weights=fwd['stiffness_weights'],
+            areas=fwd['areas'],
+            attention_mask=fwd['attention_mask'],
+            vertex_indices=batch_data.vertex_indices,
+            center_indices=batch_data.center_indices,
+            batch_indices=batch_idx,
         )
 
-    def get_val_pairs(
-        self, rng: np.random.RandomState, poses_per_pair: int = 1,
-    ) -> List[PairSample]:
-        pair_list = self.same_pairs[:]
-        if self.enable_cross_subject:
-            pair_list.extend(self.cross_pairs)
 
-        pairs = []
-        for subj_a, subj_b in pair_list:
-            pair_rng = np.random.RandomState(_stable_hash((subj_a, subj_b)))
-            poses_a = self.vertices[subj_a]
-            poses_b = self.vertices[subj_b]
-            seen: set = set()
-            for _ in range(poses_per_pair):
-                for _attempt in range(200):
-                    pa = pair_rng.randint(len(poses_a))
-                    pb = pair_rng.randint(len(poses_b))
-                    if subj_a == subj_b and pa == pb and len(poses_a) > 1:
-                        continue
-                    if (pa, pb) not in seen:
-                        break
-                else:
-                    break
-                seen.add((pa, pb))
-                corr_a, corr_b = identity_correspondence(self.num_vertices)
-                name_a = self.subject_poses[subj_a][pa]
-                name_b = self.subject_poses[subj_b][pb]
-                pairs.append(PairSample(
-                    verts_a=poses_a[pa], verts_b=poses_b[pb],
-                    corr_a=corr_a, corr_b=corr_b,
-                    name=f"val_{name_a}_vs_{name_b}",
-                    faces_b=self.faces,
-                ))
-        return pairs
+# =============================================================================
+# Differentiable eigendecomposition (stable backward)
+# =============================================================================
+
+class _StableEigh(torch.autograd.Function):
+    """eigh with clamped eigenvalue gaps in backward to prevent NaN."""
+
+    @staticmethod
+    def forward(ctx, A, min_gap):
+        eigenvalues, eigenvectors = torch.linalg.eigh(A)
+        ctx.save_for_backward(eigenvalues, eigenvectors)
+        ctx.min_gap = min_gap
+        return eigenvalues, eigenvectors
+
+    @staticmethod
+    def backward(ctx, grad_evals, grad_evecs):
+        evals, evecs = ctx.saved_tensors
+        min_gap      = ctx.min_gap
+        N            = evals.shape[0]
+
+        col_norms    = grad_evecs.norm(dim=0)
+        active_mask  = col_norms > 0
+        if grad_evals is not None:
+            active_mask = active_mask | (grad_evals.abs() > 0)
+        active_idx  = torch.where(active_mask)[0]
+        if len(active_idx) == 0:
+            return torch.zeros_like(evecs @ evecs.T), None
+
+        dV_active = grad_evecs[:, active_idx]
+        VtdV      = evecs.T @ dV_active
+        deval     = grad_evals if grad_evals is not None else torch.zeros(N, device=evals.device)
+        gaps      = evals[:, None] - evals[None, active_idx]
+        gaps_clamped = gaps.sign() * gaps.abs().clamp(min=min_gap)
+        F_active  = VtdV / gaps_clamped
+        for j_local, j_global in enumerate(active_idx):
+            F_active[j_global, j_local] = deval[j_global]
+
+        V_active = evecs[:, active_idx]
+        grad_A   = (evecs @ F_active) @ V_active.T
+        return 0.5 * (grad_A + grad_A.T), None
 
 
-# ── Composite pair generator ─────────────────────────────────────────────────
+def stable_eigh(A: torch.Tensor, min_gap: float = 1.0):
+    return _StableEigh.apply(A, min_gap)
 
-class CompositePairGenerator(PairGenerator):
-    """Merge multiple PairGenerators with configurable sampling weights."""
+
+def differentiable_eigh(
+    S: torch.Tensor, M_diag: torch.Tensor, k: int, min_gap: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable generalized eigendecomposition with stable backward."""
+    M_sqrt_inv = 1.0 / M_diag.sqrt().clamp(min=1e-8)
+    S_std      = (S * M_sqrt_inv[None, :]) * M_sqrt_inv[:, None]
+    S_std      = 0.5 * (S_std + S_std.T)
+    evals_all, evecs_all = stable_eigh(S_std, min_gap)
+    return evals_all[1:k+1], evecs_all[:, 1:k+1] * M_sqrt_inv[:, None]
+
+
+# =============================================================================
+# Shared diffusion descriptor computation
+# =============================================================================
+
+def _diffusion_solve(
+    S: torch.Tensor, M: torch.Tensor, E: torch.Tensor, alpha: float,
+) -> torch.Tensor:
+    """Solve (S + αM) x = M·E for raw diffusion values.
+
+    Args:
+        S: (N, N) stiffness matrix.
+        M: (N,) mass diagonal.
+        E: (N, L) indicator matrix (one-hot columns for landmarks).
+        alpha: diffusion scale.
+
+    Returns:
+        (N, L) raw diffusion values (unnormalised).
+    """
+    return torch.linalg.solve(S + alpha * torch.diag(M), M[:, None] * E)
+
+
+def _diffusion_descriptors(
+    S: torch.Tensor, M: torch.Tensor, E: torch.Tensor,
+    alphas: Tuple[float, ...],
+) -> torch.Tensor:
+    """Compute L2-normalised diffusion fingerprint descriptors.
+
+    For each diffusion scale α, solves (S + αM) x = M·E and concatenates.
+    The result is a per-vertex descriptor of dimension L * len(alphas),
+    where L is the number of landmark columns in E.
+
+    Args:
+        S: (N, N) stiffness matrix.
+        M: (N,) mass diagonal.
+        E: (N, L) indicator matrix (one-hot columns for landmarks).
+        alphas: tuple of diffusion scales.
+
+    Returns:
+        (N, L*len(alphas)) L2-normalised descriptors.
+    """
+    parts = [_diffusion_solve(S, M, E, a) for a in alphas]
+    return F.normalize(torch.cat(parts, dim=1), p=2, dim=1)
+
+
+# =============================================================================
+# Differentiable gradient and divergence from learned grad_coeffs
+# =============================================================================
+
+def _apply_gradient(
+    grad_coeffs: torch.Tensor, knn: torch.Tensor, u: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the learned gradient operator to scalar field(s).
+
+    Computes (∇f)_i = Σ_j g_ij (f_j - f_i) for each vertex i.
+    Fully differentiable through grad_coeffs and u.
+
+    Args:
+        grad_coeffs: (N, k, 3) per-neighbor gradient coefficients.
+        knn: (N, k) neighbor indices.
+        u: (N,) or (N, L) scalar field(s).
+
+    Returns:
+        (N, 3) or (N, L, 3) gradient field.
+    """
+    if u.dim() == 1:
+        du = u[knn] - u[:, None]                            # (N, k)
+        return (grad_coeffs * du.unsqueeze(2)).sum(dim=1)    # (N, 3)
+    else:
+        # Batched: u is (N, L)
+        du = u[knn] - u[:, None, :]                          # (N, k, L)
+        return torch.einsum('nkd,nkl->nld', grad_coeffs, du)  # (N, L, 3)
+
+
+def _apply_divergence(
+    grad_coeffs: torch.Tensor, knn: torch.Tensor, areas: torch.Tensor,
+    X: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the learned divergence operator to vector field(s).
+
+    Computes div(X)_j = Σ_{i: j∈nbr(i)} area_i * g_ij · X_i
+                      + area_j * center_coeff_j · X_j
+
+    This is the adjoint of _apply_gradient w.r.t. the area-weighted inner product.
+    Fully differentiable through grad_coeffs, areas, and X.
+
+    Args:
+        grad_coeffs: (N, k, 3) per-neighbor gradient coefficients.
+        knn: (N, k) neighbor indices.
+        areas: (N,) per-vertex areas.
+        X: (N, 3) or (N, L, 3) vector field(s).
+
+    Returns:
+        (N,) or (N, L) divergence.
+    """
+    N = grad_coeffs.shape[0]
+    device = grad_coeffs.device
+
+    if X.dim() == 2:
+        # Single field: X is (N, 3)
+        dot_nb = (grad_coeffs * X[:, None, :]).sum(dim=2)   # (N, k)
+        weighted_nb = areas[:, None] * dot_nb                # (N, k)
+        div = torch.zeros(N, device=device, dtype=X.dtype)
+        div.scatter_add_(0, knn.reshape(-1), weighted_nb.reshape(-1))
+
+        center_coeffs = -grad_coeffs.sum(dim=1)              # (N, 3)
+        div = div + areas * (center_coeffs * X).sum(dim=1)
+        return div
+    else:
+        # Batched: X is (N, L, 3)
+        L = X.shape[1]
+        dot_nb = torch.einsum('nkd,nld->nkl', grad_coeffs, X)   # (N, k, L)
+        weighted_nb = areas[:, None, None] * dot_nb               # (N, k, L)
+        div = torch.zeros(N, L, device=device, dtype=X.dtype)
+        knn_exp = knn.unsqueeze(2).expand(-1, -1, L)              # (N, k, L)
+        div.scatter_add_(0, knn_exp.reshape(-1, L), weighted_nb.reshape(-1, L))
+
+        center_coeffs = -grad_coeffs.sum(dim=1)                   # (N, 3)
+        div = div + areas[:, None] * torch.einsum('nd,nld->nl', center_coeffs, X)
+        return div
+
+
+# =============================================================================
+# Loss modules — share forward signature:
+#   forward(S_A, S_B, M_A, M_B, rng, *, corr_a=None, corr_b=None)
+#   → (loss: Tensor, metrics: Dict[str, float])
+# Each has a `weight` attribute for the weighted sum in training_step.
+# =============================================================================
+
+
+# =============================================================================
+# InfoNCE / DCL contrastive loss (supervised)
+# =============================================================================
+
+class SoftCorrespondenceLoss(nn.Module):
+    """Correspondence-aware contrastive loss via diffusion fingerprint descriptors."""
 
     def __init__(
         self,
-        generators: List[PairGenerator],
-        weights: Optional[List[float]] = None,
+        num_landmarks: int = 128,
+        alphas: Tuple[float, ...] = (1.0, 10.0, 100.0),
+        temperature: float = 0.07,
+        num_sample_vertices: int = 512,
+        landmark_seed: int = 0,
+        loss_type: str = "infonce",
+        dclw_sigma: float = 0.5,
+        weight: float = 1.0,
     ):
-        if not generators:
-            raise ValueError("CompositePairGenerator requires at least one generator")
-        self.generators = generators
-        if weights is not None:
-            total = sum(weights)
-            self.weights = [w / total for w in weights]
+        super().__init__()
+        self.num_landmarks       = num_landmarks
+        self.alphas              = alphas
+        self.temperature         = temperature
+        self.num_sample_vertices = num_sample_vertices
+        self.landmark_seed       = landmark_seed
+        self.loss_type           = loss_type
+        self.dclw_sigma          = dclw_sigma
+        self.weight              = weight
+
+    @staticmethod
+    def _compute_descriptors(S, M, E, alphas) -> torch.Tensor:
+        return _diffusion_descriptors(S, M, E, alphas)
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device   = S_A.device
+
+        if corr_a is None or corr_b is None:
+            assert N_A == N_B
+            pool = np.arange(N_A); ca = pool; cb = pool
         else:
-            n = len(generators)
-            self.weights = [1.0 / n] * n
+            pool = _compute_bijective_refs(corr_a, corr_b)
+            if len(pool) < self.num_landmarks + self.num_sample_vertices:
+                pool = np.arange(len(corr_a))
+            ca, cb = corr_a, corr_b
 
-    def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
-    ) -> PairSample:
-        idx = rng.choice(len(self.generators), p=self.weights)
-        return self.generators[idx].sample_train_pair(rng, cross_ratio)
+        lm_rng  = np.random.RandomState(self.landmark_seed)
+        L       = min(self.num_landmarks, len(pool))
+        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
 
-    def get_val_pairs(
-        self, rng: np.random.RandomState, poses_per_pair: int = 1,
-    ) -> List[PairSample]:
-        all_pairs = []
-        for gen in self.generators:
-            all_pairs.extend(gen.get_val_pairs(rng, poses_per_pair))
-        return all_pairs
+        E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
+        E_A[ca[lm_refs], torch.arange(L, device=device)] = 1.0
+        E_B = torch.zeros(N_B, L, device=device, dtype=S_B.dtype)
+        E_B[cb[lm_refs], torch.arange(L, device=device)] = 1.0
+
+        desc_A = self._compute_descriptors(S_A, M_A, E_A, self.alphas)
+        desc_B = self._compute_descriptors(S_B, M_B, E_B, self.alphas)
+
+        V           = min(self.num_sample_vertices, len(pool))
+        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+        dA          = desc_A[ca[sample_refs]]
+        dB          = desc_B[cb[sample_refs]]
+        sim         = (dA @ dB.T) / self.temperature
+        labels      = torch.arange(V, device=device)
+
+        if self.loss_type == "infonce":
+            loss_nce = 0.5 * (F.cross_entropy(sim, labels) +
+                              F.cross_entropy(sim.T, labels))
+        elif self.loss_type in ("dcl", "dclw"):
+            pos_sim  = torch.diag(sim)
+            neg_mask = ~torch.eye(V, dtype=torch.bool, device=device)
+            neg_A2B  = sim.masked_select(neg_mask).view(V, V - 1)
+            neg_B2A  = sim.T.masked_select(neg_mask).view(V, V - 1)
+            lA = -pos_sim + torch.logsumexp(neg_A2B, dim=1)
+            lB = -pos_sim + torch.logsumexp(neg_B2A, dim=1)
+            if self.loss_type == "dclw":
+                w  = (2 - V * F.softmax(pos_sim * (self.temperature / self.dclw_sigma),
+                                        dim=0)).detach()
+                lA = w * lA; lB = w * lB
+            loss_nce = 0.5 * (lA.mean() + lB.mean())
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+        with torch.no_grad():
+            pred       = sim.argmax(dim=1)
+            train_acc  = (pred == labels).float().mean().item()
+            topk_accs  = {}
+            for k in (3, 5, 10):
+                if k <= V:
+                    _, tk = sim.topk(k, dim=1)
+                    topk_accs[f'train_top{k}'] = (
+                        tk == labels.unsqueeze(1)).any(dim=1).float().mean().item()
+
+        metrics = {'loss_total': loss_nce.item(), 'loss_nce': loss_nce.item(),
+                   'train_acc': train_acc, **topk_accs}
+        return loss_nce, metrics
 
 
-# =============================================================================
-# Torch Datasets
-# =============================================================================
+class IsospectralityLoss(nn.Module):
+    """Isospectrality loss: penalise eigenvalue mismatch between two Laplacians.
 
-def pair_collate_fn(batch: List[PairSample]) -> List[PairSample]:
-    """Pass-through collate: variable vertex count, cannot be stacked."""
-    return batch
+    Two shapes from the same category should have similar LBO spectra
+    (isometry invariance). Differentiable via torch.linalg.eigvalsh —
+    eigenvalue gradients are stable even for repeated eigenvalues.
+
+    This is an unsupervised loss — it does not require GT correspondences.
+    """
+
+    def __init__(self, num_eigenvalues: int = 30, weight: float = 1.0):
+        super().__init__()
+        self.num_eigenvalues = num_eigenvalues
+        self.weight = weight
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        k = min(self.num_eigenvalues, S_A.shape[0] - 1, S_B.shape[0] - 1)
+        if k < 1:
+            zero = torch.tensor(0.0, device=S_A.device)
+            return zero, {'loss_iso': 0.0}
+
+        eigs = []
+        for S, M_diag in [(S_A, M_A), (S_B, M_B)]:
+            M_inv_sqrt = 1.0 / M_diag.sqrt().clamp(min=1e-8)
+            L_std = S * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
+            L_std = 0.5 * (L_std + L_std.T)
+            all_eigs = torch.linalg.eigvalsh(L_std)
+            eigs.append(all_eigs[1:k+1])  # skip λ_0 ≈ 0
+
+        loss = F.mse_loss(eigs[0], eigs[1])
+        return loss, {'loss_iso': loss.item()}
 
 
-class ShapePairDataset(Dataset):
-    """Training dataset — generates PairSamples on-the-fly.
+class DiffusionDistributionLoss(nn.Module):
+    """Distributional matching of diffusion distances (unsupervised).
 
-    cross_ratio is a mutable attribute updated each epoch by
-    FunctionalMapModule.on_train_epoch_start.
+    Requires that the distribution of pairwise diffusion descriptor distances
+    within shape A matches that within shape B. No GT correspondences needed —
+    just the assumption that same-category shapes have similar intrinsic geometry.
+
+    Computes diffusion fingerprints using the shared _diffusion_descriptors(),
+    samples random vertex pairs on each shape independently, computes pairwise
+    cosine similarities, sorts them, and penalises the L2 difference between
+    sorted distributions (1D Wasserstein / Earth Mover's Distance).
     """
 
     def __init__(
         self,
-        pair_generator: PairGenerator,
-        num_samples: int,
-        cross_ratio: float = 0.0,
+        num_landmarks: int = 128,
+        alphas: Tuple[float, ...] = (1.0, 10.0, 100.0),
+        num_sample_vertices: int = 256,
+        landmark_seed: int = 0,
+        weight: float = 1.0,
     ):
-        self.pair_generator = pair_generator
-        self.num_samples    = num_samples
-        self.cross_ratio    = cross_ratio
+        super().__init__()
+        self.num_landmarks       = num_landmarks
+        self.alphas              = alphas
+        self.num_sample_vertices = num_sample_vertices
+        self.landmark_seed       = landmark_seed
+        self.weight              = weight
 
-    def __len__(self) -> int:
-        return self.num_samples
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device = S_A.device
 
-    def __getitem__(self, idx: int) -> PairSample:
-        rng = np.random.RandomState()   # fresh OS-entropy seed — no epoch tracking needed
-        return self.pair_generator.sample_train_pair(rng, self.cross_ratio)
+        # Place landmarks independently on each shape (no correspondences needed)
+        lm_rng = np.random.RandomState(self.landmark_seed)
+        L = min(self.num_landmarks, N_A, N_B)
+
+        lm_A = lm_rng.choice(N_A, size=L, replace=False)
+        lm_B = lm_rng.choice(N_B, size=L, replace=False)
+
+        E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
+        E_A[lm_A, torch.arange(L, device=device)] = 1.0
+        E_B = torch.zeros(N_B, L, device=device, dtype=S_B.dtype)
+        E_B[lm_B, torch.arange(L, device=device)] = 1.0
+
+        desc_A = _diffusion_descriptors(S_A, M_A, E_A, self.alphas)
+        desc_B = _diffusion_descriptors(S_B, M_B, E_B, self.alphas)
+
+        # Sample random vertices on each shape independently
+        V = min(self.num_sample_vertices, N_A, N_B)
+        sample_A = rng.choice(N_A, size=V, replace=False)
+        sample_B = rng.choice(N_B, size=V, replace=False)
+
+        dA = desc_A[sample_A]  # (V, D)
+        dB = desc_B[sample_B]  # (V, D)
+
+        # Pairwise cosine similarities within each shape
+        sim_A = dA @ dA.T  # (V, V) — descriptors are L2-normalised
+        sim_B = dB @ dB.T  # (V, V)
+
+        # Extract upper triangle (exclude diagonal = self-similarity)
+        triu_idx = torch.triu_indices(V, V, offset=1, device=device)
+        vals_A = sim_A[triu_idx[0], triu_idx[1]]
+        vals_B = sim_B[triu_idx[0], triu_idx[1]]
+
+        # Sort and compare: 1D Wasserstein distance approximation
+        vals_A_sorted = vals_A.sort().values
+        vals_B_sorted = vals_B.sort().values
+        loss = F.mse_loss(vals_A_sorted, vals_B_sorted)
+
+        return loss, {'loss_dist': loss.item()}
 
 
-class ValPairDataset(Dataset):
-    """Validation dataset — fixed list generated once at construction."""
+class GeodesicDiffusionLoss(nn.Module):
+    """Geodesic transfer loss via diffusion distances (supervised).
+
+    Computes diffusion distances from landmark vertices on both shapes using
+    the learned Laplacian, transfers via GT correspondence, and penalises the
+    area-weighted L2 mismatch. This is a direct regression signal — stronger
+    than contrastive ranking (InfoNCE) because it penalises the actual distance
+    values, not just the relative ordering.
+
+    For each landmark l on A with correspondent corr(l) on B:
+        loss_l = Σ_v area_B(corr(v)) · (d_A(l, v) - d_B(corr(l), corr(v)))²
+
+    where d_X(s, ·) = (S_X + αM_X)⁻¹ M_X δ_s are diffusion distances from the
+    learned Laplacian. Averaged over landmarks and diffusion scales α.
+
+    Reuses _diffusion_solve() — same linear system as SoftCorrespondenceLoss.
+    """
 
     def __init__(
         self,
-        pair_generator: PairGenerator,
-        val_poses_per_pair: int = 2,
-        seed: int = 42,
+        num_landmarks: int = 128,
+        alphas: Tuple[float, ...] = (0.1, 1.0, 10.0),
+        num_sample_vertices: int = 512,
+        landmark_seed: int = 0,
+        normalize: bool = True,
+        weight: float = 1.0,
     ):
-        rng        = np.random.RandomState(seed)
-        self.pairs = pair_generator.get_val_pairs(rng, val_poses_per_pair)
-        # Derive a human-readable name from the generator class
-        gen_cls = type(pair_generator).__name__
-        if "Animal" in gen_cls:
-            self._name = "animals"
-        elif "Humanoid" in gen_cls:
-            self._name = "humanoids"
-        elif "SMAL" in gen_cls or "Smal" in gen_cls:
-            self._name = "smal"
+        super().__init__()
+        self.num_landmarks       = num_landmarks
+        self.alphas              = alphas
+        self.num_sample_vertices = num_sample_vertices
+        self.landmark_seed       = landmark_seed
+        self.normalize           = normalize
+        self.weight              = weight
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device = S_A.device
+
+        if corr_a is None or corr_b is None:
+            assert N_A == N_B
+            pool = np.arange(N_A); ca = pool; cb = pool
         else:
-            self._name = gen_cls
+            pool = _compute_bijective_refs(corr_a, corr_b)
+            if len(pool) < self.num_landmarks + self.num_sample_vertices:
+                pool = np.arange(len(corr_a))
+            ca, cb = corr_a, corr_b
 
-    @property
-    def name(self) -> str:
-        return self._name
+        # Pick fixed landmarks (same seed every step for stability)
+        lm_rng = np.random.RandomState(self.landmark_seed)
+        L = min(self.num_landmarks, len(pool))
+        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
 
-    def __len__(self) -> int:
-        return len(self.pairs)
+        # Pick random sample vertices for evaluation
+        V = min(self.num_sample_vertices, len(pool))
+        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
 
-    def __getitem__(self, idx: int) -> PairSample:
-        return self.pairs[idx]
+        # Build indicator matrices for landmarks
+        E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
+        E_A[ca[lm_refs], torch.arange(L, device=device)] = 1.0
+        E_B = torch.zeros(N_B, L, device=device, dtype=S_B.dtype)
+        E_B[cb[lm_refs], torch.arange(L, device=device)] = 1.0
+
+        # Area weights at sample vertices on B (for area-weighted L2)
+        area_B = M_B[cb[sample_refs]]                  # (V,)
+        area_B = area_B / area_B.sum()                  # normalise to sum to 1
+
+        # Accumulate loss over diffusion scales
+        total_loss = torch.tensor(0.0, device=device)
+        for alpha in self.alphas:
+            # Raw diffusion distances: (N_X, L) — column l is distance from landmark l
+            D_A = _diffusion_solve(S_A, M_A, E_A, alpha)   # (N_A, L)
+            D_B = _diffusion_solve(S_B, M_B, E_B, alpha)   # (N_B, L)
+
+            # Sample corresponding vertices
+            d_A = D_A[ca[sample_refs]]                      # (V, L)
+            d_B = D_B[cb[sample_refs]]                      # (V, L)
+
+            # Normalise each landmark's profile to unit norm so the loss
+            # compares profile *shape*, not absolute scale (which is tiny
+            # and produces negligible gradients without normalisation).
+            if self.normalize:
+                d_A = F.normalize(d_A, p=2, dim=0)              # (V, L)
+                d_B = F.normalize(d_B, p=2, dim=0)              # (V, L)
+
+            # Area-weighted L2 per landmark, averaged over landmarks
+            sq_diff = (d_A - d_B) ** 2                      # (V, L)
+            total_loss = total_loss + (area_B[:, None] * sq_diff).sum(dim=0).mean()
+
+        loss = total_loss / len(self.alphas)
+
+        return loss, {'loss_geodiff': loss.item()}
+
+
+class HeatMethodGeodesicLoss(nn.Module):
+    """Geodesic transfer loss via the full differentiable heat method (supervised).
+
+    Implements all three steps of the heat method (Crane et al. 2013) in
+    differentiable PyTorch:
+        1. Heat diffuse:  u = (S + t·diag(M))⁻¹ M δ_s
+        2. Grad + norm:   X = -∇u / max(|∇u|, ε)    via _apply_gradient
+        3. Poisson solve:  φ = (S + ε·I)⁻¹ div(X)     via _apply_divergence
+
+    The resulting φ approximates geodesic distance from the source.
+    Gradients flow through all three steps back to grad_coeffs and areas.
+
+    Requires grad_coeffs and knn to be passed as kwargs from training_step.
+    """
+
+    def __init__(
+        self,
+        num_landmarks: int = 32,
+        num_sample_vertices: int = 512,
+        landmark_seed: int = 0,
+        eps: float = 1e-6,
+        normalize: bool = True,
+        weight: float = 1.0,
+    ):
+        super().__init__()
+        self.num_landmarks       = num_landmarks
+        self.num_sample_vertices = num_sample_vertices
+        self.landmark_seed       = landmark_seed
+        self.eps                 = eps
+        self.normalize           = normalize
+        self.weight              = weight
+
+    @staticmethod
+    def _heat_method_distances(
+        S: torch.Tensor, M: torch.Tensor,
+        grad_coeffs: torch.Tensor, knn: torch.Tensor,
+        source_indices: torch.Tensor, eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Full heat method in differentiable PyTorch.
+
+        Args:
+            S: (N, N) stiffness matrix.
+            M: (N,) mass diagonal.
+            grad_coeffs: (N, k, 3) gradient coefficients.
+            knn: (N, k) neighbor indices.
+            source_indices: (L,) landmark vertex indices.
+            eps: regularisation for Poisson solve.
+
+        Returns:
+            phi: (N, L) approximate geodesic distances from each landmark.
+        """
+        N = S.shape[0]
+        L = len(source_indices)
+        device = S.device
+
+        # Diffusion time from mean vertex area
+        h = M.mean().sqrt()
+        t = h * h
+
+        # Step 1: Heat diffuse — reuses _diffusion_solve with alpha = t
+        E = torch.zeros(N, L, device=device, dtype=S.dtype)
+        E[source_indices, torch.arange(L, device=device)] = 1.0
+        u = _diffusion_solve(S, M, E, t)                       # (N, L)
+
+        # Step 2: Gradient + normalise
+        grad_u = _apply_gradient(grad_coeffs, knn, u)           # (N, L, 3)
+        norms = grad_u.norm(dim=2, keepdim=True).clamp(min=1e-8)
+        X = -grad_u / norms                                      # (N, L, 3)
+
+        # Step 3: Divergence + Poisson solve
+        div_X = _apply_divergence(grad_coeffs, knn, M, X)       # (N, L)
+        S_reg = S + eps * torch.eye(N, device=device, dtype=S.dtype)
+        phi = torch.linalg.solve(S_reg, div_X)                   # (N, L)
+
+        # Shift so source has distance 0, take abs
+        phi = phi - phi[source_indices, torch.arange(L, device=device)].unsqueeze(0)
+        phi = phi.abs()
+
+        return phi
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        grad_coeffs_a = kwargs.get('grad_coeffs_a')
+        grad_coeffs_b = kwargs.get('grad_coeffs_b')
+        knn_a = kwargs.get('knn_a')
+        knn_b = kwargs.get('knn_b')
+
+        if grad_coeffs_a is None or knn_a is None:
+            zero = torch.tensor(0.0, device=S_A.device)
+            return zero, {'loss_heatgeo': 0.0}
+
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device = S_A.device
+
+        if corr_a is None or corr_b is None:
+            assert N_A == N_B
+            pool = np.arange(N_A); ca = pool; cb = pool
+        else:
+            pool = _compute_bijective_refs(corr_a, corr_b)
+            if len(pool) < self.num_landmarks + self.num_sample_vertices:
+                pool = np.arange(len(corr_a))
+            ca, cb = corr_a, corr_b
+
+        # Pick landmarks and sample vertices
+        lm_rng = np.random.RandomState(self.landmark_seed)
+        L = min(self.num_landmarks, len(pool))
+        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
+
+        V = min(self.num_sample_vertices, len(pool))
+        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+
+        # Source indices on each shape
+        src_A = torch.from_numpy(ca[lm_refs].copy()).long().to(device)
+        src_B = torch.from_numpy(cb[lm_refs].copy()).long().to(device)
+
+        # Full heat method on both shapes
+        phi_A = self._heat_method_distances(
+            S_A, M_A, grad_coeffs_a, knn_a, src_A, self.eps)   # (N_A, L)
+        phi_B = self._heat_method_distances(
+            S_B, M_B, grad_coeffs_b, knn_b, src_B, self.eps)   # (N_B, L)
+
+        # Sample corresponding vertices
+        d_A = phi_A[ca[sample_refs]]                             # (V, L)
+        d_B = phi_B[cb[sample_refs]]                             # (V, L)
+
+        # Normalise each landmark's profile (unit norm) for scale-invariance
+        if self.normalize:
+            d_A = F.normalize(d_A, p=2, dim=0)
+            d_B = F.normalize(d_B, p=2, dim=0)
+
+        # Area-weighted L2
+        area_B = M_B[cb[sample_refs]]
+        area_B = area_B / area_B.sum()
+
+        sq_diff = (d_A - d_B) ** 2                               # (V, L)
+        loss = (area_B[:, None] * sq_diff).sum(dim=0).mean()
+
+        return loss, {'loss_heatgeo': loss.item()}
+
+
+# =============================================================================
+# Evaluation utilities (non-differentiable)
+# =============================================================================
+
+def _fmt_topk(m: Dict[str, float], prefix: str = '') -> str:
+    parts = [f"top1={m[f'{prefix}accuracy']*100:5.1f}%"]
+    for k in (3, 5, 10):
+        key = f'{prefix}top{k}_acc'
+        if key in m:
+            parts.append(f"top{k}={m[key]*100:5.1f}%")
+    parts.append(f"Err={m[f'{prefix}mean_error']:.4f}")
+    return "  ".join(parts)
+
+
+def _correspondence_metrics(
+    eigvecs_a: np.ndarray, eigvecs_b: np.ndarray,
+    mass_a: np.ndarray,    mass_b: np.ndarray,
+    vertices_b: np.ndarray, n: int,
+    gt_corr: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Functional map metrics from eigenbases."""
+    n_a = eigvecs_a.shape[0]
+    weighted_phi_b = eigvecs_b[gt_corr[:n_a]] * mass_b[gt_corr[:n_a], None] \
+        if gt_corr is not None else eigvecs_b[:n_a] * mass_b[:n_a, None]
+    C    = weighted_phi_b.T @ eigvecs_a[:n_a]
+    k_fm = C.shape[0]
+    I    = np.eye(k_fm)
+    metrics = {
+        'ortho_error':   float(np.linalg.norm(C.T @ C - I, 'fro')),
+        'biject_error':  float(np.linalg.norm(C @ C.T - I, 'fro')),
+        'corr_error':    float(np.linalg.norm(C - I, 'fro')),
+        'diag_ratio':    float(np.sum(np.diag(C) ** 2) / (np.sum(C ** 2) + 1e-10)),
+    }
+    projected_a = eigvecs_a[:n_a] @ C.T
+    nbrs = NearestNeighbors(n_neighbors=min(10, eigvecs_b.shape[0]),
+                            algorithm='auto').fit(eigvecs_b)
+    _, indices = nbrs.kneighbors(projected_a)
+    pred_corr  = indices[:, 0]
+    gt         = gt_corr[:n_a] if gt_corr is not None else np.arange(n_a)
+    metrics['accuracy'] = float((pred_corr == gt).mean())
+    for k in (3, 5, 10):
+        if k <= indices.shape[1]:
+            metrics[f'top{k}_acc'] = float(
+                (indices[:, :k] == gt[:, None]).any(axis=1).mean())
+    errors = np.linalg.norm(vertices_b[pred_corr] - vertices_b[gt], axis=1)
+    bb_diag = np.linalg.norm(vertices_b.max(0) - vertices_b.min(0))
+    metrics['mean_error']   = float(errors.mean()   / bb_diag)
+    metrics['median_error'] = float(np.median(errors) / bb_diag)
+    return metrics
+
+
+def _build_gt_corr_from_pair(pair: PairSample) -> Optional[np.ndarray]:
+    n_a = len(pair.verts_a)
+    if (len(pair.corr_a) == n_a and
+            np.array_equal(pair.corr_a, np.arange(n_a)) and
+            np.array_equal(pair.corr_b, np.arange(n_a))):
+        return None
+    gt_corr = np.full(n_a, -1, dtype=np.int64)
+    gt_corr[pair.corr_a] = pair.corr_b
+    unmapped = gt_corr == -1
+    if unmapped.any() and (~unmapped).any():
+        nbrs = NearestNeighbors(n_neighbors=1).fit(pair.verts_a[~unmapped])
+        _, idx = nbrs.kneighbors(pair.verts_a[unmapped])
+        mapped_indices = np.where(~unmapped)[0]
+        gt_corr[unmapped] = gt_corr[mapped_indices[idx.flatten()]]
+    return gt_corr
+
+
+class GeodesicCache:
+    """Lazy geodesic distance computation on mesh B.
+
+    Factorizes the Laplacian once (fast), then computes geodesic distances
+    from individual source vertices on demand. Caches distance vectors so
+    the same GT target vertex is never solved twice.
+
+    Usage in _pointwise_metrics:
+        geo_errors = geo_cache.compute_errors(pred_corr, gt_corr)
+    """
+
+    def __init__(self, pair: PairSample):
+        import potpourri3d as pp3d
+
+        verts_full = pair._verts_b_full if pair._verts_b_full is not None else pair.verts_b
+        faces = pair.faces_b
+        self._idx_b = pair._idx_b if pair._idx_b is not None else np.arange(len(pair.verts_b))
+
+        # Factorize Laplacian (one-time cost, fast)
+        self._solver = pp3d.MeshHeatMethodDistanceSolver(verts_full, faces)
+
+        # Normalisation: sqrt(surface area)
+        v0, v1, v2 = verts_full[faces[:, 0]], verts_full[faces[:, 1]], verts_full[faces[:, 2]]
+        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum()
+        self._sqrt_area = np.sqrt(max(area, 1e-12))
+
+        # Cache: subsampled B index → normalised distance to all subsampled B vertices
+        self._dist_cache: Dict[int, np.ndarray] = {}
+
+    def _get_dists_from(self, sub_idx: int) -> np.ndarray:
+        """Get normalised geodesic distances from subsampled vertex sub_idx to all others."""
+        if sub_idx not in self._dist_cache:
+            full_idx = int(self._idx_b[sub_idx])
+            full_dists = self._solver.compute_distance(full_idx)  # (N_full,)
+            self._dist_cache[sub_idx] = full_dists[self._idx_b] / self._sqrt_area
+        return self._dist_cache[sub_idx]
+
+    def precompute_from_gt(self, gt_corr: np.ndarray) -> None:
+        """Eagerly compute and cache distances from all unique GT targets.
+
+        Call this once during on_fit_start so that per-pair evaluation
+        incurs zero geodesic computation cost.
+        """
+        unique_gt = np.unique(gt_corr)
+        for g in unique_gt:
+            self._get_dists_from(int(g))
+
+    def compute_errors(self, pred_corr: np.ndarray, gt_corr: np.ndarray) -> np.ndarray:
+        """Compute normalised geodesic error for each (pred, gt) pair.
+
+        Only solves from unique GT targets — typically much fewer than N_sub.
+        Results are cached, so calling with different pred_corr but same gt_corr
+        (e.g. different evaluators on the same eigenbasis) is essentially free.
+
+        Args:
+            pred_corr: (N_A,) predicted B vertex indices.
+            gt_corr: (N_A,) ground-truth B vertex indices.
+
+        Returns:
+            (N_A,) normalised geodesic errors.
+        """
+        unique_gt = np.unique(gt_corr)
+        # Ensure all unique GT targets are cached
+        for g in unique_gt:
+            self._get_dists_from(int(g))
+        # Vectorised lookup
+        errors = np.empty(len(pred_corr), dtype=np.float32)
+        for g in unique_gt:
+            mask = gt_corr == g
+            errors[mask] = self._dist_cache[int(g)][pred_corr[mask]]
+        return errors
+
+
+def _build_geo_cache(pair: PairSample) -> Optional['GeodesicCache']:
+    """Build a GeodesicCache for pair, or None if faces/potpourri3d unavailable."""
+    if pair.faces_b is None:
+        return None
+    try:
+        return GeodesicCache(pair)
+    except ImportError:
+        print("    [geodesic] potpourri3d not installed — skipping geodesic metrics",
+              flush=True)
+        return None
+    except Exception as e:
+        print(f"    [geodesic] failed to build cache: {e}", flush=True)
+        return None
+
+
+@torch.no_grad()
+def _eigh_from_dense_L(
+    L: torch.Tensor, M_diag_t: torch.Tensor, num_eigenvectors: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    M_inv_sqrt = 1.0 / M_diag_t.sqrt().clamp(min=1e-8)
+    L_std      = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
+    L_std      = 0.5 * (L_std + L_std.T)
+    evals_all, evecs_all = torch.linalg.eigh(L_std)
+    evals = evals_all[:num_eigenvectors].cpu().numpy()
+    evecs = (M_inv_sqrt[:, None] * evecs_all[:, :num_eigenvectors]).cpu().numpy()
+    return evals, evecs
+
+
+@torch.no_grad()
+def _eigh_from_sparse_L(
+    L_sp: torch.Tensor, M_diag_t: torch.Tensor, num_eigenvectors: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    N      = L_sp.shape[0]
+    L_np   = L_sp.cpu().numpy()
+    M_np   = M_diag_t.cpu().numpy()
+    rows, cols = np.nonzero(L_np)
+    L_scipy = scipy.sparse.csc_matrix((L_np[rows, cols], (rows, cols)), shape=(N, N))
+    M_scipy = scipy.sparse.diags(M_np)
+    try:
+        evals, evecs = scipy.sparse.linalg.eigsh(
+            L_scipy, k=num_eigenvectors, M=M_scipy,
+            sigma=-1e-6, which='LM', v0=np.ones(N))
+        order = np.argsort(evals)
+        return evals[order], evecs[:, order]
+    except Exception:
+        return _eigh_from_dense_L(L_sp, M_diag_t, num_eigenvectors)
+
+
+@torch.no_grad()
+def evaluate_pair(
+    model: LaplacianTransformerModule,
+    pair: PairSample,
+    k: int,
+    num_eigenvectors: int,
+    device: torch.device,
+    k_sparsify: Optional[int] = None,
+    evaluators: Optional[List] = None,
+    geo_cache = None,
+    eval_variants: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """Evaluate correspondence quality using functional maps (non-differentiable).
+
+    Args:
+        k_sparsify: kNN for sparsification mask. None = reuse k.
+        evaluators: List of ShapePairEvaluator instances. When provided,
+            runs each evaluator and prefixes metrics with evaluator.name.
+            When None, uses the legacy _correspondence_metrics path.
+        geo_cache: Precomputed GeodesicCache for mesh B.
+            If None and pair has faces_b, builds on the fly.
+        eval_variants: Which eigenbasis variants to evaluate.
+            Subset of ['dense', 'sp', 'iso']. None = all three.
+    """
+    if eval_variants is None:
+        eval_variants = ['dense', 'sp', 'iso']
+    do_dense = 'dense' in eval_variants
+    do_sp    = 'sp' in eval_variants
+    do_iso   = 'iso' in eval_variants
+    n_a             = len(pair.verts_a)
+    is_gradient_mode = False
+    dense_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}   # (evecs, evals, mass)
+    sparse_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    iso_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
+        verts_t    = torch.from_numpy(verts).float().to(device)
+        knn_np     = compute_knn(verts, k)
+        batch_data = Batch.from_data_list(
+            [build_patch_data(verts_t, knn_np, device)]).to(device)
+        fwd        = model._forward_pass(batch_data)
+
+        if fwd.get('grad_coeffs') is not None:
+            is_gradient_mode = True
+            knn_t     = torch.from_numpy(knn_np).long().to(device)
+            L, M_diag = assemble_anisotropic_laplacian(fwd['grad_coeffs'],
+                                                       fwd['areas'], knn_t)
+            M_np = M_diag.cpu().numpy()
+
+            if do_dense:
+                evals_d, evecs_d = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
+                dense_bases[label] = (evecs_d, evals_d, M_np)
+
+            if do_sp:
+                if k_sparsify is not None and k_sparsify != k:
+                    knn_sp_np = compute_knn(verts, k_sparsify)
+                    knn_sp_t = torch.from_numpy(knn_sp_np).long().to(device)
+                    L_sp = _sparsify_L_to_knn(L, knn_sp_t)
+                else:
+                    L_sp = _sparsify_L_to_knn(L, knn_t)
+                evals_sp, evecs_sp = _eigh_from_sparse_L(L_sp, M_diag, num_eigenvectors)
+                sparse_bases[label] = (evecs_sp, evals_sp, M_np)
+
+            if do_iso:
+                L_iso, M_iso = assemble_isotropic_laplacian(
+                    fwd['grad_coeffs'], fwd['areas'], knn_t)
+                evals_iso, evecs_iso = _eigh_from_sparse_L(L_iso, M_iso, num_eigenvectors)
+                iso_bases[label] = (evecs_iso, evals_iso, M_np)
+        else:
+            batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
+            S, M = assemble_stiffness_and_mass_matrices(
+                stiffness_weights=fwd['stiffness_weights'],
+                areas=fwd['areas'],
+                attention_mask=fwd['attention_mask'],
+                vertex_indices=batch_data.vertex_indices,
+                center_indices=batch_data.center_indices,
+                batch_indices=batch_idx,
+            )
+            evals, evecs = compute_laplacian_eigendecomposition(
+                S, num_eigenvectors, mass_matrix=M)
+            M_np = np.array(M.diagonal()).flatten()
+            dense_bases[label] = (evecs, evals, M_np)
+
+    gt_corr = _build_gt_corr_from_pair(pair)
+    if geo_cache is None:
+        geo_cache = _build_geo_cache(pair)
+
+    # Get mass from whichever variant is available
+    first_bases = dense_bases or sparse_bases or iso_bases
+    mA = first_bases['A'][2]
+    mB = first_bases['B'][2]
+
+    # --- Use evaluators if provided ---
+    if evaluators is not None:
+        metrics = {}
+
+        # Dense variant
+        if dense_bases:
+            evA_d, evalsA_d, _ = dense_bases['A']
+            evB_d, evalsB_d, _ = dense_bases['B']
+            for evaluator in evaluators:
+                ev_metrics = evaluator.evaluate(
+                    evA_d, evB_d, evalsA_d, evalsB_d,
+                    mA, mB, pair.verts_b, gt_corr=gt_corr,
+                    geo_cache=geo_cache,
+                )
+                for mk, mv in ev_metrics.items():
+                    metrics[f"{evaluator.name}/{mk}"] = mv
+
+        # Sparse variant
+        if is_gradient_mode and sparse_bases:
+            evA_sp, evalsA_sp, _ = sparse_bases['A']
+            evB_sp, evalsB_sp, _ = sparse_bases['B']
+            for evaluator in evaluators:
+                sp_metrics = evaluator.evaluate(
+                    evA_sp, evB_sp, evalsA_sp, evalsB_sp,
+                    mA, mB, pair.verts_b, gt_corr=gt_corr,
+                    geo_cache=geo_cache,
+                )
+                for mk, mv in sp_metrics.items():
+                    metrics[f"sp_{evaluator.name}/{mk}"] = mv
+
+        # Isotropic variant
+        if is_gradient_mode and iso_bases:
+            evA_iso, evalsA_iso, _ = iso_bases['A']
+            evB_iso, evalsB_iso, _ = iso_bases['B']
+            for evaluator in evaluators:
+                iso_metrics = evaluator.evaluate(
+                    evA_iso, evB_iso, evalsA_iso, evalsB_iso,
+                    mA, mB, pair.verts_b, gt_corr=gt_corr,
+                    geo_cache=geo_cache,
+                )
+                for mk, mv in iso_metrics.items():
+                    metrics[f"iso_{evaluator.name}/{mk}"] = mv
+
+        return metrics
+
+    # --- Legacy path (backward compatible) ---
+    if dense_bases:
+        evA_d, evalsA_d, _ = dense_bases['A']
+        evB_d, evalsB_d, _ = dense_bases['B']
+        metrics = _correspondence_metrics(evA_d, evB_d, mA, mB,
+                                          pair.verts_b, n_a, gt_corr=gt_corr)
+    else:
+        metrics = {}
+    if is_gradient_mode and sparse_bases:
+        evA_sp, _, _ = sparse_bases['A']
+        evB_sp, _, _ = sparse_bases['B']
+        sp = _correspondence_metrics(evA_sp, evB_sp, mA, mB,
+                                     pair.verts_b, n_a, gt_corr=gt_corr)
+        for key, val in sp.items():
+            metrics[f'sp_{key}'] = val
+    return metrics
+
+
+@torch.no_grad()
+def evaluate_pair_robust(
+    pair: PairSample,
+    num_eigenvectors: int,
+    n_neighbors: int = 30,
+    evaluators: Optional[List] = None,
+    geo_cache = None,
+) -> Dict[str, float]:
+    """Evaluate using robust Laplacian (baseline, no model).
+
+    Args:
+        evaluators: List of ShapePairEvaluator instances. When provided,
+            runs each evaluator and prefixes metrics with evaluator.name.
+            When None, uses the legacy _correspondence_metrics path.
+        geo_cache: Precomputed GeodesicCache for mesh B.
+            If None and pair has faces_b, builds on the fly.
+    """
+    import robust_laplacian
+    n_a = len(pair.verts_a)
+    bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
+        S, M     = robust_laplacian.point_cloud_laplacian(verts, n_neighbors=n_neighbors)
+        evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
+        bases[label] = (evecs, evals, np.array(M.diagonal()).flatten())
+
+    gt_corr = _build_gt_corr_from_pair(pair)
+    if geo_cache is None:
+        geo_cache = _build_geo_cache(pair)
+    evA, evalsA, mA = bases['A']
+    evB, evalsB, mB = bases['B']
+
+    if evaluators is not None:
+        metrics = {}
+        for evaluator in evaluators:
+            ev_metrics = evaluator.evaluate(
+                evA, evB, evalsA, evalsB,
+                mA, mB, pair.verts_b, gt_corr=gt_corr,
+                geo_cache=geo_cache,
+            )
+            for mk, mv in ev_metrics.items():
+                metrics[f"{evaluator.name}/{mk}"] = mv
+        return metrics
+
+    # Legacy path
+    return _correspondence_metrics(evA, evB, mA, mB,
+                                   pair.verts_b, n_a, gt_corr=gt_corr)
+
+
+# =============================================================================
+# LightningModule
+# =============================================================================
+
+def cosine_flat_scheduler(
+    optimizer: torch.optim.Optimizer,
+    T_max: int,
+    eta_min: float = 1e-6,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Cosine decay from base_lr to eta_min over T_max epochs, then flat.
+
+    Unlike CosineAnnealingLR this does not cycle back up after T_max.
+    The multiplier is clamped so progress never exceeds 1.0.
+    """
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+
+    def _lambda(epoch: int, base_lr: float) -> float:
+        if base_lr < 1e-12:
+            return 1.0
+        t       = min(epoch, T_max)
+        cosine  = 0.5 * (1.0 + math.cos(math.pi * t / T_max))
+        lr      = eta_min + (base_lr - eta_min) * cosine
+        return lr / base_lr
+
+    lambdas = [lambda epoch, blr=blr: _lambda(epoch, blr) for blr in base_lrs]
+    # LambdaLR accepts a list of lambdas (one per param group) or a single one
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambdas if len(lambdas) > 1 else lambdas[0],
+    )
+
+
+
+# =============================================================================
+# Model export callback
+# =============================================================================
+
+class BestModelExportCallback(lightning.pytorch.callbacks.ModelCheckpoint):
+    """ModelCheckpoint subclass that saves only the inner LaplacianTransformerModule.
+
+    Because it inherits from ModelCheckpoint, WandbLogger (log_model=true) will
+    automatically upload its best checkpoint as a W&B artifact — identical in
+    structure and size to the input pretrained checkpoint.
+
+    Pass the same monitor/mode/dirpath as the main ModelCheckpoint so the two
+    checkpoints sit side by side and the best-model tracking is consistent.
+    """
+
+    def _save_checkpoint(self, trainer: "lightning.pytorch.Trainer", filepath: str) -> None:
+        if not trainer.is_global_zero:
+            return
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        pl_module: "FunctionalMapModule" = trainer.lightning_module  # type: ignore[assignment]
+        inner_model: lightning.pytorch.LightningModule = pl_module.model  # type: ignore[assignment]
+        ckpt: Dict[str, Any] = {
+            "state_dict":                    inner_model.state_dict(),
+            "hyper_parameters":              dict(inner_model.hparams),
+            "pytorch-lightning_version":     lightning.__version__,
+        }
+        torch.save(ckpt, filepath)
+        self.best_model_path = filepath
+
+        # WandbLogger only scans the *last* ModelCheckpoint in the callbacks list,
+        # so log_model='all' will never reliably upload our callback. Upload directly.
+        try:
+            import wandb
+            if wandb.run is not None:
+                artifact_name = f"model-{wandb.run.id}"
+                artifact = wandb.Artifact(
+                    name=artifact_name,
+                    type="model",
+                    metadata={
+                        "score":   float(self.current_score) if self.current_score is not None else None,
+                        "epoch":   trainer.current_epoch,
+                        "monitor": self.monitor,
+                    },
+                )
+                artifact.add_file(filepath, name="model.ckpt")
+                wandb.run.log_artifact(artifact, aliases=["latest", "best"])
+                print(f"  [Export] Uploaded to W&B artifact '{artifact_name}'")
+            else:
+                print("  [Export] W&B upload skipped: no active wandb run")
+        except Exception as e:
+            import traceback
+            print(f"  [Export] W&B upload failed: {e}")
+            traceback.print_exc()
+
+        print(f"  [Export] Saved inner model checkpoint → {filepath}")
+
+
+
+
+
+class FunctionalMapModule(LaplacianModuleBase):
+    """Fine-tune a pretrained LaplacianTransformerModule for shape correspondence."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        optimizer_cfg: DictConfig,
+        losses: Optional[List[nn.Module]] = None,
+        loss_fn: Optional[SoftCorrespondenceLoss] = None,  # backward compat
+        scheduler_cfg: Optional[DictConfig] = None,
+        random_init: bool = False,
+        keep_areas_head: bool = False,
+        freeze_input_projection: bool = False,
+        freeze_areas_head: bool = False,
+        k: int = 15,
+        k_sparsify: Optional[int] = None,
+        num_eigenvectors: int = 100,
+        sparsify_laplacian: bool = False,
+        max_vertices: int = 0,
+        max_vertices_val: int = 0,
+        vertex_noise: float = 0.05,
+        w_prox: float = 20.0,
+        cross_ratio_start: float = 0.0,
+        cross_ratio_end: float = 0.5,
+        curriculum_epochs: int = 50,
+        seed: int = 42,
+        use_lora: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.0,
+        lora_target_modules: str = "all-linear",
+        lora_dora: bool = False,
+        lora_rslora: bool = False,
+        profile_steps: int = 0,   # print profiler summary every N steps (0 = off)
+        # Evaluation control
+        eval_only: bool = False,       # run baselines only, then stop (no training)
+        eval_variants: Optional[List[str]] = None,  # ['dense', 'sp', 'iso'] or subset
+        # GeomFuM evaluation (optional)
+        use_geomfum_eval: bool = False,
+        geomfum_descriptors: Optional[List[str]] = None,
+        geomfum_zoomout: bool = True,
+        geomfum_zoomout_k_init: int = 20,
+        geomfum_zoomout_k_final: int = 50,
+        geomfum_zoomout_n_iters: int = 10,
+        geomfum_fmap_lmbda: float = 1e3,
+        geomfum_fmap_resolvent_gamma: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(optimizer_cfg=optimizer_cfg,
+                         scheduler_cfg=scheduler_cfg, **kwargs)
+        self.save_hyperparameters(ignore=["losses", "loss_fn", "optimizer_cfg", "scheduler_cfg"])
+
+        # Build loss list: prefer explicit `losses`, fall back to `loss_fn`
+        if losses is not None:
+            self._losses = nn.ModuleList(losses)
+        elif loss_fn is not None:
+            if not hasattr(loss_fn, 'weight'):
+                loss_fn.weight = 1.0
+            self._losses = nn.ModuleList([loss_fn])
+        else:
+            raise ValueError("Must provide either `losses` or `loss_fn`")
+
+        self.model: Optional[nn.Module] = None
+        self._train_rng: Optional[np.random.RandomState] = None
+        self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
+
+        # Validate k_sparsify
+        if k_sparsify is not None:
+            assert k_sparsify <= k, (
+                f"k_sparsify ({k_sparsify}) must be <= k ({k})")
+
+        # Build evaluators
+        self._evaluators = [SpectralNNEvaluator()]
+        if use_geomfum_eval:
+            self._evaluators.append(FunctionalMapEvaluator(
+                descriptors=geomfum_descriptors or ['hks', 'wks'],
+                use_zoomout=geomfum_zoomout,
+                zoomout_k_init=geomfum_zoomout_k_init,
+                zoomout_k_final=geomfum_zoomout_k_final,
+                zoomout_n_iters=geomfum_zoomout_n_iters,
+                fmap_lmbda=geomfum_fmap_lmbda,
+                fmap_resolvent_gamma=geomfum_fmap_resolvent_gamma,
+            ))
+
+        # Cache for geodesic solvers (pair_name → GeodesicCache)
+        # Precomputed in on_fit_start, reused in validation_step.
+        self._geo_cache: Dict[str, Optional] = {}
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def setup(self, stage: str) -> None:
+        super().setup(stage)
+        if self.model is not None:
+            return
+        hp = self.hparams
+
+        self.model = LaplacianTransformerModule.load_from_checkpoint(
+            hp.checkpoint_path, map_location="cpu",
+            normalize_patch_features=True, scale_areas_by_patch_size=True,
+        )
+
+        if hp.random_init:
+            areas_state: Optional[dict] = None
+            if hp.keep_areas_head:
+                areas_state = {
+                    name: {k: v.clone() for k, v in mod.state_dict().items()}
+                    for name, mod in self.model.named_modules()
+                    if "area" in name.lower()
+                    and any(True for _ in mod.parameters(recurse=False))
+                }
+            for mod in self.model.modules():
+                if hasattr(mod, 'reset_parameters'):
+                    mod.reset_parameters()
+            if areas_state:
+                for name, mod in self.model.named_modules():
+                    if name in areas_state:
+                        mod.load_state_dict(areas_state[name])
+
+        if hp.freeze_input_projection:
+            for name, param in self.model.named_parameters():
+                if 'input_projection' in name:
+                    param.requires_grad_(False)
+
+        if hp.freeze_areas_head:
+            for name, param in self.model.named_parameters():
+                if 'area' in name.lower():
+                    param.requires_grad_(False)
+
+        use_prox = hp.w_prox > 0 and not hp.random_init and not hp.use_lora
+        if use_prox:
+            ref = torch.cat([p.detach().flatten() for p in self.model.parameters()])
+            self.register_buffer("ref_params",  ref)
+            self.register_buffer("ref_norm_sq", ref.pow(2).sum().clamp(min=1e-8))
+
+        if hp.use_lora:
+            try:
+                from peft import get_peft_model, LoraConfig
+            except ImportError:
+                raise ImportError("LoRA requires: pip install peft")
+            target = ("all-linear" if hp.lora_target_modules == "all-linear"
+                      else [m.strip() for m in hp.lora_target_modules.split(",")])
+            self.model = get_peft_model(self.model, LoraConfig(
+                r=hp.lora_rank, lora_alpha=hp.lora_alpha,
+                lora_dropout=hp.lora_dropout, target_modules=target,
+                bias="none", use_dora=hp.lora_dora, use_rslora=hp.lora_rslora,
+            ))
+            self.model.print_trainable_parameters()
+
+        self._train_rng = np.random.RandomState(hp.seed + self.global_rank * 10_007)
+        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.parameters())
+        print(f"  [FMModule rank={self.global_rank}] "
+              f"Trainable: {n_train:,} / {n_total:,}")
+        if self.global_rank == 0 and self._scheduler_cfg is not None:
+            # Surface the effective T_max so it appears in logs / W&B config
+            t_max = getattr(self._scheduler_cfg, 'keywords', {}).get('T_max', '?')
+            print(f"  [FMModule] Scheduler T_max={t_max} epochs")
+
+    # ------------------------------------------------------------------
+    # Optimiser
+    # ------------------------------------------------------------------
+
+    def configure_optimizers(self):
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        optimizer = self._optimizer_cfg(params=trainable)
+        if self._scheduler_cfg is None:
+            return optimizer
+        scheduler = self._scheduler_cfg(optimizer=optimizer)
+        return {"optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+    # ------------------------------------------------------------------
+    # Shared metric aggregation + printing
+    # ------------------------------------------------------------------
+
+    def _summarise_and_print(
+        self,
+        all_metrics: List[Dict[str, float]],
+        label: str,
+        silent: bool = False,
+    ) -> Dict[str, float]:
+        """Aggregate per-pair metrics and print a summary.
+
+        Used by both on_fit_start (baselines) and on_validation_epoch_end
+        so they produce identical output format.
+
+        Args:
+            all_metrics: List of per-pair metric dicts from evaluators.
+            label: Human-readable label (e.g. "Robust baseline", "Val epoch 3").
+            silent: If True, skip printing (used for non-zero DDP ranks).
+
+        Returns:
+            summary: Dict mapping metric names to averaged values.
+        """
+        if not all_metrics:
+            return {}
+
+        # Collect all keys across all pairs (some pairs may have {} from failures)
+        all_keys = set()
+        for m in all_metrics:
+            all_keys.update(m.keys())
+        all_keys = sorted(all_keys)
+
+        # Aggregate: mean of each key (skip NaN / missing)
+        summary: Dict[str, float] = {}
+        for mk in all_keys:
+            vals = [m[mk] for m in all_metrics
+                    if mk in m and np.isfinite(m[mk])]
+            if vals:
+                summary[mk] = float(np.mean(vals))
+
+        # --- Identify primary metric (spectral_nn dense) ---
+        nn_prefix = "spectral_nn/"
+        has_nn = any(k.startswith(nn_prefix) for k in all_keys)
+
+        if has_nn:
+            mean_acc = summary.get(f"{nn_prefix}accuracy", 0.0)
+            mean_err = summary.get(f"{nn_prefix}mean_error", 0.0)
+        else:
+            mean_acc = summary.get("accuracy", 0.0)
+            mean_err = summary.get("mean_error", 0.0)
+
+        # Sparse / isotropic primary accuracy
+        sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
+        iso_key = f"iso_{nn_prefix}accuracy" if has_nn else "iso_accuracy"
+        sp_acc = summary.get(sp_key)
+        iso_acc = summary.get(iso_key)
+
+        # --- Print summary ---
+        if not silent:
+            # Collect all variant rows: (display_name, prefix) for each evaluator
+            # e.g. ("spectral_nn", ""), ("sp_spectral_nn", "sp_"), ("iso_spectral_nn", "iso_")
+            rows = []
+            for ev in self._evaluators:
+                for prefix, variant_label in [("", ""), ("sp_", "sp_"), ("iso_", "iso_")]:
+                    key = f"{prefix}{ev.name}/accuracy"
+                    if summary.get(key) is not None:
+                        rows.append((f"{variant_label}{ev.name}", prefix, ev))
+
+            if not rows:
+                return summary
+
+            name_w = max(len(r[0]) for r in rows)
+            n_pairs = len(all_metrics)
+
+            print(f"  {label}:", flush=True)
+
+            for display_name, prefix, ev in rows:
+                full_prefix = f"{prefix}{ev.name}"
+                acc = summary.get(f"{full_prefix}/accuracy", 0.0)
+                err = summary.get(f"{full_prefix}/mean_error", 0.0)
+
+                # Count failures
+                acc_key = f"{full_prefix}/accuracy"
+                n_valid = sum(1 for m in all_metrics
+                              if acc_key in m and np.isfinite(m[acc_key]))
+                n_fail = n_pairs - n_valid
+                fail_str = f"  ({n_fail}/{n_pairs} failed)" if n_fail else ""
+
+                # Build metrics string
+                parts = [f"    {display_name:<{name_w}}  top1={acc*100:5.1f}%"]
+
+                for topk in (3, 5, 10):
+                    topk_val = summary.get(f"{full_prefix}/top{topk}_acc")
+                    if topk_val is not None:
+                        parts.append(f"  top{topk}={topk_val*100:5.1f}%")
+
+                parts.append(f"  Err={err:.4f}")
+
+                gfm_acc = summary.get(f"{full_prefix}/geomfum_accuracy")
+                if gfm_acc is not None:
+                    parts.append(f"  gfm={gfm_acc*100:5.1f}%")
+
+                # Geodesic metrics (Princeton benchmark)
+                geo_err = summary.get(f"{full_prefix}/geo_mean_error")
+                if geo_err is not None:
+                    geo_parts = []
+                    for thresh in (1, 5, 10, 25):
+                        val = summary.get(f"{full_prefix}/geo_at_{thresh:02d}pct", 0.0)
+                        geo_parts.append(f"@{thresh}%={val*100:5.1f}%")
+                    parts.append(f"  │ {'  '.join(geo_parts)}  gErr={geo_err:.4f}")
+
+                parts.append(fail_str)
+
+                print("".join(parts), flush=True)
+
+        return summary
+
+    # ------------------------------------------------------------------
+    # Baseline evaluation (runs once before first training epoch)
+    # ------------------------------------------------------------------
+
+    def on_fit_start(self) -> None:
+        """Log robust-Laplacian and epoch-0 model baselines to W&B at step 0.
+
+        Only runs on rank 0 to avoid duplicated evaluation in DDP.
+        Iterates over all val dataset specifications.
+        """
+        if not self.trainer.is_global_zero:
+            return
+
+        hp     = self.hparams
+        device = self.device
+        dm     = self.trainer.datamodule
+        if dm is None or not dm._val_dataset_specifications:
+            return
+
+        def _subsample(pair):
+            mv = hp.max_vertices_val if hp.max_vertices_val > 0 else hp.max_vertices
+            if mv > 0:
+                return subsample_pair(pair, mv,
+                                      np.random.RandomState(_stable_hash(pair.name)))
+            return pair
+
+        # Collect all val pairs across all datasets
+        all_val_datasets: List[Tuple[str, List[PairSample]]] = []
+        for spec in dm._val_dataset_specifications:
+            ds = spec.dataset
+            ds_name = getattr(ds, 'name', ds.__class__.__name__)
+            pairs = [ds[i] for i in range(len(ds))]
+            all_val_datasets.append((ds_name, pairs))
+
+        # Precompute geodesic caches for all val pairs across all datasets.
+        # Build solver + eagerly compute distances from all unique GT targets
+        # so that per-pair evaluation incurs zero geodesic cost.
+        all_pairs = [(name, p) for name, pairs in all_val_datasets for p in pairs]
+        print(f"\n  Precomputing geodesic caches ({len(all_pairs)} pairs)...", flush=True)
+        t0_geo = time.perf_counter()
+        n_total_pairs = len(all_pairs)
+        cw_geo = len(str(n_total_pairs))
+        for i, (_, p) in enumerate(all_pairs):
+            if p.name not in self._geo_cache:
+                sub_p = _subsample(p)
+                cache = _build_geo_cache(sub_p)
+                if cache is not None:
+                    gt_corr = _build_gt_corr_from_pair(sub_p)
+                    if gt_corr is not None:
+                        cache.precompute_from_gt(gt_corr)
+                self._geo_cache[p.name] = cache
+            if (i + 1) % 10 == 0 or (i + 1) == n_total_pairs:
+                dt_so_far = time.perf_counter() - t0_geo
+                print(f"    [{i+1:>{cw_geo}}/{n_total_pairs}] {dt_so_far:.1f}s",
+                      flush=True)
+        dt_geo = time.perf_counter() - t0_geo
+        n_with_geo = sum(1 for v in self._geo_cache.values() if v is not None)
+        print(f"    Done: {n_with_geo}/{len(all_pairs)} pairs with faces "
+              f"({dt_geo:.1f}s)", flush=True)
+
+        # Run baselines per dataset
+        for ds_name, val_pairs in all_val_datasets:
+            if not val_pairs:
+                continue
+            n_total = len(val_pairs)
+            cw = len(str(n_total))
+            ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
+
+            # ── Robust Laplacian baseline ──────────────────────────────────
+            try:
+                import robust_laplacian  # noqa: F401
+                print(f"\n  Computing robust Laplacian baseline{ds_label} "
+                      f"({n_total} pairs)...", flush=True)
+                robust_metrics = []
+                for i, p in enumerate(val_pairs):
+                    print(f"    [robust {i+1:>{cw}}/{n_total}] {p.name}...",
+                          end="", flush=True)
+                    t0_ = time.perf_counter()
+                    m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
+                                             evaluators=self._evaluators,
+                                             geo_cache=self._geo_cache.get(p.name))
+                    dt_ = time.perf_counter() - t0_
+                    robust_metrics.append(m)
+                    print(f" {dt_:.1f}s", flush=True)
+                rb_summary = self._summarise_and_print(
+                    robust_metrics, f"Robust baseline{ds_label}")
+                self.logger.log_metrics(
+                    {f"baseline/robust/{ds_name}/{k}": v
+                     for k, v in rb_summary.items()}, step=0)
+            except ImportError:
+                print("  (robust_laplacian not installed — skipping robust baseline)")
+
+            # ── Epoch-0 model baseline ─────────────────────────────────────
+            init_label = "random init" if hp.random_init else "pretrained"
+            print(f"\n  Computing {init_label} model baseline{ds_label} "
+                  f"({n_total} pairs)...", flush=True)
+            self.model.eval()
+            ep0_metrics = []
+            with torch.no_grad():
+                for i, p in enumerate(val_pairs):
+                    sub_p = _subsample(p)
+                    print(f"    [model  {i+1:>{cw}}/{n_total}] {p.name}...",
+                          end="", flush=True)
+                    t0_ = time.perf_counter()
+                    m = evaluate_pair(self.model, sub_p,
+                                      hp.k, hp.num_eigenvectors, device,
+                                      k_sparsify=hp.k_sparsify,
+                                      evaluators=self._evaluators,
+                                      geo_cache=self._geo_cache.get(p.name),
+                                      eval_variants=hp.eval_variants)
+                    dt_ = time.perf_counter() - t0_
+                    ep0_metrics.append(m)
+                    print(f" {dt_:.1f}s", flush=True)
+            self.model.train()
+
+            ep0_summary = self._summarise_and_print(
+                ep0_metrics, f"Model baseline ({init_label}){ds_label}")
+            self.logger.log_metrics(
+                {f"baseline/model/{ds_name}/{k}": v
+                 for k, v in ep0_summary.items()}, step=0)
+
+        # ── Eval-only mode: stop after baselines ──────────────────────────
+        if hp.eval_only:
+            print("\n  [eval_only=true] Baselines complete — stopping.", flush=True)
+            # Finalize W&B logging before exit
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.finish()
+            except Exception:
+                pass
+            raise SystemExit(0)
+
+    # ------------------------------------------------------------------
+    # Curriculum
+    # ------------------------------------------------------------------
+
+    def _current_cross_ratio(self) -> float:
+        hp       = self.hparams
+        progress = min(1.0, self.current_epoch / max(1, hp.curriculum_epochs))
+        return hp.cross_ratio_start + progress * (hp.cross_ratio_end - hp.cross_ratio_start)
+
+    def on_train_epoch_start(self) -> None:
+        cross_ratio = self._current_cross_ratio()
+        dm = self.trainer.datamodule
+        if dm is not None:
+            dm._train_dataset_specification.dataset.cross_ratio = cross_ratio
+        self.log("train/cross_ratio", cross_ratio, sync_dist=True)
+
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch: List[PairSample], batch_idx: int):
+        hp, device = self.hparams, self.device
+        total_loss = torch.tensor(0.0, device=device)
+        metrics_list: List[Dict] = []
+
+        prof = _StepProfiler(enabled=(hp.profile_steps > 0 and self.global_rank == 0))
+
+        for pair in batch:
+            with prof.phase("subsample + noise"):
+                if hp.max_vertices > 0:
+                    pair = subsample_pair(pair, hp.max_vertices, self._train_rng)
+                if hp.vertex_noise > 0:
+                    for attr in ("verts_a", "verts_b"):
+                        v     = getattr(pair, attr)
+                        scale = hp.vertex_noise * float(np.linalg.norm(v, axis=1).mean())
+                        noise = self._train_rng.randn(*v.shape).astype(np.float32) * scale
+                        setattr(pair, attr, v + noise)
+
+            with prof.phase("knn (cpu)"):
+                knn_a = compute_knn(pair.verts_a, hp.k)
+                knn_b = compute_knn(pair.verts_b, hp.k)
+
+            with prof.phase("patch build + transfer"):
+                va_t = torch.from_numpy(pair.verts_a).float().to(device)
+                vb_t = torch.from_numpy(pair.verts_b).float().to(device)
+                knn_a_t = torch.from_numpy(knn_a).long().to(device)
+                knn_b_t = torch.from_numpy(knn_b).long().to(device)
+                bd_a = Batch.from_data_list([build_patch_data(va_t, knn_a, device)]).to(device)
+                bd_b = Batch.from_data_list([build_patch_data(vb_t, knn_b, device)]).to(device)
+
+            with prof.phase("transformer forward"):
+                fwd_a = self.model._forward_pass(bd_a)
+                fwd_b = self.model._forward_pass(bd_b)
+
+            with prof.phase("laplacian assembly"):
+                S_A, M_A = (assemble_anisotropic_laplacian(fwd_a['grad_coeffs'], fwd_a['areas'], knn_a_t)
+                            if fwd_a.get('grad_coeffs') is not None
+                            else assemble_dense_stiffness_and_mass(
+                                fwd_a['stiffness_weights'], fwd_a['areas'],
+                                fwd_a['attention_mask'], bd_a.vertex_indices,
+                                bd_a.center_indices, getattr(bd_a, 'patch_idx', bd_a.batch)))
+                S_B, M_B = (assemble_anisotropic_laplacian(fwd_b['grad_coeffs'], fwd_b['areas'], knn_b_t)
+                            if fwd_b.get('grad_coeffs') is not None
+                            else assemble_dense_stiffness_and_mass(
+                                fwd_b['stiffness_weights'], fwd_b['areas'],
+                                fwd_b['attention_mask'], bd_b.vertex_indices,
+                                bd_b.center_indices, getattr(bd_b, 'patch_idx', bd_b.batch)))
+                if hp.sparsify_laplacian:
+                    if hp.k_sparsify is not None and hp.k_sparsify != hp.k:
+                        knn_sp_a = compute_knn(pair.verts_a, hp.k_sparsify)
+                        knn_sp_b = compute_knn(pair.verts_b, hp.k_sparsify)
+                        knn_sp_a_t = torch.from_numpy(knn_sp_a).long().to(device)
+                        knn_sp_b_t = torch.from_numpy(knn_sp_b).long().to(device)
+                        S_A = _sparsify_L_to_knn(S_A, knn_sp_a_t)
+                        S_B = _sparsify_L_to_knn(S_B, knn_sp_b_t)
+                    else:
+                        S_A = _sparsify_L_to_knn(S_A, knn_a_t)
+                        S_B = _sparsify_L_to_knn(S_B, knn_b_t)
+
+            with prof.phase("losses"):
+                pair_loss = torch.tensor(0.0, device=device)
+                m: Dict[str, float] = {}
+                for loss_fn in self._losses:
+                    l, lm = loss_fn(S_A, S_B, M_A, M_B, self._train_rng,
+                                    corr_a=pair.corr_a, corr_b=pair.corr_b,
+                                    grad_coeffs_a=fwd_a.get('grad_coeffs'),
+                                    grad_coeffs_b=fwd_b.get('grad_coeffs'),
+                                    knn_a=knn_a_t, knn_b=knn_b_t)
+                    pair_loss = pair_loss + loss_fn.weight * l
+                    m.update(lm)
+
+            with prof.phase("prox regularization"):
+                if hp.w_prox > 0 and hasattr(self, "ref_params"):
+                    cur = torch.cat([p.flatten() for p in self.model.parameters()])
+                    loss_prox = ((cur - self.ref_params) ** 2).sum() / self.ref_norm_sq
+                    loss = pair_loss + hp.w_prox * loss_prox
+                else:
+                    loss_prox = torch.tensor(0.0, device=device)
+                    loss = pair_loss
+
+            if torch.isnan(loss):
+                continue
+
+            total_loss = total_loss + loss
+            m["loss_prox"]  = loss_prox.item()
+            m["loss_total"] = loss.item()
+            metrics_list.append(m)
+
+        if hp.profile_steps > 0 and self.global_rank == 0:
+            step = self.global_step
+            if step % hp.profile_steps == 0:
+                print(prof.summary_str(step=step))
+            prof.reset()
+
+        if not metrics_list:
+            return None
+
+        total_loss = total_loss / len(metrics_list)
+        avg = {k: float(np.mean([d[k] for d in metrics_list])) for k in metrics_list[0]}
+
+        self.log("train/loss",      avg["loss_total"],           sync_dist=True, prog_bar=True)
+        self.log("train/loss_prox", avg["loss_prox"],            sync_dist=True)
+        # Log all loss-specific metrics (loss_nce, loss_iso, etc.)
+        for mk in avg:
+            if mk.startswith("loss_") and mk not in ("loss_total", "loss_prox"):
+                self.log(f"train/{mk}", avg[mk], sync_dist=True)
+        self.log("train/top1",      avg.get("train_acc", 0.0),   sync_dist=True, prog_bar=True)
+        self.log("train/top3",      avg.get("train_top3", 0.0),  sync_dist=True)
+        self.log("train/top5",      avg.get("train_top5", 0.0),  sync_dist=True)
+        self.log("train/top10",     avg.get("train_top10", 0.0), sync_dist=True)
+        self.log("train/lr",
+                 self.trainer.optimizers[0].param_groups[0]["lr"],
+                 rank_zero_only=True)
+        return total_loss
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
+
+    @torch.no_grad()
+    def validation_step(self, batch: List[PairSample], batch_idx: int,
+                        dataloader_idx: int = 0) -> None:
+        assert len(batch) == 1
+        pair = batch[0]
+        mv = self.hparams.max_vertices_val or self.hparams.max_vertices
+        if mv > 0:
+            pair = subsample_pair(pair, mv,
+                                  np.random.RandomState(_stable_hash(pair.name)))
+        if dataloader_idx not in self._val_outputs:
+            self._val_outputs[dataloader_idx] = []
+        self._val_outputs[dataloader_idx].append(evaluate_pair(
+            self.model, pair, self.hparams.k,
+            self.hparams.num_eigenvectors, self.device,
+            k_sparsify=self.hparams.k_sparsify,
+            evaluators=self._evaluators,
+            geo_cache=self._geo_cache.get(pair.name),
+            eval_variants=self.hparams.eval_variants,
+        ))
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_outputs:
+            return
+
+        dm = self.trainer.datamodule
+        val_specs = dm._val_dataset_specifications
+
+        # Process each val dataset independently
+        primary_acc = None  # from first dataset, used for checkpointing
+
+        for dl_idx, outputs in sorted(self._val_outputs.items()):
+            if not outputs:
+                continue
+
+            # Dataset name for logging and printing
+            ds = val_specs[dl_idx].dataset if dl_idx < len(val_specs) else None
+            ds_name = getattr(ds, 'name', f'val_{dl_idx}')
+
+            # --- DDP gather ---
+            sample = outputs[0]
+            float_keys = [k for k, v in sample.items()
+                          if isinstance(v, (int, float)) and not k.startswith("_")]
+            local_t = torch.tensor(
+                [[d.get(k, float("nan")) for k in float_keys] for d in outputs],
+                device=self.device, dtype=torch.float32)
+
+            gathered = self.all_gather(local_t)
+            if gathered.dim() == 2:
+                gathered = gathered.unsqueeze(0)
+            all_flat = gathered.reshape(-1, len(float_keys))
+
+            true_val_size = len(val_specs[dl_idx].dataset) if dl_idx < len(val_specs) else len(outputs)
+            all_flat = all_flat[:true_val_size]
+
+            all_metrics = [{k: all_flat[i, j].item() for j, k in enumerate(float_keys)}
+                           for i in range(all_flat.shape[0])]
+
+            # --- Summarise + print (shared code path) ---
+            summary = self._summarise_and_print(
+                all_metrics, f"Val epoch {self.current_epoch} [{ds_name}]",
+                silent=not self.trainer.is_global_zero)
+
+            # --- Log to W&B / Lightning ---
+            prefix = f"val/{ds_name}" if len(val_specs) > 1 else "val"
+            for mk, mv in summary.items():
+                self.log(f"{prefix}/{mk}", mv, sync_dist=True,
+                         add_dataloader_idx=False)
+
+            # Primary metrics from first dataset
+            nn_prefix = "spectral_nn/"
+            has_nn = any(k.startswith(nn_prefix) for k in summary)
+            acc_key = f"{nn_prefix}accuracy" if has_nn else "accuracy"
+            sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
+            iso_geo5_key = f"iso_{nn_prefix}geo_at_05pct" if has_nn else "iso_geo_at_05pct"
+
+            if dl_idx == 0:
+                self.log("val/top1", summary.get(acc_key, 0.0),
+                         prog_bar=True, sync_dist=True, add_dataloader_idx=False)
+                if sp_key in summary:
+                    self.log("val/sp_top1", summary[sp_key],
+                             prog_bar=True, sync_dist=True, add_dataloader_idx=False)
+                # Primary for checkpointing: iso @5% geodesic > sp top1 > dense top1
+                primary_acc = summary.get(
+                    iso_geo5_key,
+                    summary.get(sp_key, summary.get(acc_key, 0.0)))
+
+        if primary_acc is not None:
+            self.log("val/best_acc", primary_acc,
+                     prog_bar=True, sync_dist=True, add_dataloader_idx=False)
