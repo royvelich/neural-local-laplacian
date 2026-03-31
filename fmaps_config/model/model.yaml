@@ -43,17 +43,18 @@ module:
     #   num_sample_vertices: 256
 
     # Uncomment to add geodesic diffusion transfer loss (supervised, needs GT):
-#     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
-#       weight: 1.0
-#       num_landmarks: 256
-#       alphas: [0.1, 1.0, 10.0]
-#       num_sample_vertices: 1024
-
-    # Uncomment to add heat method geodesic loss (supervised, needs GT + grad_coeffs):
-     - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
        weight: 1.0
        num_landmarks: 256
+       alphas: [0.1, 1.0, 10.0]
+       normalize: false
        num_sample_vertices: 1024
+
+    # Uncomment to add heat method geodesic loss (supervised, needs GT + grad_coeffs):
+#     - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+#       weight: 1.0
+#       num_landmarks: 256
+#       num_sample_vertices: 1024
 
   # ── Model initialisation ────────────────────────────────────────────────
   random_init: false               # reset all weights after loading architecture
