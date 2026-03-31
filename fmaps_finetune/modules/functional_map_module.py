@@ -416,6 +416,83 @@ def _diffusion_descriptors(
 
 
 # =============================================================================
+# Differentiable gradient and divergence from learned grad_coeffs
+# =============================================================================
+
+def _apply_gradient(
+    grad_coeffs: torch.Tensor, knn: torch.Tensor, u: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the learned gradient operator to scalar field(s).
+
+    Computes (∇f)_i = Σ_j g_ij (f_j - f_i) for each vertex i.
+    Fully differentiable through grad_coeffs and u.
+
+    Args:
+        grad_coeffs: (N, k, 3) per-neighbor gradient coefficients.
+        knn: (N, k) neighbor indices.
+        u: (N,) or (N, L) scalar field(s).
+
+    Returns:
+        (N, 3) or (N, L, 3) gradient field.
+    """
+    if u.dim() == 1:
+        du = u[knn] - u[:, None]                            # (N, k)
+        return (grad_coeffs * du.unsqueeze(2)).sum(dim=1)    # (N, 3)
+    else:
+        # Batched: u is (N, L)
+        du = u[knn] - u[:, None, :]                          # (N, k, L)
+        return torch.einsum('nkd,nkl->nld', grad_coeffs, du)  # (N, L, 3)
+
+
+def _apply_divergence(
+    grad_coeffs: torch.Tensor, knn: torch.Tensor, areas: torch.Tensor,
+    X: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the learned divergence operator to vector field(s).
+
+    Computes div(X)_j = Σ_{i: j∈nbr(i)} area_i * g_ij · X_i
+                      + area_j * center_coeff_j · X_j
+
+    This is the adjoint of _apply_gradient w.r.t. the area-weighted inner product.
+    Fully differentiable through grad_coeffs, areas, and X.
+
+    Args:
+        grad_coeffs: (N, k, 3) per-neighbor gradient coefficients.
+        knn: (N, k) neighbor indices.
+        areas: (N,) per-vertex areas.
+        X: (N, 3) or (N, L, 3) vector field(s).
+
+    Returns:
+        (N,) or (N, L) divergence.
+    """
+    N = grad_coeffs.shape[0]
+    device = grad_coeffs.device
+
+    if X.dim() == 2:
+        # Single field: X is (N, 3)
+        dot_nb = (grad_coeffs * X[:, None, :]).sum(dim=2)   # (N, k)
+        weighted_nb = areas[:, None] * dot_nb                # (N, k)
+        div = torch.zeros(N, device=device, dtype=X.dtype)
+        div.scatter_add_(0, knn.reshape(-1), weighted_nb.reshape(-1))
+
+        center_coeffs = -grad_coeffs.sum(dim=1)              # (N, 3)
+        div = div + areas * (center_coeffs * X).sum(dim=1)
+        return div
+    else:
+        # Batched: X is (N, L, 3)
+        L = X.shape[1]
+        dot_nb = torch.einsum('nkd,nld->nkl', grad_coeffs, X)   # (N, k, L)
+        weighted_nb = areas[:, None, None] * dot_nb               # (N, k, L)
+        div = torch.zeros(N, L, device=device, dtype=X.dtype)
+        knn_exp = knn.unsqueeze(2).expand(-1, -1, L)              # (N, k, L)
+        div.scatter_add_(0, knn_exp.reshape(-1, L), weighted_nb.reshape(-1, L))
+
+        center_coeffs = -grad_coeffs.sum(dim=1)                   # (N, 3)
+        div = div + areas[:, None] * torch.einsum('nd,nld->nl', center_coeffs, X)
+        return div
+
+
+# =============================================================================
 # Loss modules — share forward signature:
 #   forward(S_A, S_B, M_A, M_B, rng, *, corr_a=None, corr_b=None)
 #   → (loss: Tensor, metrics: Dict[str, float])
@@ -462,6 +539,7 @@ class SoftCorrespondenceLoss(nn.Module):
         rng: np.random.RandomState,
         corr_a: Optional[np.ndarray] = None,
         corr_b: Optional[np.ndarray] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         N_A, N_B = S_A.shape[0], S_B.shape[0]
         device   = S_A.device
@@ -549,6 +627,7 @@ class IsospectralityLoss(nn.Module):
         rng: np.random.RandomState,
         corr_a: Optional[np.ndarray] = None,
         corr_b: Optional[np.ndarray] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         k = min(self.num_eigenvalues, S_A.shape[0] - 1, S_B.shape[0] - 1)
         if k < 1:
@@ -602,6 +681,7 @@ class DiffusionDistributionLoss(nn.Module):
         rng: np.random.RandomState,
         corr_a: Optional[np.ndarray] = None,
         corr_b: Optional[np.ndarray] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         N_A, N_B = S_A.shape[0], S_B.shape[0]
         device = S_A.device
@@ -686,6 +766,7 @@ class GeodesicDiffusionLoss(nn.Module):
         rng: np.random.RandomState,
         corr_a: Optional[np.ndarray] = None,
         corr_b: Optional[np.ndarray] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         N_A, N_B = S_A.shape[0], S_B.shape[0]
         device = S_A.device
@@ -742,6 +823,150 @@ class GeodesicDiffusionLoss(nn.Module):
         loss = total_loss / len(self.alphas)
 
         return loss, {'loss_geodiff': loss.item()}
+
+
+class HeatMethodGeodesicLoss(nn.Module):
+    """Geodesic transfer loss via the full differentiable heat method (supervised).
+
+    Implements all three steps of the heat method (Crane et al. 2013) in
+    differentiable PyTorch:
+        1. Heat diffuse:  u = (S + t·diag(M))⁻¹ M δ_s
+        2. Grad + norm:   X = -∇u / max(|∇u|, ε)    via _apply_gradient
+        3. Poisson solve:  φ = (S + ε·I)⁻¹ div(X)     via _apply_divergence
+
+    The resulting φ approximates geodesic distance from the source.
+    Gradients flow through all three steps back to grad_coeffs and areas.
+
+    Requires grad_coeffs and knn to be passed as kwargs from training_step.
+    """
+
+    def __init__(
+        self,
+        num_landmarks: int = 32,
+        num_sample_vertices: int = 512,
+        landmark_seed: int = 0,
+        eps: float = 1e-6,
+        weight: float = 1.0,
+    ):
+        super().__init__()
+        self.num_landmarks       = num_landmarks
+        self.num_sample_vertices = num_sample_vertices
+        self.landmark_seed       = landmark_seed
+        self.eps                 = eps
+        self.weight              = weight
+
+    @staticmethod
+    def _heat_method_distances(
+        S: torch.Tensor, M: torch.Tensor,
+        grad_coeffs: torch.Tensor, knn: torch.Tensor,
+        source_indices: torch.Tensor, eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Full heat method in differentiable PyTorch.
+
+        Args:
+            S: (N, N) stiffness matrix.
+            M: (N,) mass diagonal.
+            grad_coeffs: (N, k, 3) gradient coefficients.
+            knn: (N, k) neighbor indices.
+            source_indices: (L,) landmark vertex indices.
+            eps: regularisation for Poisson solve.
+
+        Returns:
+            phi: (N, L) approximate geodesic distances from each landmark.
+        """
+        N = S.shape[0]
+        L = len(source_indices)
+        device = S.device
+
+        # Diffusion time from mean vertex area
+        h = M.mean().sqrt()
+        t = h * h
+
+        # Step 1: Heat diffuse — reuses _diffusion_solve with alpha = t
+        E = torch.zeros(N, L, device=device, dtype=S.dtype)
+        E[source_indices, torch.arange(L, device=device)] = 1.0
+        u = _diffusion_solve(S, M, E, t)                       # (N, L)
+
+        # Step 2: Gradient + normalise
+        grad_u = _apply_gradient(grad_coeffs, knn, u)           # (N, L, 3)
+        norms = grad_u.norm(dim=2, keepdim=True).clamp(min=1e-8)
+        X = -grad_u / norms                                      # (N, L, 3)
+
+        # Step 3: Divergence + Poisson solve
+        div_X = _apply_divergence(grad_coeffs, knn, M, X)       # (N, L)
+        S_reg = S + eps * torch.eye(N, device=device, dtype=S.dtype)
+        phi = torch.linalg.solve(S_reg, div_X)                   # (N, L)
+
+        # Shift so source has distance 0, take abs
+        phi = phi - phi[source_indices, torch.arange(L, device=device)].unsqueeze(0)
+        phi = phi.abs()
+
+        return phi
+
+    def forward(
+        self,
+        S_A: torch.Tensor, S_B: torch.Tensor,
+        M_A: torch.Tensor, M_B: torch.Tensor,
+        rng: np.random.RandomState,
+        corr_a: Optional[np.ndarray] = None,
+        corr_b: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        grad_coeffs_a = kwargs.get('grad_coeffs_a')
+        grad_coeffs_b = kwargs.get('grad_coeffs_b')
+        knn_a = kwargs.get('knn_a')
+        knn_b = kwargs.get('knn_b')
+
+        if grad_coeffs_a is None or knn_a is None:
+            zero = torch.tensor(0.0, device=S_A.device)
+            return zero, {'loss_heatgeo': 0.0}
+
+        N_A, N_B = S_A.shape[0], S_B.shape[0]
+        device = S_A.device
+
+        if corr_a is None or corr_b is None:
+            assert N_A == N_B
+            pool = np.arange(N_A); ca = pool; cb = pool
+        else:
+            pool = _compute_bijective_refs(corr_a, corr_b)
+            if len(pool) < self.num_landmarks + self.num_sample_vertices:
+                pool = np.arange(len(corr_a))
+            ca, cb = corr_a, corr_b
+
+        # Pick landmarks and sample vertices
+        lm_rng = np.random.RandomState(self.landmark_seed)
+        L = min(self.num_landmarks, len(pool))
+        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
+
+        V = min(self.num_sample_vertices, len(pool))
+        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+
+        # Source indices on each shape
+        src_A = torch.from_numpy(ca[lm_refs].copy()).long().to(device)
+        src_B = torch.from_numpy(cb[lm_refs].copy()).long().to(device)
+
+        # Full heat method on both shapes
+        phi_A = self._heat_method_distances(
+            S_A, M_A, grad_coeffs_a, knn_a, src_A, self.eps)   # (N_A, L)
+        phi_B = self._heat_method_distances(
+            S_B, M_B, grad_coeffs_b, knn_b, src_B, self.eps)   # (N_B, L)
+
+        # Sample corresponding vertices
+        d_A = phi_A[ca[sample_refs]]                             # (V, L)
+        d_B = phi_B[cb[sample_refs]]                             # (V, L)
+
+        # Normalise each landmark's profile (unit norm) for scale-invariance
+        d_A = F.normalize(d_A, p=2, dim=0)
+        d_B = F.normalize(d_B, p=2, dim=0)
+
+        # Area-weighted L2
+        area_B = M_B[cb[sample_refs]]
+        area_B = area_B / area_B.sum()
+
+        sq_diff = (d_A - d_B) ** 2                               # (V, L)
+        loss = (area_B[:, None] * sq_diff).sum(dim=0).mean()
+
+        return loss, {'loss_heatgeo': loss.item()}
 
 
 # =============================================================================
@@ -1737,7 +1962,10 @@ class FunctionalMapModule(LaplacianModuleBase):
                 m: Dict[str, float] = {}
                 for loss_fn in self._losses:
                     l, lm = loss_fn(S_A, S_B, M_A, M_B, self._train_rng,
-                                    corr_a=pair.corr_a, corr_b=pair.corr_b)
+                                    corr_a=pair.corr_a, corr_b=pair.corr_b,
+                                    grad_coeffs_a=fwd_a.get('grad_coeffs'),
+                                    grad_coeffs_b=fwd_b.get('grad_coeffs'),
+                                    knn_a=knn_a_t, knn_b=knn_b_t)
                     pair_loss = pair_loss + loss_fn.weight * l
                     m.update(lm)
 
