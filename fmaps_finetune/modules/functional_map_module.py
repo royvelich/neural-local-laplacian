@@ -1515,7 +1515,7 @@ class FunctionalMapModule(LaplacianModuleBase):
     def __init__(
         self,
         checkpoint_path: str,
-        optimizer_cfg: DictConfig,
+        optimizer_cfg: Optional[DictConfig] = None,
         losses: Optional[List[nn.Module]] = None,
         loss_fn: Optional[SoftCorrespondenceLoss] = None,  # backward compat
         scheduler_cfg: Optional[DictConfig] = None,
@@ -1566,6 +1566,8 @@ class FunctionalMapModule(LaplacianModuleBase):
             if not hasattr(loss_fn, 'weight'):
                 loss_fn.weight = 1.0
             self._losses = nn.ModuleList([loss_fn])
+        elif eval_only:
+            self._losses = nn.ModuleList()
         else:
             raise ValueError("Must provide either `losses` or `loss_fn`")
 
@@ -1677,6 +1679,8 @@ class FunctionalMapModule(LaplacianModuleBase):
     # ------------------------------------------------------------------
 
     def configure_optimizers(self):
+        if self._optimizer_cfg is None:
+            return None
         trainable = [p for p in self.parameters() if p.requires_grad]
         optimizer = self._optimizer_cfg(params=trainable)
         if self._scheduler_cfg is None:
@@ -1809,6 +1813,9 @@ class FunctionalMapModule(LaplacianModuleBase):
     ) -> None:
         """Save eval-only results as CSVs and comparison plots.
 
+        Each run gets a unique directory based on the W&B run name and key
+        hyperparameters, so multiple eval runs don't overwrite each other.
+
         Args:
             eval_results: {ds_name: {method_name: (per_pair_metrics, summary)}}
             all_val_datasets: [(ds_name, pairs)] for pair name lookup.
@@ -1816,9 +1823,40 @@ class FunctionalMapModule(LaplacianModuleBase):
         import csv
         from pathlib import Path
 
-        out_dir = Path(self.trainer.default_root_dir) / "eval_results"
+        # Build a unique run directory name
+        hp = self.hparams
+        try:
+            import wandb
+            run_name = wandb.run.name if wandb.run is not None else "local"
+        except ImportError:
+            run_name = "local"
+        run_tag = f"{run_name}_k{hp.k}"
+        if hp.k_sparsify is not None:
+            run_tag += f"_ksp{hp.k_sparsify}"
+
+        out_dir = Path(self.trainer.default_root_dir) / "eval_results" / run_tag
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n  Saving eval results to {out_dir}/", flush=True)
+
+        # Save run config
+        config_path = out_dir / "config.yaml"
+        try:
+            import yaml
+            config_dict = {
+                "k": hp.k,
+                "k_sparsify": hp.k_sparsify,
+                "num_eigenvectors": hp.num_eigenvectors,
+                "checkpoint_path": hp.checkpoint_path,
+                "eval_variants": hp.eval_variants,
+                "max_vertices": hp.max_vertices,
+                "max_vertices_val": hp.max_vertices_val,
+                "run_name": run_name,
+            }
+            with open(config_path, "w") as f:
+                yaml.dump(config_dict, f, default_flow_style=False)
+            print(f"    {config_path}", flush=True)
+        except ImportError:
+            pass
 
         # Build pair name lookup per dataset
         pair_names: Dict[str, List[str]] = {}
