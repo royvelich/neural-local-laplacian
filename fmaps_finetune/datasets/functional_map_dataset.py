@@ -483,6 +483,12 @@ def _resolve_categories(
 
 # ── Base pair generator ──────────────────────────────────────────────────────
 
+def _load_category_worker(args):
+    """Multiprocessing worker: load one DT4DCategory and return it."""
+    root, name = args
+    return DT4DCategory(root, name)
+
+
 class DT4DPairGeneratorBase(PairGenerator):
     """Shared DT4D logic: category loading, same-category pairs, val pairs."""
 
@@ -500,10 +506,23 @@ class DT4DPairGeneratorBase(PairGenerator):
 
         self.category_names: List[str] = resolved
         self.categories: Dict[str, DT4DCategory] = {}
-        for i, name in enumerate(resolved):
-            cat = DT4DCategory(self.root, name)
-            self.categories[name] = cat
-            print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
+
+        import os
+        _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+        n_workers = min(len(resolved), max(1, _n_cpus - 1))
+        if n_workers > 1 and len(resolved) > 1:
+            import multiprocessing as _mp
+            worker_args = [(self.root, name) for name in resolved]
+            with _mp.Pool(n_workers) as pool:
+                for i, cat in enumerate(pool.imap(
+                        _load_category_worker, worker_args)):
+                    self.categories[cat.name] = cat
+                    print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
+        else:
+            for i, name in enumerate(resolved):
+                cat = DT4DCategory(self.root, name)
+                self.categories[name] = cat
+                print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
 
         self.same_pairs = [(c, c) for c in self.category_names]
         print(f"  [{self.__class__.__name__}] Loading complete.", flush=True)
