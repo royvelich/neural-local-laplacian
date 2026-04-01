@@ -1531,9 +1531,6 @@ class FunctionalMapModule(LaplacianModuleBase):
         max_vertices_val: int = 0,
         vertex_noise: float = 0.05,
         w_prox: float = 20.0,
-        cross_ratio_start: float = 0.0,
-        cross_ratio_end: float = 0.5,
-        curriculum_epochs: int = 50,
         seed: int = 42,
         use_lora: bool = False,
         lora_rank: int = 8,
@@ -1868,7 +1865,8 @@ class FunctionalMapModule(LaplacianModuleBase):
             pair_meta.append((p.name, True))
 
         # Run workers in parallel
-        n_workers = min(len(worker_args), max(1, (os.cpu_count() or 1) - 1))
+        _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+        n_workers = min(len(worker_args), max(1, _n_cpus - 1))
         if worker_args:
             if n_workers > 1:
                 import multiprocessing as _mp
@@ -1992,18 +1990,6 @@ class FunctionalMapModule(LaplacianModuleBase):
     # ------------------------------------------------------------------
     # Curriculum
     # ------------------------------------------------------------------
-
-    def _current_cross_ratio(self) -> float:
-        hp       = self.hparams
-        progress = min(1.0, self.current_epoch / max(1, hp.curriculum_epochs))
-        return hp.cross_ratio_start + progress * (hp.cross_ratio_end - hp.cross_ratio_start)
-
-    def on_train_epoch_start(self) -> None:
-        cross_ratio = self._current_cross_ratio()
-        dm = self.trainer.datamodule
-        if dm is not None:
-            dm._train_dataset_specification.dataset.cross_ratio = cross_ratio
-        self.log("train/cross_ratio", cross_ratio, sync_dist=True)
 
     # ------------------------------------------------------------------
     # Training step

@@ -60,7 +60,7 @@ class PairSample:
 class PairGenerator(ABC):
     @abstractmethod
     def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float,
+        self, rng: np.random.RandomState,
     ) -> PairSample: ...
 
     @abstractmethod
@@ -277,6 +277,7 @@ class SMALPairGenerator(PairGenerator):
     """Generate SMAL shape pairs with identity correspondence.
 
     train_families / val_families: null → auto (val = last 2, train = rest).
+    pair_mode: 'intra' = same-family pairs, 'inter' = cross-family pairs.
     """
 
     def __init__(
@@ -285,9 +286,11 @@ class SMALPairGenerator(PairGenerator):
         train_families: Optional[List[int]] = None,
         val_families:   Optional[List[int]] = None,
         pose_scale: float = 0.2,
+        pair_mode: str = "intra",
     ):
         self.smal       = smal
         self.pose_scale = pose_scale
+        self.pair_mode  = pair_mode
 
         all_families = list(range(smal.num_families))
         if val_families is None:
@@ -297,27 +300,32 @@ class SMALPairGenerator(PairGenerator):
 
         self.train_families = train_families
         self.val_families   = val_families
-        self.cross_pairs    = list(combinations(train_families, 2))
-        self.same_pairs     = [(f, f) for f in train_families]
-        self.val_pairs      = list(combinations(val_families, 2))
-        for t in train_families:
-            for v in val_families:
-                self.val_pairs.append((t, v))
+
+        if pair_mode == "intra":
+            self.train_pairs = [(f, f) for f in train_families]
+            self.val_pairs   = [(f, f) for f in val_families]
+        elif pair_mode == "inter":
+            self.train_pairs = list(combinations(train_families, 2))
+            self.val_pairs   = list(combinations(val_families, 2))
+            for t in train_families:
+                for v in val_families:
+                    self.val_pairs.append((t, v))
+            if not self.train_pairs:
+                raise ValueError(
+                    "pair_mode='inter' but no cross-family pairs possible "
+                    f"(only {len(train_families)} train families)")
+        else:
+            raise ValueError(f"pair_mode must be 'intra' or 'inter', got '{pair_mode}'")
 
     def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.5,
+        self, rng: np.random.RandomState,
     ) -> PairSample:
-        if rng.rand() < cross_ratio and self.cross_pairs:
-            fam_a, fam_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
-        else:
-            fam_a, fam_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
+        fam_a, fam_b = self.train_pairs[rng.randint(len(self.train_pairs))]
         verts_a = self.smal.generate(fam_a, self.pose_scale, rng)
         verts_b = self.smal.generate(fam_b, self.pose_scale, rng)
         corr_a, corr_b = identity_correspondence(len(verts_a))
         return PairSample(verts_a, verts_b, corr_a, corr_b,
-                          f"{pair_type}_{fam_a}_vs_{fam_b}")
+                          f"{self.pair_mode}_{fam_a}_vs_{fam_b}")
 
     def get_val_pairs(
         self, rng: np.random.RandomState, poses_per_pair: int = 1,
@@ -403,15 +411,57 @@ def _discover_categories(root: Path) -> List[str]:
     return cats
 
 
+def _expand_spec(
+    spec: List, all_items: List,
+) -> List:
+    """Expand a mixed list of names, indices, and ranges against a reference list.
+
+    Items can be:
+      - int index:  2 → all_items[2]
+      - str range:  "5:10" → all_items[5..9]
+      - str/other:  looked up directly in all_items
+
+    Args:
+        spec: List of mixed items (int, str range, or direct values).
+        all_items: Full sorted reference list.
+
+    Returns:
+        Sorted deduplicated list of resolved items.
+    """
+    result = set()
+    n = len(all_items)
+    for item in spec:
+        if isinstance(item, int):
+            if not (0 <= item < n):
+                raise IndexError(f"Index {item} out of range [0, {n})")
+            result.add(all_items[item])
+        elif isinstance(item, str) and ':' in item:
+            parts = item.split(':')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else n
+            if start < 0 or end > n or start >= end:
+                raise IndexError(f"Range '{item}' invalid for {n} items")
+            for i in range(start, end):
+                result.add(all_items[i])
+        else:
+            if item not in all_items:
+                raise ValueError(f"Item {item!r} not found in reference list")
+            result.add(item)
+    return sorted(result)
+
+
 def _resolve_categories(
     root: Path,
-    categories: Optional[List[str]],
-    exclude_categories: Optional[List[str]],
+    categories: Optional[List] = None,
+    exclude_categories: Optional[List] = None,
 ) -> List[str]:
     """Resolve category specification to a concrete list.
 
     Exactly one of *categories* / *exclude_categories* may be non-None.
     Both None → use all categories discovered from *root*.
+
+    Items in either list can be category names (str), integer indices
+    into the sorted category list, or "start:end" range strings.
     """
     if categories is not None and exclude_categories is not None:
         raise ValueError(
@@ -421,12 +471,10 @@ def _resolve_categories(
         raise FileNotFoundError(
             f"No valid DT4D categories found in {root}.")
     if categories is not None:
-        missing = [c for c in categories if c not in all_cats]
-        if missing:
-            raise ValueError(f"Categories not found in {root}: {missing}")
-        return sorted(categories)
+        return _expand_spec(categories, all_cats)
     if exclude_categories is not None:
-        result = [c for c in all_cats if c not in exclude_categories]
+        excluded = set(_expand_spec(exclude_categories, all_cats))
+        result = [c for c in all_cats if c not in excluded]
         if not result:
             raise ValueError("All categories excluded.")
         return result
@@ -434,12 +482,6 @@ def _resolve_categories(
 
 
 # ── Base pair generator ──────────────────────────────────────────────────────
-
-def _load_category_worker(args):
-    """Multiprocessing worker: load one DT4DCategory and return it."""
-    root, name = args
-    return DT4DCategory(root, name)
-
 
 class DT4DPairGeneratorBase(PairGenerator):
     """Shared DT4D logic: category loading, same-category pairs, val pairs."""
@@ -458,22 +500,10 @@ class DT4DPairGeneratorBase(PairGenerator):
 
         self.category_names: List[str] = resolved
         self.categories: Dict[str, DT4DCategory] = {}
-
-        import os
-        n_workers = min(len(resolved), max(1, (os.cpu_count() or 1) - 1))
-        if n_workers > 1 and len(resolved) > 1:
-            import multiprocessing as _mp
-            worker_args = [(self.root, name) for name in resolved]
-            with _mp.Pool(n_workers) as pool:
-                for i, cat in enumerate(pool.imap(
-                        _load_category_worker, worker_args)):
-                    self.categories[cat.name] = cat
-                    print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
-        else:
-            for i, name in enumerate(resolved):
-                cat = DT4DCategory(self.root, name)
-                self.categories[name] = cat
-                print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
+        for i, name in enumerate(resolved):
+            cat = DT4DCategory(self.root, name)
+            self.categories[name] = cat
+            print(f"    [{i+1}/{len(resolved)}] {cat}", flush=True)
 
         self.same_pairs = [(c, c) for c in self.category_names]
         print(f"  [{self.__class__.__name__}] Loading complete.", flush=True)
@@ -538,14 +568,62 @@ class DT4DPairGeneratorBase(PairGenerator):
 # ── Humanoid pair generator (with cross-category bridges) ────────────────────
 
 class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
-    """DT4D Humanoid pairs with optional cross-category bridge support."""
+    """DT4D Humanoid pairs with optional cross-category bridge support.
+
+    pair_mode: 'intra' = same-category only, 'inter' = cross-category only.
+
+    When pair_mode='inter', the category list is pre-filtered to only those
+    that participate in at least one bridge *before* applying the
+    categories/exclude_categories spec. So categories: ["0:5"] with
+    pair_mode='inter' gives the first 5 inter-capable categories.
+    """
+
+    @staticmethod
+    def _scan_bridged_categories(root: Path, all_cats: List[str]) -> set:
+        """Scan bridge filenames to find categories with bridges (no mesh loading).
+
+        Also finds indirect bridges (A→hub→B) by building a connectivity graph.
+        """
+        bridge_dir = root / "cross_category_corres"
+        if not bridge_dir.exists():
+            return set()
+
+        # Direct bridges from filenames
+        cat_set = set(all_cats)
+        direct_pairs = set()
+        for f in bridge_dir.glob("*.vts"):
+            parts = f.stem.split("_", 1)
+            if len(parts) == 2:
+                src, dst = parts
+                if src in cat_set and dst in cat_set:
+                    direct_pairs.add((src, dst))
+
+        # Find all categories reachable via direct or indirect (1-hub) bridges
+        bridged = set()
+        for a, b in combinations(all_cats, 2):
+            # Direct
+            if (a, b) in direct_pairs or (b, a) in direct_pairs:
+                bridged.add(a)
+                bridged.add(b)
+                continue
+            # Indirect through hub
+            for hub in all_cats:
+                if hub in (a, b):
+                    continue
+                a_hub = (a, hub) in direct_pairs or (hub, a) in direct_pairs
+                hub_b = (hub, b) in direct_pairs or (b, hub) in direct_pairs
+                if a_hub and hub_b:
+                    bridged.add(a)
+                    bridged.add(b)
+                    break
+        return bridged
 
     def __init__(
         self,
         root: str,
-        categories: Optional[List[str]] = None,
-        exclude_categories: Optional[List[str]] = None,
-        enable_cross_category: bool = True,
+        categories: Optional[List] = None,
+        exclude_categories: Optional[List] = None,
+        pair_mode: str = "intra",
         # Legacy compat: accept old-style args, ignore them with a warning
         train_categories: Optional[List[str]] = None,
         val_categories: Optional[List[str]] = None,
@@ -562,29 +640,57 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
                 merged = sorted(set((train_categories or []) + (val_categories or [])))
                 categories = merged if merged else None
 
-        super().__init__(root, categories, exclude_categories)
-        self.enable_cross_category = enable_cross_category
+        # For inter mode: pre-filter discovered categories to only those with bridges,
+        # so that index specs like ["0:5"] select from bridged categories only.
+        if pair_mode == "inter":
+            all_on_disk = _discover_categories(Path(root))
+            bridged = self._scan_bridged_categories(Path(root), all_on_disk)
+            if not bridged:
+                raise ValueError(
+                    "pair_mode='inter' but no bridged categories found. "
+                    "Check that cross_category_corres/ exists.")
+            # Filter the discovered list, then apply user spec to it
+            filtered = [c for c in all_on_disk if c in bridged]
+            if categories is not None:
+                resolved = _expand_spec(categories, filtered)
+            elif exclude_categories is not None:
+                excluded = set(_expand_spec(exclude_categories, filtered))
+                resolved = [c for c in filtered if c not in excluded]
+            else:
+                resolved = filtered
+            # Override: pass resolved names directly to base class
+            categories = resolved
+            exclude_categories = None
 
+        super().__init__(root, categories, exclude_categories)
+        self.pair_mode = pair_mode
+
+        # Load cross-category bridges (VTS data)
         self.bridges: Dict[Tuple[str, str], np.ndarray] = {}
-        if enable_cross_category:
-            bridge_dir = self.root / "cross_category_corres"
-            if bridge_dir.exists():
-                for f in bridge_dir.glob("*.vts"):
-                    parts = f.stem.split("_", 1)
-                    if len(parts) == 2:
-                        src, dst = parts
-                        if src in self.categories and dst in self.categories:
-                            self.bridges[(src, dst)] = _load_vts(str(f))
+        bridge_dir = self.root / "cross_category_corres"
+        if bridge_dir.exists():
+            for f in bridge_dir.glob("*.vts"):
+                parts = f.stem.split("_", 1)
+                if len(parts) == 2:
+                    src, dst = parts
+                    if src in self.categories and dst in self.categories:
+                        self.bridges[(src, dst)] = _load_vts(str(f))
+            if self.bridges:
                 print(f"  Loaded {len(self.bridges)} cross-category bridges")
 
-        self.cross_pairs = []
-        if enable_cross_category:
-            self.cross_pairs = [
-                (a, b) for a, b in combinations(self.category_names, 2)
-                if self._can_bridge(a, b)
-            ]
+        self.cross_pairs = [
+            (a, b) for a, b in combinations(self.category_names, 2)
+            if self._can_bridge(a, b)
+        ]
+
+        if pair_mode == "inter" and not self.cross_pairs:
+            raise ValueError(
+                "pair_mode='inter' but no cross-category pairs found among "
+                f"selected categories: {self.category_names}")
+
         print(f"  Same-category pairs:  {len(self.same_pairs)}")
         print(f"  Cross-category pairs: {len(self.cross_pairs)}")
+        print(f"  pair_mode: {pair_mode}")
 
     def _can_bridge(self, a: str, b: str) -> bool:
         if a == b: return True
@@ -643,14 +749,12 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
         return corr_a[mask], corr_b[mask]
 
     def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.5,
+        self, rng: np.random.RandomState,
     ) -> PairSample:
-        if self.enable_cross_category and rng.rand() < cross_ratio and self.cross_pairs:
+        if self.pair_mode == "inter":
             cat_a, cat_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
         else:
             cat_a, cat_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
         c_a, c_b = self.categories[cat_a], self.categories[cat_b]
         pose_a = rng.randint(c_a.num_poses)
         pose_b = rng.randint(c_b.num_poses)
@@ -661,17 +765,15 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
         return PairSample(
             verts_a=c_a.vertices[pose_a], verts_b=c_b.vertices[pose_b],
             corr_a=corr_a, corr_b=corr_b,
-            name=f"{pair_type}_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
+            name=f"{self.pair_mode}_{cat_a}:{c_a.poses[pose_a]}_vs_{cat_b}:{c_b.poses[pose_b]}",
             faces_b=c_b.faces[pose_b],
         )
 
     def _get_val_pair_list(self) -> List[Tuple[str, str]]:
-        val_pairs = list(self.same_pairs)
-        if self.enable_cross_category:
-            for a, b in combinations(self.category_names, 2):
-                if self._can_bridge(a, b):
-                    val_pairs.append((a, b))
-        return val_pairs
+        if self.pair_mode == "inter":
+            return [(a, b) for a, b in combinations(self.category_names, 2)
+                    if self._can_bridge(a, b)]
+        return list(self.same_pairs)
 
 
 # Backward compatibility alias
@@ -694,7 +796,7 @@ class DT4DAnimalsPairGenerator(DT4DPairGeneratorBase):
               f"(cross-category not available)")
 
     def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
+        self, rng: np.random.RandomState,
     ) -> PairSample:
         cat_name = self.category_names[rng.randint(len(self.category_names))]
         cat = self.categories[cat_name]
@@ -722,23 +824,21 @@ class FAUSTPairGenerator(PairGenerator):
     All share the same template topology (same vertex count and faces),
     so correspondence between any pair is the identity mapping.
 
-    Supports intra-subject (same person, different pose) and optionally
-    inter-subject (different person) pairs.
-
     Args:
         root: Path to FAUST root directory (contains training/registrations/).
-        subjects: Explicit list of subject IDs (0–9) to use. None = all.
-        exclude_subjects: Subject IDs to exclude. None = exclude none.
-        enable_cross_subject: If True, include inter-subject pairs in
-            training and validation.
+        subjects: Subject IDs to use. Supports ints and "start:end" ranges.
+            None = all 10 subjects.
+        exclude_subjects: Subject IDs to exclude. Same format as subjects.
+            None = exclude none.
+        pair_mode: 'intra' = same-subject pairs, 'inter' = cross-subject pairs.
     """
 
     def __init__(
         self,
         root: str,
-        subjects: Optional[List[int]] = None,
-        exclude_subjects: Optional[List[int]] = None,
-        enable_cross_subject: bool = False,
+        subjects: Optional[List] = None,
+        exclude_subjects: Optional[List] = None,
+        pair_mode: str = "intra",
     ):
         self.root = Path(root)
         reg_dir = self.root / "training" / "registrations"
@@ -746,16 +846,17 @@ class FAUSTPairGenerator(PairGenerator):
             raise FileNotFoundError(
                 f"FAUST registrations not found at {reg_dir}")
 
-        self.enable_cross_subject = enable_cross_subject
+        self.pair_mode = pair_mode
 
         # Resolve subject list
         all_subjects = list(range(10))
         if subjects is not None and exclude_subjects is not None:
             raise ValueError("Specify 'subjects' OR 'exclude_subjects', not both.")
         if subjects is not None:
-            self.subject_ids = sorted(subjects)
+            self.subject_ids = _expand_spec(subjects, all_subjects)
         elif exclude_subjects is not None:
-            self.subject_ids = [s for s in all_subjects if s not in exclude_subjects]
+            excluded = set(_expand_spec(exclude_subjects, all_subjects))
+            self.subject_ids = [s for s in all_subjects if s not in excluded]
         else:
             self.subject_ids = all_subjects
 
@@ -786,26 +887,27 @@ class FAUSTPairGenerator(PairGenerator):
 
         # Build pair lists
         self.same_pairs = [(s, s) for s in self.subject_ids]
-        if enable_cross_subject:
-            self.cross_pairs = list(combinations(self.subject_ids, 2))
-        else:
-            self.cross_pairs = []
+        self.cross_pairs = list(combinations(self.subject_ids, 2))
+
+        if pair_mode == "inter" and not self.cross_pairs:
+            raise ValueError(
+                "pair_mode='inter' but need at least 2 subjects for "
+                "cross-subject pairs.")
 
         total_meshes = sum(len(v) for v in self.vertices.values())
         print(f"  [FAUSTPairGenerator] Loaded {total_meshes} meshes "
               f"({len(self.subject_ids)} subjects, {self.num_vertices} verts each)")
         print(f"  Same-subject pairs: {len(self.same_pairs)}, "
               f"cross-subject pairs: {len(self.cross_pairs)}")
+        print(f"  pair_mode: {pair_mode}")
 
     def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
+        self, rng: np.random.RandomState,
     ) -> PairSample:
-        if rng.rand() < cross_ratio and self.cross_pairs:
+        if self.pair_mode == "inter":
             subj_a, subj_b = self.cross_pairs[rng.randint(len(self.cross_pairs))]
-            pair_type = "cross"
         else:
             subj_a, subj_b = self.same_pairs[rng.randint(len(self.same_pairs))]
-            pair_type = "same"
 
         poses_a = self.vertices[subj_a]
         poses_b = self.vertices[subj_b]
@@ -821,16 +923,17 @@ class FAUSTPairGenerator(PairGenerator):
         return PairSample(
             verts_a=poses_a[pa], verts_b=poses_b[pb],
             corr_a=corr_a, corr_b=corr_b,
-            name=f"{pair_type}_{name_a}_vs_{name_b}",
+            name=f"{self.pair_mode}_{name_a}_vs_{name_b}",
             faces_b=self.faces,
         )
 
     def get_val_pairs(
         self, rng: np.random.RandomState, poses_per_pair: int = 1,
     ) -> List[PairSample]:
-        pair_list = self.same_pairs[:]
-        if self.enable_cross_subject:
-            pair_list.extend(self.cross_pairs)
+        if self.pair_mode == "inter":
+            pair_list = list(self.cross_pairs)
+        else:
+            pair_list = list(self.same_pairs)
 
         pairs = []
         for subj_a, subj_b in pair_list:
@@ -882,10 +985,10 @@ class CompositePairGenerator(PairGenerator):
             self.weights = [1.0 / n] * n
 
     def sample_train_pair(
-        self, rng: np.random.RandomState, cross_ratio: float = 0.0,
+        self, rng: np.random.RandomState,
     ) -> PairSample:
         idx = rng.choice(len(self.generators), p=self.weights)
-        return self.generators[idx].sample_train_pair(rng, cross_ratio)
+        return self.generators[idx].sample_train_pair(rng)
 
     def get_val_pairs(
         self, rng: np.random.RandomState, poses_per_pair: int = 1,
@@ -906,28 +1009,22 @@ def pair_collate_fn(batch: List[PairSample]) -> List[PairSample]:
 
 
 class ShapePairDataset(Dataset):
-    """Training dataset — generates PairSamples on-the-fly.
-
-    cross_ratio is a mutable attribute updated each epoch by
-    FunctionalMapModule.on_train_epoch_start.
-    """
+    """Training dataset — generates PairSamples on-the-fly."""
 
     def __init__(
         self,
         pair_generator: PairGenerator,
         num_samples: int,
-        cross_ratio: float = 0.0,
     ):
         self.pair_generator = pair_generator
         self.num_samples    = num_samples
-        self.cross_ratio    = cross_ratio
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> PairSample:
         rng = np.random.RandomState()   # fresh OS-entropy seed — no epoch tracking needed
-        return self.pair_generator.sample_train_pair(rng, self.cross_ratio)
+        return self.pair_generator.sample_train_pair(rng)
 
 
 class ValPairDataset(Dataset):

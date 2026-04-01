@@ -40,11 +40,6 @@ parameters:
       vertex_noise:
         values:
           - 0.0
-      cross_ratio_end:
-        values:
-          - 0.5
-      curriculum_epochs:
-        value: 50
 
       # ── Loss presets ──────────────────────────────────────────────────────
       loss_preset:
@@ -167,7 +162,9 @@ parameters:
               normalize: true
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Data module (DT4D Mixed) — Animals train, Animals val
+  # Data module
+  #   Train: Animals, categories 5+ (indices 5 onwards)
+  #   Val:   first 5 categories from each dataset, intra + inter where supported
   # ═══════════════════════════════════════════════════════════════════════════
   data_module:
     value:
@@ -181,10 +178,9 @@ parameters:
             pair_generator:
               _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
               root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-              exclude_categories: [bear3EP, crocodileOPW, duck, foxXAT, hippoDG]
-            num_samples: 200
-            cross_ratio: 0.0
-          batch_size: 10
+              categories: ["5:"]
+            num_samples: 120
+          batch_size: 6
           num_workers: 0
           shuffle: true
           collate_fn:
@@ -192,15 +188,15 @@ parameters:
             _partial_: true
 
         val_dataset_specifications:
-          # [0] Animals — same-category, held-out (primary for checkpointing)
+          # [0] Animals — intra (first 5 categories)
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-                categories: [bear3EP, crocodileOPW, duck, foxXAT, hippoDG]
-              val_poses_per_pair: 3
+                categories: ["0:5"]
+              val_poses_per_pair: 4
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -209,17 +205,16 @@ parameters:
               _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
               _partial_: true
 
-          # [1] Humanoids — cross-category pairs
+          # [1] Humanoids — intra (first 5 categories)
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching'
-                categories: null
-                exclude_categories: null
-                enable_cross_category: true
-              val_poses_per_pair: 3
+                categories: ["0:5"]
+                pair_mode: intra
+              val_poses_per_pair: 4
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -228,14 +223,52 @@ parameters:
               _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
               _partial_: true
 
-          # [2] FAUST — intra-subject pairs (all 10 subjects)
+          # [2] Humanoids — inter (first 5 categories, auto-filtered to bridged)
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+                root: '/workspace/datasets/DeformingThings4DMatching'
+                categories: ["0:5"]
+                pair_mode: inter
+              val_poses_per_pair: 4
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+          # [3] FAUST — intra (first 5 subjects)
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                 root: '/workspace/datasets/faust'
-              val_poses_per_pair: 3
+                subjects: ["0:5"]
+                pair_mode: intra
+              val_poses_per_pair: 4
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+          # [4] FAUST — inter (first 5 subjects)
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
+                root: '/workspace/datasets/faust'
+                subjects: ["0:5"]
+                pair_mode: inter
+              val_poses_per_pair: 4
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -280,11 +313,6 @@ parameters:
 
         # ── Proximity regularisation ────────────────────────────────────────
         w_prox: ${globals.w_prox}
-
-        # ── Cross-pair curriculum ───────────────────────────────────────────
-        cross_ratio_start: 0.0
-        cross_ratio_end: ${globals.cross_ratio_end}
-        curriculum_epochs: ${globals.curriculum_epochs}
 
         # ── LoRA ────────────────────────────────────────────────────────────
         use_lora: false
