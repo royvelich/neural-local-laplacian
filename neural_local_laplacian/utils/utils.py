@@ -1227,3 +1227,39 @@ def load_mesh_list_from_lookup(
         mesh_files = mesh_files[:max_meshes]
 
     return mesh_files
+
+# =============================================================================
+# W&B code logging
+# =============================================================================
+
+_WANDB_EXCLUDE_PATTERNS = (
+    'lightning_logs', 'outputs', 'wandb', 'checkpoints',
+    '.git', '.venvs', 'node_modules', '__pycache__',
+)
+_WANDB_INCLUDE_EXTENSIONS = ('.py', '.yml', '.yaml')
+
+
+def wandb_log_code(logger, root: str = ".") -> None:
+    """Log source code to W&B with proper filtering.
+
+    Only uploads .py/.yml/.yaml files, excluding venvs, wandb dirs, etc.
+    Call from a Lightning module's setup() on rank 0.
+
+    Args:
+        logger: Lightning WandbLogger (must have .experiment attribute).
+        root: Root directory to scan for code files.
+    """
+    try:
+        import wandb
+        if wandb.run is None:
+            return
+
+        def _exclude(path: str) -> bool:
+            return any(pat in path for pat in _WANDB_EXCLUDE_PATTERNS)
+
+        def _include(path: str) -> bool:
+            return path.endswith(_WANDB_INCLUDE_EXTENSIONS)
+
+        logger.experiment.log_code(root=root, exclude_fn=_exclude, include_fn=_include)
+    except ImportError:
+        pass

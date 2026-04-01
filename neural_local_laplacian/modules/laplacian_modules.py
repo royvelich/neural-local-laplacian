@@ -269,29 +269,13 @@ class LaplacianModuleBase(lightning.pytorch.LightningModule):
         self._scheduler_cfg = scheduler_cfg
 
     def setup(self, stage):
-        def exclude_fn(path: str):
-            if 'lightning_logs' in path:
-                return True
-            if 'outputs' in path:
-                return True
-            if 'wandb' in path:
-                return True
-            if 'checkpoints' in path:
-                return True
-            if '.git' in path:
-                return True
-            if '.venvs' in path:
-                return True
+        if self.trainer.global_rank == 0:
+            from neural_local_laplacian.utils.utils import wandb_log_code
+            wandb_log_code(self.logger)
 
-            return False
-
-        def include_fn(path: str):
-            return True if path.endswith('.py') or path.endswith('.yml') or path.endswith('.yaml') else False
-
-        if self.trainer.global_rank == 0 and wandb.run is not None:
-            self.logger.experiment.log_code(root=".", exclude_fn=exclude_fn, include_fn=include_fn)
-            dict_cfg = OmegaConf.to_container(self.trainer.cfg, resolve=True)
-            self.logger.experiment.config.update(dict_cfg)
+            if wandb.run is not None and hasattr(self.trainer, 'cfg'):
+                dict_cfg = OmegaConf.to_container(self.trainer.cfg, resolve=True)
+                self.logger.experiment.config.update(dict_cfg)
 
     def configure_optimizers(self):
         """Configure optimizer and optionally scheduler."""

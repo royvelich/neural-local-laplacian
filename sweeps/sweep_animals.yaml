@@ -108,8 +108,8 @@ parameters:
               _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
               root: '/workspace/datasets/DeformingThings4DMatching-Animals'
               categories: ["5:"]
-            num_samples: 200
-          batch_size: 10
+            num_samples: 210
+          batch_size: 7
           num_workers: 0
           shuffle: true
           collate_fn:

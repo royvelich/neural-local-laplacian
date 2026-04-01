@@ -1667,6 +1667,11 @@ class FunctionalMapModule(LaplacianModuleBase):
             t_max = getattr(self._scheduler_cfg, 'keywords', {}).get('T_max', '?')
             print(f"  [FMModule] Scheduler T_max={t_max} epochs")
 
+        # Log source code to W&B with proper filtering (excludes venvs, etc.)
+        if self.trainer.global_rank == 0:
+            from neural_local_laplacian.utils.utils import wandb_log_code
+            wandb_log_code(self.logger)
+
     # ------------------------------------------------------------------
     # Optimiser
     # ------------------------------------------------------------------

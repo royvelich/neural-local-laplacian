@@ -109,8 +109,8 @@ parameters:
               root: '/workspace/datasets/DeformingThings4DMatching'
               pair_mode: inter
               pairs: ["10:"]
-            num_samples: 200
-          batch_size: 10
+            num_samples: 210
+          batch_size: 7
           num_workers: 0
           shuffle: true
           collate_fn:
