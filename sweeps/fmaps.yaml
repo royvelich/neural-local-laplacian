@@ -20,60 +20,151 @@ parameters:
         value: '/workspace/models/model.ckpt'
       num_eigenvectors:
         value: 100
+      k_sparsify:
+        value: null
 
       # ── Swept ─────────────────────────────────────────────────────────────
       k:
         values:
-          - 10
-          - 20
-          - 30
+          - 8
+          - 15
       lr:
         values:
           - 1.0e-5
       gradient_clip_val:
         values:
           - 0.0
-          - 10.0
-      loss_type:
-        values:
-          - infonce
-      temperature:
-        values:
-          - 0.05
-          - 0.07
-          - 0.1
-      vertex_budget:
-        values:
-          - num_landmarks: 128
-            num_sample_vertices: 512
-            max_vertices: 2000
-
-          - num_landmarks: 256
-            num_sample_vertices: 1024
-            max_vertices: 2000
-      alphas:
-        values:
-          - [1.0, 10.0, 100.0]
-          - [0.1, 1.0, 10.0]
-          - [1.0, 10.0, 100.0, 1000.0]
       w_prox:
         values:
           - 0.0
-          - 5.0
-          - 10.0
-          - 20.0
       vertex_noise:
         values:
           - 0.0
-          - 0.01
-      cross_ratio_end:
+
+      # ── Loss presets ──────────────────────────────────────────────────────
+      loss_preset:
         values:
-          - 0.5
-      curriculum_epochs:
-        value: 50
+          # ── GeodesicDiffusionLoss variants ────────────────────────────────
+
+          # (A) GeoDiff, norm=true, alphas=[0.1,1,10], 128 lm, 512 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 128
+              alphas: [0.1, 1.0, 10.0]
+              num_sample_vertices: 512
+              normalize: true
+
+          # (B) GeoDiff, norm=false, alphas=[0.1,1,10], 128 lm, 512 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 128
+              alphas: [0.1, 1.0, 10.0]
+              num_sample_vertices: 512
+              normalize: false
+
+          # (C) GeoDiff, norm=true, alphas=[0.01,0.1,1], 128 lm
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 128
+              alphas: [0.01, 0.1, 1.0]
+              num_sample_vertices: 512
+              normalize: true
+
+          # (D) GeoDiff, norm=false, alphas=[0.01,0.1,1], 128 lm
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 128
+              alphas: [0.01, 0.1, 1.0]
+              num_sample_vertices: 512
+              normalize: false
+
+          # (E) GeoDiff, norm=true, alphas=[1,10,100], 128 lm
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 128
+              alphas: [1.0, 10.0, 100.0]
+              num_sample_vertices: 512
+              normalize: true
+
+          # (F) GeoDiff, norm=true, single scale alpha=[1], 128 lm
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 128
+              alphas: [1.0]
+              num_sample_vertices: 512
+              normalize: true
+
+          # (G) GeoDiff, norm=true, alphas=[0.1,1,10], 256 lm, 1024 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 256
+              alphas: [0.1, 1.0, 10.0]
+              num_sample_vertices: 1024
+              normalize: true
+
+          # (H) GeoDiff, norm=true, alphas=[0.1,1,10], 64 lm, 256 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+              weight: 1.0
+              num_landmarks: 64
+              alphas: [0.1, 1.0, 10.0]
+              num_sample_vertices: 256
+              normalize: true
+
+          # ── HeatMethodGeodesicLoss variants ───────────────────────────────
+
+          # (I) HeatMethod, norm=true, 32 lm, 512 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+              weight: 1.0
+              num_landmarks: 32
+              num_sample_vertices: 512
+              normalize: true
+
+          # (J) HeatMethod, norm=false, 32 lm, 512 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+              weight: 1.0
+              num_landmarks: 32
+              num_sample_vertices: 512
+              normalize: false
+
+          # (K) HeatMethod, norm=true, 64 lm, 512 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+              weight: 1.0
+              num_landmarks: 64
+              num_sample_vertices: 512
+              normalize: true
+
+          # (L) HeatMethod, norm=true, 16 lm, 512 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+              weight: 1.0
+              num_landmarks: 16
+              num_sample_vertices: 512
+              normalize: true
+
+          # (M) HeatMethod, norm=true, 32 lm, 1024 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+              weight: 1.0
+              num_landmarks: 32
+              num_sample_vertices: 1024
+              normalize: true
+
+          # (N) HeatMethod, norm=true, 32 lm, 256 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+              weight: 1.0
+              num_landmarks: 32
+              num_sample_vertices: 256
+              normalize: true
+
+          # (O) HeatMethod, norm=true, 64 lm, 1024 samples
+          - - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+              weight: 1.0
+              num_landmarks: 64
+              num_sample_vertices: 1024
+              normalize: true
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Data module (DT4D) — fixed, no interpolation needed here
+  # Data module
+  #   Train: Animals, categories 5+ (indices 5 onwards)
+  #   Val:   first 5 categories from each dataset, intra + inter where supported
   # ═══════════════════════════════════════════════════════════════════════════
   data_module:
     value:
@@ -85,13 +176,11 @@ parameters:
           dataset:
             _target_: fmaps_finetune.datasets.functional_map_dataset.ShapePairDataset
             pair_generator:
-              _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DPairGenerator
-              root: '/workspace/datasets/DeformingThings4DMatching'
-              train_categories: null
-              val_categories: null
-            num_samples: 200
-            cross_ratio: 0.0
-          batch_size: 5
+              _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+              root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+              categories: ["5:"]
+            num_samples: 120
+          batch_size: 6
           num_workers: 0
           shuffle: true
           collate_fn:
@@ -99,15 +188,87 @@ parameters:
             _partial_: true
 
         val_dataset_specifications:
+          # [0] Animals — intra (first 5 categories)
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
               pair_generator:
-                _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DPairGenerator
+                _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+                root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+                categories: ["0:5"]
+              val_poses_per_pair: 4
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+          # [1] Humanoids — intra (first 5 categories)
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching'
-                train_categories: null
-                val_categories: null
-              val_poses_per_pair: 2
+                categories: ["0:5"]
+                pair_mode: intra
+              val_poses_per_pair: 4
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+          # [2] Humanoids — inter (first 5 categories, auto-filtered to bridged)
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+                root: '/workspace/datasets/DeformingThings4DMatching'
+                categories: ["0:5"]
+                pair_mode: inter
+              val_poses_per_pair: 4
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+          # [3] FAUST — intra (first 5 subjects)
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
+                root: '/workspace/datasets/faust'
+                subjects: ["0:5"]
+                pair_mode: intra
+              val_poses_per_pair: 4
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+          # [4] FAUST — inter (first 5 subjects)
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
+                root: '/workspace/datasets/faust'
+                subjects: ["0:5"]
+                pair_mode: inter
+              val_poses_per_pair: 4
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -128,15 +289,13 @@ parameters:
         num_eigenvectors: ${globals.num_eigenvectors}
         seed: ${globals.training_seed}
 
-        # ── Contrastive loss ────────────────────────────────────────────────
-        loss_fn:
-          _target_: fmaps_finetune.modules.functional_map_module.SoftCorrespondenceLoss
-          num_landmarks: ${globals.vertex_budget.num_landmarks}
-          alphas: ${globals.alphas}
-          temperature: ${globals.temperature}
-          num_sample_vertices: ${globals.vertex_budget.num_sample_vertices}
-          loss_type: ${globals.loss_type}
-          dclw_sigma: 0.5
+        # ── Evaluation control ──────────────────────────────────────────────
+        eval_only: false
+        skip_baselines: true
+        eval_variants: [iso]
+
+        # ── Losses ──────────────────────────────────────────────────────────
+        losses: ${globals.loss_preset}
 
         # ── Model initialisation ────────────────────────────────────────────
         random_init: false
@@ -145,19 +304,16 @@ parameters:
         freeze_areas_head: false
 
         # ── Laplacian assembly ──────────────────────────────────────────────
-        sparsify_laplacian: false
+        sparsify_laplacian: true
+        k_sparsify: ${globals.k_sparsify}
 
         # ── Training augmentation ───────────────────────────────────────────
-        max_vertices: ${globals.vertex_budget.max_vertices}
+        max_vertices: 4000
+        max_vertices_val: 0
         vertex_noise: ${globals.vertex_noise}
 
         # ── Proximity regularisation ────────────────────────────────────────
         w_prox: ${globals.w_prox}
-
-        # ── Cross-pair curriculum ───────────────────────────────────────────
-        cross_ratio_start: 0.0
-        cross_ratio_end: ${globals.cross_ratio_end}
-        curriculum_epochs: ${globals.curriculum_epochs}
 
         # ── LoRA ────────────────────────────────────────────────────────────
         use_lora: false
@@ -167,6 +323,16 @@ parameters:
         lora_target_modules: "all-linear"
         lora_dora: false
         lora_rslora: false
+
+        # ── GeomFuM evaluation ──────────────────────────────────────────────
+        use_geomfum_eval: true
+        geomfum_descriptors: [hks, wks]
+        geomfum_zoomout: true
+        geomfum_zoomout_k_init: 20
+        geomfum_zoomout_k_final: 50
+        geomfum_zoomout_n_iters: 10
+        geomfum_fmap_lmbda: 1.0e+3
+        geomfum_fmap_resolvent_gamma: 1.0
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Optimizer — lr swept via globals
@@ -178,16 +344,6 @@ parameters:
       lr: ${globals.lr}
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Scheduler — fixed cosine decay
-  # ═══════════════════════════════════════════════════════════════════════════
-  scheduler:
-    value:
-      _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-      _partial_: true
-      T_max: 200
-      eta_min: 1.0e-6
-
-  # ═══════════════════════════════════════════════════════════════════════════
   # Trainer — gradient_clip_val swept via globals
   # ═══════════════════════════════════════════════════════════════════════════
   trainer:
@@ -196,12 +352,13 @@ parameters:
       accelerator: auto
       devices: auto
       strategy: auto
-      max_epochs: 1500
+      max_epochs: 2000
       accumulate_grad_batches: 1
       gradient_clip_val: ${globals.gradient_clip_val}
       gradient_clip_algorithm: norm
       precision: 32
-      check_val_every_n_epoch: 10
+      num_sanity_val_steps: 0
+      check_val_every_n_epoch: 25
       log_every_n_steps: 1
       enable_progress_bar: true
       default_root_dir: fmap_finetune_runs
@@ -209,7 +366,7 @@ parameters:
         _target_: lightning.pytorch.loggers.WandbLogger
         project: neural-local-laplacian-fmaps
         save_dir: fmap_finetune_runs
-        log_model: false
+        log_model: 'all'
       callbacks:
         - _target_: lightning.pytorch.callbacks.ModelCheckpoint
           monitor: val/best_acc

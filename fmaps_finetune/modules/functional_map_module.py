@@ -1542,6 +1542,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         profile_steps: int = 0,   # print profiler summary every N steps (0 = off)
         # Evaluation control
         eval_only: bool = False,       # run baselines only, then stop (no training)
+        skip_baselines: bool = False,  # skip baseline computation in on_fit_start
         eval_variants: Optional[List[str]] = None,  # ['dense', 'sp', 'iso'] or subset
         # GeomFuM evaluation (optional)
         use_geomfum_eval: bool = False,
@@ -1796,6 +1797,137 @@ class FunctionalMapModule(LaplacianModuleBase):
 
         return summary
 
+    def _export_eval_results(
+        self,
+        eval_results: Dict[str, Dict[str, Tuple[List[Dict], Dict]]],
+        all_val_datasets: List[Tuple[str, List]],
+    ) -> None:
+        """Save eval-only results as CSVs and comparison plots.
+
+        Args:
+            eval_results: {ds_name: {method_name: (per_pair_metrics, summary)}}
+            all_val_datasets: [(ds_name, pairs)] for pair name lookup.
+        """
+        import csv
+        from pathlib import Path
+
+        out_dir = Path(self.trainer.default_root_dir) / "eval_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n  Saving eval results to {out_dir}/", flush=True)
+
+        # Build pair name lookup per dataset
+        pair_names: Dict[str, List[str]] = {}
+        for ds_name, pairs in all_val_datasets:
+            pair_names[ds_name] = [p.name for p in pairs]
+
+        for ds_name, methods in eval_results.items():
+            ds_dir = out_dir / ds_name
+            ds_dir.mkdir(parents=True, exist_ok=True)
+
+            # ── Per-pair CSV ────────────────────────────────────────────────
+            # Rows = pairs, columns = pair_name + method/metric
+            names = pair_names.get(ds_name, [])
+            all_metric_keys = set()
+            for method_name, (per_pair, _) in methods.items():
+                for m in per_pair:
+                    all_metric_keys.update(m.keys())
+            all_metric_keys = sorted(all_metric_keys)
+
+            csv_path = ds_dir / "per_pair.csv"
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                # Header: pair_name, then method/metric for each method
+                header = ["pair"]
+                for method_name in methods:
+                    for mk in all_metric_keys:
+                        header.append(f"{method_name}/{mk}")
+                writer.writerow(header)
+
+                # Rows
+                n_pairs = max(len(pp) for pp, _ in methods.values()) if methods else 0
+                for i in range(n_pairs):
+                    row = [names[i] if i < len(names) else f"pair_{i}"]
+                    for method_name in methods:
+                        per_pair, _ = methods[method_name]
+                        m = per_pair[i] if i < len(per_pair) else {}
+                        for mk in all_metric_keys:
+                            row.append(f"{m.get(mk, '')}")
+                    writer.writerow(row)
+            print(f"    {csv_path}", flush=True)
+
+            # ── Summary CSV ─────────────────────────────────────────────────
+            # Rows = methods, columns = metrics
+            csv_path = ds_dir / "summary.csv"
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["method"] + all_metric_keys)
+                for method_name, (_, summary) in methods.items():
+                    row = [method_name]
+                    for mk in all_metric_keys:
+                        row.append(f"{summary.get(mk, '')}")
+                    writer.writerow(row)
+            print(f"    {csv_path}", flush=True)
+
+            # ── Comparison bar chart ────────────────────────────────────────
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                # Select key metrics for the chart
+                chart_metrics = []
+                for candidate in [
+                    "spectral_nn/accuracy",
+                    "sp_spectral_nn/accuracy",
+                    "iso_spectral_nn/accuracy",
+                    "spectral_nn/geo_at_01pct",
+                    "spectral_nn/geo_at_05pct",
+                    "sp_spectral_nn/geo_at_05pct",
+                    "iso_spectral_nn/geo_at_05pct",
+                    "spectral_nn/geo_at_10pct",
+                    "spectral_nn/geo_at_25pct",
+                    "spectral_nn/geomfum_accuracy",
+                    "sp_spectral_nn/geomfum_accuracy",
+                    "iso_spectral_nn/geomfum_accuracy",
+                ]:
+                    # Include if at least one method has it
+                    if any(candidate in s for _, (_, s) in methods.items()):
+                        chart_metrics.append(candidate)
+
+                if chart_metrics and methods:
+                    method_names = list(methods.keys())
+                    n_methods = len(method_names)
+                    n_metrics = len(chart_metrics)
+                    x = np.arange(n_metrics)
+                    width = 0.8 / n_methods
+
+                    fig, ax = plt.subplots(figsize=(max(10, n_metrics * 1.2), 6))
+                    for j, method_name in enumerate(method_names):
+                        _, summary = methods[method_name]
+                        vals = [summary.get(mk, 0.0) * 100 for mk in chart_metrics]
+                        ax.bar(x + j * width, vals, width, label=method_name)
+
+                    # Short display labels
+                    short_labels = []
+                    for mk in chart_metrics:
+                        label = mk.replace("spectral_nn/", "").replace("_spectral_nn/", " ")
+                        short_labels.append(label)
+
+                    ax.set_ylabel("% (higher = better)")
+                    ax.set_title(f"Eval comparison — {ds_name}")
+                    ax.set_xticks(x + width * (n_methods - 1) / 2)
+                    ax.set_xticklabels(short_labels, rotation=45, ha="right", fontsize=8)
+                    ax.legend(fontsize=8)
+                    ax.set_ylim(0, 105)
+                    fig.tight_layout()
+
+                    plot_path = ds_dir / "comparison.png"
+                    fig.savefig(plot_path, dpi=150)
+                    plt.close(fig)
+                    print(f"    {plot_path}", flush=True)
+            except ImportError:
+                print("    (matplotlib not installed — skipping comparison plot)")
+
     # ------------------------------------------------------------------
     # Baseline evaluation (runs once before first training epoch)
     # ------------------------------------------------------------------
@@ -1915,68 +2047,82 @@ class FunctionalMapModule(LaplacianModuleBase):
               f"({dt_geo:.1f}s)", flush=True)
 
         # Run baselines per dataset
-        for ds_name, val_pairs in all_val_datasets:
-            if not val_pairs:
-                continue
-            n_total = len(val_pairs)
-            cw = len(str(n_total))
-            ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
+        # Collect results for CSV/plot export in eval_only mode
+        eval_results: Dict[str, Dict[str, Tuple[List[Dict], Dict]]] = {}
+        # eval_results[ds_name][method_name] = (per_pair_metrics, summary_dict)
 
-            # ── Robust Laplacian baseline ──────────────────────────────────
-            try:
-                import robust_laplacian  # noqa: F401
-                print(f"\n  Computing robust Laplacian baseline{ds_label} "
+        if hp.skip_baselines:
+            print("\n  [skip_baselines=true] Skipping baseline computation.",
+                  flush=True)
+        else:
+            for ds_name, val_pairs in all_val_datasets:
+                if not val_pairs:
+                    continue
+                eval_results[ds_name] = {}
+                pair_names = [p.name for p in val_pairs]
+                n_total = len(val_pairs)
+                cw = len(str(n_total))
+                ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
+
+                # ── Robust Laplacian baseline ──────────────────────────────────
+                try:
+                    import robust_laplacian  # noqa: F401
+                    print(f"\n  Computing robust Laplacian baseline{ds_label} "
+                          f"({n_total} pairs)...", flush=True)
+                    robust_metrics = []
+                    for i, p in enumerate(val_pairs):
+                        print(f"    [robust {i+1:>{cw}}/{n_total}] {p.name}...",
+                              end="", flush=True)
+                        t0_ = time.perf_counter()
+                        m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
+                                                 evaluators=self._evaluators,
+                                                 geo_cache=self._geo_cache.get(p.name))
+                        dt_ = time.perf_counter() - t0_
+                        robust_metrics.append(m)
+                        print(f" {dt_:.1f}s", flush=True)
+                    rb_summary = self._summarise_and_print(
+                        robust_metrics, f"Robust baseline{ds_label}")
+                    self.logger.log_metrics(
+                        {f"baseline/robust/{ds_name}/{k}": v
+                         for k, v in rb_summary.items()}, step=0)
+                    eval_results[ds_name]["robust"] = (robust_metrics, rb_summary)
+                except ImportError:
+                    print("  (robust_laplacian not installed — skipping robust baseline)")
+
+                # ── Epoch-0 model baseline ─────────────────────────────────────
+                init_label = "random init" if hp.random_init else "pretrained"
+                print(f"\n  Computing {init_label} model baseline{ds_label} "
                       f"({n_total} pairs)...", flush=True)
-                robust_metrics = []
-                for i, p in enumerate(val_pairs):
-                    print(f"    [robust {i+1:>{cw}}/{n_total}] {p.name}...",
-                          end="", flush=True)
-                    t0_ = time.perf_counter()
-                    m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
-                                             evaluators=self._evaluators,
-                                             geo_cache=self._geo_cache.get(p.name))
-                    dt_ = time.perf_counter() - t0_
-                    robust_metrics.append(m)
-                    print(f" {dt_:.1f}s", flush=True)
-                rb_summary = self._summarise_and_print(
-                    robust_metrics, f"Robust baseline{ds_label}")
+                self.model.eval()
+                ep0_metrics = []
+                with torch.no_grad():
+                    for i, p in enumerate(val_pairs):
+                        sub_p = _subsample(p)
+                        print(f"    [model  {i+1:>{cw}}/{n_total}] {p.name}...",
+                              end="", flush=True)
+                        t0_ = time.perf_counter()
+                        m = evaluate_pair(self.model, sub_p,
+                                          hp.k, hp.num_eigenvectors, device,
+                                          k_sparsify=hp.k_sparsify,
+                                          evaluators=self._evaluators,
+                                          geo_cache=self._geo_cache.get(p.name),
+                                          eval_variants=hp.eval_variants)
+                        dt_ = time.perf_counter() - t0_
+                        ep0_metrics.append(m)
+                        print(f" {dt_:.1f}s", flush=True)
+                self.model.train()
+
+                ep0_summary = self._summarise_and_print(
+                    ep0_metrics, f"Model baseline ({init_label}){ds_label}")
                 self.logger.log_metrics(
-                    {f"baseline/robust/{ds_name}/{k}": v
-                     for k, v in rb_summary.items()}, step=0)
-            except ImportError:
-                print("  (robust_laplacian not installed — skipping robust baseline)")
+                    {f"baseline/model/{ds_name}/{k}": v
+                     for k, v in ep0_summary.items()}, step=0)
+                eval_results[ds_name][f"model_{init_label}"] = (ep0_metrics, ep0_summary)
 
-            # ── Epoch-0 model baseline ─────────────────────────────────────
-            init_label = "random init" if hp.random_init else "pretrained"
-            print(f"\n  Computing {init_label} model baseline{ds_label} "
-                  f"({n_total} pairs)...", flush=True)
-            self.model.eval()
-            ep0_metrics = []
-            with torch.no_grad():
-                for i, p in enumerate(val_pairs):
-                    sub_p = _subsample(p)
-                    print(f"    [model  {i+1:>{cw}}/{n_total}] {p.name}...",
-                          end="", flush=True)
-                    t0_ = time.perf_counter()
-                    m = evaluate_pair(self.model, sub_p,
-                                      hp.k, hp.num_eigenvectors, device,
-                                      k_sparsify=hp.k_sparsify,
-                                      evaluators=self._evaluators,
-                                      geo_cache=self._geo_cache.get(p.name),
-                                      eval_variants=hp.eval_variants)
-                    dt_ = time.perf_counter() - t0_
-                    ep0_metrics.append(m)
-                    print(f" {dt_:.1f}s", flush=True)
-            self.model.train()
-
-            ep0_summary = self._summarise_and_print(
-                ep0_metrics, f"Model baseline ({init_label}){ds_label}")
-            self.logger.log_metrics(
-                {f"baseline/model/{ds_name}/{k}": v
-                 for k, v in ep0_summary.items()}, step=0)
-
-        # ── Eval-only mode: stop after baselines ──────────────────────────
+        # ── Eval-only mode: save CSVs and plots, then stop ────────────────
         if hp.eval_only:
+            if eval_results:
+                self._export_eval_results(eval_results, all_val_datasets)
             print("\n  [eval_only=true] Baselines complete — stopping.", flush=True)
             # Finalize W&B logging before exit
             try:

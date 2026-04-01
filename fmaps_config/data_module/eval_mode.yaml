@@ -1,0 +1,114 @@
+# fmaps_config/data_module/eval.yaml
+# Eval-only: no training, validate on ALL categories/subjects across all datasets.
+#
+# Datasets:
+#   [0] Animals intra       — all 53 categories
+#   [1] Humanoids intra     — all 10 categories
+#   [2] Humanoids inter     — all bridged categories
+#   [3] FAUST intra         — all 10 subjects
+#   [4] FAUST inter         — all 10 subjects
+
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericPlainDataModule
+
+  # Dummy train spec (required by Lightning, never used in eval_only mode)
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: fmaps_finetune.datasets.functional_map_dataset.ShapePairDataset
+      pair_generator:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+        root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+        categories: ["0:5"]
+      num_samples: 1
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    collate_fn:
+      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+      _partial_: true
+
+  val_dataset_specifications:
+    # [0] Animals — intra (all categories)
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+          root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+        val_poses_per_pair: 4
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
+
+    # [1] Humanoids — intra (all categories)
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+          root: '/workspace/datasets/DeformingThings4DMatching'
+          pair_mode: intra
+        val_poses_per_pair: 4
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
+
+    # [2] Humanoids — inter (all bridged categories)
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+          root: '/workspace/datasets/DeformingThings4DMatching'
+          pair_mode: inter
+        val_poses_per_pair: 4
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
+
+    # [3] FAUST — intra (all 10 subjects)
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
+          root: '/workspace/datasets/faust'
+          pair_mode: intra
+        val_poses_per_pair: 4
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
+
+    # [4] FAUST — inter (all 10 subjects)
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
+          root: '/workspace/datasets/faust'
+          pair_mode: inter
+        val_poses_per_pair: 4
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
