@@ -22,14 +22,6 @@ parameters:
         value: 100
       k_sparsify:
         value: null
-      lr:
-        value: 1.0e-5
-      gradient_clip_val:
-        value: 0.0
-      w_prox:
-        value: 0.0
-      vertex_noise:
-        value: 0.0
 
       # ── Swept ─────────────────────────────────────────────────────────────
       k:
