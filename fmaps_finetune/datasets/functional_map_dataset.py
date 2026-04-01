@@ -613,15 +613,17 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
     """
 
     @staticmethod
-    def _scan_bridged_pairs(root: Path, all_cats: List[str]) -> List[Tuple[str, str]]:
+    def _scan_bridged_pairs(root: Path, all_cats: List[str]
+                            ) -> Tuple[List[Tuple[str, str]], Dict[Tuple[str, str], Optional[str]]]:
         """Scan bridge filenames to find all valid inter pairs (no mesh loading).
 
-        Finds direct and indirect (1-hub) bridges. Returns sorted list of
-        (cat_a, cat_b) tuples with cat_a < cat_b lexicographically.
+        Finds direct and indirect (1-hub) bridges. Returns:
+            pairs: sorted list of (cat_a, cat_b) tuples
+            hubs: dict mapping (cat_a, cat_b) → hub category name (None if direct)
         """
         bridge_dir = root / "cross_category_corres"
         if not bridge_dir.exists():
-            return []
+            return [], {}
 
         cat_set = set(all_cats)
         direct_pairs = set()
@@ -633,10 +635,12 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
                     direct_pairs.add((src, dst))
 
         valid_pairs = []
+        hubs: Dict[Tuple[str, str], Optional[str]] = {}
         for a, b in combinations(all_cats, 2):
             # Direct
             if (a, b) in direct_pairs or (b, a) in direct_pairs:
                 valid_pairs.append((a, b))
+                hubs[(a, b)] = None
                 continue
             # Indirect through hub
             for hub in all_cats:
@@ -646,8 +650,9 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
                 hub_b = (hub, b) in direct_pairs or (b, hub) in direct_pairs
                 if a_hub and hub_b:
                     valid_pairs.append((a, b))
+                    hubs[(a, b)] = hub
                     break
-        return sorted(valid_pairs)
+        return sorted(valid_pairs), hubs
 
     def __init__(
         self,
@@ -676,7 +681,7 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
         if pair_mode == "inter":
             # Discover all valid inter pairs from bridge filenames (no mesh loading)
             all_on_disk = _discover_categories(Path(root))
-            all_inter_pairs = self._scan_bridged_pairs(Path(root), all_on_disk)
+            all_inter_pairs, pair_hubs = self._scan_bridged_pairs(Path(root), all_on_disk)
             if not all_inter_pairs:
                 raise ValueError(
                     "pair_mode='inter' but no bridged pairs found. "
@@ -701,11 +706,14 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
             if not selected_pairs:
                 raise ValueError("No inter pairs selected after filtering.")
 
-            # Determine which categories are needed
+            # Determine which categories are needed (including hubs for indirect bridges)
             needed_cats = set()
             for a, b in selected_pairs:
                 needed_cats.add(a)
                 needed_cats.add(b)
+                hub = pair_hubs.get((a, b))
+                if hub is not None:
+                    needed_cats.add(hub)
             categories = sorted(needed_cats)
             exclude_categories = None
             self._selected_inter_pairs = selected_pairs
