@@ -10,8 +10,8 @@ module:
   skip_baselines: false
   eval_variants:
     - iso
-    - dense
-    - sp
+#    - dense
+#    - sp
   losses:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
       weight: 1.0
@@ -26,7 +26,7 @@ module:
   keep_areas_head: false
   freeze_input_projection: false
   freeze_areas_head: false
-  sparsify_laplacian: true
+  sparsify_laplacian: false
   k_sparsify: ${globals.k_sparsify}
   max_vertices: 4000
   max_vertices_val: 0

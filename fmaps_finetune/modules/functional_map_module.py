@@ -204,15 +204,18 @@ def assemble_anisotropic_laplacian(
     areas: torch.Tensor,
     knn: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Differentiable L = G^T M_3 G from gradient coefficients."""
+    """Differentiable L = G^T G from gradient coefficients.
+
+    Area is NOT included in L because the learned g_ij already carry the
+    integration measure (trained via MCV = (1/a_i) sum w_ij p_j matching
+    cotangent weights which have area baked in).
+    """
     N, k, _ = grad_coeffs.shape
     device   = grad_coeffs.device
 
     center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)
     ext_coeffs    = torch.cat([center_coeffs, grad_coeffs], dim=1)
-    sqrt_a        = areas.sqrt()[:, None, None]
-    scaled        = sqrt_a * ext_coeffs
-    gram          = torch.bmm(scaled, scaled.transpose(1, 2))
+    gram          = torch.bmm(ext_coeffs, ext_coeffs.transpose(1, 2))
 
     center_idx  = torch.arange(N, device=device).unsqueeze(1)
     ext_indices = torch.cat([center_idx, knn], dim=1)
@@ -250,13 +253,16 @@ def assemble_isotropic_laplacian(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Isotropic graph Laplacian from gradient coefficients.
 
-    Uses scalar edge weights w_ij = area_i * ||g_ij||^2, producing a
-    standard graph Laplacian L = D - W with non-negative weights.
+    Uses scalar edge weights w_ij = ||g_ij||^2 (no area scaling), producing
+    a standard graph Laplacian L = D - W with non-negative weights.
     This is guaranteed PSD and sparse (kNN only, no 2-hop fill-in).
+
+    Area is NOT included in L because the learned g_ij already carry the
+    integration measure (trained via MCV matching cotangent weights).
 
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
-        areas: (N,) per-vertex areas.
+        areas: (N,) per-vertex areas (returned as mass, not used in L).
         knn: (N, k) kNN indices.
 
     Returns:
@@ -266,8 +272,8 @@ def assemble_isotropic_laplacian(
     N, k, _ = grad_coeffs.shape
     device  = grad_coeffs.device
 
-    # w_ij = area_i * ||g_ij||^2  — scalar weight per edge (i, j)
-    edge_weights = areas[:, None] * (grad_coeffs ** 2).sum(dim=2)  # (N, k)
+    # w_ij = ||g_ij||^2  — scalar weight per edge (i, j)
+    edge_weights = (grad_coeffs ** 2).sum(dim=2)  # (N, k)
 
     # Build sparse graph Laplacian: L_ij = -w_ij, L_ii = sum_j w_ij
     # Symmetrise: w_ij_sym = 0.5 * (w_ij + w_ji)
