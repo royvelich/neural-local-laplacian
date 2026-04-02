@@ -888,22 +888,51 @@ def main(cfg: DictConfig) -> None:
     total_meshes = len(data_loader.dataset)
     del data_module, data_loader
 
-    # ---- Output setup ----
-    output_dir = Path(getattr(cfg, 'output_dir', '.'))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir = output_dir / '.tmp_quantitative_ranks'
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
     pred_k = getattr(cfg, 'k_pred', None) or getattr(cfg, 'k', 30)
     robust_k = getattr(cfg, 'k_robust', None) or 30
     nelo_k = getattr(cfg, 'k_nelo', 8)
     num_eigenpairs = getattr(cfg, 'num_eigenpairs', 50)
 
+    # ---- Output setup ----
+    from datetime import datetime
+    from hydra.core.hydra_config import HydraConfig
+
+    # Dataset name from Hydra config group choice
+    try:
+        dataset_name = HydraConfig.get().runtime.choices.get('data_module', 'unknown')
+    except Exception:
+        dataset_name = 'unknown'
+
+    # Laplacian config
+    lap_dict = OmegaConf.to_container(cfg.laplacian) if hasattr(cfg, 'laplacian') else {}
+    pred_lap_config = LaplacianConfig(**lap_dict) if lap_dict else LaplacianConfig(assembly='isotropic')
+
+    # Build subfolder name
+    methods_str = '_'.join(sorted(methods))
+    timestamp = datetime.now().strftime('%d%b%Y_%H%M')
+    parts = [dataset_name, methods_str, f'k{pred_k}']
+    if 'robust' in methods:
+        parts.append(f'kr{robust_k}')
+    if 'nelo' in methods:
+        parts.append(f'kn{nelo_k}')
+    parts.append(f'eig{num_eigenpairs}')
+    parts.append(pred_lap_config.tag)
+    parts.append(timestamp)
+    run_name = '_'.join(parts)
+
+    base_output_dir = Path(getattr(cfg, 'output_dir', '.'))
+    output_dir = base_output_dir / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = output_dir / '.tmp_quantitative_ranks'
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"\n{'=' * 80}")
     print(f"QUANTITATIVE EVALUATION")
     print(f"{'=' * 80}")
+    print(f"Dataset:     {dataset_name}")
     print(f"Checkpoint:  {ckpt_path}")
     print(f"Methods:     GT + {', '.join(sorted(methods))}")
+    print(f"Laplacian:   {pred_lap_config.tag}")
     print(f"Meshes:      {total_meshes}")
     print(f"GPUs:        {num_gpus} / {num_gpus_available} available")
     if 'pred' in methods:
@@ -920,6 +949,7 @@ def main(cfg: DictConfig) -> None:
         print(f"NeLo k:      {nelo_k}")
         print(f"NeLo ckpt:   {getattr(cfg, 'nelo_ckpt_path', 'N/A')}")
     print(f"Eigenpairs:  {num_eigenpairs}")
+    print(f"Run name:    {run_name}")
     print(f"Output:      {output_dir}")
     print(f"{'=' * 80}\n")
 
