@@ -67,6 +67,7 @@ class MeshDataset(Dataset):
             shuffle: bool = False,
             require_complete_geodesics: bool = False,
             verbose_diagnostics: bool = False,
+            skip_eigendecomposition: bool = False,
             # Backward compatibility: singular form still accepted
             mesh_folder_path: Union[str, Path] = None
     ):
@@ -105,6 +106,9 @@ class MeshDataset(Dataset):
                 in the lookup table). Requires running preprocess_mesh_folder.py first.
             verbose_diagnostics: If True, print detailed diagnostic messages before each
                 native call during mesh loading (useful for debugging segfaults).
+            skip_eigendecomposition: If True, skip GT eigendecomposition during loading.
+                Useful when the consumer (e.g. quantitative_eval.py) computes its own
+                eigendecomposition and only needs mesh paths + geodesic data.
         """
         super().__init__()
 
@@ -132,6 +136,7 @@ class MeshDataset(Dataset):
         self._shuffle = shuffle
         self._require_complete_geodesics = require_complete_geodesics
         self._verbose = verbose_diagnostics
+        self._skip_eigendecomposition = skip_eigendecomposition
 
         # Validate inputs
         self._validate_inputs()
@@ -213,7 +218,7 @@ class MeshDataset(Dataset):
             - raw_vertices: (N, 3) normalized vertex positions
             - raw_faces: (F, 3) face indices
             - vertex_normals: (N, 3) per-vertex normals
-            - gt_eigen: tuple of (eigenvalues, eigenvectors)
+            - gt_eigen: tuple of (eigenvalues, eigenvectors) or (None, None)
             - geodesic_data: dict with source_indices + exact geodesics
             - mesh_file_path, original_num_vertices, etc.
         """
@@ -234,10 +239,13 @@ class MeshDataset(Dataset):
             if _v: print(f"    [diag] Loaded: {original_num_vertices} verts, {original_num_faces} faces", flush=True)
 
             # Compute ground-truth Laplacian eigendecomposition using robust-laplacian
-            if _v: print(f"    [diag] GT eigendecomposition ...", flush=True)
-            gt_eigenvalues, gt_eigenvectors = self._compute_ground_truth_eigendecomposition(
-                vertices, faces
-            )
+            if self._skip_eigendecomposition:
+                gt_eigenvalues, gt_eigenvectors = None, None
+            else:
+                if _v: print(f"    [diag] GT eigendecomposition ...", flush=True)
+                gt_eigenvalues, gt_eigenvectors = self._compute_ground_truth_eigendecomposition(
+                    vertices, faces
+                )
 
         except Exception as e:
             raise RuntimeError(f"Failed to load mesh {mesh_file_path}: {e}")
