@@ -5,4 +5,4 @@ ckpt_path: null
 checkpoint_path: "C:/Users/Roy/Downloads/model.ckpt"
 num_eigenvectors: 100
 k_sparsify: null
-k: 15
+k: 6

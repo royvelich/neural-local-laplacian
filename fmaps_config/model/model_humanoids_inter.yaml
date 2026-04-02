@@ -10,15 +10,17 @@ module:
   skip_baselines: false
   eval_variants:
     - iso
+    - dense
+    - sp
   losses:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
       weight: 1.0
-      num_landmarks: 128
+      num_landmarks: 256
       alphas:
         - 0.1
         - 1.0
         - 10.0
-      num_sample_vertices: 512
+      num_sample_vertices: 2048
       normalize: false
   random_init: false
   keep_areas_head: false
