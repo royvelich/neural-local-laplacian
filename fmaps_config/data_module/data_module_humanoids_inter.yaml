@@ -12,8 +12,8 @@ module:
         pair_mode: inter
         pairs:
         - '2:'
-      num_samples: 60
-    batch_size: 6
+      num_samples: 20
+    batch_size: 2
     num_workers: 0
     shuffle: true
     collate_fn:
