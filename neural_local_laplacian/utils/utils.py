@@ -383,33 +383,21 @@ def assemble_stiffness_and_mass_matrices(
         symmetry_policy: str = "union"
 ) -> Tuple[scipy.sparse.csr_matrix, scipy.sparse.csr_matrix]:
     """
-    Assemble separate stiffness and mass matrices from predicted weights and areas.
+    DEPRECATED: Use laplacian_assembly.assemble_isotropic_laplacian() instead.
 
-    GPU-OPTIMIZED VERSION: All computation stays on GPU until final scipy conversion.
+    This function assembles L from scalar stiffness weights without area in L,
+    which is the legacy stiffness-mode path. For gradient-mode models, use
+    assemble_isotropic_laplacian(grad_coeffs, knn) from laplacian_assembly.py.
 
-    The stiffness matrix S is symmetric and contains the edge weights.
-    The mass matrix M is diagonal and contains the vertex areas.
-    Together they define the generalized eigenvalue problem: S @ v = lambda * M @ v
-
-    Args:
-        stiffness_weights: Stiffness weights of shape (num_patches, max_k)
-        areas: Predicted areas of shape (num_patches,)
-        attention_mask: Mask of shape (num_patches, max_k) - True for real tokens
-        vertex_indices: Neighbor vertex indices of shape (total_points,)
-        center_indices: Center vertex index for each patch, shape (num_patches,)
-        batch_indices: Batch indices of shape (total_points,)
-        top_k: If set, keep only the top_k highest weights per patch (must be < max_k).
-            This decouples the receptive field (max_k neighbors seen by the model)
-            from the operator support (top_k edges in the assembled Laplacian).
-        symmetry_policy: How to symmetrize after top-k pruning. Only matters when top_k is set.
-            - "union": Keep edge if either direction was selected (default, most edges).
-            - "intersection": Keep edge only if both directions were selected (fewest edges).
-
-    Returns:
-        Tuple of (S, M):
-        - S: Symmetric stiffness matrix (N, N) as scipy.sparse.csr_matrix
-        - M: Diagonal mass matrix (N, N) as scipy.sparse.csr_matrix
+    Kept for backward compatibility with old scripts.
     """
+    import warnings
+    warnings.warn(
+        "assemble_stiffness_and_mass_matrices is deprecated. "
+        "Use laplacian_assembly.assemble_isotropic_laplacian() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
+
     device = stiffness_weights.device
     num_patches = stiffness_weights.shape[0]
     max_k = stiffness_weights.shape[1]
@@ -781,22 +769,19 @@ def cuda_warmup(model, device: torch.device, k: int):
         torch.cuda.synchronize()
 
     # Warmup assembly (scatter ops have their own cold start)
-    _ = assemble_stiffness_and_mass_matrices(
-        warmup_result['stiffness_weights'].float(),
-        warmup_result['areas'].float(),
-        warmup_result['attention_mask'],
-        warmup_data.vertex_indices,
-        warmup_data.center_indices,
-        warmup_data.patch_idx,
+    from neural_local_laplacian.utils.laplacian_assembly import assemble_isotropic_laplacian
+    knn_warmup = warmup_data.vertex_indices.reshape(num_patches, k)
+    _ = assemble_isotropic_laplacian(
+        warmup_result['grad_coeffs'].float(),
+        knn_warmup,
     )
-    if warmup_result.get('grad_coeffs') is not None:
-        _ = assemble_gradient_operator(
-            grad_coeffs=warmup_result['grad_coeffs'],
-            attention_mask=warmup_result['attention_mask'],
-            vertex_indices=warmup_data.vertex_indices,
-            center_indices=warmup_data.center_indices,
-            batch_indices=warmup_data.patch_idx,
-        )
+    _ = assemble_gradient_operator(
+        grad_coeffs=warmup_result['grad_coeffs'],
+        attention_mask=warmup_result['attention_mask'],
+        vertex_indices=warmup_data.vertex_indices,
+        center_indices=warmup_data.center_indices,
+        batch_indices=warmup_data.patch_idx,
+    )
     torch.cuda.synchronize()
 
     del warmup_data, warmup_result

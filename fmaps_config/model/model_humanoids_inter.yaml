@@ -7,11 +7,16 @@ module:
   num_eigenvectors: ${globals.num_eigenvectors}
   seed: ${globals.training_seed}
   eval_only: false
-  skip_baselines: true
-  eval_variants:
-    - iso
-#    - dense
-#    - sp
+  skip_baselines: false
+
+  train_laplacian:
+    assembly: isotropic
+    pruning: none
+    
+  eval_laplacians:
+    - assembly: isotropic
+      pruning: none
+
   losses:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
       weight: 1.0
@@ -26,8 +31,6 @@ module:
   keep_areas_head: false
   freeze_input_projection: false
   freeze_areas_head: false
-  sparsify_laplacian: true
-  k_sparsify: ${globals.k_sparsify}
   max_vertices: 4000
   max_vertices_val: 0
   vertex_noise: 0.0

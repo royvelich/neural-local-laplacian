@@ -24,10 +24,17 @@ import torch
 
 from neural_local_laplacian.utils.utils import (
     normalize_mesh_vertices,
-    assemble_stiffness_and_mass_matrices,
     assemble_gradient_operator,
     build_patches_from_vertices,
     compute_laplacian_eigendecomposition,
+)
+from neural_local_laplacian.utils.laplacian_assembly import (
+    LaplacianConfig,
+    assemble_laplacian,
+    assemble_isotropic_laplacian,
+    prune_to_topk,
+    to_scipy_sparse,
+    mass_matrix_to_scipy,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     heat_method_build,
@@ -146,16 +153,23 @@ def step_pred_inference(
     patch_data: Any,
     device: torch.device,
     use_amp: bool = True,
-    top_k: Optional[int] = None,
+    laplacian_config: Optional[LaplacianConfig] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, float]]:
     """
     Run model forward pass, assemble L,M matrices and gradient operator.
 
+    Args:
+        laplacian_config: LaplacianConfig for assembly/pruning.
+            Defaults to LaplacianConfig(assembly='isotropic').
+
     Returns:
         (result_dict, timing) where:
-        - result_dict has 'L', 'M', 'G' (gradient op, may be None), 'fwd_result'
+        - result_dict has 'L', 'M', 'G' (gradient op), 'fwd_result'
         - timing has keys 'forward', 'assembly', 'grad_op'
     """
+    if laplacian_config is None:
+        laplacian_config = LaplacianConfig(assembly='isotropic')
+
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
     # Forward pass
@@ -174,39 +188,40 @@ def step_pred_inference(
         torch.cuda.synchronize()
     t_forward = time.perf_counter() - t0
 
-    # L, M assembly
-    stiffness_w = fwd_result['stiffness_weights'].float()
+    # Build knn (N, k) from patch data
+    grad_coeffs = fwd_result['grad_coeffs'].float()
     areas = fwd_result['areas'].float()
     attention_mask = fwd_result['attention_mask']
-    vi = patch_data.vertex_indices.to(device)
-    ci = patch_data.center_indices.to(device)
-    bi = patch_data.patch_idx.to(device)
+    batch_sizes = fwd_result['batch_sizes']
+    N = len(batch_sizes)
+    k = batch_sizes[0].item()
+    knn = patch_data.vertex_indices.to(device).reshape(N, k)
 
+    # L, M assembly
     t0 = time.perf_counter()
-    L, M = assemble_stiffness_and_mass_matrices(
-        stiffness_w, areas, attention_mask, vi, ci, bi,
-        top_k=top_k,
-    )
+    with torch.no_grad():
+        L_dense = assemble_laplacian(grad_coeffs, knn, laplacian_config)
+    L = to_scipy_sparse(L_dense)
+    M = mass_matrix_to_scipy(areas)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t_assembly = time.perf_counter() - t0
 
     # Gradient operator
-    t_grad_op = 0.0
-    G = None
-    has_grad = getattr(model, '_operator_mode', 'stiffness') == 'gradient'
-    if has_grad and fwd_result.get('grad_coeffs') is not None:
-        t0 = time.perf_counter()
-        G = assemble_gradient_operator(
-            grad_coeffs=fwd_result['grad_coeffs'],
-            attention_mask=attention_mask,
-            vertex_indices=vi,
-            center_indices=ci,
-            batch_indices=bi,
-        )
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t_grad_op = time.perf_counter() - t0
+    vi = patch_data.vertex_indices.to(device)
+    ci = patch_data.center_indices.to(device)
+    bi = patch_data.patch_idx.to(device)
+    t0 = time.perf_counter()
+    G = assemble_gradient_operator(
+        grad_coeffs=fwd_result['grad_coeffs'],
+        attention_mask=attention_mask,
+        vertex_indices=vi,
+        center_indices=ci,
+        batch_indices=bi,
+    )
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_grad_op = time.perf_counter() - t0
 
     result = {'L': ensure_psd(L), 'M': M, 'G': G, 'fwd_result': fwd_result}
     timing = {'forward': t_forward, 'assembly': t_assembly, 'grad_op': t_grad_op}
@@ -217,35 +232,35 @@ def step_pred_reassemble(
     fwd_result: Dict[str, Any],
     patch_data: Any,
     device: torch.device,
-    top_k: int,
+    laplacian_config: LaplacianConfig,
 ) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix, float]:
     """
-    Re-assemble L, M from cached forward pass result with a different top_k.
+    Re-assemble L, M from cached forward pass result with a different config.
 
-    Skips kNN and forward pass — only runs sparse assembly with top_k pruning.
+    Skips kNN and forward pass — only runs assembly + pruning.
     Does NOT rebuild the gradient operator G.
 
     Args:
         fwd_result: The 'fwd_result' dict from step_pred_inference
         patch_data: The patch_data from step_pred_knn
         device: torch device
-        top_k: Number of highest weights to keep per patch
+        laplacian_config: LaplacianConfig for assembly/pruning
 
     Returns:
         (L, M, assembly_time_seconds)
     """
-    stiffness_w = fwd_result['stiffness_weights'].float()
+    grad_coeffs = fwd_result['grad_coeffs'].float()
     areas = fwd_result['areas'].float()
-    attention_mask = fwd_result['attention_mask']
-    vi = patch_data.vertex_indices.to(device)
-    ci = patch_data.center_indices.to(device)
-    bi = patch_data.patch_idx.to(device)
+    batch_sizes = fwd_result['batch_sizes']
+    N = len(batch_sizes)
+    k = batch_sizes[0].item()
+    knn = patch_data.vertex_indices.to(device).reshape(N, k)
 
     t0 = time.perf_counter()
-    L, M = assemble_stiffness_and_mass_matrices(
-        stiffness_w, areas, attention_mask, vi, ci, bi,
-        top_k=top_k,
-    )
+    with torch.no_grad():
+        L_dense = assemble_laplacian(grad_coeffs, knn, laplacian_config)
+    L = to_scipy_sparse(L_dense)
+    M = mass_matrix_to_scipy(areas)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t_assembly = time.perf_counter() - t0

@@ -41,7 +41,16 @@ import trimesh
 from pyFM.mesh import TriMesh
 
 # neural laplacian
-from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_stiffness_and_mass_matrices, assemble_gradient_operator, compute_laplacian_eigendecomposition, build_patches_from_vertices
+from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_gradient_operator, compute_laplacian_eigendecomposition, build_patches_from_vertices
+from neural_local_laplacian.utils.laplacian_assembly import (
+    LaplacianConfig,
+    assemble_laplacian,
+    assemble_anisotropic_laplacian,
+    assemble_isotropic_laplacian,
+    prune_to_knn,
+    to_scipy_sparse,
+    mass_matrix_to_scipy,
+)
 from neural_local_laplacian.modules.losses import LossConfig, LossContext
 from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.geodesic_utils import (
@@ -52,184 +61,6 @@ from neural_local_laplacian.utils.geodesic_utils import (
     build_pointcloud_grad_div_operators,
     edge_index_from_knn_indices
 )
-
-
-# =============================================================================
-# Anisotropic Laplacian assembly (dense) for validation
-# =============================================================================
-
-def _assemble_anisotropic_laplacian_dense(
-    grad_coeffs: torch.Tensor,
-    areas: torch.Tensor,
-    knn: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Assemble dense L = G^T M_3 G from gradient coefficients.
-
-    Preserves the full directional structure of the learned gradient operator:
-    L(p,q) = Σᵢ aᵢ · G_i[:,p] · G_i[:,q]
-
-    Guaranteed PSD with null space = constant functions.
-
-    Args:
-        grad_coeffs: (N, k, 3) gradient coefficients per edge
-        areas: (N,) vertex areas (mass)
-        knn: (N, k) neighbor indices (long tensor)
-
-    Returns:
-        L: (N, N) dense PSD Laplacian matrix
-        M_diag: (N,) mass diagonal
-    """
-    N, k, _ = grad_coeffs.shape
-    device = grad_coeffs.device
-
-    # Extended coefficients: prepend center coefficient cᵢ = -Σⱼ gᵢⱼ
-    center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)  # (N, 1, 3)
-    ext_coeffs = torch.cat([center_coeffs, grad_coeffs], dim=1)  # (N, k+1, 3)
-
-    # Local Gram matrices: aᵢ * (ext_coeffs @ ext_coeffsᵀ) per vertex
-    sqrt_a = areas.sqrt()[:, None, None]  # (N, 1, 1)
-    scaled = sqrt_a * ext_coeffs  # (N, k+1, 3)
-    gram = torch.bmm(scaled, scaled.transpose(1, 2))  # (N, k+1, k+1)
-
-    # Extended index array: [i, j₁, ..., jₖ] per vertex
-    center_idx = torch.arange(N, device=device).unsqueeze(1)  # (N, 1)
-    ext_indices = torch.cat([center_idx, knn], dim=1)  # (N, k+1)
-
-    # Scatter Gram entries into (N, N) matrix
-    kp1 = k + 1
-    row_idx = ext_indices[:, :, None].expand(-1, -1, kp1)  # (N, k+1, k+1)
-    col_idx = ext_indices[:, None, :].expand(-1, kp1, -1)  # (N, k+1, k+1)
-    flat_idx = (row_idx * N + col_idx).reshape(-1)
-
-    L_flat = torch.zeros(N * N, device=device, dtype=grad_coeffs.dtype)
-    L_flat = L_flat.scatter_add(0, flat_idx, gram.reshape(-1))
-    L = L_flat.view(N, N)
-
-    # Symmetrize
-    L = 0.5 * (L + L.T)
-
-    return L, areas.detach()
-
-
-def _sparsify_L_to_knn(L: torch.Tensor, knn: torch.Tensor) -> torch.Tensor:
-    """
-    Zero out entries of L not in the 1-hop kNN graph, fix diagonal.
-
-    Args:
-        L: (N, N) dense Laplacian
-        knn: (N, k) neighbor indices
-
-    Returns:
-        L_sparse: (N, N) dense tensor with kNN sparsity pattern
-    """
-    N = L.shape[0]
-    device = L.device
-
-    # Build kNN mask: mask[i, j] = True if j ∈ kNN(i) or i ∈ kNN(j)
-    mask = torch.zeros(N, N, dtype=torch.bool, device=device)
-    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn)
-    mask[row_idx, knn] = True
-    mask = mask | mask.T  # symmetrize
-
-    # Apply mask to off-diagonal entries
-    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    keep = (mask | diag_mask).float()
-    L_sp = L * keep
-
-    # Fix diagonal: zero it out then set to -row_sum of off-diagonals
-    off_diag = L_sp * (1.0 - diag_mask.float())
-    row_sums = off_diag.sum(dim=1)
-    L_sp = off_diag - torch.diag(row_sums)
-
-    return L_sp
-
-
-def _assemble_anisotropic_laplacian_sparse(
-    grad_coeffs: torch.Tensor,
-    areas: torch.Tensor,
-    knn: torch.Tensor,
-) -> Tuple[scipy.sparse.spmatrix, scipy.sparse.spmatrix]:
-    """
-    Assemble sparse anisotropic L = G^T M_3 G, keeping only 1-hop entries.
-
-    Directly computes 1-hop entries without building a dense N×N intermediate.
-    For center vertex i, the local Gram contribution is:
-        L_local(p,q) = a_i * (ext_coeffs[p] · ext_coeffs[q])
-    where ext_coeffs = [-Σ_m g_im, g_i1, ..., g_ik].
-
-    Returns scipy sparse matrices ready for eigsh.
-
-    Args:
-        grad_coeffs: (N, k, 3) gradient coefficients per edge
-        areas: (N,) vertex areas
-        knn: (N, k) neighbor indices
-
-    Returns:
-        L: (N, N) scipy CSR sparse Laplacian
-        M: (N, N) scipy sparse diagonal mass matrix
-    """
-    N, k, _ = grad_coeffs.shape
-
-    # Move to CPU numpy
-    gc = grad_coeffs.detach().cpu().numpy()   # (N, k, 3)
-    a = areas.detach().cpu().numpy()           # (N,)
-    knn_np = knn.cpu().numpy()                 # (N, k)
-
-    # Extended coefficients: prepend center = -Σ g_im
-    center_coeffs = -gc.sum(axis=1, keepdims=True)  # (N, 1, 3)
-    ext_coeffs = np.concatenate([center_coeffs, gc], axis=1)  # (N, k+1, 3)
-
-    # Local Gram matrices: a_i * ext @ ext^T  -> (N, k+1, k+1)
-    sqrt_a = np.sqrt(a)[:, None, None]  # (N, 1, 1)
-    scaled = sqrt_a * ext_coeffs  # (N, k+1, 3)
-    gram = np.einsum('npd,nqd->npq', scaled, scaled)  # (N, k+1, k+1)
-
-    # Extended indices: [i, knn[i,0], ..., knn[i,k-1]]
-    center_idx = np.arange(N)[:, None]  # (N, 1)
-    ext_idx = np.concatenate([center_idx, knn_np], axis=1)  # (N, k+1)
-
-    # Build COO arrays (vectorized)
-    kp1 = k + 1
-    # Row indices: ext_idx[:, p] repeated for each q
-    row_idx = np.repeat(ext_idx[:, :, None], kp1, axis=2)  # (N, k+1, k+1)
-    col_idx = np.repeat(ext_idx[:, None, :], kp1, axis=1)  # (N, k+1, k+1)
-
-    # Flatten
-    rows = row_idx.ravel()
-    cols = col_idx.ravel()
-    vals = gram.ravel()
-
-    # Build sparse matrix (duplicates summed automatically)
-    L = scipy.sparse.coo_matrix((vals, (rows, cols)), shape=(N, N)).tocsr()
-    L = 0.5 * (L + L.T)
-
-    # Mask to 1-hop kNN sparsity pattern (remove 2-hop fill between
-    # neighbors of the same center that aren't direct neighbors of each other)
-    knn_row = np.repeat(np.arange(N), k)
-    knn_col = knn_np.ravel()
-    ones = np.ones(N * k)
-    # Symmetric adjacency: edge exists if i∈kNN(j) or j∈kNN(i)
-    adj = scipy.sparse.coo_matrix((ones, (knn_row, knn_col)), shape=(N, N)).tocsr()
-    adj = adj + adj.T
-    adj = (adj > 0).astype(L.dtype)
-    # Add diagonal
-    adj = adj + scipy.sparse.eye(N, dtype=L.dtype)
-
-    # Element-wise multiply to keep only 1-hop + diagonal entries
-    L = L.multiply(adj).tocsr()
-
-    # Fix diagonal: ensure row sums are zero
-    offdiag = L.copy()
-    offdiag.setdiag(0)
-    offdiag.eliminate_zeros()
-    diag_vals = -np.array(offdiag.sum(axis=1)).ravel()
-    L = offdiag + scipy.sparse.diags(diag_vals)
-
-    # Mass matrix
-    M = scipy.sparse.diags(a)
-
-    return L, M
 
 
 def _eigh_anisotropic(L: torch.Tensor, M_diag: torch.Tensor,
@@ -323,11 +154,12 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  output_projection_hidden_dims: Optional[List[int]] = None,
                  normalize_patch_features: bool = True,
                  scale_areas_by_patch_size: bool = True,
-                 operator_mode: str = "gradient",
-                 patch_mcv_mode: str = "isotropic",
-                 val_laplacian_mode: str = "sparse_isotropic",
+                 val_laplacian: Optional[Dict] = None,
                  **kwargs):
-        super().__init__(**kwargs)
+        # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
+        # val_laplacian_mode) from old checkpoints.
+        super().__init__(**{k: v for k, v in kwargs.items()
+                           if k in ('optimizer_cfg', 'scheduler_cfg')})
 
         # This saves all the __init__ arguments automatically
         # Exclude loss_configs and feature_extractor: they contain non-serializable PyTorch modules
@@ -366,31 +198,15 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                 raise ValueError("input_dim must be a positive integer when no feature_extractor is provided.")
             resolved_input_dim = input_dim
 
-        # Validate operator_mode
-        if operator_mode not in ("stiffness", "gradient"):
-            raise ValueError(f"operator_mode must be 'stiffness' or 'gradient', got: {operator_mode}")
-
-        # Validate patch_mcv_mode
-        if patch_mcv_mode not in ("isotropic", "anisotropic"):
-            raise ValueError(f"patch_mcv_mode must be 'isotropic' or 'anisotropic', got: {patch_mcv_mode}")
-        if patch_mcv_mode == "anisotropic" and operator_mode != "gradient":
-            raise ValueError("patch_mcv_mode='anisotropic' requires operator_mode='gradient'")
-
-        # Validate val_laplacian_mode
-        _valid_val_modes = ("sparse_isotropic", "dense_anisotropic", "sparse_anisotropic")
-        if val_laplacian_mode not in _valid_val_modes:
-            raise ValueError(f"val_laplacian_mode must be one of {_valid_val_modes}, got: {val_laplacian_mode}")
-        if val_laplacian_mode != "sparse_isotropic" and operator_mode != "gradient":
-            raise ValueError(f"val_laplacian_mode='{val_laplacian_mode}' requires operator_mode='gradient'")
-
         self._d_model = d_model
         self._input_dim = resolved_input_dim
         self._num_eigenvalues = num_eigenvalues
         self._normalize_patch_features = normalize_patch_features
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
-        self._operator_mode = operator_mode
-        self._patch_mcv_mode = patch_mcv_mode
-        self._val_laplacian_mode = val_laplacian_mode
+
+        # Validation Laplacian config
+        _val_lap = val_laplacian or {'assembly': 'isotropic', 'pruning': 'none'}
+        self._val_lap_config = LaplacianConfig(**_val_lap)
 
         # Store loss configs (optionally normalized)
         if normalize_loss_weights:
@@ -415,15 +231,10 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             num_layers=num_encoder_layers
         )
 
-        # Output head: depends on operator_mode
-        if self._operator_mode == "stiffness":
-            # Per-token Ã¢â€ â€™ scalar stiffness weight s_ij (current behavior)
-            self.stiffness_projection = self._build_projection(d_model, 1, output_projection_hidden_dims)
-        elif self._operator_mode == "gradient":
-            # Per-token Ã¢â€ â€™ 3D gradient coefficient g_ij
-            self.grad_projection = self._build_projection(d_model, 3, output_projection_hidden_dims)
+        # Output head: gradient coefficients g_ij in R^3
+        self.grad_projection = self._build_projection(d_model, 3, output_projection_hidden_dims)
 
-        # Area head: aggregated features -> scalar area A_i (shared across modes)
+        # Area head: aggregated features -> scalar area A_i
         # Uses mean pooling of token features followed by MLP
         self.area_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -571,19 +382,15 @@ class LaplacianTransformerModule(LaplacianModuleBase):
     def _compute_mean_curvature_vectors(self, forward_result: Dict[str, torch.Tensor],
                                         batch_data: Batch) -> torch.Tensor:
         """
-        Compute predicted mean curvature vectors from stiffness weights and areas.
+        Compute predicted mean curvature vectors from gradient coefficients and areas.
 
-        This method computes the mean curvature vector as:
+        Computes the anisotropic mean curvature vector as:
             mcv = (Sum_j w_ij * p_j) / A_i
-
-        where the weights w_ij depend on patch_mcv_mode:
-        - "isotropic":    w_ij = s_ij = ||g_ij||^2  (scalar magnitude, no directional info)
-        - "anisotropic":  w_ij = g_ii . g_ij  where g_ii = -Sum_m g_im
-                          (dot product with aggregate, preserves directional coupling)
+        where w_ij = g_ii . g_ij  and  g_ii = -Sum_m g_im
 
         Args:
-            forward_result: Dictionary containing stiffness_weights, areas, attention_mask,
-                          batch_sizes, and optionally grad_coeffs
+            forward_result: Dictionary containing grad_coeffs, areas, attention_mask,
+                          batch_sizes
             batch_data: PyTorch Geometric batch containing positions and batch indices
 
         Returns:
@@ -595,23 +402,12 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         batch_sizes = forward_result['batch_sizes']  # (batch_size,)
         batch_size = len(batch_sizes)
 
-        # Compute weights based on mode
-        if (self._patch_mcv_mode == "anisotropic"
-                and forward_result.get('grad_coeffs') is not None):
-            # Anisotropic: w_ij = g_ii . g_ij, where g_ii = -Sum_m g_im
-            grad_coeffs = forward_result['grad_coeffs']  # (batch_size, max_k, 3)
-            # Mask grad_coeffs for padding
-            gc_masked = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
-            # Self-coefficient: g_ii = -Sum_j g_ij
-            g_self = -gc_masked.sum(dim=1)  # (batch_size, 3)
-            # Dot product: w_ij = g_ii . g_ij  →  (batch_size, max_k)
-            weights = torch.einsum('bd,bkd->bk', g_self, gc_masked)
-            # Zero out padded positions
-            weights = weights.masked_fill(~attention_mask, 0.0)
-        else:
-            # Isotropic: w_ij = ||g_ij||^2 (or scalar stiffness weights)
-            stiffness_weights = forward_result['stiffness_weights']  # (batch_size, max_k)
-            weights = stiffness_weights.masked_fill(~attention_mask, 0.0)
+        # Anisotropic weights: w_ij = g_ii . g_ij
+        grad_coeffs = forward_result['grad_coeffs']  # (batch_size, max_k, 3)
+        gc_masked = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
+        g_self = -gc_masked.sum(dim=1)  # (batch_size, 3)
+        weights = torch.einsum('bd,bkd->bk', g_self, gc_masked)
+        weights = weights.masked_fill(~attention_mask, 0.0)
 
         # Get positions and flatten weights
         positions = batch_data.pos  # (total_points, 3)
@@ -775,15 +571,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # src_key_padding_mask=None means no masking, which is correct for fixed k
         encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=None)
 
-        # === Output head: depends on operator_mode ===
-        if self._operator_mode == "stiffness":
-            stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, k, 1)
-            stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, k)
-            stiffness_weights = torch.exp(stiffness_weights)  # Ensure positive
-            grad_coeffs = None
-        elif self._operator_mode == "gradient":
-            grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, k, 3)
-            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, k) Ã¢â‚¬â€ structural positivity
+                # === Output head: gradient coefficients ===
+        grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, k, 3)
+        stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, k)
 
         # === Area prediction (per patch) ===
         # OPTIMIZED: Simple mean pooling (no mask needed)
@@ -808,7 +598,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             'attention_mask': attention_mask,
             'batch_sizes': batch_sizes,
             'scale_factors': scale_factors,
-            'grad_coeffs': grad_coeffs,  # None in stiffness mode, (batch_size, k, 3) in gradient mode
+            'grad_coeffs': grad_coeffs,  # (batch_size, k, 3)
         }
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -889,17 +679,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Note: src_key_padding_mask expects True for positions to IGNORE
         encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=~attention_mask)
 
-        # === Output head: depends on operator_mode ===
-        if self._operator_mode == "stiffness":
-            stiffness_weights = self.stiffness_projection(encoded_features)  # (batch_size, max_k, 1)
-            stiffness_weights = stiffness_weights.squeeze(-1)  # (batch_size, max_k)
-            stiffness_weights = torch.exp(stiffness_weights)  # Ensure positive
-            stiffness_weights = stiffness_weights.masked_fill(~attention_mask, 0.0)  # Mask padding
-            grad_coeffs = None
-        elif self._operator_mode == "gradient":
-            grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, max_k, 3)
-            grad_coeffs = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)  # Mask padding
-            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, max_k) Ã¢â‚¬â€ structural positivity
+                # === Output head: gradient coefficients ===
+        grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, max_k, 3)
+        stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, max_k)
 
         # === Area prediction (per patch) ===
         # Mean pooling of encoded features (excluding padding)
@@ -1103,66 +885,30 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
         batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
 
-        # Always assemble sparse isotropic S and M (needed for geodesics,
-        # and also for spectral metrics in sparse_isotropic mode)
-        stiffness_matrix, mass_matrix = assemble_stiffness_and_mass_matrices(
-            stiffness_weights=forward_result['stiffness_weights'],
-            areas=forward_result['areas'],
-            attention_mask=forward_result['attention_mask'],
-            vertex_indices=mesh_batch.vertex_indices,
-            center_indices=mesh_batch.center_indices,
-            batch_indices=batch_indices
-        )
+        # Build knn indices from patch data
+        grad_coeffs = forward_result['grad_coeffs']
+        batch_sizes = forward_result['batch_sizes']
+        N = len(batch_sizes)
+        k_val = batch_sizes[0].item()
+        knn = mesh_batch.vertex_indices.reshape(N, k_val).to(device)
+        areas = forward_result['areas'].detach()
+
+        # Assemble Laplacian according to config
+        with torch.no_grad():
+            L = assemble_laplacian(grad_coeffs, knn, self._val_lap_config)
+
+        # Convert to scipy for geodesics
+        stiffness_matrix = to_scipy_sparse(L)
+        mass_matrix = mass_matrix_to_scipy(areas)
 
         # Store matrices for callback (last mesh in batch)
         self._last_stiffness_matrix = stiffness_matrix
         self._last_mass_matrix = mass_matrix
 
-        # --- Eigendecomposition: depends on val_laplacian_mode ---
-        if self._val_laplacian_mode == "sparse_isotropic":
-            # Original: sparse S @ v = lambda * M @ v via scipy
-            pred_eigenvalues, pred_eigenvectors = compute_laplacian_eigendecomposition(
-                stiffness_matrix, self._num_eigenvalues, mass_matrix=mass_matrix
-            )
-        elif self._val_laplacian_mode in ("dense_anisotropic", "sparse_anisotropic"):
-            # Build dense anisotropic L = G^T M_3 G from grad_coeffs
-            grad_coeffs = forward_result.get('grad_coeffs')
-            if grad_coeffs is None:
-                # Fallback to sparse isotropic if no grad_coeffs
-                pred_eigenvalues, pred_eigenvectors = compute_laplacian_eigendecomposition(
-                    stiffness_matrix, self._num_eigenvalues, mass_matrix=mass_matrix
-                )
-            else:
-                device = grad_coeffs.device
-                batch_sizes = forward_result['batch_sizes']
-                N = len(batch_sizes)           # number of vertices
-                k = batch_sizes[0].item()      # neighbors per patch
-
-                # Reshape vertex_indices to (N, k) for knn
-                knn = mesh_batch.vertex_indices.reshape(N, k).to(device)
-                areas = forward_result['areas'].detach()
-
-                with torch.no_grad():
-                    if self._val_laplacian_mode == "sparse_anisotropic":
-                        # Direct sparse assembly — no dense N×N intermediate
-                        L_scipy, M_scipy = _assemble_anisotropic_laplacian_sparse(
-                            grad_coeffs=grad_coeffs,
-                            areas=areas,
-                            knn=knn,
-                        )
-                        pred_eigenvalues, pred_eigenvectors = compute_laplacian_eigendecomposition(
-                            L_scipy, self._num_eigenvalues, mass_matrix=M_scipy
-                        )
-                    else:
-                        # dense_anisotropic: full dense L then dense eigh
-                        L, M_diag = _assemble_anisotropic_laplacian_dense(
-                            grad_coeffs=grad_coeffs,
-                            areas=areas,
-                            knn=knn,
-                        )
-                        pred_eigenvalues, pred_eigenvectors = _eigh_anisotropic(
-                            L, M_diag, self._num_eigenvalues
-                        )
+        # Eigendecomposition: dense L on GPU
+        pred_eigenvalues, pred_eigenvectors = _eigh_anisotropic(
+            L, areas, self._num_eigenvalues
+        )
 
         # Get ground-truth eigendecomposition (stored as tuple to avoid PyG batching issues)
         gt_eigenvalues, gt_eigenvectors = mesh_data.gt_eigen
@@ -1193,72 +939,45 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Compute geodesic validation metrics using Heat Method with multiple sources.
 
-        In stiffness mode (frankenstein): uses pcdiff grad/div operators from precomputed data.
-        In gradient mode (self-consistent): assembles G from learned grad_coeffs and uses
-        the formal adjoint divergence.
+        Assembles G from learned grad_coeffs and uses the formal adjoint divergence.
 
         Args:
             mesh_data: PyTorch Geometric Data object with geodesic_data
-            stiffness_matrix: Assembled stiffness matrix from predicted weights
-            mass_matrix: Assembled mass matrix from predicted areas
-            forward_result: Forward pass output (needed for gradient mode to get grad_coeffs)
-            mesh_batch: Batched mesh data (needed for gradient mode to get vertex/center indices)
+            stiffness_matrix: Assembled stiffness matrix (scipy sparse)
+            mass_matrix: Assembled mass matrix (scipy sparse)
+            forward_result: Forward pass output (grad_coeffs)
+            mesh_batch: Batched mesh data (vertex/center indices)
 
         Returns:
             Dictionary with geodesic validation metrics (averaged over sources)
         """
-        # Check if geodesic data is available
         geodesic_data = getattr(mesh_data, 'geodesic_data', None)
         if geodesic_data is None or not geodesic_data.get('has_geodesic_data', False):
             return {}
 
         try:
             source_indices = geodesic_data['source_indices']
-            exact_geodesics_dict = geodesic_data['exact_geodesics']  # Dict: source_idx -> distances
+            exact_geodesics_dict = geodesic_data['exact_geodesics']
             n_vertices = stiffness_matrix.shape[0]
 
-            if self._operator_mode == "gradient" and forward_result is not None and mesh_batch is not None:
-                # === Gradient mode: self-consistent heat method ===
-                # Assemble G from learned grad_coeffs
-                batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
-                gradient_operator = assemble_gradient_operator(
-                    grad_coeffs=forward_result['grad_coeffs'],
-                    attention_mask=forward_result['attention_mask'],
-                    vertex_indices=mesh_batch.vertex_indices,
-                    center_indices=mesh_batch.center_indices,
-                    batch_indices=batch_indices
+            # Assemble G from learned grad_coeffs
+            batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
+            gradient_operator = assemble_gradient_operator(
+                grad_coeffs=forward_result['grad_coeffs'],
+                attention_mask=forward_result['attention_mask'],
+                vertex_indices=mesh_batch.vertex_indices,
+                center_indices=mesh_batch.center_indices,
+                batch_indices=batch_indices
+            )
+
+            def compute_pred_geodesics(source_idx):
+                return compute_heat_geodesic_learned(
+                    S=stiffness_matrix,
+                    M=mass_matrix,
+                    G=gradient_operator,
+                    source_idx=source_idx,
+                    n_vertices=n_vertices
                 )
-
-                def compute_pred_geodesics(source_idx):
-                    return compute_heat_geodesic_learned(
-                        S=stiffness_matrix,
-                        M=mass_matrix,
-                        G=gradient_operator,
-                        source_idx=source_idx,
-                        n_vertices=n_vertices
-                    )
-            else:
-                # === Stiffness mode: build pcdiff operators from kNN connectivity ===
-                try:
-                    vertices_np = mesh_data.raw_vertices.cpu().numpy() if torch.is_tensor(mesh_data.raw_vertices) else mesh_data.raw_vertices
-                    vertex_indices_np = mesh_batch.vertex_indices.cpu().numpy()
-                    center_indices_np = mesh_batch.center_indices.cpu().numpy()
-                    batch_indices_np = (getattr(mesh_batch, 'patch_idx', mesh_batch.batch)).cpu().numpy()
-                    k_val = int(np.bincount(batch_indices_np).max())
-                    edge_index = edge_index_from_knn_indices(vertex_indices_np, center_indices_np, k_val)
-                    pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices_np, edge_index)
-                except Exception:
-                    return {}
-
-                def compute_pred_geodesics(source_idx):
-                    return compute_heat_geodesic_pointcloud(
-                        L=stiffness_matrix,
-                        M=mass_matrix,
-                        grad_op=pc_grad_op,
-                        div_op=pc_div_op,
-                        source_idx=source_idx,
-                        n_vertices=n_vertices
-                    )
 
             def get_exact_geodesics(source_idx):
                 return exact_geodesics_dict.get(source_idx, None)

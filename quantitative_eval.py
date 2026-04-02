@@ -49,6 +49,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
 from neural_local_laplacian.utils.utils import cuda_warmup, load_mesh
+from neural_local_laplacian.utils.laplacian_assembly import LaplacianConfig
 from neural_local_laplacian.utils.validation_utils import (
     step_pred_knn,
     step_pred_inference,
@@ -198,6 +199,17 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 top_k_values = sorted([int(x.strip()) for x in cleaned.split(',') if x.strip()])
         top_k_values = [k for k in top_k_values if 2 <= k < pred_k]
 
+    # ---- Laplacian config ----
+    # Accepts: +laplacian.assembly=isotropic +laplacian.pruning=none
+    lap_dict = OmegaConf.to_container(cfg.laplacian) if hasattr(cfg, 'laplacian') else {}
+    pred_lap_config = LaplacianConfig(**lap_dict) if lap_dict else LaplacianConfig(assembly='isotropic')
+
+    # Build top-k configs for the sweep
+    top_k_configs = [
+        LaplacianConfig(assembly=pred_lap_config.assembly, pruning='topk', k_prune=tk)
+        for tk in top_k_values
+    ]
+
     # ---- Load PRED model ----
     model = None
     if run_pred:
@@ -243,57 +255,30 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     # ==================================================================
     print(f"{tag}Loading {n_total} meshes...")
     mesh_data_list: List[Optional[Dict[str, Any]]] = []
-    t_load_start = time.time()
-    t_loadmesh_total = 0.0
-    t_geodata_total = 0.0
-
-    # Get file paths directly from dataset — no need to call dataset[idx]
-    all_mesh_paths = dataset.mesh_file_paths
-    num_geo_sources = getattr(dataset, '_num_geodesic_sources', 15)
-    geo_source_method = getattr(dataset, '_geodesic_source_method', 'farthest_point_sampling')
-
-    # Import geodesic utilities for direct cache loading
-    from neural_local_laplacian.utils.geodesic_utils import (
-        select_multiple_geodesic_sources as _select_fps,
-        load_cached_geodesics as _load_geo_cache,
-    )
-
     for local_idx, global_idx in enumerate(my_indices):
         try:
-            mesh_file_path = str(all_mesh_paths[global_idx])
+            batch_data = dataset[global_idx]
+            data = batch_data[0] if isinstance(batch_data, list) else batch_data
+            mesh_file_path = data.mesh_file_path
+            if isinstance(mesh_file_path, list):
+                mesh_file_path = mesh_file_path[0]
             mesh_name = Path(mesh_file_path).name
-
-            t0 = time.time()
             vertices, faces, _ = load_mesh(mesh_file_path)
-            t_loadmesh = time.time() - t0
-            t_loadmesh_total += t_loadmesh
             N = len(vertices)
 
-            # Load geodesic data directly from cache (same logic as MeshDataset)
-            t0 = time.time()
+            # Pull precomputed source indices and exact geodesics from dataset
             source_indices = None
             exact_geodesics = None
-            fps_indices = _select_fps(
-                vertices, num_sources=num_geo_sources,
-                method=geo_source_method, seed=42,
-            )
-            source_indices = fps_indices.tolist() if hasattr(fps_indices, 'tolist') else list(fps_indices)
-            cached = _load_geo_cache(mesh_file_path, N, fps_indices)
-            if cached is not None:
-                exact_geodesics = cached
-            t_geodata = time.time() - t0
-            t_geodata_total += t_geodata
-
-            # Print timing every 50 meshes or on the first one
-            if local_idx == 0 or (local_idx + 1) % 50 == 0:
-                elapsed = time.time() - t_load_start
-                print(f"{tag}  [{local_idx+1}/{n_total}] {mesh_name:<20s} "
-                      f"N={N:>6d}  load={t_loadmesh:.3f}s  geo={t_geodata:.3f}s  "
-                      f"[cumul: load={t_loadmesh_total:.1f}s  "
-                      f"geo={t_geodata_total:.1f}s  wall={elapsed:.1f}s]", flush=True)
+            geo_data = getattr(data, 'geodesic_data', None)
+            if geo_data is not None:
+                src = geo_data.get('source_indices')
+                if src is not None:
+                    source_indices = src.tolist() if hasattr(src, 'tolist') else list(src)
+                if geo_data.get('has_geodesic_data'):
+                    exact_geodesics = geo_data.get('exact_geodesics')
 
             if source_indices is None:
-                print(f"{tag}  Warning: no source indices for {mesh_name}, skipping")
+                print(f"{tag}  Warning: no precomputed source indices for {mesh_name}, skipping")
                 mesh_data_list.append(None)
                 metrics_list.append({})
                 mesh_cache.append({})
@@ -315,10 +300,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         metrics_list.append({})
         mesh_cache.append({})
 
-    t_load_elapsed = time.time() - t_load_start
-    print(f"{tag}Loading done: {t_load_elapsed:.1f}s total  "
-          f"(load_mesh={t_loadmesh_total:.1f}s  geodata={t_geodata_total:.1f}s)", flush=True)
-
     # ==================================================================
     # PASS 1: PRED assembly (GPU, back-to-back, hottest possible)
     #         + top-k reassembly variants (still GPU-warm, assembly only)
@@ -338,6 +319,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 patch_data, t_knn = step_pred_knn(verts_tensor, pred_k, device)
                 pred_result, t_infer = step_pred_inference(
                     model, patch_data, device, use_amp=use_amp,
+                    laplacian_config=pred_lap_config,
                 )
 
                 t_pred = PredLaplacianTiming(
@@ -358,9 +340,10 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics_list[i]['pred_lm_total_ms'] = t_pred.lm_total * 1000
 
                 # Top-k reassembly variants (reuse cached forward pass)
-                for tk in top_k_values:
+                for tk, tk_cfg in zip(top_k_values, top_k_configs):
                     tk_L, tk_M, tk_asm_time = step_pred_reassemble(
-                        pred_result['fwd_result'], patch_data, device, top_k=tk,
+                        pred_result['fwd_result'], patch_data, device,
+                        laplacian_config=tk_cfg,
                     )
                     pfx = f'pred_tk{tk}'
                     mesh_cache[i][f'{pfx}_L'] = tk_L
@@ -429,16 +412,13 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         metrics['num_sources'] = n_src
 
         errors = []
-        step_times = {}  # diagnostic timing per step
         gc.collect()
         gc.disable()
 
         # ---- GT assembly ----
         gt_L, gt_M, t_gt = None, None, None
         try:
-            _t0 = time.time()
             gt_L, gt_M, t_gt = step_gt_laplacian(vertices, faces)
-            step_times['gt_asm'] = time.time() - _t0
             metrics['gt_assembly_ms'] = t_gt['assembly'] * 1000
             cache['gt_L'] = gt_L
             cache['gt_M'] = gt_M
@@ -449,9 +429,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         rob_L, rob_M, t_rob_lm = None, None, None
         if run_robust:
             try:
-                _t0 = time.time()
                 rob_L, rob_M, t_rob_lm = step_robust_laplacian(vertices, robust_k)
-                step_times['rob_asm'] = time.time() - _t0
                 metrics['robust_k'] = robust_k
                 metrics['robust_lm_assembly_ms'] = t_rob_lm['assembly'] * 1000
                 cache['rob_L'] = rob_L
@@ -463,11 +441,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         gt_distances = None
         if gt_L is not None:
             try:
-                _t0 = time.time()
                 gt_distances, gt_geo_timing = step_gt_geodesic(
                     gt_L, gt_M, vertices, faces, source_indices, N,
                 )
-                step_times['gt_geo'] = time.time() - _t0
                 metrics['gt_geo_total_ms'] = gt_geo_timing.total * 1000
                 metrics['gt_e2e_geodesic_ms'] = (t_gt['assembly'] + gt_geo_timing.total) * 1000
             except Exception as e:
@@ -478,9 +454,7 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         robust_timing = None
         if run_robust and rob_L is not None:
             try:
-                _t0 = time.time()
                 robust_distances, robust_timing = step_robust_geodesic(vertices, source_indices, robust_k)
-                step_times['rob_geo'] = time.time() - _t0
                 metrics['robust_constructor_ms'] = robust_timing.constructor * 1000
                 metrics['robust_geo_solve_ms'] = robust_timing.solve * 1000
                 metrics['robust_e2e_geodesic_ms'] = robust_timing.total * 1000
@@ -496,11 +470,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         t_pred = cache.get('t_pred')
         if run_pred and pred_G is not None:
             try:
-                _t0 = time.time()
                 pred_distances, pred_geo_timing = step_pred_geodesic(
                     pred_L, pred_M, pred_G, source_indices, N,
                 )
-                step_times['pred_geo'] = time.time() - _t0
                 pred_onetime = (t_pred.total
                                 + pred_geo_timing.build
                                 + pred_geo_timing.heat_factorize
@@ -522,11 +494,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         t_nelo = cache.get('t_nelo')
         if run_nelo and nelo_L is not None:
             try:
-                _t0 = time.time()
                 nelo_distances, nelo_geo_timing = step_pcdiff_geodesic(
                     nelo_L, nelo_M, vertices, nelo_k, source_indices, N,
                 )
-                step_times['nelo_geo'] = time.time() - _t0
                 nelo_geo_e2e = t_nelo.total + nelo_geo_timing.total
                 metrics['nelo_geo_total_ms'] = nelo_geo_timing.total * 1000
                 metrics['nelo_e2e_geodesic_ms'] = nelo_geo_e2e * 1000
@@ -535,7 +505,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 errors.append(f"NeLo geodesic: {e}")
 
         # ---- Geodesic quality vs exact ----
-        _t0 = time.time()
         exact_geo = md.get('exact_geodesics') or {}
         if not exact_geo:
             try:
@@ -562,10 +531,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics[f'{prefix}_geodesic_mono_mean'] = qual.mono_mean
             except Exception as e:
                 errors.append(f"{prefix} geodesic quality: {e}")
-        step_times['geo_qual'] = time.time() - _t0
 
         # ---- Green's function ----
-        _t0 = time.time()
         gt_gvals = None
         if gt_L is not None:
             try:
@@ -591,12 +558,10 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics, 'nelo', nelo_L, nelo_M,
                 source_indices, gt_gvals, t_nelo.total if t_nelo else 0,
             )
-        step_times['greens'] = time.time() - _t0
 
         gc.enable()
 
         # ---- Eigendecomposition (not timing-sensitive) ----
-        _t0 = time.time()
         gt_evals, gt_evecs = None, None
         if gt_L is not None:
             try:
@@ -634,10 +599,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 )
             except Exception as e:
                 errors.append(f"NeLo eigen: {e}")
-        step_times['eigen'] = time.time() - _t0
 
         # ---- HKS / WKS descriptor comparison ----
-        _t0 = time.time()
         if gt_evals is not None and gt_evecs is not None:
             for prefix, m_evals, m_evecs in [
                 ('pred', pred_evals, pred_evecs),
@@ -651,10 +614,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics[f'{prefix}_hks_l2_err'] = desc.hks_l2_error
                 metrics[f'{prefix}_wks_corr'] = desc.wks_correlation
                 metrics[f'{prefix}_wks_l2_err'] = desc.wks_l2_error
-        step_times['desc'] = time.time() - _t0
 
         # ---- Probe function MSE ----
-        _t0 = time.time()
         if gt_L is not None and gt_evals is not None and gt_evecs is not None:
             for prefix, m_L, m_M in [
                 ('pred', pred_L, pred_M),
@@ -669,10 +630,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 metrics[f'{prefix}_probe_mse'] = probe.mse
                 metrics[f'{prefix}_probe_cosine'] = probe.cosine_similarity
                 metrics[f'{prefix}_probe_failure_rate'] = probe.failure_rate
-        step_times['probe'] = time.time() - _t0
 
         # ---- Sparsity ----
-        _t0 = time.time()
         if gt_L is not None:
             sp_gt = step_sparsity(gt_L)
             metrics['gt_nnz'] = sp_gt.nnz
@@ -685,10 +644,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             metrics[f'{prefix}_nnz'] = sp.nnz
             metrics[f'{prefix}_avg_nnz_per_row'] = sp.avg_nnz_per_row
             metrics[f'{prefix}_density_pct'] = sp.density_percent
-        step_times['sparsity'] = time.time() - _t0
 
         # ---- Spectral compression ----
-        _t0 = time.time()
         compression_k_values = list(range(5, num_eigenpairs + 1, 5))
         for prefix, m_evecs, m_M in [
             ('gt', gt_evecs, gt_M),
@@ -702,10 +659,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             for k, errs in comp.errors.items():
                 metrics[f'{prefix}_compress_k{k}_mean_l2'] = errs['mean_l2']
                 metrics[f'{prefix}_compress_k{k}_max_l2'] = errs['max_l2']
-        step_times['compress'] = time.time() - _t0
 
         # ---- Top-k pruning variants (full quality sweep) ----
-        _t0 = time.time()
         for tk in top_k_values:
             pfx = f'pred_tk{tk}'
             tk_L = cache.get(f'{pfx}_L')
@@ -758,8 +713,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                 for kc, errs in comp.errors.items():
                     metrics[f'{pfx}_compress_k{kc}_mean_l2'] = errs['mean_l2']
                     metrics[f'{pfx}_compress_k{kc}_max_l2'] = errs['max_l2']
-        if top_k_values:
-            step_times['topk'] = time.time() - _t0
 
         # ---- Timing ratios ----
         if run_pred and run_robust and robust_timing is not None and t_pred is not None:
@@ -801,15 +754,6 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
             parts.append(f"geo={metrics['pred_geodesic_corr_mean']:.3f}")
         parts.append(f"[{t_mesh:.1f}s, ETA {eta:.0f}s]")
         print(' '.join(parts))
-        # Print step timing breakdown
-        timing_parts = []
-        for step_name in ['gt_asm', 'rob_asm', 'gt_geo', 'rob_geo', 'pred_geo',
-                          'geo_qual', 'greens', 'eigen', 'desc', 'probe',
-                          'sparsity', 'compress', 'topk']:
-            if step_name in step_times:
-                timing_parts.append(f"{step_name}={step_times[step_name]:.2f}s")
-        if timing_parts:
-            print(f"{tag}  steps: {' | '.join(timing_parts)}")
 
     elapsed = time.time() - t_start
     print(f"\n{tag}Done — {len(metrics_list)} meshes in {elapsed:.1f}s")

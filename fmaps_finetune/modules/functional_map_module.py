@@ -29,8 +29,15 @@ from neural_local_laplacian.modules.laplacian_modules import (
 from neural_local_laplacian.datasets.mesh_datasets import MeshPatchData
 from neural_local_laplacian.utils.utils import (
     normalize_mesh_vertices,
-    assemble_stiffness_and_mass_matrices,
     compute_laplacian_eigendecomposition,
+)
+from neural_local_laplacian.utils.laplacian_assembly import (
+    LaplacianConfig,
+    assemble_laplacian,
+    assemble_anisotropic_laplacian,
+    assemble_isotropic_laplacian,
+    prune_to_knn,
+    prune_to_topk,
 )
 
 from fmaps_finetune.datasets.functional_map_dataset import (
@@ -137,158 +144,6 @@ def build_patch_data(vertices_t: torch.Tensor, knn: np.ndarray, device: torch.de
     )
 
 
-# =============================================================================
-# Laplacian assembly
-# =============================================================================
-
-def assemble_dense_stiffness_and_mass(
-    stiffness_weights, areas, attention_mask,
-    vertex_indices, center_indices, batch_indices,
-):
-    """Differentiable dense S and M from scalar edge weights."""
-    device       = stiffness_weights.device
-    num_patches  = stiffness_weights.shape[0]
-    max_k        = stiffness_weights.shape[1]
-    num_vertices = max(vertex_indices.max().item(), center_indices.max().item()) + 1
-
-    weights_flat      = stiffness_weights.flatten()
-    mask_flat         = attention_mask.flatten()
-    patch_indices_flat = torch.arange(num_patches, device=device).repeat_interleave(max_k)
-
-    valid_weights       = weights_flat[mask_flat]
-    valid_patch_indices = patch_indices_flat[mask_flat]
-    num_valid           = len(valid_patch_indices)
-
-    if num_valid > 0:
-        patch_changes = torch.ones(num_valid, dtype=torch.bool, device=device)
-        if num_valid > 1:
-            patch_changes[1:] = valid_patch_indices[1:] != valid_patch_indices[:-1]
-        group_ids    = torch.cumsum(patch_changes.long(), dim=0) - 1
-        change_indices = torch.where(patch_changes)[0]
-        group_starts = change_indices[group_ids]
-        positions_in_patch = torch.arange(num_valid, device=device, dtype=torch.long) - group_starts
-    else:
-        positions_in_patch = torch.tensor([], device=device, dtype=torch.long)
-
-    batch_sizes   = batch_indices.bincount(minlength=num_patches)
-    cumsum_sizes  = torch.cumsum(batch_sizes, dim=0)
-    starts        = torch.cat([torch.tensor([0], device=device, dtype=torch.long),
-                               cumsum_sizes[:-1]])
-
-    valid_centers   = center_indices[valid_patch_indices]
-    valid_neighbors = vertex_indices[starts[valid_patch_indices] + positions_in_patch]
-
-    all_rows = torch.cat([valid_centers, valid_neighbors])
-    all_cols = torch.cat([valid_neighbors, valid_centers])
-    all_vals = torch.cat([-valid_weights, -valid_weights])
-
-    flat_indices = all_rows * num_vertices + all_cols
-    S_flat = torch.zeros(num_vertices * num_vertices, device=device,
-                         dtype=stiffness_weights.dtype)
-    S_flat = S_flat.scatter_add(0, flat_indices, all_vals)
-    S      = S_flat.view(num_vertices, num_vertices)
-    S      = 0.5 * (S + S.T)
-    S      = S - torch.diag(S.sum(dim=1))
-
-    M_diag  = torch.zeros(num_vertices, device=device, dtype=areas.dtype)
-    M_diag  = M_diag.scatter_add(0, center_indices, areas)
-    M_count = torch.zeros(num_vertices, device=device, dtype=areas.dtype)
-    M_count = M_count.scatter_add(0, center_indices, torch.ones_like(areas))
-    M_diag  = M_diag / M_count.clamp(min=1.0)
-    M_diag  = M_diag.clamp(min=1e-8)
-    return S, M_diag
-
-
-def assemble_anisotropic_laplacian(
-    grad_coeffs: torch.Tensor,
-    areas: torch.Tensor,
-    knn: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Differentiable L = G^T G from gradient coefficients.
-
-    Area is NOT included in L because the learned g_ij already carry the
-    integration measure (trained via MCV = (1/a_i) sum w_ij p_j matching
-    cotangent weights which have area baked in).
-    """
-    N, k, _ = grad_coeffs.shape
-    device   = grad_coeffs.device
-
-    center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)
-    ext_coeffs    = torch.cat([center_coeffs, grad_coeffs], dim=1)
-    gram          = torch.bmm(ext_coeffs, ext_coeffs.transpose(1, 2))
-
-    center_idx  = torch.arange(N, device=device).unsqueeze(1)
-    ext_indices = torch.cat([center_idx, knn], dim=1)
-    kp1         = k + 1
-    row_idx     = ext_indices[:, :, None].expand(-1, -1, kp1)
-    col_idx     = ext_indices[:, None, :].expand(-1, kp1, -1)
-    flat_idx    = (row_idx * N + col_idx).reshape(-1)
-
-    L_flat = torch.zeros(N * N, device=device, dtype=grad_coeffs.dtype)
-    L_flat = L_flat.scatter_add(0, flat_idx, gram.reshape(-1))
-    L      = L_flat.view(N, N)
-    L      = 0.5 * (L + L.T)
-    return L, areas.detach()
-
-
-def _sparsify_L_to_knn(L: torch.Tensor, knn_t: torch.Tensor) -> torch.Tensor:
-    """Zero out entries of L not in the 1-hop kNN graph, fix diagonal."""
-    N      = L.shape[0]
-    device = L.device
-    mask   = torch.zeros(N, N, dtype=torch.bool, device=device)
-    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn_t)
-    mask[row_idx, knn_t] = True
-    mask   = mask | mask.T
-    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    L_sp   = L * (mask | diag_mask).float()
-    off    = L_sp * (1.0 - diag_mask.float())
-    L_sp   = off - torch.diag(off.sum(dim=1))
-    return L_sp
-
-
-def assemble_isotropic_laplacian(
-    grad_coeffs: torch.Tensor,
-    areas: torch.Tensor,
-    knn: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Isotropic graph Laplacian from gradient coefficients.
-
-    Uses scalar edge weights w_ij = ||g_ij||^2 (no area scaling), producing
-    a standard graph Laplacian L = D - W with non-negative weights.
-    This is guaranteed PSD and sparse (kNN only, no 2-hop fill-in).
-
-    Area is NOT included in L because the learned g_ij already carry the
-    integration measure (trained via MCV matching cotangent weights).
-
-    Args:
-        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
-        areas: (N,) per-vertex areas (returned as mass, not used in L).
-        knn: (N, k) kNN indices.
-
-    Returns:
-        L: (N, N) isotropic Laplacian (PSD, sparse).
-        M_diag: (N,) mass diagonal (same as areas).
-    """
-    N, k, _ = grad_coeffs.shape
-    device  = grad_coeffs.device
-
-    # w_ij = ||g_ij||^2  — scalar weight per edge (i, j)
-    edge_weights = (grad_coeffs ** 2).sum(dim=2)  # (N, k)
-
-    # Build sparse graph Laplacian: L_ij = -w_ij, L_ii = sum_j w_ij
-    # Symmetrise: w_ij_sym = 0.5 * (w_ij + w_ji)
-    L = torch.zeros(N, N, device=device, dtype=grad_coeffs.dtype)
-    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn)
-    L[row_idx, knn] -= edge_weights
-    L[knn, row_idx] -= edge_weights
-    L = 0.5 * L  # average the two directions
-    # Fix diagonal: L_ii = -sum of off-diagonal in row i
-    L.fill_diagonal_(0.0)
-    L.diagonal().copy_(-L.sum(dim=1))
-
-    return L, areas.detach()
-
-
 def compute_laplacian_differentiable(
     model: LaplacianTransformerModule,
     vertices_np: np.ndarray,
@@ -296,28 +151,29 @@ def compute_laplacian_differentiable(
     device: torch.device,
     sparsify: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Full forward pass: vertices → dense differentiable (S, M)."""
+    """Full forward pass: vertices → dense differentiable (L, M_diag).
+
+    Args:
+        model: LaplacianTransformerModule in gradient mode.
+        vertices_np: (N, 3) vertex positions.
+        k: kNN neighborhood size.
+        device: torch device.
+        sparsify: If True, prune L to kNN sparsity pattern.
+
+    Returns:
+        L: (N, N) dense Laplacian.
+        M_diag: (N,) mass diagonal (areas).
+    """
     vertices_t = torch.from_numpy(vertices_np).float().to(device)
     knn        = compute_knn(vertices_np, k)
     knn_t      = torch.from_numpy(knn).long().to(device)
     batch_data = Batch.from_data_list([build_patch_data(vertices_t, knn, device)]).to(device)
     fwd        = model._forward_pass(batch_data)
 
-    if fwd.get('grad_coeffs') is not None:
-        L, M_diag = assemble_anisotropic_laplacian(fwd['grad_coeffs'], fwd['areas'], knn_t)
-        if sparsify:
-            L = _sparsify_L_to_knn(L, knn_t)
-        return L, M_diag
-    else:
-        batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
-        return assemble_dense_stiffness_and_mass(
-            stiffness_weights=fwd['stiffness_weights'],
-            areas=fwd['areas'],
-            attention_mask=fwd['attention_mask'],
-            vertex_indices=batch_data.vertex_indices,
-            center_indices=batch_data.center_indices,
-            batch_indices=batch_idx,
-        )
+    L = assemble_anisotropic_laplacian(fwd['grad_coeffs'], knn_t)
+    if sparsify:
+        L = prune_to_knn(L, knn_t)
+    return L, fwd['areas'].detach()
 
 
 # =============================================================================
@@ -1225,33 +1081,27 @@ def evaluate_pair(
     k: int,
     num_eigenvectors: int,
     device: torch.device,
-    k_sparsify: Optional[int] = None,
+    laplacian_configs: Optional[List[LaplacianConfig]] = None,
     evaluators: Optional[List] = None,
     geo_cache = None,
-    eval_variants: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """Evaluate correspondence quality using functional maps (non-differentiable).
 
     Args:
-        k_sparsify: kNN for sparsification mask. None = reuse k.
-        evaluators: List of ShapePairEvaluator instances. When provided,
-            runs each evaluator and prefixes metrics with evaluator.name.
-            When None, uses the legacy _correspondence_metrics path.
+        laplacian_configs: List of LaplacianConfig to evaluate. Each config
+            produces a separate eigenbasis and metric set prefixed by config.tag.
+            Defaults to [LaplacianConfig(assembly='isotropic')].
+        evaluators: List of ShapePairEvaluator instances.
         geo_cache: Precomputed GeodesicCache for mesh B.
-            If None and pair has faces_b, builds on the fly.
-        eval_variants: Which eigenbasis variants to evaluate.
-            Subset of ['dense', 'sp', 'iso']. None = all three.
     """
-    if eval_variants is None:
-        eval_variants = ['dense', 'sp', 'iso']
-    do_dense = 'dense' in eval_variants
-    do_sp    = 'sp' in eval_variants
-    do_iso   = 'iso' in eval_variants
-    n_a             = len(pair.verts_a)
-    is_gradient_mode = False
-    dense_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}   # (evecs, evals, mass)
-    sparse_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    iso_bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    if laplacian_configs is None:
+        laplacian_configs = [LaplacianConfig(assembly='isotropic')]
+
+    n_a = len(pair.verts_a)
+
+    # bases_by_config[config_tag][label] = (evecs, evals, M_np)
+    bases_by_config: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+    M_np_shared = None  # mass is the same for all configs (areas don't change)
 
     for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
         verts_t    = torch.from_numpy(verts).float().to(device)
@@ -1260,116 +1110,63 @@ def evaluate_pair(
             [build_patch_data(verts_t, knn_np, device)]).to(device)
         fwd        = model._forward_pass(batch_data)
 
-        if fwd.get('grad_coeffs') is not None:
-            is_gradient_mode = True
-            knn_t     = torch.from_numpy(knn_np).long().to(device)
-            L, M_diag = assemble_anisotropic_laplacian(fwd['grad_coeffs'],
-                                                       fwd['areas'], knn_t)
-            M_np = M_diag.cpu().numpy()
+        knn_t     = torch.from_numpy(knn_np).long().to(device)
+        M_diag    = fwd['areas'].detach()
+        M_np      = M_diag.cpu().numpy()
+        if M_np_shared is None:
+            M_np_shared = {}
+        M_np_shared[label] = M_np
 
-            if do_dense:
-                evals_d, evecs_d = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
-                dense_bases[label] = (evecs_d, evals_d, M_np)
+        grad_coeffs = fwd['grad_coeffs']
 
-            if do_sp:
-                if k_sparsify is not None and k_sparsify != k:
-                    knn_sp_np = compute_knn(verts, k_sparsify)
-                    knn_sp_t = torch.from_numpy(knn_sp_np).long().to(device)
-                    L_sp = _sparsify_L_to_knn(L, knn_sp_t)
-                else:
-                    L_sp = _sparsify_L_to_knn(L, knn_t)
-                evals_sp, evecs_sp = _eigh_from_sparse_L(L_sp, M_diag, num_eigenvectors)
-                sparse_bases[label] = (evecs_sp, evals_sp, M_np)
+        for cfg in laplacian_configs:
+            tag = cfg.tag
 
-            if do_iso:
-                L_iso, M_iso = assemble_isotropic_laplacian(
-                    fwd['grad_coeffs'], fwd['areas'], knn_t)
-                evals_iso, evecs_iso = _eigh_from_sparse_L(L_iso, M_iso, num_eigenvectors)
-                iso_bases[label] = (evecs_iso, evals_iso, M_np)
-        else:
-            batch_idx = getattr(batch_data, 'patch_idx', batch_data.batch)
-            S, M = assemble_stiffness_and_mass_matrices(
-                stiffness_weights=fwd['stiffness_weights'],
-                areas=fwd['areas'],
-                attention_mask=fwd['attention_mask'],
-                vertex_indices=batch_data.vertex_indices,
-                center_indices=batch_data.center_indices,
-                batch_indices=batch_idx,
-            )
-            evals, evecs = compute_laplacian_eigendecomposition(
-                S, num_eigenvectors, mass_matrix=M)
-            M_np = np.array(M.diagonal()).flatten()
-            dense_bases[label] = (evecs, evals, M_np)
+            # Compute knn_prune if needed
+            knn_prune = None
+            if cfg.pruning == 'knn' and cfg.k_prune is not None and cfg.k_prune != k:
+                knn_prune_np = compute_knn(verts, cfg.k_prune)
+                knn_prune = torch.from_numpy(knn_prune_np).long().to(device)
+
+            L = assemble_laplacian(grad_coeffs, knn_t, cfg, knn_prune=knn_prune)
+            evals, evecs = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
+
+            if tag not in bases_by_config:
+                bases_by_config[tag] = {}
+            bases_by_config[tag][label] = (evecs, evals, M_np)
 
     gt_corr = _build_gt_corr_from_pair(pair)
     if geo_cache is None:
         geo_cache = _build_geo_cache(pair)
 
-    # Get mass from whichever variant is available
-    first_bases = dense_bases or sparse_bases or iso_bases
-    mA = first_bases['A'][2]
-    mB = first_bases['B'][2]
+    mA = M_np_shared['A']
+    mB = M_np_shared['B']
 
     # --- Use evaluators if provided ---
     if evaluators is not None:
         metrics = {}
-
-        # Dense variant
-        if dense_bases:
-            evA_d, evalsA_d, _ = dense_bases['A']
-            evB_d, evalsB_d, _ = dense_bases['B']
+        for tag, bases in bases_by_config.items():
+            evA, evalsA, _ = bases['A']
+            evB, evalsB, _ = bases['B']
+            # First config gets unprefixed metrics, rest get tag prefix
+            prefix = f"{tag}_" if len(bases_by_config) > 1 else ""
             for evaluator in evaluators:
                 ev_metrics = evaluator.evaluate(
-                    evA_d, evB_d, evalsA_d, evalsB_d,
+                    evA, evB, evalsA, evalsB,
                     mA, mB, pair.verts_b, gt_corr=gt_corr,
                     geo_cache=geo_cache,
                 )
                 for mk, mv in ev_metrics.items():
-                    metrics[f"{evaluator.name}/{mk}"] = mv
-
-        # Sparse variant
-        if is_gradient_mode and sparse_bases:
-            evA_sp, evalsA_sp, _ = sparse_bases['A']
-            evB_sp, evalsB_sp, _ = sparse_bases['B']
-            for evaluator in evaluators:
-                sp_metrics = evaluator.evaluate(
-                    evA_sp, evB_sp, evalsA_sp, evalsB_sp,
-                    mA, mB, pair.verts_b, gt_corr=gt_corr,
-                    geo_cache=geo_cache,
-                )
-                for mk, mv in sp_metrics.items():
-                    metrics[f"sp_{evaluator.name}/{mk}"] = mv
-
-        # Isotropic variant
-        if is_gradient_mode and iso_bases:
-            evA_iso, evalsA_iso, _ = iso_bases['A']
-            evB_iso, evalsB_iso, _ = iso_bases['B']
-            for evaluator in evaluators:
-                iso_metrics = evaluator.evaluate(
-                    evA_iso, evB_iso, evalsA_iso, evalsB_iso,
-                    mA, mB, pair.verts_b, gt_corr=gt_corr,
-                    geo_cache=geo_cache,
-                )
-                for mk, mv in iso_metrics.items():
-                    metrics[f"iso_{evaluator.name}/{mk}"] = mv
-
+                    metrics[f"{prefix}{evaluator.name}/{mk}"] = mv
         return metrics
 
     # --- Legacy path (backward compatible) ---
-    if dense_bases:
-        evA_d, evalsA_d, _ = dense_bases['A']
-        evB_d, evalsB_d, _ = dense_bases['B']
-        metrics = _correspondence_metrics(evA_d, evB_d, mA, mB,
-                                          pair.verts_b, n_a, gt_corr=gt_corr)
-    else:
-        metrics = {}
-    if is_gradient_mode and sparse_bases:
-        evA_sp, _, _ = sparse_bases['A']
-        evB_sp, _, _ = sparse_bases['B']
-        sp = _correspondence_metrics(evA_sp, evB_sp, mA, mB,
-                                     pair.verts_b, n_a, gt_corr=gt_corr)
-        for key, val in sp.items():
-            metrics[f'sp_{key}'] = val
+    first_tag = list(bases_by_config.keys())[0]
+    bases = bases_by_config[first_tag]
+    evA, evalsA, _ = bases['A']
+    evB, evalsB, _ = bases['B']
+    metrics = _correspondence_metrics(evA, evB, mA, mB,
+                                      pair.verts_b, n_a, gt_corr=gt_corr)
     return metrics
 
 
@@ -1530,9 +1327,9 @@ class FunctionalMapModule(LaplacianModuleBase):
         freeze_input_projection: bool = False,
         freeze_areas_head: bool = False,
         k: int = 15,
-        k_sparsify: Optional[int] = None,
         num_eigenvectors: int = 100,
-        sparsify_laplacian: bool = False,
+        train_laplacian: Optional[Dict] = None,
+        eval_laplacians: Optional[List[Dict]] = None,
         max_vertices: int = 0,
         max_vertices_val: int = 0,
         vertex_noise: float = 0.05,
@@ -1549,7 +1346,6 @@ class FunctionalMapModule(LaplacianModuleBase):
         # Evaluation control
         eval_only: bool = False,       # run baselines only, then stop (no training)
         skip_baselines: bool = False,  # skip baseline computation in on_fit_start
-        eval_variants: Optional[List[str]] = None,  # ['dense', 'sp', 'iso'] or subset
         # GeomFuM evaluation (optional)
         use_geomfum_eval: bool = False,
         geomfum_descriptors: Optional[List[str]] = None,
@@ -1581,10 +1377,12 @@ class FunctionalMapModule(LaplacianModuleBase):
         self._train_rng: Optional[np.random.RandomState] = None
         self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
 
-        # Validate k_sparsify
-        if k_sparsify is not None:
-            assert k_sparsify <= k, (
-                f"k_sparsify ({k_sparsify}) must be <= k ({k})")
+        # Build LaplacianConfig objects from dict parameters
+        _train_lap = train_laplacian or {'assembly': 'anisotropic', 'pruning': 'none'}
+        self._train_lap_config = LaplacianConfig(**_train_lap)
+
+        _eval_laps = eval_laplacians or [{'assembly': 'isotropic', 'pruning': 'none'}]
+        self._eval_lap_configs = [LaplacianConfig(**d) for d in _eval_laps]
 
         # Build evaluators
         self._evaluators = [SpectralNNEvaluator()]
@@ -1837,8 +1635,8 @@ class FunctionalMapModule(LaplacianModuleBase):
         except ImportError:
             run_name = "local"
         run_tag = f"{run_name}_k{hp.k}"
-        if hp.k_sparsify is not None:
-            run_tag += f"_ksp{hp.k_sparsify}"
+        if self._train_lap_config.pruning != 'none':
+            run_tag += f"_{self._train_lap_config.tag}"
 
         out_dir = Path(self.trainer.default_root_dir) / "eval_results" / run_tag
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1850,10 +1648,10 @@ class FunctionalMapModule(LaplacianModuleBase):
             import yaml
             config_dict = {
                 "k": hp.k,
-                "k_sparsify": hp.k_sparsify,
+                "train_laplacian": hp.train_laplacian,
+                "eval_laplacians": hp.eval_laplacians,
                 "num_eigenvectors": hp.num_eigenvectors,
                 "checkpoint_path": hp.checkpoint_path,
-                "eval_variants": hp.eval_variants,
                 "max_vertices": hp.max_vertices,
                 "max_vertices_val": hp.max_vertices_val,
                 "run_name": run_name,
@@ -2145,10 +1943,9 @@ class FunctionalMapModule(LaplacianModuleBase):
                         t0_ = time.perf_counter()
                         m = evaluate_pair(self.model, sub_p,
                                           hp.k, hp.num_eigenvectors, device,
-                                          k_sparsify=hp.k_sparsify,
+                                          laplacian_configs=self._eval_lap_configs,
                                           evaluators=self._evaluators,
-                                          geo_cache=self._geo_cache.get(p.name),
-                                          eval_variants=hp.eval_variants)
+                                          geo_cache=self._geo_cache.get(p.name))
                         dt_ = time.perf_counter() - t0_
                         ep0_metrics.append(m)
                         print(f" {dt_:.1f}s", flush=True)
@@ -2218,29 +2015,17 @@ class FunctionalMapModule(LaplacianModuleBase):
                 fwd_b = self.model._forward_pass(bd_b)
 
             with prof.phase("laplacian assembly"):
-                S_A, M_A = (assemble_anisotropic_laplacian(fwd_a['grad_coeffs'], fwd_a['areas'], knn_a_t)
-                            if fwd_a.get('grad_coeffs') is not None
-                            else assemble_dense_stiffness_and_mass(
-                                fwd_a['stiffness_weights'], fwd_a['areas'],
-                                fwd_a['attention_mask'], bd_a.vertex_indices,
-                                bd_a.center_indices, getattr(bd_a, 'patch_idx', bd_a.batch)))
-                S_B, M_B = (assemble_anisotropic_laplacian(fwd_b['grad_coeffs'], fwd_b['areas'], knn_b_t)
-                            if fwd_b.get('grad_coeffs') is not None
-                            else assemble_dense_stiffness_and_mass(
-                                fwd_b['stiffness_weights'], fwd_b['areas'],
-                                fwd_b['attention_mask'], bd_b.vertex_indices,
-                                bd_b.center_indices, getattr(bd_b, 'patch_idx', bd_b.batch)))
-                if hp.sparsify_laplacian:
-                    if hp.k_sparsify is not None and hp.k_sparsify != hp.k:
-                        knn_sp_a = compute_knn(pair.verts_a, hp.k_sparsify)
-                        knn_sp_b = compute_knn(pair.verts_b, hp.k_sparsify)
-                        knn_sp_a_t = torch.from_numpy(knn_sp_a).long().to(device)
-                        knn_sp_b_t = torch.from_numpy(knn_sp_b).long().to(device)
-                        S_A = _sparsify_L_to_knn(S_A, knn_sp_a_t)
-                        S_B = _sparsify_L_to_knn(S_B, knn_sp_b_t)
-                    else:
-                        S_A = _sparsify_L_to_knn(S_A, knn_a_t)
-                        S_B = _sparsify_L_to_knn(S_B, knn_b_t)
+                lap_cfg = self._train_lap_config
+                knn_sp_a_t, knn_sp_b_t = None, None
+                if lap_cfg.pruning == 'knn' and lap_cfg.k_prune is not None and lap_cfg.k_prune != hp.k:
+                    knn_sp_a = compute_knn(pair.verts_a, lap_cfg.k_prune)
+                    knn_sp_b = compute_knn(pair.verts_b, lap_cfg.k_prune)
+                    knn_sp_a_t = torch.from_numpy(knn_sp_a).long().to(device)
+                    knn_sp_b_t = torch.from_numpy(knn_sp_b).long().to(device)
+                S_A = assemble_laplacian(fwd_a['grad_coeffs'], knn_a_t, lap_cfg, knn_prune=knn_sp_a_t)
+                M_A = fwd_a['areas']
+                S_B = assemble_laplacian(fwd_b['grad_coeffs'], knn_b_t, lap_cfg, knn_prune=knn_sp_b_t)
+                M_B = fwd_b['areas']
 
             with prof.phase("losses"):
                 pair_loss = torch.tensor(0.0, device=device)
@@ -2319,10 +2104,9 @@ class FunctionalMapModule(LaplacianModuleBase):
         self._val_outputs[dataloader_idx].append(evaluate_pair(
             self.model, pair, self.hparams.k,
             self.hparams.num_eigenvectors, self.device,
-            k_sparsify=self.hparams.k_sparsify,
+            laplacian_configs=self._eval_lap_configs,
             evaluators=self._evaluators,
             geo_cache=self._geo_cache.get(pair.name),
-            eval_variants=self.hparams.eval_variants,
         ))
 
     def on_validation_epoch_end(self) -> None:
