@@ -255,18 +255,29 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     # ==================================================================
     print(f"{tag}Loading {n_total} meshes...")
     mesh_data_list: List[Optional[Dict[str, Any]]] = []
+    t_load_start = time.time()
+    t_dataset_total = 0.0
+    t_geodata_total = 0.0
     for local_idx, global_idx in enumerate(my_indices):
         try:
+            t0 = time.time()
             batch_data = dataset[global_idx]
+            t_dataset = time.time() - t0
+            t_dataset_total += t_dataset
+
             data = batch_data[0] if isinstance(batch_data, list) else batch_data
             mesh_file_path = data.mesh_file_path
             if isinstance(mesh_file_path, list):
                 mesh_file_path = mesh_file_path[0]
             mesh_name = Path(mesh_file_path).name
-            vertices, faces, _ = load_mesh(mesh_file_path)
+
+            # Reuse vertices/faces from dataset (avoids double load_mesh call)
+            vertices = data.raw_vertices.numpy() if hasattr(data.raw_vertices, 'numpy') else np.array(data.raw_vertices)
+            faces = data.raw_faces.numpy() if hasattr(data.raw_faces, 'numpy') else np.array(data.raw_faces)
             N = len(vertices)
 
             # Pull precomputed source indices and exact geodesics from dataset
+            t0 = time.time()
             source_indices = None
             exact_geodesics = None
             geo_data = getattr(data, 'geodesic_data', None)
@@ -276,6 +287,18 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     source_indices = src.tolist() if hasattr(src, 'tolist') else list(src)
                 if geo_data.get('has_geodesic_data'):
                     exact_geodesics = geo_data.get('exact_geodesics')
+            t_geodata = time.time() - t0
+            t_geodata_total += t_geodata
+
+            # Print timing every 50 meshes or on the first one
+            if local_idx == 0 or (local_idx + 1) % 50 == 0:
+                elapsed = time.time() - t_load_start
+                print(f"{tag}  [{local_idx+1}/{n_total}] {mesh_name:<20s} "
+                      f"N={N:>6d}  dataset={t_dataset:.3f}s  "
+                      f"geodata={t_geodata:.3f}s  "
+                      f"[cumul: dataset={t_dataset_total:.1f}s  "
+                      f"geodata={t_geodata_total:.1f}s  "
+                      f"wall={elapsed:.1f}s]", flush=True)
 
             if source_indices is None:
                 print(f"{tag}  Warning: no precomputed source indices for {mesh_name}, skipping")
@@ -299,6 +322,11 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
 
         metrics_list.append({})
         mesh_cache.append({})
+
+    t_load_elapsed = time.time() - t_load_start
+    print(f"{tag}Loading done: {t_load_elapsed:.1f}s total  "
+          f"(dataset={t_dataset_total:.1f}s  geodata={t_geodata_total:.1f}s)",
+          flush=True)
 
     # ==================================================================
     # PASS 1: PRED assembly (GPU, back-to-back, hottest possible)
