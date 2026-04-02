@@ -1918,24 +1918,17 @@ class FunctionalMapModule(LaplacianModuleBase):
                 import matplotlib.pyplot as plt
 
                 # Select key metrics for the chart
+                # Select key metrics for the chart — auto-discover from summaries
                 chart_metrics = []
-                for candidate in [
-                    "spectral_nn/accuracy",
-                    "sp_spectral_nn/accuracy",
-                    "iso_spectral_nn/accuracy",
-                    "spectral_nn/geo_at_01pct",
-                    "spectral_nn/geo_at_05pct",
-                    "sp_spectral_nn/geo_at_05pct",
-                    "iso_spectral_nn/geo_at_05pct",
-                    "spectral_nn/geo_at_10pct",
-                    "spectral_nn/geo_at_25pct",
-                    "spectral_nn/geomfum_accuracy",
-                    "sp_spectral_nn/geomfum_accuracy",
-                    "iso_spectral_nn/geomfum_accuracy",
-                ]:
-                    # Include if at least one method has it
-                    if any(candidate in s for _, (_, s) in methods.items()):
-                        chart_metrics.append(candidate)
+                all_summary_keys = set()
+                for _, (_, s) in methods.items():
+                    all_summary_keys.update(s.keys())
+                # Include accuracy and geodesic threshold metrics
+                for key in sorted(all_summary_keys):
+                    if any(pat in key for pat in (
+                        '/accuracy', '/geo_at_', '/geomfum_accuracy',
+                    )):
+                        chart_metrics.append(key)
 
                 if chart_metrics and methods:
                     method_names = list(methods.keys())
@@ -2387,10 +2380,20 @@ class FunctionalMapModule(LaplacianModuleBase):
                 if sp_key in summary:
                     self.log("val/sp_top1", summary[sp_key],
                              prog_bar=True, sync_dist=True, add_dataloader_idx=False)
-                # Primary for checkpointing: iso @5% geodesic > sp top1 > dense top1
-                primary_acc = summary.get(
-                    iso_geo5_key,
-                    summary.get(sp_key, summary.get(acc_key, 0.0)))
+                # Primary for checkpointing: prefer fmap evaluator geo@5%,
+                # fall back to spectral_nn geo@5%, then sp top1, then dense top1
+                primary_acc = None
+                # Try fmap evaluators (iso variant) first
+                for ev in self._evaluators:
+                    if ev.name.startswith("fmap_"):
+                        fmap_geo5_key = f"iso_{ev.name}/geo_at_05pct"
+                        if fmap_geo5_key in summary:
+                            primary_acc = summary[fmap_geo5_key]
+                            break
+                if primary_acc is None:
+                    primary_acc = summary.get(
+                        iso_geo5_key,
+                        summary.get(sp_key, summary.get(acc_key, 0.0)))
 
         if primary_acc is not None:
             self.log("val/best_acc", primary_acc,
