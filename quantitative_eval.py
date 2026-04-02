@@ -389,6 +389,13 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                     ) * 1000
 
                 del verts_tensor, patch_data
+
+                # Progress print
+                if i == 0 or (i + 1) % 50 == 0 or i < 3:
+                    print(f"{tag}  Pass1 [{i+1}/{n_total}] {md['mesh_name']:<16s} N={md['N']:>6d}  "
+                          f"knn={t_pred.knn*1000:.0f}ms  fwd={t_pred.forward*1000:.0f}ms  "
+                          f"asm={t_pred.assembly*1000:.0f}ms  grad={t_pred.grad_op*1000:.0f}ms  "
+                          f"total={t_pred.lm_total*1000:.0f}ms", flush=True)
             except Exception as e:
                 print(f"{tag}  PRED assembly failed for {md['mesh_name']}: {e}")
         gc.enable()
