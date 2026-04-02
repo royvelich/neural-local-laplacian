@@ -202,7 +202,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     # ---- Laplacian config ----
     # Accepts: +laplacian.assembly=isotropic +laplacian.pruning=none
     lap_dict = OmegaConf.to_container(cfg.laplacian) if hasattr(cfg, 'laplacian') else {}
-    pred_lap_config = LaplacianConfig(**lap_dict) if lap_dict else LaplacianConfig(assembly='isotropic')
+    # Always use sparse assembly for eval (fast COO path, no N×N dense allocation)
+    lap_dict.pop('sparse', None)  # remove if user passed it via CLI
+    pred_lap_config = LaplacianConfig(sparse=True, **lap_dict) if lap_dict else LaplacianConfig(assembly='isotropic', sparse=True)
 
     # Build top-k configs for the sweep
     top_k_configs = [
