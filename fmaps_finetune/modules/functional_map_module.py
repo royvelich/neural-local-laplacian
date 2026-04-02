@@ -611,17 +611,38 @@ class GeodesicDiffusionLoss(nn.Module):
         num_landmarks: int = 128,
         alphas: Tuple[float, ...] = (0.1, 1.0, 10.0),
         num_sample_vertices: int = 512,
+        landmark_ratio: Optional[float] = None,
         landmark_seed: int = 0,
         normalize: bool = True,
         weight: float = 1.0,
     ):
+        """
+        Args:
+            num_landmarks: Fixed number of landmarks (ignored if landmark_ratio is set).
+            num_sample_vertices: Fixed number of sample vertices (ignored if landmark_ratio is set).
+            landmark_ratio: If set (0 < ratio < 1), use ONLY bijective correspondences
+                and split them into landmarks (ratio) and samples (1-ratio) with no
+                overlap. E.g. 0.2 = 20% landmarks, 80% samples.
+                When None, uses num_landmarks/num_sample_vertices with fallback.
+            alphas: Diffusion time scales.
+            landmark_seed: Seed for deterministic landmark selection.
+            normalize: L2-normalize diffusion profiles before comparing.
+            weight: Loss weight.
+        """
         super().__init__()
         self.num_landmarks       = num_landmarks
         self.alphas              = alphas
         self.num_sample_vertices = num_sample_vertices
+        self.landmark_ratio      = landmark_ratio
         self.landmark_seed       = landmark_seed
         self.normalize           = normalize
         self.weight              = weight
+        self._pool_log_count     = 0
+        self._pool_log_max       = 10
+
+        if landmark_ratio is not None:
+            assert 0.0 < landmark_ratio < 1.0, \
+                f"landmark_ratio must be in (0, 1), got {landmark_ratio}"
 
     def forward(
         self,
@@ -637,21 +658,56 @@ class GeodesicDiffusionLoss(nn.Module):
 
         if corr_a is None or corr_b is None:
             assert N_A == N_B
-            pool = np.arange(N_A); ca = pool; cb = pool
+            bijective_pool = np.arange(N_A)
+            ca = bijective_pool; cb = bijective_pool
         else:
-            pool = _compute_bijective_refs(corr_a, corr_b)
-            if len(pool) < self.num_landmarks + self.num_sample_vertices:
-                pool = np.arange(len(corr_a))
+            bijective_pool = _compute_bijective_refs(corr_a, corr_b)
             ca, cb = corr_a, corr_b
 
-        # Pick fixed landmarks (same seed every step for stability)
-        lm_rng = np.random.RandomState(self.landmark_seed)
-        L = min(self.num_landmarks, len(pool))
-        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
+        bijective_n = len(bijective_pool)
 
-        # Pick random sample vertices for evaluation
-        V = min(self.num_sample_vertices, len(pool))
-        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+        if self.landmark_ratio is not None:
+            # Ratio mode: split bijective pool into disjoint landmarks + samples
+            lm_rng = np.random.RandomState(self.landmark_seed)
+            shuffled = bijective_pool[lm_rng.permutation(bijective_n)]
+            L = max(1, int(bijective_n * self.landmark_ratio))
+            lm_refs = shuffled[:L]
+            sample_refs = shuffled[L:]
+            V = len(sample_refs)
+
+            if self._pool_log_count < self._pool_log_max:
+                self._pool_log_count += 1
+                print(f"[GeodesicDiffusionLoss] pair {self._pool_log_count}: "
+                      f"bijective={bijective_n}, ratio={self.landmark_ratio}, "
+                      f"L={L}, V={V} (disjoint)",
+                      flush=True)
+                if self._pool_log_count == self._pool_log_max:
+                    print(f"[GeodesicDiffusionLoss] (silencing after {self._pool_log_max} pairs)",
+                          flush=True)
+        else:
+            # Fixed-count mode: fallback to all corr if bijective pool too small
+            if bijective_n < self.num_landmarks + self.num_sample_vertices:
+                pool = np.arange(len(corr_a)) if corr_a is not None else bijective_pool
+            else:
+                pool = bijective_pool
+
+            lm_rng = np.random.RandomState(self.landmark_seed)
+            L = min(self.num_landmarks, len(pool))
+            lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
+            V = min(self.num_sample_vertices, len(pool))
+            sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+
+            if self._pool_log_count < self._pool_log_max:
+                self._pool_log_count += 1
+                used_bij = len(pool) == bijective_n
+                print(f"[GeodesicDiffusionLoss] pair {self._pool_log_count}: "
+                      f"pool={len(pool)} ({'bijective' if used_bij else f'all corr, bij={bijective_n}'}), "
+                      f"L={L}/{self.num_landmarks}, "
+                      f"V={V}/{self.num_sample_vertices}",
+                      flush=True)
+                if self._pool_log_count == self._pool_log_max:
+                    print(f"[GeodesicDiffusionLoss] (silencing after {self._pool_log_max} pairs)",
+                          flush=True)
 
         # Build indicator matrices for landmarks
         E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)

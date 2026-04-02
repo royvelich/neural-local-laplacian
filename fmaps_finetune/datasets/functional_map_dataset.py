@@ -1128,22 +1128,30 @@ def pair_collate_fn(batch: List[PairSample]) -> List[PairSample]:
 
 
 class ShapePairDataset(Dataset):
-    """Training dataset — generates PairSamples on-the-fly."""
+    """Training dataset — generates PairSamples on-the-fly.
+
+    Args:
+        pair_generator: PairGenerator that samples training pairs.
+        num_samples: Number of pairs per epoch.
+        seed: RNG seed for reproducibility. For multi-GPU (DDP),
+            pass a different seed per rank (e.g. seed + global_rank).
+    """
 
     def __init__(
         self,
         pair_generator: PairGenerator,
         num_samples: int,
+        seed: int = 42,
     ):
         self.pair_generator = pair_generator
         self.num_samples    = num_samples
+        self._rng = np.random.RandomState(seed)
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> PairSample:
-        rng = np.random.RandomState()   # fresh OS-entropy seed — no epoch tracking needed
-        return self.pair_generator.sample_train_pair(rng)
+        return self.pair_generator.sample_train_pair(self._rng)
 
 
 class ValPairDataset(Dataset):

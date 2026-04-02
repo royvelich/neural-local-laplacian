@@ -13,6 +13,7 @@ module:
         pairs:
         - '2:'
       num_samples: 20
+      seed: ${globals.training_seed}
     batch_size: 2
     num_workers: 0
     shuffle: true
