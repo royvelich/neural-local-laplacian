@@ -264,7 +264,8 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
     t_geodata_total = 0.0
 
     # Get file paths directly from dataset — no need to call dataset[idx]
-    all_mesh_paths = dataset.mesh_file_paths
+    # Sort by filename for deterministic ordering across runs
+    all_mesh_paths = sorted(dataset.mesh_file_paths, key=lambda p: p.name)
     num_geo_sources = getattr(dataset, '_num_geodesic_sources', 15)
     geo_source_method = getattr(dataset, '_geodesic_source_method', 'farthest_point_sampling')
 
