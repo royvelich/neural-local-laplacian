@@ -205,8 +205,18 @@ def assemble_isotropic_laplacian(
 
 
 # =============================================================================
-# Sparse assembly (for eval — returns scipy.sparse.csr_matrix)
+# Sparse assembly (for eval — builds torch.sparse on GPU, converts to scipy)
 # =============================================================================
+
+def _torch_sparse_to_scipy(L_sparse: torch.Tensor, N: int) -> scipy.sparse.csr_matrix:
+    """Convert a coalesced torch sparse COO tensor to scipy CSR."""
+    L_sparse = L_sparse.coalesce()
+    indices = L_sparse.indices().cpu().numpy()
+    values = L_sparse.values().cpu().to(torch.float64).numpy()
+    return scipy.sparse.coo_matrix(
+        (values, (indices[0], indices[1])), shape=(N, N)
+    ).tocsr()
+
 
 def _assemble_isotropic_sparse(
     grad_coeffs: torch.Tensor,
@@ -214,8 +224,8 @@ def _assemble_isotropic_sparse(
 ) -> scipy.sparse.csr_matrix:
     """Assemble sparse isotropic graph Laplacian from gradient coefficients.
 
-    Same math as assemble_isotropic_laplacian but builds COO triplets
-    directly — never allocates an N×N matrix. O(N*k) memory.
+    Same math as assemble_isotropic_laplacian but builds sparse COO
+    on GPU — never allocates an N×N matrix. O(N*k) memory.
 
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
@@ -225,29 +235,31 @@ def _assemble_isotropic_sparse(
         L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
     """
     N, k, _ = grad_coeffs.shape
+    device = grad_coeffs.device
 
-    # w_ij = ||g_ij||^2, move to CPU numpy
+    # w_ij = ||g_ij||^2
     edge_weights = (grad_coeffs ** 2).sum(dim=2)  # (N, k)
-    w_np = edge_weights.detach().cpu().to(torch.float64).numpy()  # (N, k)
-    knn_np = knn.detach().cpu().numpy()  # (N, k)
 
-    # Build COO triplets for off-diagonal: both (i→j) and (j→i)
-    row_idx = np.repeat(np.arange(N), k)  # (N*k,)
-    col_idx = knn_np.ravel()               # (N*k,)
-    vals = -w_np.ravel()                   # (N*k,) negative off-diagonal
+    # Build COO indices on GPU: both (i→j) and (j→i)
+    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn).reshape(-1)
+    col_idx = knn.reshape(-1)
+    vals = -edge_weights.reshape(-1)
 
     # Stack both directions, average
-    all_rows = np.concatenate([row_idx, col_idx])
-    all_cols = np.concatenate([col_idx, row_idx])
-    all_vals = np.concatenate([vals, vals]) * 0.5
+    all_rows = torch.cat([row_idx, col_idx])
+    all_cols = torch.cat([col_idx, row_idx])
+    all_vals = torch.cat([vals, vals]) * 0.5
 
-    # Build sparse off-diagonal
-    L_coo = scipy.sparse.coo_matrix((all_vals, (all_rows, all_cols)), shape=(N, N))
-    L_csr = L_coo.tocsr()
-    L_csr.sum_duplicates()
+    # Build torch sparse, coalesce (sums duplicates)
+    indices = torch.stack([all_rows, all_cols])  # (2, 2*N*k)
+    L_sparse = torch.sparse_coo_tensor(indices, all_vals, size=(N, N)).coalesce()
 
-    # Symmetrize (handles asymmetric kNN)
-    L_csr = 0.5 * (L_csr + L_csr.T)
+    # Symmetrize: 0.5 * (L + L^T)
+    L_sparse = (L_sparse + L_sparse.t()).coalesce()
+    L_sparse._values().mul_(0.5)
+
+    # Convert to scipy for diagonal fix
+    L_csr = _torch_sparse_to_scipy(L_sparse, N)
 
     # Fix diagonal: L_ii = -sum of off-diagonal in row i
     L_csr.setdiag(0.0)
@@ -264,8 +276,8 @@ def _assemble_anisotropic_sparse(
 ) -> scipy.sparse.csr_matrix:
     """Assemble sparse anisotropic Laplacian L = G^T G.
 
-    Same math as assemble_anisotropic_laplacian but builds COO triplets
-    from local Gram matrices — never allocates an N×N matrix.
+    Same math as assemble_anisotropic_laplacian but builds sparse COO
+    on GPU from local Gram matrices — never allocates an N×N matrix.
 
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
@@ -281,32 +293,29 @@ def _assemble_anisotropic_sparse(
     center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)  # (N, 1, 3)
     ext_coeffs = torch.cat([center_coeffs, grad_coeffs], dim=1)  # (N, k+1, 3)
 
-    # Local Gram matrices
+    # Local Gram matrices on GPU
     gram = torch.bmm(ext_coeffs, ext_coeffs.transpose(1, 2))  # (N, k+1, k+1)
 
     # Global indices: [i, knn[i,0], ..., knn[i,k-1]]
     center_idx = torch.arange(N, device=device).unsqueeze(1)  # (N, 1)
     ext_indices = torch.cat([center_idx, knn], dim=1)  # (N, k+1)
 
-    # Build COO triplets from all local Gram entries
+    # Build COO from all local Gram entries on GPU
     kp1 = k + 1
-    row_idx = ext_indices[:, :, None].expand(-1, -1, kp1)  # (N, k+1, k+1)
-    col_idx = ext_indices[:, None, :].expand(-1, kp1, -1)  # (N, k+1, k+1)
+    row_idx = ext_indices[:, :, None].expand(-1, -1, kp1).reshape(-1)
+    col_idx = ext_indices[:, None, :].expand(-1, kp1, -1).reshape(-1)
+    vals = gram.reshape(-1)
 
-    # Move to CPU numpy
-    all_rows = row_idx.reshape(-1).cpu().numpy()
-    all_cols = col_idx.reshape(-1).cpu().numpy()
-    all_vals = gram.detach().cpu().reshape(-1).to(torch.float64).numpy()
+    # Build torch sparse, coalesce (sums duplicates from overlapping patches)
+    indices = torch.stack([row_idx, col_idx])  # (2, N*(k+1)^2)
+    L_sparse = torch.sparse_coo_tensor(indices, vals, size=(N, N)).coalesce()
 
-    # Build sparse matrix, sum duplicates
-    L_coo = scipy.sparse.coo_matrix((all_vals, (all_rows, all_cols)), shape=(N, N))
-    L_csr = L_coo.tocsr()
-    L_csr.sum_duplicates()
+    # Symmetrize: 0.5 * (L + L^T)
+    L_sparse = (L_sparse + L_sparse.t()).coalesce()
+    L_sparse._values().mul_(0.5)
 
-    # Symmetrize
-    L_csr = 0.5 * (L_csr + L_csr.T)
-
-    return L_csr
+    # Convert to scipy
+    return _torch_sparse_to_scipy(L_sparse, N)
 
 
 # =============================================================================
