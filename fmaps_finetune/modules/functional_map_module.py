@@ -1984,42 +1984,32 @@ class FunctionalMapModule(LaplacianModuleBase):
                 n_total = len(val_pairs)
                 ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
 
-                # ── Robust Laplacian baseline (rank 0, ThreadPoolExecutor) ──
+                # ── Robust Laplacian baseline (rank 0, sequential) ─────────
                 if is_rank0:
                     try:
                         import robust_laplacian  # noqa: F401
                         print(f"\n  Computing robust Laplacian baseline{ds_label} "
                               f"({n_total} pairs)...", flush=True)
                         t0_rb = time.perf_counter()
+                        cw = len(str(n_total))
 
-                        from concurrent.futures import ThreadPoolExecutor, as_completed
-                        rb_n_workers = min(max(1, _n_cpus // max(world_size, 1)), 8)
-
-                        def _eval_robust(p):
-                            return evaluate_pair_robust(
+                        robust_metrics = []
+                        for i, p in enumerate(val_pairs):
+                            m = evaluate_pair_robust(
                                 _subsample(p), hp.num_eigenvectors,
                                 evaluators=self._evaluators,
                                 geo_cache=self._geo_cache.get(p.name))
-
-                        cw = len(str(n_total))
-                        robust_metrics = [None] * n_total
-                        with ThreadPoolExecutor(max_workers=rb_n_workers) as executor:
-                            futures = {executor.submit(_eval_robust, p): i
-                                       for i, p in enumerate(val_pairs)}
-                            done_count = 0
-                            for future in as_completed(futures):
-                                idx = futures[future]
-                                robust_metrics[idx] = future.result()
-                                done_count += 1
-                                dt = time.perf_counter() - t0_rb
-                                eta = (dt / done_count) * (n_total - done_count)
-                                print(f"    [robust {done_count:>{cw}}/{n_total}] "
-                                      f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
-                                      flush=True)
+                            robust_metrics.append(m)
+                            done = i + 1
+                            dt = time.perf_counter() - t0_rb
+                            eta = (dt / done) * (n_total - done)
+                            print(f"    [robust {done:>{cw}}/{n_total}] "
+                                  f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                  flush=True)
 
                         dt_rb = time.perf_counter() - t0_rb
-                        print(f"    Done: {n_total} pairs in {dt_rb:.1f}s "
-                              f"({rb_n_workers} threads)", flush=True)
+                        print(f"    Done: {n_total} pairs in {dt_rb:.1f}s",
+                              flush=True)
 
                         rb_summary = self._summarise_and_print(
                             robust_metrics, f"Robust baseline{ds_label}")
