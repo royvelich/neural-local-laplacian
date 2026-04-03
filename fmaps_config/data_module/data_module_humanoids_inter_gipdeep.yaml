@@ -29,7 +29,7 @@ module:
         root: "/mnt/gipnetapp_public/neural-cotangent-weights/DeformingThings4DMatching"
         pair_mode: inter
         pairs: null
-      val_poses_per_pair: -1
+      val_poses_per_pair: 15
       seed: ${globals.training_seed}
     batch_size: 1
     num_workers: 0
