@@ -1993,7 +1993,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                         t0_rb = time.perf_counter()
 
                         from concurrent.futures import ThreadPoolExecutor, as_completed
-                        rb_n_workers = min(max(1, _n_cpus // max(world_size, 1)), 8)
+                        rb_n_workers = max(1, _n_cpus // max(world_size, 1))
 
                         def _eval_robust(p):
                             return evaluate_pair_robust(
