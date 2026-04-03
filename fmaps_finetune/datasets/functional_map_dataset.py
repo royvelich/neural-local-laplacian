@@ -687,8 +687,17 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
                     "pair_mode='inter' but no bridged pairs found. "
                     "Check that cross_category_corres/ exists.")
 
+            # Deterministic permutation: pairs come out sorted from
+            # _scan_bridged_pairs, shuffle with a fixed seed so index-based
+            # selection (e.g. pairs: [0:3]) gives diverse category coverage
+            # rather than alphabetical bias. Same seed → same order every run.
+            _pair_perm_rng = np.random.RandomState(42)
+            perm = _pair_perm_rng.permutation(len(all_inter_pairs))
+            all_inter_pairs = [all_inter_pairs[i] for i in perm]
+            # Also permute hubs to keep them aligned (keyed by tuple, so no reorder needed)
+
             print(f"  [DT4DHumanoidPairGenerator] Found {len(all_inter_pairs)} "
-                  f"bridged pairs total", flush=True)
+                  f"bridged pairs total (deterministically shuffled)", flush=True)
 
             # Select pairs via index/range spec
             if pairs is not None and exclude_pairs is not None:
@@ -835,8 +844,7 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
 
     def _get_val_pair_list(self) -> List[Tuple[str, str]]:
         if self.pair_mode == "inter":
-            return [(a, b) for a, b in combinations(self.category_names, 2)
-                    if self._can_bridge(a, b)]
+            return list(self.cross_pairs)
         return list(self.same_pairs)
 
 
@@ -1165,6 +1173,12 @@ class ValPairDataset(Dataset):
     ):
         rng        = np.random.RandomState(seed)
         self.pairs = pair_generator.get_val_pairs(rng, val_poses_per_pair)
+        # Deterministic permutation: pairs come out sorted from get_val_pairs,
+        # shuffle with a fixed seed so ordering is reproducible across runs
+        # but not trivially lexicographic.
+        perm_rng = np.random.RandomState(seed)
+        perm = perm_rng.permutation(len(self.pairs))
+        self.pairs = [self.pairs[i] for i in perm]
         # Derive a human-readable name from the generator class + pair_mode
         gen_cls = type(pair_generator).__name__
         if "Animal" in gen_cls:

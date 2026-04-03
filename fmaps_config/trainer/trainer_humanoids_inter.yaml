@@ -29,3 +29,5 @@ callbacks:
     auto_insert_metric_name: false
   - _target_: lightning.pytorch.callbacks.LearningRateMonitor
     logging_interval: epoch
+  - _target_: fmaps_finetune.modules.training_output_callback.TrainingOutputCallback
+    output_root: ./fmaps_finetune_results

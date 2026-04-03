@@ -32,7 +32,7 @@ module:
   keep_areas_head: false
   freeze_input_projection: false
   freeze_areas_head: false
-  max_vertices: 6000
+  max_vertices: 4000
   max_vertices_val: 0
   vertex_noise: 0.0
   w_prox: 5.0

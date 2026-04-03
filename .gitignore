@@ -7,3 +7,4 @@ local-laplacian-venv/
 checkpoints/
 .venvs/
 fmap_finetune_runs/
+fmaps_finetune_results/

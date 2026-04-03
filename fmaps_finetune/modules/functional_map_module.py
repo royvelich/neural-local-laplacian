@@ -2014,6 +2014,13 @@ class FunctionalMapModule(LaplacianModuleBase):
                      for k, v in ep0_summary.items()}, step=0)
                 eval_results[ds_name][f"model_{init_label}"] = (ep0_metrics, ep0_summary)
 
+        # Store baseline summaries for TrainingOutputCallback access
+        self._baseline_summaries = {}
+        for ds_name, methods in eval_results.items():
+            for method_name, (_, summary) in methods.items():
+                for k, v in summary.items():
+                    self._baseline_summaries[f"baseline/{method_name}/{ds_name}/{k}"] = v
+
         # ── Eval-only mode: save CSVs and plots, then stop ────────────────
         if hp.eval_only:
             if eval_results:

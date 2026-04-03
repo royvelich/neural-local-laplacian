@@ -29,10 +29,10 @@ module:
         root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching"
         pair_mode: inter
         pairs:
-        - 0:3
-      val_poses_per_pair: 8
+        - 0:4
+      val_poses_per_pair: 4
       seed: ${globals.training_seed}
-    batch_size: 5
+    batch_size: 1
     num_workers: 0
     shuffle: false
     collate_fn:

@@ -4,4 +4,4 @@ training_seed: 42
 ckpt_path: null
 checkpoint_path: "C:/Users/Roy/Downloads/model.ckpt"
 num_eigenvectors: 100
-k: 10
+k: 15
