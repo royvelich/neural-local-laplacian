@@ -6,7 +6,7 @@ val_dataset_specifications:
       _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
       skip_eigendecomposition: True
       mesh_folder_path: '/mnt/gipnetapp_public/neural-cotangent-weights/thingi10k'
-      vertices_count_range: [0, 20000]
+      vertices_count_range: [0, 30000]
       require_complete_geodesics: True
       shuffle: True
       k: 30
