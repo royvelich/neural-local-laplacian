@@ -89,10 +89,11 @@ VALID_METHODS = {'pred', 'robust', 'nelo'}
 
 def _parse_methods(methods_input) -> Set[str]:
     """Parse methods from string or list, validate."""
-    if isinstance(methods_input, (list, tuple)):
-        methods = {str(m).strip().lower() for m in methods_input}
+    if isinstance(methods_input, str):
+        methods = {m.strip().lower() for m in methods_input.split(',')}
     else:
-        methods = {m.strip().lower() for m in str(methods_input).split(',')}
+        # OmegaConf ListConfig, list, tuple, etc.
+        methods = {str(m).strip().lower() for m in methods_input}
     invalid = methods - VALID_METHODS
     if invalid:
         raise ValueError(f"Unknown methods: {invalid}. Valid: {VALID_METHODS}")
