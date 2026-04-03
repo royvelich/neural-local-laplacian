@@ -362,6 +362,101 @@ def _apply_divergence(
 # =============================================================================
 
 
+def _select_landmarks_and_samples(
+    N_A: int, N_B: int,
+    corr_a: Optional[np.ndarray],
+    corr_b: Optional[np.ndarray],
+    rng: np.random.RandomState,
+    num_landmarks: int,
+    num_sample_vertices: int,
+    landmark_seed: int,
+    landmark_ratio: Optional[float] = None,
+    loss_name: str = "",
+    _log_state: Optional[List[int]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Shared landmark and sample vertex selection for supervised losses.
+
+    Two modes:
+        landmark_ratio (not None): Split bijective pool into disjoint
+            landmarks (ratio) and samples (1 - ratio).
+        Fixed-count (landmark_ratio=None): Use num_landmarks and
+            num_sample_vertices with fallback to all correspondences
+            if bijective pool is too small.
+
+    Args:
+        N_A, N_B: Number of vertices on shapes A and B.
+        corr_a, corr_b: Ground-truth correspondence arrays.
+        rng: Per-step RNG (used for sample vertex selection in fixed-count mode).
+        num_landmarks: Fixed landmark count (ignored if landmark_ratio is set).
+        num_sample_vertices: Fixed sample count (ignored if landmark_ratio is set).
+        landmark_seed: Deterministic seed for landmark selection.
+        landmark_ratio: If set, fraction of bijective pool to use as landmarks.
+        loss_name: Name for diagnostic prints (e.g. "GeodesicDiffusionLoss").
+        _log_state: Mutable [count, max] list for silencing prints.
+            Pass a list stored on self so state persists across calls.
+
+    Returns:
+        (lm_refs, sample_refs, ca, cb) where:
+            lm_refs: indices into the reference pool for landmarks
+            sample_refs: indices into the reference pool for samples
+            ca, cb: correspondence arrays (identity if no correspondences)
+    """
+    if corr_a is None or corr_b is None:
+        assert N_A == N_B
+        bijective_pool = np.arange(N_A)
+        ca = bijective_pool; cb = bijective_pool
+    else:
+        bijective_pool = _compute_bijective_refs(corr_a, corr_b)
+        ca, cb = corr_a, corr_b
+
+    bijective_n = len(bijective_pool)
+
+    if landmark_ratio is not None:
+        # Ratio mode: split bijective pool into disjoint landmarks + samples
+        lm_rng = np.random.RandomState(landmark_seed)
+        shuffled = bijective_pool[lm_rng.permutation(bijective_n)]
+        L = max(1, int(bijective_n * landmark_ratio))
+        lm_refs = shuffled[:L]
+        sample_refs = shuffled[L:]
+        V = len(sample_refs)
+
+        if _log_state is not None and _log_state[0] < _log_state[1]:
+            _log_state[0] += 1
+            print(f"[{loss_name}] pair {_log_state[0]}: "
+                  f"bijective={bijective_n}, ratio={landmark_ratio}, "
+                  f"L={L}, V={V} (disjoint)",
+                  flush=True)
+            if _log_state[0] == _log_state[1]:
+                print(f"[{loss_name}] (silencing after {_log_state[1]} pairs)",
+                      flush=True)
+    else:
+        # Fixed-count mode: fallback to all corr if bijective pool too small
+        if bijective_n < num_landmarks + num_sample_vertices:
+            pool = np.arange(len(corr_a)) if corr_a is not None else bijective_pool
+        else:
+            pool = bijective_pool
+
+        lm_rng = np.random.RandomState(landmark_seed)
+        L = min(num_landmarks, len(pool))
+        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
+        V = min(num_sample_vertices, len(pool))
+        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+
+        if _log_state is not None and _log_state[0] < _log_state[1]:
+            _log_state[0] += 1
+            used_bij = len(pool) == bijective_n
+            print(f"[{loss_name}] pair {_log_state[0]}: "
+                  f"pool={len(pool)} ({'bijective' if used_bij else f'all corr, bij={bijective_n}'}), "
+                  f"L={L}/{num_landmarks}, "
+                  f"V={V}/{num_sample_vertices}",
+                  flush=True)
+            if _log_state[0] == _log_state[1]:
+                print(f"[{loss_name}] (silencing after {_log_state[1]} pairs)",
+                      flush=True)
+
+    return lm_refs, sample_refs, ca, cb
+
+
 # =============================================================================
 # InfoNCE / DCL contrastive loss (supervised)
 # =============================================================================
@@ -406,18 +501,11 @@ class SoftCorrespondenceLoss(nn.Module):
         N_A, N_B = S_A.shape[0], S_B.shape[0]
         device   = S_A.device
 
-        if corr_a is None or corr_b is None:
-            assert N_A == N_B
-            pool = np.arange(N_A); ca = pool; cb = pool
-        else:
-            pool = _compute_bijective_refs(corr_a, corr_b)
-            if len(pool) < self.num_landmarks + self.num_sample_vertices:
-                pool = np.arange(len(corr_a))
-            ca, cb = corr_a, corr_b
-
-        lm_rng  = np.random.RandomState(self.landmark_seed)
-        L       = min(self.num_landmarks, len(pool))
-        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
+        lm_refs, sample_refs, ca, cb = _select_landmarks_and_samples(
+            N_A, N_B, corr_a, corr_b, rng,
+            self.num_landmarks, self.num_sample_vertices,
+            self.landmark_seed)
+        L = len(lm_refs)
 
         E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
         E_A[ca[lm_refs], torch.arange(L, device=device)] = 1.0
@@ -427,8 +515,7 @@ class SoftCorrespondenceLoss(nn.Module):
         desc_A = self._compute_descriptors(S_A, M_A, E_A, self.alphas)
         desc_B = self._compute_descriptors(S_B, M_B, E_B, self.alphas)
 
-        V           = min(self.num_sample_vertices, len(pool))
-        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+        V           = len(sample_refs)
         dA          = desc_A[ca[sample_refs]]
         dB          = desc_B[cb[sample_refs]]
         sim         = (dA @ dB.T) / self.temperature
@@ -637,8 +724,7 @@ class GeodesicDiffusionLoss(nn.Module):
         self.landmark_seed       = landmark_seed
         self.normalize           = normalize
         self.weight              = weight
-        self._pool_log_count     = 0
-        self._pool_log_max       = 10
+        self._log_state          = [0, 10]  # [count, max] for diagnostic prints
 
         if landmark_ratio is not None:
             assert 0.0 < landmark_ratio < 1.0, \
@@ -656,58 +742,13 @@ class GeodesicDiffusionLoss(nn.Module):
         N_A, N_B = S_A.shape[0], S_B.shape[0]
         device = S_A.device
 
-        if corr_a is None or corr_b is None:
-            assert N_A == N_B
-            bijective_pool = np.arange(N_A)
-            ca = bijective_pool; cb = bijective_pool
-        else:
-            bijective_pool = _compute_bijective_refs(corr_a, corr_b)
-            ca, cb = corr_a, corr_b
-
-        bijective_n = len(bijective_pool)
-
-        if self.landmark_ratio is not None:
-            # Ratio mode: split bijective pool into disjoint landmarks + samples
-            lm_rng = np.random.RandomState(self.landmark_seed)
-            shuffled = bijective_pool[lm_rng.permutation(bijective_n)]
-            L = max(1, int(bijective_n * self.landmark_ratio))
-            lm_refs = shuffled[:L]
-            sample_refs = shuffled[L:]
-            V = len(sample_refs)
-
-            if self._pool_log_count < self._pool_log_max:
-                self._pool_log_count += 1
-                print(f"[GeodesicDiffusionLoss] pair {self._pool_log_count}: "
-                      f"bijective={bijective_n}, ratio={self.landmark_ratio}, "
-                      f"L={L}, V={V} (disjoint)",
-                      flush=True)
-                if self._pool_log_count == self._pool_log_max:
-                    print(f"[GeodesicDiffusionLoss] (silencing after {self._pool_log_max} pairs)",
-                          flush=True)
-        else:
-            # Fixed-count mode: fallback to all corr if bijective pool too small
-            if bijective_n < self.num_landmarks + self.num_sample_vertices:
-                pool = np.arange(len(corr_a)) if corr_a is not None else bijective_pool
-            else:
-                pool = bijective_pool
-
-            lm_rng = np.random.RandomState(self.landmark_seed)
-            L = min(self.num_landmarks, len(pool))
-            lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
-            V = min(self.num_sample_vertices, len(pool))
-            sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
-
-            if self._pool_log_count < self._pool_log_max:
-                self._pool_log_count += 1
-                used_bij = len(pool) == bijective_n
-                print(f"[GeodesicDiffusionLoss] pair {self._pool_log_count}: "
-                      f"pool={len(pool)} ({'bijective' if used_bij else f'all corr, bij={bijective_n}'}), "
-                      f"L={L}/{self.num_landmarks}, "
-                      f"V={V}/{self.num_sample_vertices}",
-                      flush=True)
-                if self._pool_log_count == self._pool_log_max:
-                    print(f"[GeodesicDiffusionLoss] (silencing after {self._pool_log_max} pairs)",
-                          flush=True)
+        lm_refs, sample_refs, ca, cb = _select_landmarks_and_samples(
+            N_A, N_B, corr_a, corr_b, rng,
+            self.num_landmarks, self.num_sample_vertices,
+            self.landmark_seed, self.landmark_ratio,
+            loss_name="GeodesicDiffusionLoss",
+            _log_state=self._log_state)
+        L = len(lm_refs)
 
         # Build indicator matrices for landmarks
         E_A = torch.zeros(N_A, L, device=device, dtype=S_A.dtype)
@@ -765,18 +806,38 @@ class HeatMethodGeodesicLoss(nn.Module):
         self,
         num_landmarks: int = 32,
         num_sample_vertices: int = 512,
+        landmark_ratio: Optional[float] = None,
         landmark_seed: int = 0,
         eps: float = 1e-6,
         normalize: bool = True,
         weight: float = 1.0,
     ):
+        """
+        Args:
+            num_landmarks: Fixed number of landmarks (ignored if landmark_ratio is set).
+            num_sample_vertices: Fixed number of sample vertices (ignored if landmark_ratio is set).
+            landmark_ratio: If set (0 < ratio < 1), use ONLY bijective correspondences
+                and split them into landmarks (ratio) and samples (1-ratio) with no
+                overlap. E.g. 0.2 = 20% landmarks, 80% samples.
+                When None, uses num_landmarks/num_sample_vertices with fallback.
+            landmark_seed: Seed for deterministic landmark selection.
+            eps: regularisation for Poisson solve.
+            normalize: L2-normalize geodesic profiles before comparing.
+            weight: Loss weight.
+        """
         super().__init__()
         self.num_landmarks       = num_landmarks
         self.num_sample_vertices = num_sample_vertices
+        self.landmark_ratio      = landmark_ratio
         self.landmark_seed       = landmark_seed
         self.eps                 = eps
         self.normalize           = normalize
         self.weight              = weight
+        self._log_state          = [0, 10]  # [count, max] for diagnostic prints
+
+        if landmark_ratio is not None:
+            assert 0.0 < landmark_ratio < 1.0, \
+                f"landmark_ratio must be in (0, 1), got {landmark_ratio}"
 
     @staticmethod
     def _heat_method_distances(
@@ -847,22 +908,13 @@ class HeatMethodGeodesicLoss(nn.Module):
         N_A, N_B = S_A.shape[0], S_B.shape[0]
         device = S_A.device
 
-        if corr_a is None or corr_b is None:
-            assert N_A == N_B
-            pool = np.arange(N_A); ca = pool; cb = pool
-        else:
-            pool = _compute_bijective_refs(corr_a, corr_b)
-            if len(pool) < self.num_landmarks + self.num_sample_vertices:
-                pool = np.arange(len(corr_a))
-            ca, cb = corr_a, corr_b
-
-        # Pick landmarks and sample vertices
-        lm_rng = np.random.RandomState(self.landmark_seed)
-        L = min(self.num_landmarks, len(pool))
-        lm_refs = pool[lm_rng.choice(len(pool), size=L, replace=False)]
-
-        V = min(self.num_sample_vertices, len(pool))
-        sample_refs = pool[rng.choice(len(pool), size=V, replace=False)]
+        lm_refs, sample_refs, ca, cb = _select_landmarks_and_samples(
+            N_A, N_B, corr_a, corr_b, rng,
+            self.num_landmarks, self.num_sample_vertices,
+            self.landmark_seed, self.landmark_ratio,
+            loss_name="HeatMethodGeodesicLoss",
+            _log_state=self._log_state)
+        L = len(lm_refs)
 
         # Source indices on each shape
         src_A = torch.from_numpy(ca[lm_refs].copy()).long().to(device)
