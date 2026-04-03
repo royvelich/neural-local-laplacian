@@ -57,19 +57,8 @@ Usage examples:
 """
 # standard library
 import os
-import sys
-import io
 import argparse
 import yaml
-
-sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
-
-os.environ.setdefault("WANDB_DIR", "C:/wandb/WANDB_DIR")
-os.environ.setdefault("WANDB_ARTIFACT_DIR", "C:/wandb/WANDB_ARTIFACT_DIR")
-os.environ.setdefault("WANDB_CACHE_DIR", "C:/wandb/WANDB_CACHE_DIR")
-os.environ.setdefault("WANDB_CONFIG_DIR", "C:/wandb/WANDB_CONFIG_DIR")
-os.environ.setdefault("WANDB_DATA_DIR", "C:/wandb/WANDB_DATA_DIR")
 
 # hydra
 import hydra

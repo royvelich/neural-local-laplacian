@@ -1,0 +1,7 @@
+folder: "/workspace/datasets/thingi10k"
+require_manifold: true
+vertices_count_range: [0, 40000]
+num_sources: 15
+seed: 42
+num_workers: 30
+timeout_per_source: 60

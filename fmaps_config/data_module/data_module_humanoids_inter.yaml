@@ -32,7 +32,7 @@ module:
         - 0:3
       val_poses_per_pair: 8
       seed: ${globals.training_seed}
-    batch_size: 1
+    batch_size: 5
     num_workers: 0
     shuffle: false
     collate_fn:

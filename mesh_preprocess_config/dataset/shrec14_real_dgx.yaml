@@ -1,0 +1,6 @@
+folder: "/workspace/datasets/shrec14/Real"
+require_manifold: true
+num_sources: 15
+seed: 42
+num_workers: 30
+timeout_per_source: 60
