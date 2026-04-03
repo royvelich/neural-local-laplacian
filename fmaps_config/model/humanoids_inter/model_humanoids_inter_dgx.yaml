@@ -18,21 +18,20 @@ module:
       pruning: none
 
   losses:
-    - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
-      weight: 1.0
-      landmark_ratio: 0.25
-      normalize: false
-#    - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+#    - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
 #      weight: 1.0
 #      landmark_ratio: 0.25
-##      num_landmarks: 128
-#      alphas:
-#        - 0.01
-#        - 0.1
-#        - 1.0
-#        - 10.0
-##      num_sample_vertices: 512
 #      normalize: false
+    - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+      weight: 1.0
+      landmark_ratio: 0.1
+#      num_landmarks: 128
+      alphas:
+        - 0.1
+        - 1.0
+        - 10.0
+#      num_sample_vertices: 512
+      normalize: false
   random_init: false
   keep_areas_head: false
   freeze_input_projection: false

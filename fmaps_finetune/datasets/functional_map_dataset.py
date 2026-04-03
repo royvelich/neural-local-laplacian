@@ -652,82 +652,68 @@ class DT4DHumanoidPairGenerator(DT4DPairGeneratorBase):
     def __init__(
         self,
         root: str,
-        categories: Optional[List] = None,
-        exclude_categories: Optional[List] = None,
         pair_mode: str = "intra",
         pairs: Optional[List] = None,
         exclude_pairs: Optional[List] = None,
-        # Legacy compat: accept old-style args, ignore them with a warning
-        train_categories: Optional[List[str]] = None,
-        val_categories: Optional[List[str]] = None,
     ):
-        # Legacy compat shim
-        if train_categories is not None or val_categories is not None:
-            import warnings
-            warnings.warn(
-                "train_categories / val_categories are deprecated. "
-                "Use categories / exclude_categories instead.",
-                DeprecationWarning, stacklevel=2,
-            )
-            if categories is None and exclude_categories is None:
-                merged = sorted(set((train_categories or []) + (val_categories or [])))
-                categories = merged if merged else None
-
         if pair_mode == "inter":
             # Discover all valid inter pairs from bridge filenames (no mesh loading)
             all_on_disk = _discover_categories(Path(root))
-            all_inter_pairs, pair_hubs = self._scan_bridged_pairs(Path(root), all_on_disk)
-            if not all_inter_pairs:
+            all_pairs, pair_hubs = self._scan_bridged_pairs(Path(root), all_on_disk)
+            if not all_pairs:
                 raise ValueError(
                     "pair_mode='inter' but no bridged pairs found. "
                     "Check that cross_category_corres/ exists.")
 
-            # Deterministic permutation: pairs come out sorted from
-            # _scan_bridged_pairs, shuffle with a fixed seed so index-based
-            # selection (e.g. pairs: [0:3]) gives diverse category coverage
-            # rather than alphabetical bias. Same seed → same order every run.
+            # Deterministic permutation so index-based selection gives diverse
+            # category coverage rather than alphabetical bias.
             _pair_perm_rng = np.random.RandomState(42)
-            perm = _pair_perm_rng.permutation(len(all_inter_pairs))
-            all_inter_pairs = [all_inter_pairs[i] for i in perm]
-            # Also permute hubs to keep them aligned (keyed by tuple, so no reorder needed)
+            perm = _pair_perm_rng.permutation(len(all_pairs))
+            all_pairs = [all_pairs[i] for i in perm]
 
-            print(f"  [DT4DHumanoidPairGenerator] Found {len(all_inter_pairs)} "
+            print(f"  [DT4DHumanoidPairGenerator] Found {len(all_pairs)} "
                   f"bridged pairs total (deterministically shuffled)", flush=True)
+        else:
+            # Intra: one self-pair per category
+            all_on_disk = _discover_categories(Path(root))
+            all_pairs = [(c, c) for c in all_on_disk]
+            pair_hubs = {}
 
-            # Select pairs via index/range spec
-            if pairs is not None and exclude_pairs is not None:
-                raise ValueError("Specify 'pairs' OR 'exclude_pairs', not both.")
-            if pairs is not None:
-                selected_indices = _expand_spec(pairs, list(range(len(all_inter_pairs))))
-                selected_pairs = [all_inter_pairs[i] for i in selected_indices]
-            elif exclude_pairs is not None:
-                excluded_indices = set(_expand_spec(exclude_pairs, list(range(len(all_inter_pairs)))))
-                selected_pairs = [p for i, p in enumerate(all_inter_pairs)
-                                  if i not in excluded_indices]
-            else:
-                selected_pairs = all_inter_pairs
+        # Apply pairs / exclude_pairs filter
+        if pairs is not None and exclude_pairs is not None:
+            raise ValueError("Specify 'pairs' OR 'exclude_pairs', not both.")
+        if pairs is not None:
+            selected_indices = _expand_spec(pairs, list(range(len(all_pairs))))
+            selected_pairs = [all_pairs[i] for i in selected_indices]
+        elif exclude_pairs is not None:
+            excluded_indices = set(_expand_spec(exclude_pairs, list(range(len(all_pairs)))))
+            selected_pairs = [p for i, p in enumerate(all_pairs)
+                              if i not in excluded_indices]
+        else:
+            selected_pairs = all_pairs
 
-            if not selected_pairs:
-                raise ValueError("No inter pairs selected after filtering.")
+        if not selected_pairs:
+            raise ValueError(f"No {pair_mode} pairs selected after filtering.")
 
-            # Determine which categories are needed (including hubs for indirect bridges)
-            needed_cats = set()
-            for a, b in selected_pairs:
-                needed_cats.add(a)
-                needed_cats.add(b)
-                hub = pair_hubs.get((a, b))
-                if hub is not None:
-                    needed_cats.add(hub)
-            categories = sorted(needed_cats)
-            exclude_categories = None
+        # Derive which categories to load (including hubs for indirect bridges)
+        needed_cats = set()
+        for a, b in selected_pairs:
+            needed_cats.add(a)
+            needed_cats.add(b)
+            hub = pair_hubs.get((a, b))
+            if hub is not None:
+                needed_cats.add(hub)
+
+        print(f"  [DT4DHumanoidPairGenerator] Selected {len(selected_pairs)} "
+              f"{pair_mode} pairs → {len(needed_cats)} categories to load",
+              flush=True)
+
+        if pair_mode == "inter":
             self._selected_inter_pairs = selected_pairs
-
-            print(f"  [DT4DHumanoidPairGenerator] Selected {len(selected_pairs)} "
-                  f"inter pairs → {len(categories)} categories to load", flush=True)
         else:
             self._selected_inter_pairs = None
 
-        super().__init__(root, categories, exclude_categories)
+        super().__init__(root, sorted(needed_cats))
         self.pair_mode = pair_mode
 
         # Load cross-category bridges (VTS data)
@@ -855,10 +841,33 @@ class DT4DAnimalsPairGenerator(DT4DPairGeneratorBase):
     def __init__(
         self,
         root: str,
-        categories: Optional[List[str]] = None,
-        exclude_categories: Optional[List[str]] = None,
+        pairs: Optional[List] = None,
+        exclude_pairs: Optional[List] = None,
     ):
-        super().__init__(root, categories, exclude_categories)
+        # Discover all categories, build intra pair list, filter
+        all_on_disk = _discover_categories(Path(root))
+        all_pairs = [(c, c) for c in all_on_disk]
+
+        if pairs is not None and exclude_pairs is not None:
+            raise ValueError("Specify 'pairs' OR 'exclude_pairs', not both.")
+        if pairs is not None:
+            selected_indices = _expand_spec(pairs, list(range(len(all_pairs))))
+            selected_pairs = [all_pairs[i] for i in selected_indices]
+        elif exclude_pairs is not None:
+            excluded_indices = set(_expand_spec(exclude_pairs, list(range(len(all_pairs)))))
+            selected_pairs = [p for i, p in enumerate(all_pairs)
+                              if i not in excluded_indices]
+        else:
+            selected_pairs = all_pairs
+
+        if not selected_pairs:
+            raise ValueError("No pairs selected after filtering.")
+
+        needed_cats = sorted(set(c for a, b in selected_pairs for c in (a, b)))
+        print(f"  [DT4DAnimalsPairGenerator] Selected {len(selected_pairs)} "
+              f"pairs → {len(needed_cats)} categories to load", flush=True)
+
+        super().__init__(root, needed_cats)
         print(f"  Same-category pairs: {len(self.same_pairs)} "
               f"(cross-category not available)")
 
@@ -891,25 +900,16 @@ class FAUSTPairGenerator(PairGenerator):
     All share the same template topology (same vertex count and faces),
     so correspondence between any pair is the identity mapping.
 
-    For intra mode, use subjects/exclude_subjects to select subjects.
-    For inter mode, use pairs/exclude_pairs to select from the sorted list of
-    cross-subject pairs. Example: pairs: ["0:5"] gives exactly the first 5
-    inter pairs. Only the subjects needed for selected pairs are loaded.
-
     Args:
         root: Path to FAUST root directory (contains training/registrations/).
-        subjects: Subject IDs to use (intra mode). Supports ints and ranges.
-        exclude_subjects: Subject IDs to exclude (intra mode).
         pair_mode: 'intra' = same-subject, 'inter' = cross-subject.
-        pairs: Pair indices to use (inter mode). Supports ints and ranges.
-        exclude_pairs: Pair indices to exclude (inter mode).
+        pairs: Pair indices to select. Supports ints and ranges (e.g. ["0:5"]).
+        exclude_pairs: Pair indices to exclude.
     """
 
     def __init__(
         self,
         root: str,
-        subjects: Optional[List] = None,
-        exclude_subjects: Optional[List] = None,
         pair_mode: str = "intra",
         pairs: Optional[List] = None,
         exclude_pairs: Optional[List] = None,
@@ -923,52 +923,41 @@ class FAUSTPairGenerator(PairGenerator):
         self.pair_mode = pair_mode
         all_subjects = list(range(10))
 
+        # Build full pair list
         if pair_mode == "inter":
-            # Build all possible cross-subject pairs, then select
-            all_inter_pairs = list(combinations(all_subjects, 2))
-
-            print(f"  [FAUSTPairGenerator] {len(all_inter_pairs)} "
+            all_pairs = list(combinations(all_subjects, 2))
+            print(f"  [FAUSTPairGenerator] {len(all_pairs)} "
                   f"cross-subject pairs total", flush=True)
+        else:
+            all_pairs = [(s, s) for s in all_subjects]
 
-            if pairs is not None and exclude_pairs is not None:
-                raise ValueError("Specify 'pairs' OR 'exclude_pairs', not both.")
-            if pairs is not None:
-                selected_indices = _expand_spec(pairs, list(range(len(all_inter_pairs))))
-                selected_pairs = [all_inter_pairs[i] for i in selected_indices]
-            elif exclude_pairs is not None:
-                excluded_indices = set(_expand_spec(exclude_pairs, list(range(len(all_inter_pairs)))))
-                selected_pairs = [p for i, p in enumerate(all_inter_pairs)
-                                  if i not in excluded_indices]
-            else:
-                selected_pairs = all_inter_pairs
+        # Apply pairs / exclude_pairs filter
+        if pairs is not None and exclude_pairs is not None:
+            raise ValueError("Specify 'pairs' OR 'exclude_pairs', not both.")
+        if pairs is not None:
+            selected_indices = _expand_spec(pairs, list(range(len(all_pairs))))
+            selected_pairs = [all_pairs[i] for i in selected_indices]
+        elif exclude_pairs is not None:
+            excluded_indices = set(_expand_spec(exclude_pairs, list(range(len(all_pairs)))))
+            selected_pairs = [p for i, p in enumerate(all_pairs)
+                              if i not in excluded_indices]
+        else:
+            selected_pairs = all_pairs
 
-            if not selected_pairs:
-                raise ValueError("No inter pairs selected after filtering.")
+        if not selected_pairs:
+            raise ValueError(f"No {pair_mode} pairs selected after filtering.")
 
+        # Derive which subjects to load
+        self.subject_ids = sorted(set(s for a, b in selected_pairs for s in (a, b)))
+
+        if pair_mode == "inter":
             self._selected_inter_pairs = selected_pairs
-            # Determine which subjects are needed
-            needed = set()
-            for a, b in selected_pairs:
-                needed.add(a)
-                needed.add(b)
-            self.subject_ids = sorted(needed)
-
-            print(f"  [FAUSTPairGenerator] Selected {len(selected_pairs)} "
-                  f"inter pairs → {len(self.subject_ids)} subjects to load",
-                  flush=True)
         else:
             self._selected_inter_pairs = None
-            # Resolve subject list for intra mode
-            if subjects is not None and exclude_subjects is not None:
-                raise ValueError("Specify 'subjects' OR 'exclude_subjects', not both.")
-            if subjects is not None:
-                self.subject_ids = _expand_spec(subjects, all_subjects)
-            elif exclude_subjects is not None:
-                excluded = set(_expand_spec(exclude_subjects, all_subjects))
-                self.subject_ids = [s for s in all_subjects if s not in excluded]
-            else:
-                self.subject_ids = all_subjects
 
+        print(f"  [FAUSTPairGenerator] Selected {len(selected_pairs)} "
+              f"{pair_mode} pairs → {len(self.subject_ids)} subjects to load",
+              flush=True)
         print(f"  [FAUSTPairGenerator] root: {self.root}")
         print(f"  [FAUSTPairGenerator] Loading subjects: {self.subject_ids}")
 
@@ -1056,22 +1045,17 @@ class FAUSTPairGenerator(PairGenerator):
                     pose_pairs = [(pa, pb) for pa in range(len(poses_a))
                                   for pb in range(len(poses_b))]
             else:
-                # Sample random pose pairs
+                # Enumerate all valid pairs, shuffle deterministically, take first N
+                if subj_a == subj_b:
+                    all_pose_pairs = [(pa, pb) for pa in range(len(poses_a))
+                                      for pb in range(pa + 1, len(poses_a))]
+                else:
+                    all_pose_pairs = [(pa, pb) for pa in range(len(poses_a))
+                                      for pb in range(len(poses_b))]
                 pair_rng = np.random.RandomState(_stable_hash((subj_a, subj_b)))
-                pose_pairs = []
-                seen: set = set()
-                for _ in range(poses_per_pair):
-                    for _attempt in range(200):
-                        pa = pair_rng.randint(len(poses_a))
-                        pb = pair_rng.randint(len(poses_b))
-                        if subj_a == subj_b and pa == pb and len(poses_a) > 1:
-                            continue
-                        if (pa, pb) not in seen:
-                            break
-                    else:
-                        break
-                    seen.add((pa, pb))
-                    pose_pairs.append((pa, pb))
+                perm = pair_rng.permutation(len(all_pose_pairs))
+                n_take = min(poses_per_pair, len(all_pose_pairs))
+                pose_pairs = [all_pose_pairs[i] for i in perm[:n_take]]
 
             for pa, pb in pose_pairs:
                 corr_a, corr_b = identity_correspondence(self.num_vertices)

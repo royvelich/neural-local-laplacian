@@ -1,3 +1,14 @@
+# W&B sweep: evaluate pretrained model on 5 dataset flavors × 2 k values.
+#
+# Usage:
+#   wandb sweep fmaps_config/sweeps/eval_5datasets.yaml
+#   wandb agent <entity/project/sweep_id>
+#
+# Or with path overrides:
+#   python train_fmaps.py --sweep-id <sweep_id> \
+#       --checkpoint-path /path/to/model.ckpt \
+#       --data-root /path/to/DeformingThings4DMatching
+
 program: ./train_fmaps.py
 command:
   - python
@@ -20,22 +31,15 @@ parameters:
         value: '/workspace/models/model.ckpt'
       num_eigenvectors:
         value: 100
-      k_sparsify:
-        value: null
 
       # ── Swept ─────────────────────────────────────────────────────────────
       k:
         values:
           - 8
           - 15
-          - 20
-          - 30
-
-      loss_preset:
-        value: null
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Data module — same val splits as the 5 training sweeps
+  # Data module — 5 val splits (all evaluated in a single run)
   # ═══════════════════════════════════════════════════════════════════════════
   data_module:
     value:
@@ -43,31 +47,16 @@ parameters:
         _target_: neural_local_laplacian.data_modules.common.GenericPlainDataModule
 
         # Dummy train spec (required by Lightning, unused in eval_only)
-        train_dataset_specification:
-          _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
-          dataset:
-            _target_: fmaps_finetune.datasets.functional_map_dataset.ShapePairDataset
-            pair_generator:
-              _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
-              root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-              categories: ["0:3"]
-            num_samples: 1
-          batch_size: 1
-          num_workers: 0
-          shuffle: false
-          collate_fn:
-            _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
-            _partial_: true
+        train_dataset_specification: null
 
         val_dataset_specifications:
-          # [0] Animals intra — first 5 categories, 16 poses/pair = 80 pairs
+          # [0] Animals intra — all categories, 16 poses/pair
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-                categories: ["0:5"]
               val_poses_per_pair: 16
               seed: ${globals.training_seed}
             batch_size: 1
@@ -77,14 +66,13 @@ parameters:
               _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
               _partial_: true
 
-          # [1] Humanoids intra — first 5 categories, 16 poses/pair = 80 pairs
+          # [1] Humanoids intra — all categories, 16 poses/pair
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching'
-                categories: ["0:5"]
                 pair_mode: intra
               val_poses_per_pair: 16
               seed: ${globals.training_seed}
@@ -95,7 +83,7 @@ parameters:
               _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
               _partial_: true
 
-          # [2] Humanoids inter — first 10 bridged pairs, 8 poses/pair = 80 pairs
+          # [2] Humanoids inter — all bridged pairs, 8 poses/pair
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
@@ -103,7 +91,6 @@ parameters:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching'
                 pair_mode: inter
-                pairs: ["0:10"]
               val_poses_per_pair: 8
               seed: ${globals.training_seed}
             batch_size: 1
@@ -113,14 +100,13 @@ parameters:
               _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
               _partial_: true
 
-          # [3] FAUST intra — first 5 subjects, 16 poses/pair = 80 pairs
+          # [3] FAUST intra — all subjects, 16 poses/pair
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                 root: '/workspace/datasets/faust'
-                subjects: ["0:5"]
                 pair_mode: intra
               val_poses_per_pair: 16
               seed: ${globals.training_seed}
@@ -131,7 +117,7 @@ parameters:
               _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
               _partial_: true
 
-          # [4] FAUST inter — first 10 cross-subject pairs, 8 poses/pair = 80 pairs
+          # [4] FAUST inter — all cross-subject pairs, 8 poses/pair
           - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
             dataset:
               _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
@@ -139,7 +125,6 @@ parameters:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                 root: '/workspace/datasets/faust'
                 pair_mode: inter
-                pairs: ["0:10"]
               val_poses_per_pair: 8
               seed: ${globals.training_seed}
             batch_size: 1
@@ -150,7 +135,7 @@ parameters:
               _partial_: true
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Model — eval only, all variants
+  # Model — eval only, both assembly variants
   # ═══════════════════════════════════════════════════════════════════════════
   model:
     value:
@@ -163,10 +148,15 @@ parameters:
 
         eval_only: true
         skip_baselines: false
-        eval_variants:
-          - dense
-          - sp
-          - iso
+
+        train_laplacian:
+          assembly: diagonal_gram
+          pruning: none
+        eval_laplacians:
+          - assembly: diagonal_gram
+            pruning: none
+          - assembly: full_gram
+            pruning: none
 
         losses: null
 
@@ -174,9 +164,6 @@ parameters:
         keep_areas_head: false
         freeze_input_projection: false
         freeze_areas_head: false
-
-        sparsify_laplacian: true
-        k_sparsify: ${globals.k_sparsify}
 
         max_vertices: 4000
         max_vertices_val: 0
@@ -229,14 +216,5 @@ parameters:
         _target_: lightning.pytorch.loggers.WandbLogger
         project: neural-local-laplacian-fmaps
         save_dir: fmap_finetune_runs
-        log_model: 'all'
-      callbacks:
-        - _target_: lightning.pytorch.callbacks.ModelCheckpoint
-          monitor: val/best_acc
-          mode: max
-          save_top_k: 1
-          save_last: false
-          filename: "best-epoch={epoch:04d}-acc={val/best_acc:.4f}"
-          auto_insert_metric_name: false
-        - _target_: lightning.pytorch.callbacks.LearningRateMonitor
-          logging_interval: epoch
+        log_model: false
+      callbacks: []
