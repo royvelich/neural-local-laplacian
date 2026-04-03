@@ -808,7 +808,7 @@ class HeatMethodGeodesicLoss(nn.Module):
         num_sample_vertices: int = 512,
         landmark_ratio: Optional[float] = None,
         landmark_seed: int = 0,
-        eps: float = 1e-6,
+        eps: float = 1e-4,
         normalize: bool = True,
         weight: float = 1.0,
     ):
@@ -921,10 +921,15 @@ class HeatMethodGeodesicLoss(nn.Module):
         src_B = torch.from_numpy(cb[lm_refs].copy()).long().to(device)
 
         # Full heat method on both shapes
-        phi_A = self._heat_method_distances(
-            S_A, M_A, grad_coeffs_a, knn_a, src_A, self.eps)   # (N_A, L)
-        phi_B = self._heat_method_distances(
-            S_B, M_B, grad_coeffs_b, knn_b, src_B, self.eps)   # (N_B, L)
+        try:
+            phi_A = self._heat_method_distances(
+                S_A, M_A, grad_coeffs_a, knn_a, src_A, self.eps)   # (N_A, L)
+            phi_B = self._heat_method_distances(
+                S_B, M_B, grad_coeffs_b, knn_b, src_B, self.eps)   # (N_B, L)
+        except torch.linalg.LinAlgError:
+            # Singular matrix — skip this pair (early training / degenerate mesh)
+            zero = torch.tensor(0.0, device=device)
+            return zero, {'loss_heatgeo': 0.0}
 
         # Sample corresponding vertices
         d_A = phi_A[ca[sample_refs]]                             # (V, L)
