@@ -1,0 +1,40 @@
+# fmaps_config/data_module/humanoids_inter.yaml
+
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericPlainDataModule
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: fmaps_finetune.datasets.functional_map_dataset.ShapePairDataset
+      pair_generator:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+        root: "/workspace/datasets/DeformingThings4DMatching"
+        pair_mode: inter
+        pairs:
+        - '10:'
+      num_samples: 80
+      seed: ${globals.training_seed}
+    batch_size: 8
+    num_workers: 0
+    shuffle: true
+    collate_fn:
+      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+      _partial_: true
+  val_dataset_specifications:
+  - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+      pair_generator:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+        root: "/workspace/datasets/DeformingThings4DMatching"
+        pair_mode: inter
+        pairs:
+          - ':10'
+      val_poses_per_pair: 20
+      seed: ${globals.training_seed}
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    collate_fn:
+      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+      _partial_: true

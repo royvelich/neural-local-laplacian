@@ -1,0 +1,7 @@
+# fmaps_config/globals/humanoids_inter.yaml
+
+training_seed: 42
+ckpt_path: null
+checkpoint_path: "/workspace/models/model.ckpt"
+num_eigenvectors: 100
+k: 8
