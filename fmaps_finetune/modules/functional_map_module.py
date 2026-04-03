@@ -2031,6 +2031,13 @@ class FunctionalMapModule(LaplacianModuleBase):
                         print("  (robust_laplacian not installed — "
                               "skipping robust baseline)")
 
+                # Synchronise: rank 0 must finish robust before all ranks
+                # enter the model baseline (which uses all_gather).
+                if world_size > 1:
+                    import torch.distributed as dist
+                    if dist.is_initialized():
+                        dist.barrier()
+
                 # ── Epoch-0 model baseline (all ranks, distributed) ─────────
                 init_label = "random init" if hp.random_init else "pretrained"
                 if is_rank0:
