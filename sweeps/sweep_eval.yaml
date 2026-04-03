@@ -57,7 +57,7 @@ parameters:
               pair_generator:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-              val_poses_per_pair: 16
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -74,7 +74,7 @@ parameters:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching'
                 pair_mode: intra
-              val_poses_per_pair: 16
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -91,7 +91,7 @@ parameters:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching'
                 pair_mode: inter
-              val_poses_per_pair: 8
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -108,7 +108,7 @@ parameters:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                 root: '/workspace/datasets/faust'
                 pair_mode: intra
-              val_poses_per_pair: 16
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
@@ -125,7 +125,7 @@ parameters:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                 root: '/workspace/datasets/faust'
                 pair_mode: inter
-              val_poses_per_pair: 8
+              val_poses_per_pair: 3
               seed: ${globals.training_seed}
             batch_size: 1
             num_workers: 0
