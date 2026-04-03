@@ -10,13 +10,11 @@ module:
   skip_baselines: false
 
   train_laplacian:
-    assembly: anisotropic
+    assembly: diagonal_gram
     pruning: none
     
   eval_laplacians:
-    - assembly: isotropic
-      pruning: none
-    - assembly: anisotropic
+    - assembly: diagonal_gram
       pruning: none
 
   losses:
