@@ -571,22 +571,17 @@ class DT4DPairGeneratorBase(PairGenerator):
                     pose_pairs = [(pa, pb) for pa in range(c_a.num_poses)
                                   for pb in range(c_b.num_poses)]
             else:
-                # Sample random pose pairs
+                # Enumerate all valid pairs, shuffle deterministically, take first N
+                if cat_a == cat_b:
+                    all_pose_pairs = [(pa, pb) for pa in range(c_a.num_poses)
+                                      for pb in range(pa + 1, c_a.num_poses)]
+                else:
+                    all_pose_pairs = [(pa, pb) for pa in range(c_a.num_poses)
+                                      for pb in range(c_b.num_poses)]
                 pair_rng = np.random.RandomState(_stable_hash((cat_a, cat_b)))
-                pose_pairs = []
-                seen: set = set()
-                for _ in range(poses_per_pair):
-                    for _attempt in range(200):
-                        pa = pair_rng.randint(c_a.num_poses)
-                        pb = pair_rng.randint(c_b.num_poses)
-                        if cat_a == cat_b and pa == pb and c_a.num_poses > 1:
-                            continue
-                        if (pa, pb) not in seen:
-                            break
-                    else:
-                        break
-                    seen.add((pa, pb))
-                    pose_pairs.append((pa, pb))
+                perm = pair_rng.permutation(len(all_pose_pairs))
+                n_take = min(poses_per_pair, len(all_pose_pairs))
+                pose_pairs = [all_pose_pairs[i] for i in perm[:n_take]]
 
             for pa, pb in pose_pairs:
                 corr_a, corr_b = self._build_correspondence(cat_a, pa, cat_b, pb)

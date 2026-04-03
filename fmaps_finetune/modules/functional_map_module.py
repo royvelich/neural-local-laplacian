@@ -1913,11 +1913,13 @@ class FunctionalMapModule(LaplacianModuleBase):
         # Run geo cache workers (limit parallelism in multi-GPU to avoid CPU contention)
         _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
         n_workers = min(len(worker_args), max(1, _n_cpus // max(world_size, 1)))
+        _geo_n = len(worker_args)
+        _geo_cw = len(str(_geo_n))
         if worker_args:
             if n_workers > 1:
                 import multiprocessing as _mp
                 if is_rank0:
-                    print(f"    Parallel precomputation: {len(worker_args)} pairs, "
+                    print(f"    Parallel precomputation: {_geo_n} pairs, "
                           f"{n_workers} workers", flush=True)
                 with _mp.Pool(n_workers) as pool:
                     results = {}
@@ -1925,9 +1927,11 @@ class FunctionalMapModule(LaplacianModuleBase):
                             _precompute_geo_cache_worker, worker_args)):
                         results[r[0]] = r[1:]
                         done = i + 1
-                        if is_rank0 and (done % 10 == 0 or done == len(worker_args)):
+                        if is_rank0:
                             dt = time.perf_counter() - t0_geo
-                            print(f"    [{done}/{len(worker_args)}] {dt:.1f}s",
+                            eta = (dt / done) * (_geo_n - done)
+                            print(f"    [{done:>{_geo_cw}}/{_geo_n}] "
+                                  f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
                                   flush=True)
             else:
                 results = {}
@@ -1935,9 +1939,11 @@ class FunctionalMapModule(LaplacianModuleBase):
                     r = _precompute_geo_cache_worker(args)
                     results[r[0]] = r[1:]
                     done = i + 1
-                    if is_rank0 and (done % 10 == 0 or done == len(worker_args)):
+                    if is_rank0:
                         dt = time.perf_counter() - t0_geo
-                        print(f"    [{done}/{len(worker_args)}] {dt:.1f}s",
+                        eta = (dt / done) * (_geo_n - done)
+                        print(f"    [{done:>{_geo_cw}}/{_geo_n}] "
+                              f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
                               flush=True)
         else:
             results = {}
@@ -1986,7 +1992,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                               f"({n_total} pairs)...", flush=True)
                         t0_rb = time.perf_counter()
 
-                        from concurrent.futures import ThreadPoolExecutor
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
                         rb_n_workers = max(1, _n_cpus - 1)
 
                         def _eval_robust(p):
@@ -1995,11 +2001,24 @@ class FunctionalMapModule(LaplacianModuleBase):
                                 evaluators=self._evaluators,
                                 geo_cache=self._geo_cache.get(p.name))
 
+                        # Submit all, track progress as they complete
+                        robust_metrics = [None] * n_total
                         with ThreadPoolExecutor(max_workers=rb_n_workers) as executor:
-                            robust_metrics = list(executor.map(_eval_robust, val_pairs))
+                            futures = {executor.submit(_eval_robust, p): i
+                                       for i, p in enumerate(val_pairs)}
+                            done_count = 0
+                            for future in as_completed(futures):
+                                idx = futures[future]
+                                robust_metrics[idx] = future.result()
+                                done_count += 1
+                                dt = time.perf_counter() - t0_rb
+                                eta = (dt / done_count) * (n_total - done_count)
+                                print(f"    [robust {done_count:>{len(str(n_total))}}/{n_total}] "
+                                      f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                      flush=True)
 
                         dt_rb = time.perf_counter() - t0_rb
-                        print(f"    {n_total} pairs in {dt_rb:.1f}s "
+                        print(f"    Done: {n_total} pairs in {dt_rb:.1f}s "
                               f"({rb_n_workers} threads)", flush=True)
 
                         rb_summary = self._summarise_and_print(
@@ -2025,7 +2044,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                 t0_ep0 = time.perf_counter()
 
                 with torch.no_grad():
-                    for i in my_indices:
+                    for count, i in enumerate(my_indices, 1):
                         sub_p = _subsample(val_pairs[i])
                         m = evaluate_pair(self.model, sub_p,
                                           hp.k, hp.num_eigenvectors, device,
@@ -2033,6 +2052,14 @@ class FunctionalMapModule(LaplacianModuleBase):
                                           evaluators=self._evaluators,
                                           geo_cache=self._geo_cache.get(val_pairs[i].name))
                         my_metrics.append(m)
+                        n_my = len(my_indices)
+                        if is_rank0:
+                            dt = time.perf_counter() - t0_ep0
+                            total_done = count * world_size
+                            eta = (dt / count) * (n_my - count)
+                            print(f"    [model {min(total_done, n_total):>{len(str(n_total))}}/{n_total}] "
+                                  f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                  flush=True)
                 self.model.train()
 
                 # Gather metrics from all ranks
@@ -2244,6 +2271,7 @@ class FunctionalMapModule(LaplacianModuleBase):
 
     def on_validation_epoch_start(self) -> None:
         self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
+        self._val_t0 = time.perf_counter()
 
     @torch.no_grad()
     def validation_step(self, batch: List[PairSample], batch_idx: int,
@@ -2263,6 +2291,21 @@ class FunctionalMapModule(LaplacianModuleBase):
             evaluators=self._evaluators,
             geo_cache=self._geo_cache.get(pair.name),
         ))
+
+        # Progress print (rank 0)
+        if self.trainer.is_global_zero:
+            done = batch_idx + 1
+            try:
+                total = self.trainer.num_val_batches[dataloader_idx]
+            except (IndexError, TypeError):
+                total = None
+            dt = time.perf_counter() - self._val_t0
+            if total:
+                eta = (dt / done) * (total - done)
+                print(f"    [val {done:>{len(str(total))}}/{total}] "
+                      f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining", flush=True)
+            else:
+                print(f"    [val {done}] {dt:.1f}s elapsed", flush=True)
 
     def on_validation_epoch_end(self) -> None:
         if not self._val_outputs:

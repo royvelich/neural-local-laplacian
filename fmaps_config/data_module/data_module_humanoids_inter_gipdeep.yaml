@@ -28,9 +28,8 @@ module:
         _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
         root: "/mnt/gipnetapp_public/neural-cotangent-weights/DeformingThings4DMatching"
         pair_mode: inter
-        pairs:
-        - 0:10
-      val_poses_per_pair: 10
+        pairs: null
+      val_poses_per_pair: -1
       seed: ${globals.training_seed}
     batch_size: 1
     num_workers: 0
