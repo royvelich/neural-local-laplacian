@@ -45,14 +45,17 @@ class LaplacianConfig:
                  For 'knn': neighbor count for the pruning graph (caller
                  must compute knn_prune and pass it to assemble_laplacian).
                  Ignored when pruning='none'.
-        sparse: If True, return scipy.sparse.csr_matrix instead of dense
-                torch.Tensor. Much faster for large meshes in eval.
-                Pruning is not supported in sparse mode (must be 'none').
+        sparse: If True, return scipy.sparse.csr_matrix (for eval).
+                No autograd. Pruning not supported.
+        torch_sparse: If True, return torch.sparse_coo_tensor with autograd
+                      intact (for training with sparse solvers like torch-sla).
+                      Pruning not supported.
     """
     assembly: Literal['isotropic', 'anisotropic'] = 'isotropic'
     pruning: Literal['none', 'knn', 'topk'] = 'none'
     k_prune: Optional[int] = None
     sparse: bool = False
+    torch_sparse: bool = False
 
     def __post_init__(self):
         if self.assembly not in ('isotropic', 'anisotropic'):
@@ -61,8 +64,12 @@ class LaplacianConfig:
             raise ValueError(f"pruning must be 'none', 'knn', or 'topk', got: {self.pruning}")
         if self.pruning in ('knn', 'topk') and self.k_prune is None:
             raise ValueError(f"k_prune is required when pruning='{self.pruning}'")
+        if self.sparse and self.torch_sparse:
+            raise ValueError("Cannot set both sparse=True and torch_sparse=True")
         if self.sparse and self.pruning != 'none':
             raise ValueError(f"Pruning is not supported in sparse mode (got pruning='{self.pruning}')")
+        if self.torch_sparse and self.pruning != 'none':
+            raise ValueError(f"Pruning is not supported in torch_sparse mode (got pruning='{self.pruning}')")
 
     @property
     def tag(self) -> str:
@@ -74,6 +81,8 @@ class LaplacianConfig:
             t += f'_top{self.k_prune}'
         if self.sparse:
             t += '_sp'
+        elif self.torch_sparse:
+            t += '_tsp'
         return t
 
 
@@ -97,10 +106,18 @@ def assemble_laplacian(
                    If None and pruning='knn', uses the assembly knn.
 
     Returns:
-        L: (N, N) dense torch.Tensor or scipy.sparse.csr_matrix.
+        Dense torch.Tensor, scipy.sparse.csr_matrix, or torch sparse
+        COO tensor depending on config.sparse / config.torch_sparse.
     """
+    if config.torch_sparse:
+        # Torch sparse path — returns torch.sparse_coo_tensor with autograd
+        if config.assembly == 'anisotropic':
+            return _assemble_anisotropic_torch_sparse(grad_coeffs, knn)
+        else:
+            return _assemble_isotropic_torch_sparse(grad_coeffs, knn)
+
     if config.sparse:
-        # Sparse path — returns scipy.sparse.csr_matrix
+        # Scipy sparse path — returns scipy.sparse.csr_matrix (no autograd)
         if config.assembly == 'anisotropic':
             return _assemble_anisotropic_sparse(grad_coeffs, knn)
         else:
@@ -205,34 +222,20 @@ def assemble_isotropic_laplacian(
 
 
 # =============================================================================
-# Sparse assembly (for eval — builds torch.sparse on GPU, converts to scipy)
+# Sparse assembly — shared helpers
 # =============================================================================
 
-def _torch_sparse_to_scipy(L_sparse: torch.Tensor, N: int) -> scipy.sparse.csr_matrix:
-    """Convert a coalesced torch sparse COO tensor to scipy CSR."""
-    L_sparse = L_sparse.coalesce()
-    indices = L_sparse.indices().cpu().numpy()
-    values = L_sparse.values().cpu().to(torch.float64).numpy()
-    return scipy.sparse.coo_matrix(
-        (values, (indices[0], indices[1])), shape=(N, N)
-    ).tocsr()
-
-
-def _assemble_isotropic_sparse(
+def _build_isotropic_offdiag_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
-) -> scipy.sparse.csr_matrix:
-    """Assemble sparse isotropic graph Laplacian from gradient coefficients.
+) -> torch.Tensor:
+    """Build sparse off-diagonal Laplacian (no diagonal) on GPU.
 
-    Same math as assemble_isotropic_laplacian but builds sparse COO
-    on GPU — never allocates an N×N matrix. O(N*k) memory.
-
-    Args:
-        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
-        knn: (N, k) kNN indices (long tensor).
+    Shared by both scipy and torch sparse paths.
 
     Returns:
-        L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
+        L_offdiag: (N, N) torch.sparse_coo_tensor, coalesced, symmetric,
+                   containing only off-diagonal entries. Autograd intact.
     """
     N, k, _ = grad_coeffs.shape
     device = grad_coeffs.device
@@ -258,33 +261,20 @@ def _assemble_isotropic_sparse(
     L_sparse = (L_sparse + L_sparse.t()).coalesce()
     L_sparse._values().mul_(0.5)
 
-    # Convert to scipy for diagonal fix
-    L_csr = _torch_sparse_to_scipy(L_sparse, N)
-
-    # Fix diagonal: L_ii = -sum of off-diagonal in row i
-    L_csr.setdiag(0.0)
-    row_sums = np.asarray(L_csr.sum(axis=1)).ravel()
-    L_csr.setdiag(-row_sums)
-    L_csr.eliminate_zeros()
-
-    return L_csr
+    return L_sparse
 
 
-def _assemble_anisotropic_sparse(
+def _build_anisotropic_offdiag_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
-) -> scipy.sparse.csr_matrix:
-    """Assemble sparse anisotropic Laplacian L = G^T G.
+) -> torch.Tensor:
+    """Build sparse anisotropic Laplacian L = G^T G on GPU.
 
-    Same math as assemble_anisotropic_laplacian but builds sparse COO
-    on GPU from local Gram matrices — never allocates an N×N matrix.
-
-    Args:
-        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
-        knn: (N, k) kNN indices (long tensor).
+    Shared by both scipy and torch sparse paths.
 
     Returns:
-        L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
+        L: (N, N) torch.sparse_coo_tensor, coalesced, symmetric.
+           Autograd intact.
     """
     N, k, _ = grad_coeffs.shape
     device = grad_coeffs.device
@@ -314,7 +304,122 @@ def _assemble_anisotropic_sparse(
     L_sparse = (L_sparse + L_sparse.t()).coalesce()
     L_sparse._values().mul_(0.5)
 
-    # Convert to scipy
+    return L_sparse
+
+
+# =============================================================================
+# Torch sparse assembly (for training — autograd-compatible)
+# =============================================================================
+
+def _assemble_isotropic_torch_sparse(
+    grad_coeffs: torch.Tensor,
+    knn: torch.Tensor,
+) -> torch.Tensor:
+    """Assemble sparse isotropic Laplacian as torch.sparse_coo_tensor.
+
+    Autograd-compatible: gradients flow through values back to grad_coeffs.
+    O(N*k) memory — never allocates N×N dense.
+
+    Args:
+        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
+        knn: (N, k) kNN indices (long tensor).
+
+    Returns:
+        L: (N, N) torch.sparse_coo_tensor, coalesced, symmetric PSD.
+    """
+    N = grad_coeffs.shape[0]
+    device = grad_coeffs.device
+
+    L_offdiag = _build_isotropic_offdiag_sparse(grad_coeffs, knn)
+
+    # Diagonal fix in torch: L_ii = -sum of off-diagonal in row i
+    row_sums = torch.sparse.sum(L_offdiag, dim=1).to_dense()  # (N,)
+    diag_indices = torch.arange(N, device=device).unsqueeze(0).expand(2, -1)
+    L_diag = torch.sparse_coo_tensor(diag_indices, -row_sums, size=(N, N))
+
+    return (L_offdiag + L_diag).coalesce()
+
+
+def _assemble_anisotropic_torch_sparse(
+    grad_coeffs: torch.Tensor,
+    knn: torch.Tensor,
+) -> torch.Tensor:
+    """Assemble sparse anisotropic Laplacian as torch.sparse_coo_tensor.
+
+    Autograd-compatible: gradients flow through values back to grad_coeffs.
+
+    Args:
+        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
+        knn: (N, k) kNN indices (long tensor).
+
+    Returns:
+        L: (N, N) torch.sparse_coo_tensor, coalesced, symmetric PSD.
+    """
+    # Anisotropic Gram already includes diagonal contributions
+    return _build_anisotropic_offdiag_sparse(grad_coeffs, knn)
+
+
+# =============================================================================
+# Scipy sparse assembly (for eval — no autograd, converts to scipy)
+# =============================================================================
+
+def _torch_sparse_to_scipy(L_sparse: torch.Tensor, N: int) -> scipy.sparse.csr_matrix:
+    """Convert a coalesced torch sparse COO tensor to scipy CSR."""
+    L_sparse = L_sparse.coalesce()
+    indices = L_sparse.indices().cpu().numpy()
+    values = L_sparse.values().detach().cpu().to(torch.float64).numpy()
+    return scipy.sparse.coo_matrix(
+        (values, (indices[0], indices[1])), shape=(N, N)
+    ).tocsr()
+
+
+def _assemble_isotropic_sparse(
+    grad_coeffs: torch.Tensor,
+    knn: torch.Tensor,
+) -> scipy.sparse.csr_matrix:
+    """Assemble sparse isotropic Laplacian, returned as scipy CSR.
+
+    No autograd — for eval only.
+
+    Args:
+        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
+        knn: (N, k) kNN indices (long tensor).
+
+    Returns:
+        L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
+    """
+    N = grad_coeffs.shape[0]
+    L_offdiag = _build_isotropic_offdiag_sparse(grad_coeffs, knn)
+
+    # Convert to scipy for diagonal fix
+    L_csr = _torch_sparse_to_scipy(L_offdiag, N)
+
+    # Fix diagonal: L_ii = -sum of off-diagonal in row i
+    L_csr.setdiag(0.0)
+    row_sums = np.asarray(L_csr.sum(axis=1)).ravel()
+    L_csr.setdiag(-row_sums)
+    L_csr.eliminate_zeros()
+
+    return L_csr
+
+
+def _assemble_anisotropic_sparse(
+    grad_coeffs: torch.Tensor,
+    knn: torch.Tensor,
+) -> scipy.sparse.csr_matrix:
+    """Assemble sparse anisotropic Laplacian, returned as scipy CSR.
+
+    No autograd — for eval only.
+
+    Args:
+        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
+        knn: (N, k) kNN indices (long tensor).
+
+    Returns:
+        L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
+    """
+    N = grad_coeffs.shape[0]
+    L_sparse = _build_anisotropic_offdiag_sparse(grad_coeffs, knn)
     return _torch_sparse_to_scipy(L_sparse, N)
 
 
