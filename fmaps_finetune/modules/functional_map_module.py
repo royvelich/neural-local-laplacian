@@ -1520,6 +1520,22 @@ class FunctionalMapModule(LaplacianModuleBase):
             self.model.print_trainable_parameters()
 
         self._train_rng = np.random.RandomState(hp.seed + self.global_rank * 10_007)
+
+        # DDP fix: reseed training dataset so each rank generates different pairs.
+        # ShapePairDataset.__getitem__ ignores idx and uses self._rng, so all ranks
+        # would produce identical pairs without per-rank seeding.
+        if self.trainer.world_size > 1:
+            dm = self.trainer.datamodule
+            train_ds = getattr(dm, '_train_dataset_specification', None)
+            if train_ds is not None:
+                train_ds = getattr(train_ds, 'dataset', None)
+            if train_ds is not None and hasattr(train_ds, '_rng'):
+                new_seed = hp.seed + self.global_rank * 10_007
+                train_ds._rng = np.random.RandomState(new_seed)
+                if self.global_rank == 0:
+                    print(f"  [FMModule] DDP: reseeded training dataset "
+                          f"(world_size={self.trainer.world_size})")
+
         n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.parameters())
         print(f"  [FMModule rank={self.global_rank}] "
@@ -1829,17 +1845,18 @@ class FunctionalMapModule(LaplacianModuleBase):
     # ------------------------------------------------------------------
 
     def on_fit_start(self) -> None:
-        """Log robust-Laplacian and epoch-0 model baselines to W&B at step 0.
+        """Compute baselines and precompute geo caches.
 
-        Only runs on rank 0 to avoid duplicated evaluation in DDP.
-        Iterates over all val dataset specifications.
+        All ranks participate in geo cache precomputation and model baseline
+        (distributed across GPUs). Robust baseline runs on rank 0 only
+        (CPU-parallelised with ThreadPoolExecutor).
         """
-        if not self.trainer.is_global_zero:
-            return
-
         hp     = self.hparams
         device = self.device
         dm     = self.trainer.datamodule
+        is_rank0 = self.trainer.is_global_zero
+        world_size = self.trainer.world_size
+
         if dm is None or not dm._val_dataset_specifications:
             return
 
@@ -1850,7 +1867,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                                       np.random.RandomState(_stable_hash(pair.name)))
             return pair
 
-        # Collect all val pairs across all datasets
+        # Collect all val pairs across all datasets (all ranks need this)
         all_val_datasets: List[Tuple[str, List[PairSample]]] = []
         for spec in dm._val_dataset_specifications:
             ds = spec.dataset
@@ -1858,16 +1875,18 @@ class FunctionalMapModule(LaplacianModuleBase):
             pairs = [ds[i] for i in range(len(ds))]
             all_val_datasets.append((ds_name, pairs))
 
-        # Precompute geodesic caches for all val pairs across all datasets.
-        # Build solver + eagerly compute distances from all unique GT targets
-        # so that per-pair evaluation incurs zero geodesic cost.
+        # ==================================================================
+        # Precompute geodesic caches (all ranks — needed for DDP validation)
+        # ==================================================================
         all_pairs = [(name, p) for name, pairs in all_val_datasets for p in pairs]
-        print(f"\n  Precomputing geodesic caches ({len(all_pairs)} pairs)...", flush=True)
+        if is_rank0:
+            print(f"\n  Precomputing geodesic caches ({len(all_pairs)} pairs)...",
+                  flush=True)
         t0_geo = time.perf_counter()
 
-        # Prepare worker args: subsample, extract gt, collect serialisable data
+        # Prepare worker args
         worker_args = []
-        pair_meta = []   # (pair_name, sent_to_worker) — to reconstruct caches later
+        pair_meta = []
         for _, p in all_pairs:
             if p.name in self._geo_cache:
                 pair_meta.append((p.name, False))
@@ -1884,7 +1903,6 @@ class FunctionalMapModule(LaplacianModuleBase):
             if gt_corr is not None:
                 unique_targets = np.unique(gt_corr)
             else:
-                # Identity correspondence: every B vertex is a GT target
                 unique_targets = np.arange(len(sub_p.verts_b))
 
             worker_args.append((
@@ -1892,21 +1910,22 @@ class FunctionalMapModule(LaplacianModuleBase):
             ))
             pair_meta.append((p.name, True))
 
-        # Run workers in parallel
+        # Run geo cache workers (limit parallelism in multi-GPU to avoid CPU contention)
         _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
-        n_workers = min(len(worker_args), max(1, _n_cpus - 1))
+        n_workers = min(len(worker_args), max(1, _n_cpus // max(world_size, 1)))
         if worker_args:
             if n_workers > 1:
                 import multiprocessing as _mp
-                print(f"    Parallel precomputation: {len(worker_args)} pairs, "
-                      f"{n_workers} workers", flush=True)
+                if is_rank0:
+                    print(f"    Parallel precomputation: {len(worker_args)} pairs, "
+                          f"{n_workers} workers", flush=True)
                 with _mp.Pool(n_workers) as pool:
                     results = {}
                     for i, r in enumerate(pool.imap_unordered(
                             _precompute_geo_cache_worker, worker_args)):
                         results[r[0]] = r[1:]
                         done = i + 1
-                        if done % 10 == 0 or done == len(worker_args):
+                        if is_rank0 and (done % 10 == 0 or done == len(worker_args)):
                             dt = time.perf_counter() - t0_geo
                             print(f"    [{done}/{len(worker_args)}] {dt:.1f}s",
                                   flush=True)
@@ -1916,14 +1935,13 @@ class FunctionalMapModule(LaplacianModuleBase):
                     r = _precompute_geo_cache_worker(args)
                     results[r[0]] = r[1:]
                     done = i + 1
-                    if done % 10 == 0 or done == len(worker_args):
+                    if is_rank0 and (done % 10 == 0 or done == len(worker_args)):
                         dt = time.perf_counter() - t0_geo
                         print(f"    [{done}/{len(worker_args)}] {dt:.1f}s",
                               flush=True)
         else:
             results = {}
 
-        # Reconstruct GeodesicCache objects from worker results
         for pair_name, sent_to_worker in pair_meta:
             if pair_name in self._geo_cache:
                 continue
@@ -1939,80 +1957,153 @@ class FunctionalMapModule(LaplacianModuleBase):
 
         dt_geo = time.perf_counter() - t0_geo
         n_with_geo = sum(1 for v in self._geo_cache.values() if v is not None)
-        print(f"    Done: {n_with_geo}/{len(all_pairs)} pairs with faces "
-              f"({dt_geo:.1f}s)", flush=True)
+        if is_rank0:
+            print(f"    Done: {n_with_geo}/{len(all_pairs)} pairs with faces "
+                  f"({dt_geo:.1f}s)", flush=True)
 
-        # Run baselines per dataset
-        # Collect results for CSV/plot export in eval_only mode
+        # ==================================================================
+        # Baselines
+        # ==================================================================
         eval_results: Dict[str, Dict[str, Tuple[List[Dict], Dict]]] = {}
-        # eval_results[ds_name][method_name] = (per_pair_metrics, summary_dict)
 
         if hp.skip_baselines:
-            print("\n  [skip_baselines=true] Skipping baseline computation.",
-                  flush=True)
+            if is_rank0:
+                print("\n  [skip_baselines=true] Skipping baseline computation.",
+                      flush=True)
         else:
             for ds_name, val_pairs in all_val_datasets:
                 if not val_pairs:
                     continue
                 eval_results[ds_name] = {}
-                pair_names = [p.name for p in val_pairs]
                 n_total = len(val_pairs)
-                cw = len(str(n_total))
                 ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
 
-                # ── Robust Laplacian baseline ──────────────────────────────────
-                try:
-                    import robust_laplacian  # noqa: F401
-                    print(f"\n  Computing robust Laplacian baseline{ds_label} "
-                          f"({n_total} pairs)...", flush=True)
-                    robust_metrics = []
-                    for i, p in enumerate(val_pairs):
-                        print(f"    [robust {i+1:>{cw}}/{n_total}] {p.name}...",
-                              end="", flush=True)
-                        t0_ = time.perf_counter()
-                        m = evaluate_pair_robust(_subsample(p), hp.num_eigenvectors,
-                                                 evaluators=self._evaluators,
-                                                 geo_cache=self._geo_cache.get(p.name))
-                        dt_ = time.perf_counter() - t0_
-                        robust_metrics.append(m)
-                        print(f" {dt_:.1f}s", flush=True)
-                    rb_summary = self._summarise_and_print(
-                        robust_metrics, f"Robust baseline{ds_label}")
-                    self.logger.log_metrics(
-                        {f"baseline/robust/{ds_name}/{k}": v
-                         for k, v in rb_summary.items()}, step=0)
-                    eval_results[ds_name]["robust"] = (robust_metrics, rb_summary)
-                except ImportError:
-                    print("  (robust_laplacian not installed — skipping robust baseline)")
+                # ── Robust Laplacian baseline (rank 0, ThreadPoolExecutor) ──
+                if is_rank0:
+                    try:
+                        import robust_laplacian  # noqa: F401
+                        print(f"\n  Computing robust Laplacian baseline{ds_label} "
+                              f"({n_total} pairs)...", flush=True)
+                        t0_rb = time.perf_counter()
 
-                # ── Epoch-0 model baseline ─────────────────────────────────────
+                        from concurrent.futures import ThreadPoolExecutor
+                        rb_n_workers = max(1, _n_cpus - 1)
+
+                        def _eval_robust(p):
+                            return evaluate_pair_robust(
+                                _subsample(p), hp.num_eigenvectors,
+                                evaluators=self._evaluators,
+                                geo_cache=self._geo_cache.get(p.name))
+
+                        with ThreadPoolExecutor(max_workers=rb_n_workers) as executor:
+                            robust_metrics = list(executor.map(_eval_robust, val_pairs))
+
+                        dt_rb = time.perf_counter() - t0_rb
+                        print(f"    {n_total} pairs in {dt_rb:.1f}s "
+                              f"({rb_n_workers} threads)", flush=True)
+
+                        rb_summary = self._summarise_and_print(
+                            robust_metrics, f"Robust baseline{ds_label}")
+                        self.logger.log_metrics(
+                            {f"baseline/robust/{ds_name}/{k}": v
+                             for k, v in rb_summary.items()}, step=0)
+                        eval_results[ds_name]["robust"] = (robust_metrics, rb_summary)
+                    except ImportError:
+                        print("  (robust_laplacian not installed — "
+                              "skipping robust baseline)")
+
+                # ── Epoch-0 model baseline (all ranks, distributed) ─────────
                 init_label = "random init" if hp.random_init else "pretrained"
-                print(f"\n  Computing {init_label} model baseline{ds_label} "
-                      f"({n_total} pairs)...", flush=True)
+                if is_rank0:
+                    print(f"\n  Computing {init_label} model baseline{ds_label} "
+                          f"({n_total} pairs, {world_size} GPU(s))...", flush=True)
+
                 self.model.eval()
-                ep0_metrics = []
+                # Distribute pairs across ranks
+                my_indices = list(range(self.global_rank, n_total, world_size))
+                my_metrics = []
+                t0_ep0 = time.perf_counter()
+
                 with torch.no_grad():
-                    for i, p in enumerate(val_pairs):
-                        sub_p = _subsample(p)
-                        print(f"    [model  {i+1:>{cw}}/{n_total}] {p.name}...",
-                              end="", flush=True)
-                        t0_ = time.perf_counter()
+                    for i in my_indices:
+                        sub_p = _subsample(val_pairs[i])
                         m = evaluate_pair(self.model, sub_p,
                                           hp.k, hp.num_eigenvectors, device,
                                           laplacian_configs=self._eval_lap_configs,
                                           evaluators=self._evaluators,
-                                          geo_cache=self._geo_cache.get(p.name))
-                        dt_ = time.perf_counter() - t0_
-                        ep0_metrics.append(m)
-                        print(f" {dt_:.1f}s", flush=True)
+                                          geo_cache=self._geo_cache.get(val_pairs[i].name))
+                        my_metrics.append(m)
                 self.model.train()
 
-                ep0_summary = self._summarise_and_print(
-                    ep0_metrics, f"Model baseline ({init_label}){ds_label}")
-                self.logger.log_metrics(
-                    {f"baseline/model/{ds_name}/{k}": v
-                     for k, v in ep0_summary.items()}, step=0)
-                eval_results[ds_name][f"model_{init_label}"] = (ep0_metrics, ep0_summary)
+                # Gather metrics from all ranks
+                if world_size > 1:
+                    # All ranks must participate in all_gather even with 0 local pairs.
+                    # Determine float_keys from any rank that has metrics.
+                    max_per_rank = (n_total + world_size - 1) // world_size
+                    if my_metrics:
+                        sample = my_metrics[0]
+                        float_keys = sorted(k for k, v in sample.items()
+                                            if isinstance(v, (int, float)))
+                    else:
+                        float_keys = []
+
+                    # Broadcast float_keys length from rank 0 so all ranks agree
+                    n_keys_t = torch.tensor(
+                        [len(float_keys)], device=device, dtype=torch.long)
+                    import torch.distributed as dist
+                    if dist.is_initialized():
+                        dist.broadcast(n_keys_t, src=0)
+                    n_keys = n_keys_t.item()
+
+                    if n_keys > 0:
+                        local_t = torch.full(
+                            (max_per_rank, n_keys),
+                            float("nan"), device=device, dtype=torch.float32)
+                        for j, m in enumerate(my_metrics):
+                            for ki, k in enumerate(float_keys):
+                                val = m.get(k, float("nan"))
+                                local_t[j, ki] = val
+
+                        gathered = self.all_gather(local_t)
+                        if gathered.dim() == 2:
+                            gathered = gathered.unsqueeze(0)
+
+                        if is_rank0:
+                            # Reconstruct original pair order from gathered results.
+                            # Rank r processed pairs[r::world_size].
+                            ep0_metrics = [{}] * n_total
+                            for rank in range(world_size):
+                                rank_indices = list(range(rank, n_total, world_size))
+                                for j, orig_idx in enumerate(rank_indices):
+                                    row = gathered[rank, j]
+                                    if not torch.isnan(row).all():
+                                        ep0_metrics[orig_idx] = {
+                                            k: row[ki].item()
+                                            for ki, k in enumerate(float_keys)
+                                        }
+                    else:
+                        ep0_metrics = []
+                elif not my_metrics:
+                    ep0_metrics = []
+                else:
+                    ep0_metrics = my_metrics
+
+                if is_rank0:
+                    dt_ep0 = time.perf_counter() - t0_ep0
+                    print(f"    {n_total} pairs in {dt_ep0:.1f}s", flush=True)
+                    ep0_summary = self._summarise_and_print(
+                        ep0_metrics, f"Model baseline ({init_label}){ds_label}")
+                    self.logger.log_metrics(
+                        {f"baseline/model/{ds_name}/{k}": v
+                         for k, v in ep0_summary.items()}, step=0)
+                    eval_results[ds_name][f"model_{init_label}"] = (
+                        ep0_metrics, ep0_summary)
+
+                # Synchronise ranks before moving to next dataset
+                if world_size > 1:
+                    import torch.distributed as dist
+                    if dist.is_initialized():
+                        dist.barrier()
 
         # Store baseline summaries for TrainingOutputCallback access
         self._baseline_summaries = {}
@@ -2023,10 +2114,11 @@ class FunctionalMapModule(LaplacianModuleBase):
 
         # ── Eval-only mode: save CSVs and plots, then stop ────────────────
         if hp.eval_only:
-            if eval_results:
+            if eval_results and is_rank0:
                 self._export_eval_results(eval_results, all_val_datasets)
-            print("\n  [eval_only=true] Baselines complete — stopping.", flush=True)
-            # Finalize W&B logging before exit
+            if is_rank0:
+                print("\n  [eval_only=true] Baselines complete — stopping.",
+                      flush=True)
             try:
                 import wandb
                 if wandb.run is not None:
