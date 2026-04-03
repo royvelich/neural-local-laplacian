@@ -23,6 +23,7 @@ module:
       landmark_ratio: 0.25
 #      num_landmarks: 128
       alphas:
+        - 0.01
         - 0.1
         - 1.0
         - 10.0
