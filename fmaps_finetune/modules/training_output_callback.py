@@ -78,7 +78,7 @@ class TrainingOutputCallback(pl.Callback):
         lap_cfg = self.cfg.get('model', {}).get('module', {}).get('train_laplacian', {})
         if isinstance(lap_cfg, dict) and lap_cfg.get('assembly'):
             asm = lap_cfg['assembly']
-            if asm != 'isotropic':
+            if asm != 'diagonal_gram':
                 parts.append(asm)
 
         # Loss info — try loss_preset first, then individual loss names

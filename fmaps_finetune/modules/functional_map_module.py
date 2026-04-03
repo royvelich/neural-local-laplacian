@@ -34,8 +34,8 @@ from neural_local_laplacian.utils.utils import (
 from neural_local_laplacian.utils.laplacian_assembly import (
     LaplacianConfig,
     assemble_laplacian,
-    assemble_anisotropic_laplacian,
-    assemble_isotropic_laplacian,
+    assemble_full_gram_laplacian,
+    assemble_diagonal_gram_laplacian,
     prune_to_knn,
     prune_to_topk,
 )
@@ -170,7 +170,7 @@ def compute_laplacian_differentiable(
     batch_data = Batch.from_data_list([build_patch_data(vertices_t, knn, device)]).to(device)
     fwd        = model._forward_pass(batch_data)
 
-    L = assemble_anisotropic_laplacian(fwd['grad_coeffs'], knn_t)
+    L = assemble_full_gram_laplacian(fwd['grad_coeffs'], knn_t)
     if sparsify:
         L = prune_to_knn(L, knn_t)
     return L, fwd['areas'].detach()
@@ -1146,12 +1146,12 @@ def evaluate_pair(
     Args:
         laplacian_configs: List of LaplacianConfig to evaluate. Each config
             produces a separate eigenbasis and metric set prefixed by config.tag.
-            Defaults to [LaplacianConfig(assembly='isotropic')].
+            Defaults to [LaplacianConfig(assembly='diagonal_gram')].
         evaluators: List of ShapePairEvaluator instances.
         geo_cache: Precomputed GeodesicCache for mesh B.
     """
     if laplacian_configs is None:
-        laplacian_configs = [LaplacianConfig(assembly='isotropic')]
+        laplacian_configs = [LaplacianConfig(assembly='diagonal_gram')]
 
     n_a = len(pair.verts_a)
 
@@ -1434,10 +1434,10 @@ class FunctionalMapModule(LaplacianModuleBase):
         self._val_outputs: Dict[int, List[Dict[str, float]]] = {}
 
         # Build LaplacianConfig objects from dict parameters
-        _train_lap = train_laplacian or {'assembly': 'anisotropic', 'pruning': 'none'}
+        _train_lap = train_laplacian or {'assembly': 'full_gram', 'pruning': 'none'}
         self._train_lap_config = LaplacianConfig(**_train_lap)
 
-        _eval_laps = eval_laplacians or [{'assembly': 'isotropic', 'pruning': 'none'}]
+        _eval_laps = eval_laplacians or [{'assembly': 'diagonal_gram', 'pruning': 'none'}]
         self._eval_lap_configs = [LaplacianConfig(**d) for d in _eval_laps]
 
         # Build evaluators
@@ -1616,22 +1616,20 @@ class FunctionalMapModule(LaplacianModuleBase):
             mean_acc = summary.get("accuracy", 0.0)
             mean_err = summary.get("mean_error", 0.0)
 
-        # Sparse / isotropic primary accuracy
-        sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
-        iso_key = f"iso_{nn_prefix}accuracy" if has_nn else "iso_accuracy"
-        sp_acc = summary.get(sp_key)
-        iso_acc = summary.get(iso_key)
-
         # --- Print summary ---
         if not silent:
-            # Collect all variant rows: (display_name, prefix) for each evaluator
-            # e.g. ("spectral_nn", ""), ("sp_spectral_nn", "sp_"), ("iso_spectral_nn", "iso_")
+            # Auto-discover variant prefixes from metric keys.
+            # Metrics are keyed as "{prefix}{evaluator.name}/{metric}".
+            # Prefix is "" for single config, or "{tag}_" for multiple configs.
+            # We discover all prefixes by looking for "*/accuracy" keys.
             rows = []
             for ev in self._evaluators:
-                for prefix, variant_label in [("", ""), ("sp_", "sp_"), ("iso_", "iso_")]:
-                    key = f"{prefix}{ev.name}/accuracy"
-                    if summary.get(key) is not None:
-                        rows.append((f"{variant_label}{ev.name}", prefix, ev))
+                acc_suffix = f"{ev.name}/accuracy"
+                for key in sorted(all_keys):
+                    if key.endswith(acc_suffix) and summary.get(key) is not None:
+                        prefix = key[:-len(acc_suffix)]
+                        display = f"{prefix}{ev.name}" if prefix else ev.name
+                        rows.append((display, prefix, ev))
 
             if not rows:
                 return summary
@@ -2363,32 +2361,66 @@ class FunctionalMapModule(LaplacianModuleBase):
                          add_dataloader_idx=False)
 
             # Primary metrics from first dataset
-            nn_prefix = "spectral_nn/"
-            has_nn = any(k.startswith(nn_prefix) for k in summary)
-            acc_key = f"{nn_prefix}accuracy" if has_nn else "accuracy"
-            sp_key = f"sp_{nn_prefix}accuracy" if has_nn else "sp_accuracy"
-            iso_geo5_key = f"iso_{nn_prefix}geo_at_05pct" if has_nn else "iso_geo_at_05pct"
-
             if dl_idx == 0:
-                self.log("val/top1", summary.get(acc_key, 0.0),
-                         prog_bar=True, sync_dist=True, add_dataloader_idx=False)
-                if sp_key in summary:
-                    self.log("val/sp_top1", summary[sp_key],
+                # Find unprefixed (first config) accuracy for top1
+                # Auto-discover: first evaluator with unprefixed accuracy key
+                acc_key = None
+                for ev in self._evaluators:
+                    k = f"{ev.name}/accuracy"
+                    if k in summary:
+                        acc_key = k
+                        break
+                if acc_key:
+                    self.log("val/top1", summary[acc_key],
                              prog_bar=True, sync_dist=True, add_dataloader_idx=False)
-                # Primary for checkpointing: prefer fmap evaluator geo@5%,
-                # fall back to spectral_nn geo@5%, then sp top1, then dense top1
+
+                # Find secondary variant accuracy (any prefixed evaluator accuracy)
+                secondary_acc_key = None
+                for ev in self._evaluators:
+                    suffix = f"{ev.name}/accuracy"
+                    for k in sorted(summary.keys()):
+                        if k.endswith(suffix) and k != suffix and summary.get(k) is not None:
+                            secondary_acc_key = k
+                            break
+                    if secondary_acc_key:
+                        break
+                if secondary_acc_key:
+                    self.log("val/secondary_top1", summary[secondary_acc_key],
+                             prog_bar=True, sync_dist=True, add_dataloader_idx=False)
+
+                # Primary for checkpointing: prefer fmap evaluator geo@5%
+                # from any variant, fall back to spectral_nn geo@5%, then accuracy
                 primary_acc = None
-                # Try fmap evaluators (iso variant) first
+
+                # Try fmap evaluators geo@5% (prefer non-default / prefixed variant)
                 for ev in self._evaluators:
                     if ev.name.startswith("fmap_"):
-                        fmap_geo5_key = f"iso_{ev.name}/geo_at_05pct"
-                        if fmap_geo5_key in summary:
-                            primary_acc = summary[fmap_geo5_key]
+                        suffix = f"{ev.name}/geo_at_05pct"
+                        # Prefer prefixed (non-default) variant
+                        for k in sorted(summary.keys()):
+                            if k.endswith(suffix) and k != suffix:
+                                primary_acc = summary[k]
+                                break
+                        if primary_acc is None:
+                            # Fall back to unprefixed
+                            if suffix in summary:
+                                primary_acc = summary[suffix]
+                        if primary_acc is not None:
                             break
+
+                # Fall back to any spectral_nn geo@5%
                 if primary_acc is None:
-                    primary_acc = summary.get(
-                        iso_geo5_key,
-                        summary.get(sp_key, summary.get(acc_key, 0.0)))
+                    for k in sorted(summary.keys()):
+                        if k.endswith("spectral_nn/geo_at_05pct"):
+                            primary_acc = summary[k]
+                            break
+
+                # Fall back to secondary accuracy, then default accuracy
+                if primary_acc is None:
+                    if secondary_acc_key:
+                        primary_acc = summary[secondary_acc_key]
+                    elif acc_key:
+                        primary_acc = summary.get(acc_key, 0.0)
 
         if primary_acc is not None:
             self.log("val/best_acc", primary_acc,

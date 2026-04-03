@@ -45,8 +45,8 @@ from neural_local_laplacian.utils.utils import split_results_by_nodes, split_res
 from neural_local_laplacian.utils.laplacian_assembly import (
     LaplacianConfig,
     assemble_laplacian,
-    assemble_anisotropic_laplacian,
-    assemble_isotropic_laplacian,
+    assemble_full_gram_laplacian,
+    assemble_diagonal_gram_laplacian,
     prune_to_knn,
     to_scipy_sparse,
     mass_matrix_to_scipy,
@@ -63,7 +63,7 @@ from neural_local_laplacian.utils.geodesic_utils import (
 )
 
 
-def _eigh_anisotropic(L: torch.Tensor, M_diag: torch.Tensor,
+def _eigh_full_gram(L: torch.Tensor, M_diag: torch.Tensor,
                       num_eigenvectors: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generalized eigenproblem L v = λ M v on GPU via standard form.
@@ -205,7 +205,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
 
         # Validation Laplacian config
-        _val_lap = val_laplacian or {'assembly': 'isotropic', 'pruning': 'none'}
+        _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
         self._val_lap_config = LaplacianConfig(**_val_lap)
 
         # Store loss configs (optionally normalized)
@@ -384,7 +384,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """
         Compute predicted mean curvature vectors from gradient coefficients and areas.
 
-        Computes the anisotropic mean curvature vector as:
+        Computes the full-Gram mean curvature vector as:
             mcv = (Sum_j w_ij * p_j) / A_i
         where w_ij = g_ii . g_ij  and  g_ii = -Sum_m g_im
 
@@ -402,7 +402,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         batch_sizes = forward_result['batch_sizes']  # (batch_size,)
         batch_size = len(batch_sizes)
 
-        # Anisotropic weights: w_ij = g_ii . g_ij
+        # Full-Gram weights: w_ij = g_ii . g_ij
         grad_coeffs = forward_result['grad_coeffs']  # (batch_size, max_k, 3)
         gc_masked = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
         g_self = -gc_masked.sum(dim=1)  # (batch_size, 3)
@@ -906,7 +906,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._last_mass_matrix = mass_matrix
 
         # Eigendecomposition: dense L on GPU
-        pred_eigenvalues, pred_eigenvectors = _eigh_anisotropic(
+        pred_eigenvalues, pred_eigenvectors = _eigh_full_gram(
             L, areas, self._num_eigenvalues
         )
 

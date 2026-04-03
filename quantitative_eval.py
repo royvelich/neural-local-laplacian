@@ -204,11 +204,11 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
         top_k_values = [k for k in top_k_values if 2 <= k < pred_k]
 
     # ---- Laplacian config ----
-    # Accepts: +laplacian.assembly=isotropic +laplacian.pruning=none
+    # Accepts: +laplacian.assembly=diagonal_gram +laplacian.pruning=none
     lap_dict = OmegaConf.to_container(cfg.laplacian) if hasattr(cfg, 'laplacian') else {}
     # Always use sparse assembly for eval (fast COO path, no N×N dense allocation)
     lap_dict.pop('sparse', None)  # remove if user passed it via CLI
-    pred_lap_config = LaplacianConfig(sparse=True, **lap_dict) if lap_dict else LaplacianConfig(assembly='isotropic', sparse=True)
+    pred_lap_config = LaplacianConfig(sparse=True, **lap_dict) if lap_dict else LaplacianConfig(assembly='diagonal_gram', sparse=True)
 
     # Build top-k configs for the sweep
     top_k_configs = [
@@ -994,7 +994,7 @@ def main(cfg: DictConfig) -> None:
 
     # Laplacian config
     lap_dict = OmegaConf.to_container(cfg.laplacian) if hasattr(cfg, 'laplacian') else {}
-    pred_lap_config = LaplacianConfig(**lap_dict) if lap_dict else LaplacianConfig(assembly='isotropic')
+    pred_lap_config = LaplacianConfig(**lap_dict) if lap_dict else LaplacianConfig(assembly='diagonal_gram')
 
     # Build subfolder name
     methods_str = '_'.join(sorted(methods))

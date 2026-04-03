@@ -12,8 +12,8 @@ The eigenvalue problem is: L v = λ M v, where M = diag(areas) is
 constructed separately by the caller from fwd['areas'].
 
 Assembly variants:
-    isotropic:   scalar w_ij = ||g_ij||^2, kNN-sparse (no 2-hop)
-    anisotropic: full Gram L = G^T G, has 2-hop fill-in
+    diagonal_gram: scalar w_ij = ||g_ij||^2, kNN-sparse (no 2-hop)
+    full_gram:    full Gram L = G^T G, has 2-hop fill-in
 
 Pruning options (dense mode only):
     none:  keep L as-is
@@ -37,8 +37,8 @@ class LaplacianConfig:
     """Configuration for Laplacian assembly and pruning.
 
     Args:
-        assembly: 'isotropic' (scalar ||g||^2, kNN-sparse) or
-                  'anisotropic' (full Gram G^T G, 2-hop fill-in).
+        assembly: 'diagonal_gram' (scalar ||g||^2, kNN-sparse) or
+                  'full_gram' (full Gram G^T G, 2-hop fill-in).
         pruning: 'none' (keep as-is), 'knn' (prune to kNN graph),
                  or 'topk' (keep k largest per row).
         k_prune: For 'topk': number of off-diagonal entries to keep per row.
@@ -51,15 +51,15 @@ class LaplacianConfig:
                       intact (for training with sparse solvers like torch-sla).
                       Pruning not supported.
     """
-    assembly: Literal['isotropic', 'anisotropic'] = 'isotropic'
+    assembly: Literal['diagonal_gram', 'full_gram'] = 'diagonal_gram'
     pruning: Literal['none', 'knn', 'topk'] = 'none'
     k_prune: Optional[int] = None
     sparse: bool = False
     torch_sparse: bool = False
 
     def __post_init__(self):
-        if self.assembly not in ('isotropic', 'anisotropic'):
-            raise ValueError(f"assembly must be 'isotropic' or 'anisotropic', got: {self.assembly}")
+        if self.assembly not in ('diagonal_gram', 'full_gram'):
+            raise ValueError(f"assembly must be 'diagonal_gram' or 'full_gram', got: {self.assembly}")
         if self.pruning not in ('none', 'knn', 'topk'):
             raise ValueError(f"pruning must be 'none', 'knn', or 'topk', got: {self.pruning}")
         if self.pruning in ('knn', 'topk') and self.k_prune is None:
@@ -111,23 +111,23 @@ def assemble_laplacian(
     """
     if config.torch_sparse:
         # Torch sparse path — returns torch.sparse_coo_tensor with autograd
-        if config.assembly == 'anisotropic':
-            return _assemble_anisotropic_torch_sparse(grad_coeffs, knn)
+        if config.assembly == 'full_gram':
+            return _assemble_full_gram_torch_sparse(grad_coeffs, knn)
         else:
-            return _assemble_isotropic_torch_sparse(grad_coeffs, knn)
+            return _assemble_diagonal_gram_torch_sparse(grad_coeffs, knn)
 
     if config.sparse:
         # Scipy sparse path — returns scipy.sparse.csr_matrix (no autograd)
-        if config.assembly == 'anisotropic':
-            return _assemble_anisotropic_sparse(grad_coeffs, knn)
+        if config.assembly == 'full_gram':
+            return _assemble_full_gram_sparse(grad_coeffs, knn)
         else:
-            return _assemble_isotropic_sparse(grad_coeffs, knn)
+            return _assemble_diagonal_gram_sparse(grad_coeffs, knn)
 
     # Dense path — returns torch.Tensor
-    if config.assembly == 'anisotropic':
-        L = assemble_anisotropic_laplacian(grad_coeffs, knn)
+    if config.assembly == 'full_gram':
+        L = assemble_full_gram_laplacian(grad_coeffs, knn)
     else:
-        L = assemble_isotropic_laplacian(grad_coeffs, knn)
+        L = assemble_diagonal_gram_laplacian(grad_coeffs, knn)
 
     # Pruning (dense only)
     if config.pruning == 'knn':
@@ -142,11 +142,11 @@ def assemble_laplacian(
 # Dense assembly (for training with backprop)
 # =============================================================================
 
-def assemble_anisotropic_laplacian(
+def assemble_full_gram_laplacian(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> torch.Tensor:
-    """Assemble dense anisotropic Laplacian L = G^T G.
+    """Assemble dense full-Gram Laplacian L = G^T G.
 
     Uses the full Gram structure: L_pq = sum_i <g_ip, g_iq> where
     g_ii = -sum_j g_ij (consistency constraint). Has 2-hop fill-in.
@@ -185,11 +185,11 @@ def assemble_anisotropic_laplacian(
     return L
 
 
-def assemble_isotropic_laplacian(
+def assemble_diagonal_gram_laplacian(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> torch.Tensor:
-    """Assemble dense isotropic graph Laplacian from gradient coefficients.
+    """Assemble dense diagonal-Gram graph Laplacian from gradient coefficients.
 
     Drops cross-terms, keeps only w_ij = ||g_ij||^2. Produces a standard
     graph Laplacian L = D - W. Guaranteed PSD and kNN-sparse (no 2-hop).
@@ -225,7 +225,7 @@ def assemble_isotropic_laplacian(
 # Sparse assembly — shared helpers
 # =============================================================================
 
-def _build_isotropic_offdiag_sparse(
+def _build_diagonal_gram_offdiag_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> torch.Tensor:
@@ -264,11 +264,11 @@ def _build_isotropic_offdiag_sparse(
     return L_sparse
 
 
-def _build_anisotropic_offdiag_sparse(
+def _build_full_gram_offdiag_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> torch.Tensor:
-    """Build sparse anisotropic Laplacian L = G^T G on GPU.
+    """Build sparse full-Gram Laplacian L = G^T G on GPU.
 
     Shared by both scipy and torch sparse paths.
 
@@ -311,11 +311,11 @@ def _build_anisotropic_offdiag_sparse(
 # Torch sparse assembly (for training — autograd-compatible)
 # =============================================================================
 
-def _assemble_isotropic_torch_sparse(
+def _assemble_diagonal_gram_torch_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> torch.Tensor:
-    """Assemble sparse isotropic Laplacian as torch.sparse_coo_tensor.
+    """Assemble sparse diagonal-Gram Laplacian as torch.sparse_coo_tensor.
 
     Autograd-compatible: gradients flow through values back to grad_coeffs.
     O(N*k) memory — never allocates N×N dense.
@@ -330,7 +330,7 @@ def _assemble_isotropic_torch_sparse(
     N = grad_coeffs.shape[0]
     device = grad_coeffs.device
 
-    L_offdiag = _build_isotropic_offdiag_sparse(grad_coeffs, knn)
+    L_offdiag = _build_diagonal_gram_offdiag_sparse(grad_coeffs, knn)
 
     # Diagonal fix in torch: L_ii = -sum of off-diagonal in row i
     row_sums = torch.sparse.sum(L_offdiag, dim=1).to_dense()  # (N,)
@@ -340,11 +340,11 @@ def _assemble_isotropic_torch_sparse(
     return (L_offdiag + L_diag).coalesce()
 
 
-def _assemble_anisotropic_torch_sparse(
+def _assemble_full_gram_torch_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> torch.Tensor:
-    """Assemble sparse anisotropic Laplacian as torch.sparse_coo_tensor.
+    """Assemble sparse full-Gram Laplacian as torch.sparse_coo_tensor.
 
     Autograd-compatible: gradients flow through values back to grad_coeffs.
 
@@ -355,8 +355,8 @@ def _assemble_anisotropic_torch_sparse(
     Returns:
         L: (N, N) torch.sparse_coo_tensor, coalesced, symmetric PSD.
     """
-    # Anisotropic Gram already includes diagonal contributions
-    return _build_anisotropic_offdiag_sparse(grad_coeffs, knn)
+    # Full Gram already includes diagonal contributions
+    return _build_full_gram_offdiag_sparse(grad_coeffs, knn)
 
 
 # =============================================================================
@@ -373,11 +373,11 @@ def _torch_sparse_to_scipy(L_sparse: torch.Tensor, N: int) -> scipy.sparse.csr_m
     ).tocsr()
 
 
-def _assemble_isotropic_sparse(
+def _assemble_diagonal_gram_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> scipy.sparse.csr_matrix:
-    """Assemble sparse isotropic Laplacian, returned as scipy CSR.
+    """Assemble sparse diagonal-Gram Laplacian, returned as scipy CSR.
 
     No autograd — for eval only.
 
@@ -389,7 +389,7 @@ def _assemble_isotropic_sparse(
         L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
     """
     N = grad_coeffs.shape[0]
-    L_offdiag = _build_isotropic_offdiag_sparse(grad_coeffs, knn)
+    L_offdiag = _build_diagonal_gram_offdiag_sparse(grad_coeffs, knn)
 
     # Convert to scipy for diagonal fix
     L_csr = _torch_sparse_to_scipy(L_offdiag, N)
@@ -403,11 +403,11 @@ def _assemble_isotropic_sparse(
     return L_csr
 
 
-def _assemble_anisotropic_sparse(
+def _assemble_full_gram_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
 ) -> scipy.sparse.csr_matrix:
-    """Assemble sparse anisotropic Laplacian, returned as scipy CSR.
+    """Assemble sparse full-Gram Laplacian, returned as scipy CSR.
 
     No autograd — for eval only.
 
@@ -419,7 +419,7 @@ def _assemble_anisotropic_sparse(
         L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
     """
     N = grad_coeffs.shape[0]
-    L_sparse = _build_anisotropic_offdiag_sparse(grad_coeffs, knn)
+    L_sparse = _build_full_gram_offdiag_sparse(grad_coeffs, knn)
     return _torch_sparse_to_scipy(L_sparse, N)
 
 
@@ -431,7 +431,7 @@ def prune_to_knn(L: torch.Tensor, knn: torch.Tensor) -> torch.Tensor:
     """Zero out entries of L not in the kNN graph, recompute diagonal.
 
     Keeps entry L_ij if j in kNN(i) or i in kNN(j) (symmetric).
-    Useful for removing 2-hop fill-in from the anisotropic Laplacian.
+    Useful for removing 2-hop fill-in from the full-Gram Laplacian.
 
     Args:
         L: (N, N) dense Laplacian.
