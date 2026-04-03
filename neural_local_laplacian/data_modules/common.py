@@ -52,12 +52,12 @@ class _GenericDataModuleBase(lightning.pytorch.LightningDataModule):
 
     def __init__(
         self,
-        train_dataset_specification: DatasetSpecification,
-        val_dataset_specifications: List[DatasetSpecification],
+        train_dataset_specification: Optional[DatasetSpecification] = None,
+        val_dataset_specifications: Optional[List[DatasetSpecification]] = None,
     ) -> None:
         super().__init__()
         self._train_dataset_specification = train_dataset_specification
-        self._val_dataset_specifications  = val_dataset_specifications
+        self._val_dataset_specifications  = val_dataset_specifications or []
 
     def _make_train_loader(self, spec: DatasetSpecification):
         raise NotImplementedError
@@ -66,6 +66,8 @@ class _GenericDataModuleBase(lightning.pytorch.LightningDataModule):
         raise NotImplementedError
 
     def train_dataloader(self):
+        if self._train_dataset_specification is None:
+            return None
         return self._make_train_loader(self._train_dataset_specification)
 
     def val_dataloader(self) -> List:
