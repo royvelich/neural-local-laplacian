@@ -1,0 +1,15 @@
+_target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
+train_dataset_specification: null
+val_dataset_specifications:
+  - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+      skip_eigendecomposition: True
+      mesh_folder_path: '/mnt/gipnetapp_public/neural-cotangent-weights/shrec14/Real'
+      require_complete_geodesics: True
+      shuffle: True
+      k: 30
+      pose_transformers: null
+    batch_size: 1
+    num_workers: 0
+    shuffle: False
