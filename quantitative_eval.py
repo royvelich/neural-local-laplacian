@@ -87,9 +87,12 @@ if HAS_NELO:
 VALID_METHODS = {'pred', 'robust', 'nelo'}
 
 
-def _parse_methods(methods_str: str) -> Set[str]:
-    """Parse comma-separated methods string, validate."""
-    methods = {m.strip().lower() for m in methods_str.split(',')}
+def _parse_methods(methods_input) -> Set[str]:
+    """Parse methods from string or list, validate."""
+    if isinstance(methods_input, (list, tuple)):
+        methods = {str(m).strip().lower() for m in methods_input}
+    else:
+        methods = {m.strip().lower() for m in str(methods_input).split(',')}
     invalid = methods - VALID_METHODS
     if invalid:
         raise ValueError(f"Unknown methods: {invalid}. Valid: {VALID_METHODS}")
