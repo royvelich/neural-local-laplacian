@@ -1082,6 +1082,26 @@ def _precompute_geo_cache_worker(args):
         return name, None, None, None
 
 
+def _robust_baseline_worker(args):
+    """Multiprocessing worker: evaluate one pair with robust Laplacian.
+
+    Recreates evaluators in each process to avoid pickle issues.
+    """
+    (pair, num_eigenvectors, evaluator_configs, geo_cache) = args
+    try:
+        from fmaps_finetune.modules.evaluators import (
+            SpectralNNEvaluator, FunctionalMapEvaluator)
+        evaluators = [SpectralNNEvaluator()]
+        for cfg in evaluator_configs:
+            evaluators.append(FunctionalMapEvaluator(**cfg))
+        return evaluate_pair_robust(
+            pair, num_eigenvectors,
+            evaluators=evaluators, geo_cache=geo_cache)
+    except Exception as e:
+        print(f"    [robust worker] Error: {e}", flush=True)
+        return {}
+
+
 def _build_geo_cache(pair: PairSample) -> Optional['GeodesicCache']:
     """Build a GeodesicCache for pair, or None if faces/potpourri3d unavailable."""
     if pair.faces_b is None:
@@ -1984,7 +2004,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                 n_total = len(val_pairs)
                 ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
 
-                # ── Robust Laplacian baseline (rank 0, ThreadPoolExecutor) ──
+                # ── Robust Laplacian baseline (rank 0, mp.Pool) ────────────
                 if is_rank0:
                     try:
                         import robust_laplacian  # noqa: F401
@@ -1992,34 +2012,46 @@ class FunctionalMapModule(LaplacianModuleBase):
                               f"({n_total} pairs)...", flush=True)
                         t0_rb = time.perf_counter()
 
-                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        import multiprocessing as _mp
                         rb_n_workers = max(1, _n_cpus - 1)
 
-                        def _eval_robust(p):
-                            return evaluate_pair_robust(
-                                _subsample(p), hp.num_eigenvectors,
-                                evaluators=self._evaluators,
-                                geo_cache=self._geo_cache.get(p.name))
+                        # Extract evaluator configs for pickle-safe worker
+                        eval_configs = []
+                        for ev in self._evaluators:
+                            if hasattr(ev, 'descriptors'):  # FunctionalMapEvaluator
+                                eval_configs.append({
+                                    k: getattr(ev, k) for k in [
+                                        'descriptors', 'use_zoomout',
+                                        'zoomout_k_init', 'zoomout_k_final',
+                                        'zoomout_n_iters', 'fmap_lmbda',
+                                        'fmap_resolvent_gamma',
+                                    ] if hasattr(ev, k)
+                                })
+                            # SpectralNNEvaluator has no config, created by default in worker
 
-                        # Submit all, track progress as they complete
-                        robust_metrics = [None] * n_total
-                        with ThreadPoolExecutor(max_workers=rb_n_workers) as executor:
-                            futures = {executor.submit(_eval_robust, p): i
-                                       for i, p in enumerate(val_pairs)}
-                            done_count = 0
-                            for future in as_completed(futures):
-                                idx = futures[future]
-                                robust_metrics[idx] = future.result()
-                                done_count += 1
+                        # Build worker args: (subsampled_pair, num_eig, eval_configs, geo_cache)
+                        worker_args = [
+                            (_subsample(p), hp.num_eigenvectors, eval_configs,
+                             self._geo_cache.get(p.name))
+                            for p in val_pairs
+                        ]
+
+                        cw = len(str(n_total))
+                        robust_metrics = []
+                        with _mp.Pool(rb_n_workers) as pool:
+                            for i, m in enumerate(pool.imap(
+                                    _robust_baseline_worker, worker_args)):
+                                robust_metrics.append(m)
+                                done = i + 1
                                 dt = time.perf_counter() - t0_rb
-                                eta = (dt / done_count) * (n_total - done_count)
-                                print(f"    [robust {done_count:>{len(str(n_total))}}/{n_total}] "
+                                eta = (dt / done) * (n_total - done)
+                                print(f"    [robust {done:>{cw}}/{n_total}] "
                                       f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
                                       flush=True)
 
                         dt_rb = time.perf_counter() - t0_rb
                         print(f"    Done: {n_total} pairs in {dt_rb:.1f}s "
-                              f"({rb_n_workers} threads)", flush=True)
+                              f"({rb_n_workers} workers)", flush=True)
 
                         rb_summary = self._summarise_and_print(
                             robust_metrics, f"Robust baseline{ds_label}")
