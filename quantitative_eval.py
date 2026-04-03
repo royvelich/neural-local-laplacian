@@ -404,7 +404,9 @@ def _worker(rank: int, world_size: int, cfg_dict: dict, output_dir: str, total_m
                           f"asm={t_pred.assembly*1000:.0f}ms  grad={t_pred.grad_op*1000:.0f}ms  "
                           f"total={t_pred.lm_total*1000:.0f}ms", flush=True)
             except Exception as e:
-                print(f"{tag}  PRED assembly failed for {md['mesh_name']}: {e}")
+                import traceback
+                print(f"{tag}  PRED assembly failed for {md['mesh_name']} (N={md['N']}): {e}")
+                traceback.print_exc()
         gc.enable()
         print(f"{tag}Pass 1 done: {time.time() - t_start:.1f}s")
 
