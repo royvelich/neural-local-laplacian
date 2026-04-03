@@ -30,7 +30,7 @@ module:
         pair_mode: inter
         pairs:
           - ':10'
-      val_poses_per_pair: 20
+      val_poses_per_pair: 3
       seed: ${globals.training_seed}
     batch_size: 1
     num_workers: 0
