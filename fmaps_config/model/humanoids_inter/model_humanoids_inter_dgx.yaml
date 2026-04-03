@@ -7,7 +7,7 @@ module:
   num_eigenvectors: ${globals.num_eigenvectors}
   seed: ${globals.training_seed}
   eval_only: false
-  skip_baselines: false
+  skip_baselines: true
 
   train_laplacian:
     assembly: diagonal_gram
