@@ -47,7 +47,7 @@ class VisualizationConfig:
     pointcloud_scalar_colormap: str
     pointcloud_color: Tuple[float, float, float] = (0.0, 0.8, 0.0)  # Default: green
     # Display scale constants
-    normal_display_scale: float = 8.0  # Multiplier for normal vector display
+    normal_display_scale: float = 2.0  # Multiplier for normal vector display
     origin_indicator_scale: float = 3.0  # Multiplier for origin point radius
     reference_frame_point_radius: float = 0.02
     reference_frame_line_radius: float = 0.01

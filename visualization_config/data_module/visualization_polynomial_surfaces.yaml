@@ -1,4 +1,4 @@
-_target_: neural_local_laplacian.data_modules.common.GenericDataModule
+_target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
 train_dataset_specification:
   _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
   dataset:
@@ -15,8 +15,6 @@ train_dataset_specification:
         num_points: 1000
       - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
         num_points_range: 30
-    feature_extractor:
-        _target_: neural_local_laplacian.utils.features.XYZFeatureExtractor
     diff_geom_at_origin_only: False
     include_origin_in_grid: True
     conv_k_nearest: null

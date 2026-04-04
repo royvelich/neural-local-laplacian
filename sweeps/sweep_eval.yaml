@@ -157,6 +157,7 @@ parameters:
 
         eval_only: true
         skip_baselines: false
+        geo_cache_workers: 5
 
         train_laplacian:
           assembly: diagonal_gram

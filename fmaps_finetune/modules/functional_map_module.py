@@ -1457,6 +1457,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         lora_rslora: bool = False,
         profile_steps: int = 0,   # print profiler summary every N steps (0 = off)
         # Evaluation control
+        geo_cache_workers: Optional[int] = None,  # max mp.Pool workers per rank (None = auto)
         eval_only: bool = False,       # run baselines only, then stop (no training)
         skip_baselines: bool = False,  # skip baseline computation in on_fit_start
         # GeomFuM evaluation (optional)
@@ -1967,7 +1968,10 @@ class FunctionalMapModule(LaplacianModuleBase):
 
         # Run geo cache workers (limit parallelism in multi-GPU to avoid CPU contention)
         _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
-        n_workers = min(len(worker_args), max(1, _n_cpus // max(world_size, 1)))
+        _max_per_rank = max(1, _n_cpus // max(world_size, 1))
+        if hp.geo_cache_workers is not None:
+            _max_per_rank = min(_max_per_rank, hp.geo_cache_workers)
+        n_workers = min(len(worker_args), _max_per_rank)
         _geo_n = len(worker_args)
         _geo_cw = len(str(_geo_n))
         if worker_args:
@@ -2208,6 +2212,12 @@ class FunctionalMapModule(LaplacianModuleBase):
             if is_rank0:
                 print("\n  [eval_only=true] Baselines complete — stopping.",
                       flush=True)
+            # Synchronize all DDP ranks before exit to prevent zombies
+            if world_size > 1:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    dist.barrier()
+                    dist.destroy_process_group()
             try:
                 import wandb
                 if wandb.run is not None:
