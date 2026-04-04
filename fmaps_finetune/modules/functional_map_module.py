@@ -2005,6 +2005,7 @@ class FunctionalMapModule(LaplacianModuleBase):
         # ==================================================================
         all_pairs = [(name, p) for name, pairs in all_val_datasets for p in pairs]
         mv = self._effective_max_vertices()
+        _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
 
         if hp.mode == 'geo_cache' and hp.geo_cache_dir:
             # ── Mode: geo_cache — compute all caches and save to disk ────
@@ -2037,7 +2038,6 @@ class FunctionalMapModule(LaplacianModuleBase):
             # Distribute across ranks
             my_args = to_compute[self.global_rank::world_size]
             t0_geo = time.perf_counter()
-            _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
             _max_per_rank = max(1, _n_cpus // max(world_size, 1))
             if hp.geo_cache_workers is not None:
                 _max_per_rank = min(_max_per_rank, hp.geo_cache_workers)
@@ -2144,7 +2144,6 @@ class FunctionalMapModule(LaplacianModuleBase):
                 ))
                 pair_meta.append((p.name, True))
 
-            _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
             _max_per_rank = max(1, _n_cpus // max(world_size, 1))
             if hp.geo_cache_workers is not None:
                 _max_per_rank = min(_max_per_rank, hp.geo_cache_workers)
