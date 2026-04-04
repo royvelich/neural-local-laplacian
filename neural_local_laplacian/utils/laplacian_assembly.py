@@ -62,8 +62,8 @@ class LaplacianConfig:
             raise ValueError(f"assembly must be 'diagonal_gram' or 'full_gram', got: {self.assembly}")
         if self.pruning not in ('none', 'knn', 'topk'):
             raise ValueError(f"pruning must be 'none', 'knn', or 'topk', got: {self.pruning}")
-        if self.pruning in ('knn', 'topk') and self.k_prune is None:
-            raise ValueError(f"k_prune is required when pruning='{self.pruning}'")
+        if self.pruning == 'topk' and self.k_prune is None:
+            raise ValueError(f"k_prune is required when pruning='topk'")
         if self.sparse and self.torch_sparse:
             raise ValueError("Cannot set both sparse=True and torch_sparse=True")
         if self.sparse and self.pruning != 'none':

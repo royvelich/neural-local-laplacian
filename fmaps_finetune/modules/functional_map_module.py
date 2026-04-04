@@ -169,7 +169,7 @@ def compute_laplacian_differentiable(
     knn        = compute_knn(vertices_np, k)
     knn_t      = torch.from_numpy(knn).long().to(device)
     batch_data = Batch.from_data_list([build_patch_data(vertices_t, knn, device)]).to(device)
-    fwd        = model._forward_pass(batch_data)
+    fwd        = model(batch_data)
 
     L = assemble_full_gram_laplacian(fwd['grad_coeffs'], knn_t)
     if sparsify:
@@ -1252,7 +1252,7 @@ def evaluate_pair(
         knn_np     = compute_knn(verts, k)
         batch_data = Batch.from_data_list(
             [build_patch_data(verts_t, knn_np, device)]).to(device)
-        fwd        = model._forward_pass(batch_data)
+        fwd        = model(batch_data)
 
         knn_t     = torch.from_numpy(knn_np).long().to(device)
         M_diag    = fwd['areas'].detach()
@@ -2450,8 +2450,8 @@ class FunctionalMapModule(LaplacianModuleBase):
                 bd_b = Batch.from_data_list([build_patch_data(vb_t, knn_b, device)]).to(device)
 
             with prof.phase("transformer forward"):
-                fwd_a = self.model._forward_pass(bd_a)
-                fwd_b = self.model._forward_pass(bd_b)
+                fwd_a = self.model(bd_a)
+                fwd_b = self.model(bd_b)
 
             with prof.phase("laplacian assembly"):
                 lap_cfg = self._train_lap_config
