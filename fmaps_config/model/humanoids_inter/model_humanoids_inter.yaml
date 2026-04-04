@@ -6,15 +6,20 @@ module:
   k: ${globals.k}
   num_eigenvectors: ${globals.num_eigenvectors}
   seed: ${globals.training_seed}
-  eval_only: false
-  skip_baselines: false
+
+  mode: eval
+  baselines: [model, robust]
+  geo_cache_dir: ./geo_cache
+  eval_results_dir: ./eval_results/model
+
+  geo_cache_workers: 4
 
   train_laplacian:
-    assembly: isotropic
+    assembly: diagonal_gram
     pruning: none
-    
+
   eval_laplacians:
-    - assembly: isotropic
+    - assembly: diagonal_gram
       pruning: none
 
   losses:

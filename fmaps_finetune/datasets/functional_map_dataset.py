@@ -417,12 +417,14 @@ def _expand_spec(
     """Expand a mixed list of names, indices, and ranges against a reference list.
 
     Items can be:
-      - int index:  2 → all_items[2]
-      - str range:  "5:10" → all_items[5..9]
-      - str/other:  looked up directly in all_items
+      - int index:    2 → all_items[2]
+      - str range:    "5:10" → all_items[5..9]
+      - float pct:    0.25 → first 25% of all_items
+      - str pct range: "0.25:0.75" → 25%–75% of all_items (detected by '.' in range)
+      - str/other:    looked up directly in all_items
 
     Args:
-        spec: List of mixed items (int, str range, or direct values).
+        spec: List of mixed items (int, float, str range, or direct values).
         all_items: Full sorted reference list.
 
     Returns:
@@ -431,14 +433,31 @@ def _expand_spec(
     result = set()
     n = len(all_items)
     for item in spec:
-        if isinstance(item, int):
+        if isinstance(item, float):
+            # Float: percentage of total (e.g. 0.25 = first 25%)
+            if not (0.0 < item <= 1.0):
+                raise ValueError(f"Float {item} must be in (0, 1]")
+            end = int(n * item)
+            for i in range(end):
+                result.add(all_items[i])
+        elif isinstance(item, int):
             if not (0 <= item < n):
                 raise IndexError(f"Index {item} out of range [0, {n})")
             result.add(all_items[item])
         elif isinstance(item, str) and ':' in item:
             parts = item.split(':')
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else n
+            # Detect percentage range by presence of '.'
+            if '.' in parts[0] or '.' in parts[1]:
+                start_f = float(parts[0]) if parts[0] else 0.0
+                end_f = float(parts[1]) if parts[1] else 1.0
+                if not (0.0 <= start_f < end_f <= 1.0):
+                    raise ValueError(
+                        f"Percentage range '{item}' must satisfy 0 <= start < end <= 1")
+                start = int(n * start_f)
+                end = int(n * end_f)
+            else:
+                start = int(parts[0]) if parts[0] else 0
+                end = int(parts[1]) if parts[1] else n
             if start < 0 or end > n or start >= end:
                 raise IndexError(f"Range '{item}' invalid for {n} items")
             for i in range(start, end):

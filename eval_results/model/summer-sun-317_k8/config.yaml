@@ -1,0 +1,99 @@
+checkpoint_path: C:/Users/Roy/Downloads/model.ckpt
+eval_laplacians: &id004 !!python/object:omegaconf.listconfig.ListConfig
+  _content:
+  - &id001 !!python/object:omegaconf.dictconfig.DictConfig
+    _content:
+      assembly: !!python/object:omegaconf.nodes.AnyNode
+        _metadata: !!python/object:omegaconf.base.Metadata
+          flags: {}
+          flags_root: false
+          key: assembly
+          object_type: null
+          optional: true
+          ref_type: &id002 !!python/name:typing.Any ''
+          resolver_cache: !!python/object/apply:collections.defaultdict
+          - &id003 !!python/name:builtins.dict ''
+        _parent: *id001
+        _val: diagonal_gram
+      pruning: !!python/object:omegaconf.nodes.AnyNode
+        _metadata: !!python/object:omegaconf.base.Metadata
+          flags: {}
+          flags_root: false
+          key: pruning
+          object_type: null
+          optional: true
+          ref_type: *id002
+          resolver_cache: !!python/object/apply:collections.defaultdict
+          - *id003
+        _parent: *id001
+        _val: none
+    _metadata: !!python/object:omegaconf.base.ContainerMetadata
+      element_type: *id002
+      flags:
+        allow_objects: true
+      flags_root: false
+      key: 0
+      key_type: *id002
+      object_type: *id003
+      optional: true
+      ref_type: *id002
+      resolver_cache: !!python/object/apply:collections.defaultdict
+      - *id003
+    _parent: *id004
+  _metadata: !!python/object:omegaconf.base.ContainerMetadata
+    element_type: *id002
+    flags:
+      allow_objects: true
+    flags_root: false
+    key: null
+    key_type: !!python/name:builtins.int ''
+    object_type: !!python/name:builtins.list ''
+    optional: true
+    ref_type: *id002
+    resolver_cache: !!python/object/apply:collections.defaultdict
+    - *id003
+  _parent: null
+k: 8
+max_vertices: 4000
+max_vertices_val: 0
+num_eigenvectors: 100
+run_name: summer-sun-317
+train_laplacian: &id005 !!python/object:omegaconf.dictconfig.DictConfig
+  _content:
+    assembly: !!python/object:omegaconf.nodes.AnyNode
+      _metadata: !!python/object:omegaconf.base.Metadata
+        flags: {}
+        flags_root: false
+        key: assembly
+        object_type: null
+        optional: true
+        ref_type: *id002
+        resolver_cache: !!python/object/apply:collections.defaultdict
+        - *id003
+      _parent: *id005
+      _val: diagonal_gram
+    pruning: !!python/object:omegaconf.nodes.AnyNode
+      _metadata: !!python/object:omegaconf.base.Metadata
+        flags: {}
+        flags_root: false
+        key: pruning
+        object_type: null
+        optional: true
+        ref_type: *id002
+        resolver_cache: !!python/object/apply:collections.defaultdict
+        - *id003
+      _parent: *id005
+      _val: none
+  _metadata: !!python/object:omegaconf.base.ContainerMetadata
+    element_type: *id002
+    flags:
+      allow_objects: true
+    flags_root: false
+    key: null
+    key_type: *id002
+    object_type: *id003
+    optional: true
+    ref_type: *id002
+    resolver_cache: !!python/object/apply:collections.defaultdict
+    - *id003
+  _parent: null

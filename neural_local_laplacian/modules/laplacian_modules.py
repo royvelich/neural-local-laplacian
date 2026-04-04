@@ -1,83 +1,42 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
-from torch_geometric.data import Batch, Data
+from typing import List, Optional, Dict, Tuple
 
-import os
-import pickle
-import zipfile
-import shutil
-from pathlib import Path
-from typing import List, Type, Callable, Optional, Dict, Tuple, Any
-from dataclasses import dataclass
-
-# wandb
 import wandb
-
-# omegaconf
 from omegaconf import DictConfig, OmegaConf
-
-# numpy
 import numpy as np
-
-# scipy
 import scipy.sparse
 import scipy.sparse.linalg
-
-# lightning
 import lightning
-from pytorch_lightning.callbacks import Callback
-
-# torch_geometric
-from torch_geometric.data import Batch
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
 from torch_geometric.data.data import BaseData
 
-# trimesh for loading mesh vertices
-import trimesh
-
-# pyfm
-from pyFM.mesh import TriMesh
-
-# neural laplacian
-from neural_local_laplacian.utils.utils import split_results_by_nodes, split_results_by_graphs, assemble_sparse_laplacian_variable, assemble_gradient_operator, compute_laplacian_eigendecomposition, build_patches_from_vertices
+from neural_local_laplacian.utils.utils import (
+    assemble_gradient_operator,
+    compute_laplacian_eigendecomposition,
+    build_patches_from_vertices,
+)
 from neural_local_laplacian.utils.laplacian_assembly import (
     LaplacianConfig,
     assemble_laplacian,
-    assemble_full_gram_laplacian,
-    assemble_diagonal_gram_laplacian,
-    prune_to_knn,
     to_scipy_sparse,
     mass_matrix_to_scipy,
 )
 from neural_local_laplacian.modules.losses import LossConfig, LossContext
 from neural_local_laplacian.utils.features import FeatureExtractor
 from neural_local_laplacian.utils.geodesic_utils import (
-    compute_heat_geodesic_pointcloud,
     compute_heat_geodesic_learned,
-    compute_geodesic_metrics,
     compute_multisource_geodesic_metrics,
-    build_pointcloud_grad_div_operators,
-    edge_index_from_knn_indices
 )
 
 
 def _eigh_full_gram(L: torch.Tensor, M_diag: torch.Tensor,
-                      num_eigenvectors: int) -> Tuple[np.ndarray, np.ndarray]:
+                    num_eigenvectors: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generalized eigenproblem L v = λ M v on GPU via standard form.
+    Generalized eigenproblem L v = lambda M v on GPU via standard form.
 
-    Converts to M^{-1/2} L M^{-1/2} w = λ w, solves, transforms back.
-
-    Args:
-        L: (N, N) dense Laplacian on GPU
-        M_diag: (N,) mass diagonal on GPU
-        num_eigenvectors: number of smallest eigenpairs to return
-
-    Returns:
-        eigenvalues: (num_eigenvectors,) numpy array
-        eigenvectors: (N, num_eigenvectors) numpy array
+    Converts to M^{-1/2} L M^{-1/2} w = lambda w, solves, transforms back.
     """
     M_inv_sqrt = 1.0 / M_diag.sqrt().clamp(min=1e-8)
     L_std = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
@@ -93,8 +52,7 @@ class LaplacianModuleBase(lightning.pytorch.LightningModule):
     def __init__(self,
                  optimizer_cfg: DictConfig,
                  scheduler_cfg: Optional[DictConfig] = None,
-                 **kwargs
-                 ):
+                 **kwargs):
         super().__init__()
         self._optimizer_cfg = optimizer_cfg
         self._scheduler_cfg = scheduler_cfg
@@ -113,26 +71,15 @@ class LaplacianModuleBase(lightning.pytorch.LightningModule):
         if self._optimizer_cfg is None:
             raise ValueError("optimizer_cfg is required but was None")
 
-        # Create optimizer
         optimizer = self._optimizer_cfg(params=self.parameters())
 
-        # If no scheduler config, return just the optimizer
         if self._scheduler_cfg is None:
             return optimizer
 
-        # Create scheduler
         scheduler = self._scheduler_cfg(optimizer=optimizer)
-
-        # Return optimizer and scheduler configuration
-        # The format depends on what scheduler monitoring you want
-        scheduler_config = {
-            "scheduler": scheduler,
-            "interval": 'epoch'
-        }
-
         return {
             "optimizer": optimizer,
-            "lr_scheduler": scheduler_config
+            "lr_scheduler": {"scheduler": scheduler, "interval": 'epoch'},
         }
 
 
@@ -154,6 +101,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  output_projection_hidden_dims: Optional[List[int]] = None,
                  normalize_patch_features: bool = True,
                  scale_areas_by_patch_size: bool = True,
+                 mcv_mode: str = 'diagonal_gram',
                  val_laplacian: Optional[Dict] = None,
                  **kwargs):
         # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
@@ -161,8 +109,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         super().__init__(**{k: v for k, v in kwargs.items()
                            if k in ('optimizer_cfg', 'scheduler_cfg')})
 
-        # This saves all the __init__ arguments automatically
-        # Exclude loss_configs and feature_extractor: they contain non-serializable PyTorch modules
         self.save_hyperparameters(ignore=['loss_configs', 'feature_extractor'])
 
         # Manually save loss configuration info for logging (serializable version)
@@ -180,7 +126,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # Validate input_dim / feature_extractor
         if feature_extractor is not None:
-            # Register as a proper submodule so it moves with .to(device) and is saved in state_dict
             if isinstance(feature_extractor, nn.Module):
                 self.feature_extractor = feature_extractor
             else:
@@ -203,6 +148,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._num_eigenvalues = num_eigenvalues
         self._normalize_patch_features = normalize_patch_features
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
+        self._mcv_mode = mcv_mode
 
         # Validation Laplacian config
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
@@ -219,486 +165,244 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, activation='gelu', batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=num_encoder_layers
+            encoder_layer=encoder_layer, num_layers=num_encoder_layers,
         )
 
         # Output head: gradient coefficients g_ij in R^3
         self.grad_projection = self._build_projection(d_model, 3, output_projection_hidden_dims)
 
         # Area head: aggregated features -> scalar area A_i
-        # Uses mean pooling of token features followed by MLP
         self.area_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.LayerNorm(d_model // 2),
             nn.GELU(),
             nn.Linear(d_model // 2, 1),
-            nn.Softplus()  # Ensure positive area
+            nn.Softplus(),
         )
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _build_projection(in_dim: int, out_dim: int, hidden_dims: Optional[List[int]] = None) -> nn.Module:
-        """
-        Build a projection module: either single linear or MLP with hidden layers.
-
-        Args:
-            in_dim: Input dimension
-            out_dim: Output dimension
-            hidden_dims: Optional list of hidden layer dimensions. If None or empty, uses single linear.
-
-        Returns:
-            nn.Linear or nn.Sequential module
-        """
+    def _build_projection(in_dim: int, out_dim: int,
+                          hidden_dims: Optional[List[int]] = None) -> nn.Module:
+        """Build a linear or MLP projection."""
         if hidden_dims is None or len(hidden_dims) == 0:
             return nn.Linear(in_dim, out_dim)
-
         layers = []
         prev_dim = in_dim
         for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
+            layers.extend([nn.Linear(prev_dim, hidden_dim),
+                           nn.LayerNorm(hidden_dim), nn.GELU()])
             prev_dim = hidden_dim
         layers.append(nn.Linear(prev_dim, out_dim))
         return nn.Sequential(*layers)
 
     def _normalize_loss_weights(self, loss_configs: List[LossConfig]) -> List[LossConfig]:
-        """
-        Normalize loss weights so they sum to 1.
-
-        Loss configs with weight=None are kept as-is (logged but not included in backprop).
-
-        Args:
-            loss_configs: List of LossConfig objects
-
-        Returns:
-            List of LossConfig objects with normalized weights (for non-None weights)
-        """
+        """Normalize loss weights so non-None weights sum to 1."""
         if not loss_configs:
             return loss_configs
-
-        # Calculate total weight (only for non-None weights)
-        total_weight = sum(config.weight for config in loss_configs if config.weight is not None)
-
+        total_weight = sum(c.weight for c in loss_configs if c.weight is not None)
         if total_weight == 0:
-            raise ValueError("Total loss weights cannot be zero (at least one loss must have a non-None weight)")
-
-        # Create new configs with normalized weights
-        normalized_configs = []
-        for config in loss_configs:
-            if config.weight is None:
-                # Keep as-is for logging-only losses
-                normalized_configs.append(config)
+            raise ValueError("Total loss weights cannot be zero")
+        normalized = []
+        for c in loss_configs:
+            if c.weight is None:
+                normalized.append(c)
             else:
-                normalized_weight = config.weight / total_weight
-                # Create a new LossConfig with normalized weight
-                normalized_config = LossConfig(
-                    loss_module=config.loss_module,
-                    weight=normalized_weight
-                )
-                normalized_configs.append(normalized_config)
+                normalized.append(LossConfig(
+                    loss_module=c.loss_module, weight=c.weight / total_weight))
+        return normalized
 
-        # Verify non-None weights sum to 1 (within numerical precision)
-        total_normalized = sum(config.weight for config in normalized_configs if config.weight is not None)
-        assert abs(total_normalized - 1.0) < 1e-6, f"Normalized weights sum to {total_normalized}, not 1.0"
-
-        return normalized_configs
-
-    def _pad_sequences_vectorized(self, features: torch.Tensor, batch_indices: torch.Tensor,
-                                  batch_size: int, max_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Vectorized padding of variable-length sequences to max_k length using scatter operations.
-
-        Args:
-            features: (total_points, d_model)
-            batch_indices: (total_points,) - which batch each point belongs to
-            batch_size: number of sequences
-            max_k: maximum sequence length
-
-        Returns:
-            sequences: (batch_size, max_k, d_model) - padded sequences
-            attention_mask: (batch_size, max_k) - True for real tokens, False for padding
-        """
+    def _pad_sequences_vectorized(self, features: torch.Tensor,
+                                  batch_indices: torch.Tensor,
+                                  batch_size: int, max_k: int
+                                  ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pad variable-length sequences to (batch_size, max_k, d_model)."""
         device = features.device
         d_model = features.shape[1]
 
-        # Sort indices to group by batch
         sorted_indices = torch.argsort(batch_indices)
         sorted_batch = batch_indices[sorted_indices]
-
-        # Get batch sizes
         batch_sizes = torch.bincount(batch_indices, minlength=batch_size)
 
-        # Calculate positions within each batch using fully vectorized operations
-        positions = torch.zeros_like(batch_indices, dtype=torch.long)
-
-        # Create cumulative positions for sorted indices
-        # This replaces the loop with a vectorized operation
         cumsum_sizes = torch.cumsum(batch_sizes, dim=0)
         starts = torch.cat([torch.tensor([0], device=device), cumsum_sizes[:-1]])
 
-        # Create position indices for each batch
         total_points = batch_indices.shape[0]
         arange_full = torch.arange(total_points, device=device)
-
-        # Calculate relative positions within each batch
         batch_starts = starts[sorted_batch]
-        relative_positions = arange_full[sorted_indices] - batch_starts
 
-        # Assign positions back to original order
-        positions[sorted_indices] = relative_positions
+        positions = torch.zeros_like(batch_indices, dtype=torch.long)
+        positions[sorted_indices] = arange_full[sorted_indices] - batch_starts
 
-        # Filter out positions >= max_k (in case some patches are larger than max_k)
         valid_mask = positions < max_k
-        valid_batch_indices = batch_indices[valid_mask]
-        valid_positions = positions[valid_mask]
-        valid_features = features[valid_mask]
+        flat_indices = batch_indices[valid_mask] * max_k + positions[valid_mask]
 
-        # Create flat indices for scatter
-        flat_indices = valid_batch_indices * max_k + valid_positions
+        sequences = torch.zeros(batch_size * max_k, d_model, device=device,
+                                dtype=features.dtype)
+        attention_mask = torch.zeros(batch_size * max_k, dtype=torch.bool,
+                                     device=device)
 
-        # Create output tensors
-        sequences = torch.zeros(batch_size * max_k, d_model, device=device, dtype=features.dtype)
-        attention_mask = torch.zeros(batch_size * max_k, dtype=torch.bool, device=device)
-
-        # Scatter features and create mask
-        sequences.scatter_(0, flat_indices.unsqueeze(1).expand(-1, d_model), valid_features)
+        sequences.scatter_(0, flat_indices.unsqueeze(1).expand(-1, d_model),
+                           features[valid_mask])
         attention_mask.scatter_(0, flat_indices, True)
 
-        # Reshape to (batch_size, max_k, d_model) and (batch_size, max_k)
-        sequences = sequences.view(batch_size, max_k, d_model)
-        attention_mask = attention_mask.view(batch_size, max_k)
-
-        return sequences, attention_mask
+        return (sequences.view(batch_size, max_k, d_model),
+                attention_mask.view(batch_size, max_k))
 
     def _compute_mean_curvature_vectors(self, forward_result: Dict[str, torch.Tensor],
                                         batch_data: Batch) -> torch.Tensor:
         """
         Compute predicted mean curvature vectors from gradient coefficients and areas.
 
-        Computes the full-Gram mean curvature vector as:
-            mcv = (Sum_j w_ij * p_j) / A_i
-        where w_ij = g_ii . g_ij  and  g_ii = -Sum_m g_im
-
-        Args:
-            forward_result: Dictionary containing grad_coeffs, areas, attention_mask,
-                          batch_sizes
-            batch_data: PyTorch Geometric batch containing positions and batch indices
-
-        Returns:
-            predicted_mean_curvature_vectors: (batch_size, 3) tensor of predicted mean curvature vectors
+        Mode determines how weights are computed:
+        - 'diagonal_gram': w_ij = ||g_ij||^2  (always positive, isotropic)
+        - 'full_gram':     w_ij = g_ii . g_ij  (can be negative, anisotropic)
         """
-        # Extract results
-        areas = forward_result['areas']  # (batch_size,)
-        attention_mask = forward_result['attention_mask']  # (batch_size, max_k)
-        batch_sizes = forward_result['batch_sizes']  # (batch_size,)
+        areas = forward_result['areas']
+        attention_mask = forward_result['attention_mask']
+        batch_sizes = forward_result['batch_sizes']
         batch_size = len(batch_sizes)
 
-        # Full-Gram weights: w_ij = g_ii . g_ij
-        grad_coeffs = forward_result['grad_coeffs']  # (batch_size, max_k, 3)
-        gc_masked = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
-        g_self = -gc_masked.sum(dim=1)  # (batch_size, 3)
-        weights = torch.einsum('bd,bkd->bk', g_self, gc_masked)
-        weights = weights.masked_fill(~attention_mask, 0.0)
+        if self._mcv_mode == 'full_gram':
+            grad_coeffs = forward_result['grad_coeffs']
+            gc_masked = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
+            g_self = -gc_masked.sum(dim=1)
+            weights = torch.einsum('bd,bkd->bk', g_self, gc_masked)
+            weights = weights.masked_fill(~attention_mask, 0.0)
+        else:
+            # diagonal_gram: w_ij = s_ij = ||g_ij||^2
+            weights = forward_result['stiffness_weights'].masked_fill(~attention_mask, 0.0)
 
-        # Get positions and flatten weights
-        positions = batch_data.pos  # (total_points, 3)
-        weights_flat = weights.flatten()  # (batch_size * max_k,)
-
-        # Create batch indices for flattened weights
-        batch_indices_weights = torch.arange(batch_size, device=weights.device).repeat_interleave(weights.shape[1])
-
-        # Create position indices within each batch for mapping
+        positions = batch_data.pos
+        weights_flat = weights.flatten()
+        batch_indices_w = torch.arange(batch_size, device=weights.device
+                                       ).repeat_interleave(weights.shape[1])
         batch_cumsum = torch.cumsum(batch_sizes, dim=0)
-        batch_starts = torch.cat([torch.zeros(1, device=batch_cumsum.device, dtype=batch_cumsum.dtype), batch_cumsum[:-1]])
-
-        # Create position indices for each weight
-        position_indices = torch.arange(weights.shape[1], device=weights.device).repeat(batch_size)
-
-        # Filter out indices that exceed actual batch sizes
+        batch_starts = torch.cat([torch.zeros(1, device=batch_cumsum.device,
+                                              dtype=batch_cumsum.dtype),
+                                  batch_cumsum[:-1]])
+        position_indices = torch.arange(weights.shape[1], device=weights.device
+                                        ).repeat(batch_size)
         valid_mask = position_indices < batch_sizes.repeat_interleave(weights.shape[1])
 
-        # Get valid weights and their corresponding batch indices
-        valid_weights = weights_flat[valid_mask]  # (num_valid,)
-        valid_batch_indices = batch_indices_weights[valid_mask]  # (num_valid,)
-        valid_position_indices = position_indices[valid_mask]  # (num_valid,)
+        valid_weights = weights_flat[valid_mask]
+        valid_batch_idx = batch_indices_w[valid_mask]
+        actual_pos_idx = batch_starts[valid_batch_idx] + position_indices[valid_mask]
+        weighted_pos = valid_weights.unsqueeze(-1) * positions[actual_pos_idx]
 
-        # Calculate actual position indices in the flattened positions array
-        actual_position_indices = batch_starts[valid_batch_indices] + valid_position_indices
-
-        # Get valid positions
-        valid_positions = positions[actual_position_indices]  # (num_valid, 3)
-
-        # Compute weighted positions: w_ij * p_j
-        weighted_positions = valid_weights.unsqueeze(-1) * valid_positions  # (num_valid, 3)
-
-        # Sum weighted positions for each batch using scatter_add
         stiffness_sum = torch.zeros(batch_size, 3, device=weights.device)
-        stiffness_sum.scatter_add_(0,
-                                   valid_batch_indices.unsqueeze(-1).expand(-1, 3),
-                                   weighted_positions)
+        stiffness_sum.scatter_add_(
+            0, valid_batch_idx.unsqueeze(-1).expand(-1, 3), weighted_pos)
 
-        # Divide by area to get mean curvature vector: mcv = stiffness_sum / A_i
-        predicted_mean_curvature_vectors = stiffness_sum / areas.unsqueeze(-1)
-
-        return predicted_mean_curvature_vectors
+        return stiffness_sum / areas.unsqueeze(-1)
 
     def _reshape_positions_to_batched(self, pos_flat: torch.Tensor,
                                       batch_sizes: torch.Tensor) -> torch.Tensor:
-        """
-        Reshape flat positions to padded batched format.
-
-        Args:
-            pos_flat: Flat positions (total_points, 3) from batch_data.pos
-            batch_sizes: Number of points per patch (batch_size,)
-
-        Returns:
-            Padded positions (batch_size, max_k, 3) with zeros for padding
-        """
+        """Reshape flat positions to padded (batch_size, max_k, 3)."""
         batch_size = len(batch_sizes)
         max_k = batch_sizes.max().item()
-        device = pos_flat.device
-
-        # Check if all patches have the same size (fixed-k fast path)
         if torch.all(batch_sizes == batch_sizes[0]):
             return pos_flat.view(batch_size, max_k, 3)
-
-        # Variable-k: pad each patch
-        positions = torch.zeros(batch_size, max_k, 3, device=device, dtype=pos_flat.dtype)
+        out = torch.zeros(batch_size, max_k, 3, device=pos_flat.device,
+                          dtype=pos_flat.dtype)
         offset = 0
         for i in range(batch_size):
-            size = batch_sizes[i].item()
-            positions[i, :size] = pos_flat[offset:offset + size]
-            offset += size
-        return positions
+            sz = batch_sizes[i].item()
+            out[i, :sz] = pos_flat[offset:offset + sz]
+            offset += sz
+        return out
 
-    def _forward_pass(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """
-        Internal forward pass method that can be called from both forward() and validation_step().
-
-        Automatically selects between optimized fixed-k path and variable-k path.
-
-        Args:
-            batch: PyTorch Geometric batch
-
-        Returns:
-            Dictionary containing forward pass results
-        """
-        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
-        batch_indices = getattr(batch, 'patch_idx', batch.batch)
-
-        # Check if all patches have the same size (fixed k)
-        batch_sizes = batch_indices.bincount()
-
-        # If all batch sizes are equal, use optimized fixed-k path
-        if torch.all(batch_sizes == batch_sizes[0]):
-            return self.forward_fixed_k(batch)
-        else:
-            return self.forward(batch)
-
-    def forward_fixed_k(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """
-        Optimized forward pass for fixed-k inference (all patches have same size).
-
-        Skips padding, attention masking, and related overhead for faster inference.
-        This is automatically used when all patches have the same number of neighbors.
-
-        Args:
-            batch: PyTorch Geometric batch where all patches have identical size
-
-        Returns:
-            Dict containing:
-            - stiffness_weights: (batch_size, k) - learned stiffness weights s_ij
-            - areas: (batch_size,) - learned area A_i for each patch center
-            - attention_mask: (batch_size, k) - all True (for compatibility)
-            - batch_sizes: (batch_size,) - all equal to k
-            - scale_factors: (batch_size,) - max_dist per patch (only if normalizing)
-        """
-        features = batch.x  # Shape: (total_points, 3) — raw positions
-        positions = batch.pos  # Shape: (total_points, 3)
-
-        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
-        batch_indices = getattr(batch, 'patch_idx', batch.batch)
-
-        # Get batch info - all sizes should be equal
-        batch_sizes = batch_indices.bincount()
-        batch_size = len(batch_sizes)
-        k = batch_sizes[0].item()  # Fixed k for all patches
-
-        # === Compute scale factors and optionally normalize ===
-        if self._normalize_patch_features:
-            # Compute max distance per patch for normalization
-            distances = torch.norm(positions, dim=1)  # (total_points,)
-
-            # Get max distance per patch using scatter_reduce
-            scale_factors = torch.zeros(batch_size, device=positions.device, dtype=positions.dtype)
-            scale_factors.scatter_reduce_(
-                0, batch_indices, distances, reduce='amax', include_self=True
-            )
-            # Avoid division by zero
-            scale_factors = torch.clamp(scale_factors, min=1e-8)
-
-            # Normalize features by scale factors (broadcast per-patch scale to per-point)
-            per_point_scales = scale_factors[batch_indices]  # (total_points,)
-            features = features / per_point_scales.unsqueeze(-1)  # (total_points, 3)
-        else:
-            # No normalization - scale factors are all 1.0
-            scale_factors = torch.ones(batch_size, device=features.device, dtype=features.dtype)
-
-        # Apply feature extractor if provided (operates on normalized positions)
-        if self.feature_extractor is not None:
-            # Reshape to (batch_size, k, 3), extract, reshape back to (total_points, feature_dim)
-            features = features.view(batch_size, k, 3)
-            features = self.feature_extractor.extract_features(features)  # (batch_size, k, feature_dim)
-            features = features.view(batch_size * k, -1)  # (total_points, feature_dim)
-
-        # Project to model dimension
-        features = self.input_projection(features)  # (total_points, d_model)
-
-        # === OPTIMIZED: Direct reshape instead of padding ===
-        # Since all patches have the same size k, we can directly reshape
-        sequences = features.view(batch_size, k, -1)  # (batch_size, k, d_model)
-
-        # === OPTIMIZED: No attention mask needed (pass None) ===
-        # src_key_padding_mask=None means no masking, which is correct for fixed k
-        encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=None)
-
-                # === Output head: gradient coefficients ===
-        grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, k, 3)
-        stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, k)
-
-        # === Area prediction (per patch) ===
-        # OPTIMIZED: Simple mean pooling (no mask needed)
-        pooled_features = encoded_features.mean(dim=1)  # (batch_size, d_model)
-
-        # Area head outputs positive scalar per patch (for normalized geometry)
-        areas_normalized = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
-
-        # === Scale areas back to original geometry ===
-        if self._scale_areas_by_patch_size:
-            # A = A' * dÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â² (area scales as lengthÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²)
-            areas = areas_normalized * (scale_factors ** 2)
-        else:
-            areas = areas_normalized
-
-        # Create dummy attention mask (all True) for compatibility with downstream code
-        attention_mask = torch.ones(batch_size, k, dtype=torch.bool, device=features.device)
-
-        return {
-            'stiffness_weights': stiffness_weights,
-            'areas': areas,
-            'attention_mask': attention_mask,
-            'batch_sizes': batch_sizes,
-            'scale_factors': scale_factors,
-            'grad_coeffs': grad_coeffs,  # (batch_size, k, 3)
-        }
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """
-        Forward pass supporting variable-sized patches.
+        Forward pass supporting both fixed-k and variable-sized patches.
 
-        Predicts both stiffness weights (per neighbor) and area (per patch center).
-
-        If normalize_patch_features=True:
-        - Normalizes patch positions to unit sphere before transformer
-
-        If scale_areas_by_patch_size=True:
-        - Scales output areas by dÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â² to restore original geometry scale
-
-        Args:
-            batch: PyTorch Geometric batch
+        Automatically selects the optimized fixed-k path (no padding, no masking)
+        when all patches have the same size.
 
         Returns:
-            Dict containing:
-            - stiffness_weights: (batch_size, max_k) - learned stiffness weights s_ij (padded)
-            - areas: (batch_size,) - learned area A_i for each patch center
-            - attention_mask: (batch_size, max_k) - True for real tokens, False for padding
-            - batch_sizes: (batch_size,) - actual number of points per patch
-            - scale_factors: (batch_size,) - max_dist per patch (only if normalizing)
+            Dict with stiffness_weights, areas, attention_mask, batch_sizes,
+            scale_factors, grad_coeffs.
         """
-        features = batch.x  # Shape: (total_points, 3) — raw positions
-        positions = batch.pos  # Shape: (total_points, 3)
-
-        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
+        features = batch.x
+        positions = batch.pos
         batch_indices = getattr(batch, 'patch_idx', batch.batch)
 
-        # Get batch sizes (number of points per patch)
         batch_sizes = batch_indices.bincount()
         batch_size = len(batch_sizes)
         max_k = batch_sizes.max().item()
+        fixed_k = torch.all(batch_sizes == batch_sizes[0]).item()
 
-        # === Compute scale factors and optionally normalize ===
+        # ── Normalize features by per-patch scale ────────────────────
         if self._normalize_patch_features:
-            # Compute max distance per patch for normalization
-            distances = torch.norm(positions, dim=1)  # (total_points,)
-
-            # Get max distance per patch using scatter_reduce
-            scale_factors = torch.zeros(batch_size, device=positions.device, dtype=positions.dtype)
+            distances = torch.norm(positions, dim=1)
+            scale_factors = torch.zeros(batch_size, device=positions.device,
+                                        dtype=positions.dtype)
             scale_factors.scatter_reduce_(
-                0, batch_indices, distances, reduce='amax', include_self=True
-            )
-            # Avoid division by zero
+                0, batch_indices, distances, reduce='amax', include_self=True)
             scale_factors = torch.clamp(scale_factors, min=1e-8)
-
-            # Normalize features by scale factors (broadcast per-patch scale to per-point)
-            per_point_scales = scale_factors[batch_indices]  # (total_points,)
-            features = features / per_point_scales.unsqueeze(-1)  # (total_points, 3)
+            features = features / scale_factors[batch_indices].unsqueeze(-1)
         else:
-            # No normalization - scale factors are all 1.0
-            scale_factors = torch.ones(batch_size, device=features.device, dtype=features.dtype)
+            scale_factors = torch.ones(batch_size, device=features.device,
+                                        dtype=features.dtype)
 
-        # Apply feature extractor if provided (operates on normalized positions)
-        # Variable-k: extract per-patch using the base class dispatch (handles ragged via loop)
+        # ── Feature extractor ────────────────────────────────────────
         if self.feature_extractor is not None:
-            extracted = []
-            start = 0
-            for sz in batch_sizes:
-                sz = sz.item()
-                patch = features[start:start + sz]  # (sz, 3)
-                extracted.append(self.feature_extractor.extract_features(patch))  # (sz, feature_dim)
-                start += sz
-            features = torch.cat(extracted, dim=0)  # (total_points, feature_dim)
+            if fixed_k:
+                features = features.view(batch_size, max_k, -1)
+                features = self.feature_extractor.extract_features(features)
+                features = features.view(batch_size * max_k, -1)
+            else:
+                extracted = []
+                start = 0
+                for sz in batch_sizes:
+                    sz = sz.item()
+                    extracted.append(
+                        self.feature_extractor.extract_features(
+                            features[start:start + sz]))
+                    start += sz
+                features = torch.cat(extracted, dim=0)
 
-        # Project to model dimension
-        features = self.input_projection(features)  # (total_points, d_model)
+        # ── Input projection ─────────────────────────────────────────
+        features = self.input_projection(features)
 
-        # Pad sequences to max_k and create attention masks
-        sequences, attention_mask = self._pad_sequences_vectorized(
-            features, batch_indices, batch_size, max_k
-        )
+        # ── Sequence padding + transformer ───────────────────────────
+        if fixed_k:
+            sequences = features.view(batch_size, max_k, -1)
+            encoded = self.transformer_encoder(sequences,
+                                               src_key_padding_mask=None)
+            attention_mask = torch.ones(batch_size, max_k, dtype=torch.bool,
+                                        device=features.device)
+        else:
+            sequences, attention_mask = self._pad_sequences_vectorized(
+                features, batch_indices, batch_size, max_k)
+            encoded = self.transformer_encoder(
+                sequences, src_key_padding_mask=~attention_mask)
 
-        # Pass through transformer with attention mask
-        # Note: src_key_padding_mask expects True for positions to IGNORE
-        encoded_features = self.transformer_encoder(sequences, src_key_padding_mask=~attention_mask)
+        # ── Output heads ─────────────────────────────────────────────
+        grad_coeffs = self.grad_projection(encoded)
+        stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)
 
-                # === Output head: gradient coefficients ===
-        grad_coeffs = self.grad_projection(encoded_features)  # (batch_size, max_k, 3)
-        stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)   # (batch_size, max_k)
+        # ── Area prediction ──────────────────────────────────────────
+        if fixed_k:
+            pooled = encoded.mean(dim=1)
+        else:
+            float_mask = attention_mask.float()
+            num_tokens = float_mask.sum(dim=1, keepdim=True)
+            pooled = (encoded * float_mask.unsqueeze(-1)).sum(dim=1) / num_tokens
 
-        # === Area prediction (per patch) ===
-        # Mean pooling of encoded features (excluding padding)
-        # Create float mask for proper averaging
-        float_mask = attention_mask.float()  # (batch_size, max_k)
-        num_tokens = float_mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
-
-        # Masked mean: sum of (features * mask) / num_tokens
-        masked_features = encoded_features * float_mask.unsqueeze(-1)  # (batch_size, max_k, d_model)
-        pooled_features = masked_features.sum(dim=1) / num_tokens  # (batch_size, d_model)
-
-        # Area head outputs positive scalar per patch (for normalized geometry)
-        areas_normalized = self.area_head(pooled_features).squeeze(-1)  # (batch_size,)
-
-        # === Scale areas back to original geometry ===
+        areas_normalized = self.area_head(pooled).squeeze(-1)
         if self._scale_areas_by_patch_size:
-            # A = A' * dÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â² (area scales as lengthÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²)
             areas = areas_normalized * (scale_factors ** 2)
         else:
             areas = areas_normalized
@@ -709,223 +413,133 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             'attention_mask': attention_mask,
             'batch_sizes': batch_sizes,
             'scale_factors': scale_factors,
-            'grad_coeffs': grad_coeffs,  # None in stiffness mode, (batch_size, max_k, 3) in gradient mode
+            'grad_coeffs': grad_coeffs,
         }
 
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
     def training_step(self, batch: List[Batch], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Training step with variable-sized patch support.
-
-        Args:
-            batch: List of PyTorch Geometric batches (synthetic data)
-            batch_idx: Batch index
-
-        Returns:
-            Dictionary with loss and other metrics
-        """
-        # Take the first batch from the list
+        """Training step with variable-sized patch support."""
         batch_data = batch[0]
         forward_result = self.forward(batch_data)
+        predicted_mcv = self._compute_mean_curvature_vectors(forward_result, batch_data)
 
-        # Compute mean curvature vectors using vectorized method
-        predicted_mean_curvature_vectors = self._compute_mean_curvature_vectors(forward_result, batch_data)
-
-        # Get batch size for logging
         batch_size = len(forward_result['batch_sizes'])
+        normals = batch_data.normal
+        mean_curvatures = batch_data.H
+        target_mcv = 2.0 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)
 
-        # In training mode, diff_geom_at_origin_only=True, so normals and H are per-surface
-        normals = batch_data.normal  # (batch_size, 3) - one normal per surface at origin
-        mean_curvatures = batch_data.H  # (batch_size,) - one curvature per surface at origin
-
-        # Target: 2 * H * n_hat (mean curvature times unit normal at origin)
-        target_mean_curvature_vectors = 2.0 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)  # (batch_size, 3)
-
-        # Build LossContext with all fields any loss might need
         loss_context = LossContext(
-            predicted_mcv=predicted_mean_curvature_vectors,
-            target_mcv=target_mean_curvature_vectors,
+            predicted_mcv=predicted_mcv,
+            target_mcv=target_mcv,
             grad_coeffs=forward_result.get('grad_coeffs'),
-            positions=self._reshape_positions_to_batched(batch_data.pos, forward_result['batch_sizes'])
-                      if forward_result.get('grad_coeffs') is not None else None,
+            positions=(self._reshape_positions_to_batched(
+                           batch_data.pos, forward_result['batch_sizes'])
+                       if forward_result.get('grad_coeffs') is not None else None),
             normals=getattr(batch_data, 'normal', None),
             attention_mask=forward_result['attention_mask'],
             areas=forward_result['areas'],
             stiffness_weights=forward_result['stiffness_weights'],
         )
 
-        # Apply all losses through unified loss_configs pipeline
         total_loss = 0.0
         loss_components_weighted = {}
         loss_components_unweighted = {}
 
-        for i, loss_config in enumerate(self._loss_configs):
-            # Compute unweighted loss Ã¢â‚¬â€ every loss takes the same LossContext
+        for loss_config in self._loss_configs:
             unweighted_loss = loss_config.loss_module(loss_context)
-
-            # Store unweighted loss for logging
-            loss_name = f"{loss_config.loss_module.__class__.__name__}"
+            loss_name = loss_config.loss_module.__class__.__name__
             loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
-
-            # Only add to total loss if weight is not None
             if loss_config.weight is not None:
                 weighted_loss = loss_config.weight * unweighted_loss
-                total_loss = total_loss + weighted_loss  # This converts 0.0 to tensor on first add
+                total_loss = total_loss + weighted_loss
                 loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
 
-        # Ensure total_loss is a tensor (at least one loss must have non-None weight)
         if not isinstance(total_loss, torch.Tensor):
             raise ValueError("At least one loss must have a non-None weight for training")
 
-        # Compute average cosine similarity between predicted and target mean curvature vectors
-        cosine_sim = F.cosine_similarity(predicted_mean_curvature_vectors, target_mean_curvature_vectors, dim=1)
-        avg_cosine_sim = cosine_sim.mean()
-
-        # Log area statistics (useful for monitoring the area head)
+        cosine_sim = F.cosine_similarity(predicted_mcv, target_mcv, dim=1).mean()
         areas = forward_result['areas']
-        area_mean = areas.mean()
-        area_std = areas.std()
 
-        # Log the total loss
-        self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True, prog_bar=True,
-                 logger=True, batch_size=batch_size, sync_dist=True)
-
-        # Log average cosine similarity
-        self.log('train/cosine_similarity', avg_cosine_sim.item(), on_step=False, on_epoch=True,
+        self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True,
                  prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-
-        # Log area statistics
-        self.log('train/area_mean', area_mean.item(), on_step=False, on_epoch=True,
+        self.log('train/cosine_similarity', cosine_sim.item(), on_step=False,
+                 on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size,
+                 sync_dist=True)
+        self.log('train/area_mean', areas.mean().item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
-        self.log('train/area_std', area_std.item(), on_step=False, on_epoch=True,
+        self.log('train/area_std', areas.std().item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
 
-        # Log individual unweighted loss components (these are the main loss values to track)
-        for loss_name, loss_value in loss_components_unweighted.items():
-            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True,
+        for name, val in loss_components_unweighted.items():
+            self.log(name, val, on_step=False, on_epoch=True, logger=True,
+                     batch_size=batch_size, sync_dist=True)
+        for name, val in loss_components_weighted.items():
+            self.log(name, val, on_step=False, on_epoch=True, logger=True,
                      batch_size=batch_size, sync_dist=True)
 
-        # Log individual weighted loss components (for debugging the weighting)
-        for loss_name, loss_value in loss_components_weighted.items():
-            self.log(loss_name, loss_value, on_step=False, on_epoch=True, logger=True,
-                     batch_size=batch_size, sync_dist=True)
-
-        # Create return dictionary with all losses
         result = {"loss": total_loss}
         result.update(loss_components_weighted)
         result.update(loss_components_unweighted)
-
         return result
 
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
     def validation_step(self, batch: Batch, batch_idx: int) -> Dict[str, float]:
-        """
-        Validation step - compare predicted Laplacian eigendecomposition with ground truth.
-
-        Handles PyG batching by splitting combined Batch back into individual meshes.
-
-        Args:
-            batch: PyG Batch object (combined meshes)
-            batch_idx: Batch index
-
-        Returns:
-            Dictionary with averaged validation metrics
-        """
-        # Split batch back into individual Data objects
+        """Validate against ground-truth eigendecomposition and geodesics."""
         mesh_list = batch.to_data_list()
-
-        # Validate each mesh and collect metrics
         all_metrics = []
         for mesh_data in mesh_list:
-            mesh_metrics = self._validate_single_mesh(mesh_data)
-            all_metrics.append(mesh_metrics)
+            all_metrics.append(self._validate_single_mesh(mesh_data))
 
-        # Average metrics across batch
         averaged_metrics = {}
         if all_metrics:
-            metric_names = all_metrics[0].keys()
-            for name in metric_names:
+            for name in all_metrics[0].keys():
                 values = [m[name] for m in all_metrics if name in m]
                 if values:
                     averaged_metrics[name] = sum(values) / len(values)
 
-        # Log validation metrics
-        for metric_name, metric_value in averaged_metrics.items():
-            self.log(f'val/{metric_name}', metric_value, on_step=False, on_epoch=True,
+        for name, val in averaged_metrics.items():
+            self.log(f'val/{name}', val, on_step=False, on_epoch=True,
                      logger=True, batch_size=len(mesh_list), sync_dist=True)
-
         return averaged_metrics
 
     def _validate_single_mesh(self, mesh_data: BaseData) -> Dict[str, float]:
-        """
-        Validate a single mesh by comparing predicted vs ground-truth eigendecomposition
-        and geodesic distances.
-
-        MeshDataset now returns raw mesh data (vertices, faces, normals).
-        Patch extraction (kNN) happens here on GPU via build_patches_from_vertices.
-
-        Args:
-            mesh_data: Data object with raw_vertices, raw_faces, gt_eigen, geodesic_data, etc.
-
-        Returns:
-            Dictionary with validation metrics for this mesh
-        """
-        # Get device from model parameters
+        """Validate a single mesh: eigendecomposition + geodesics."""
         device = next(self.parameters()).device
-
-        # Extract raw vertices and build patches on GPU
-        vertices = mesh_data.raw_vertices  # (N, 3) tensor
+        vertices = mesh_data.raw_vertices
         k = int(mesh_data.k_neighbors) if hasattr(mesh_data, 'k_neighbors') else 20
 
         patch_data = build_patches_from_vertices(vertices, k, device=device)
-
-        # Convert single Data to Batch for forward pass
-        mesh_batch = Batch.from_data_list([patch_data])
-        mesh_batch = mesh_batch.to(device)
+        mesh_batch = Batch.from_data_list([patch_data]).to(device)
         forward_result = self.forward(mesh_batch)
 
-        # Use patch_idx if available (MeshDataset), otherwise use batch (synthetic)
-        batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
-
-        # Build knn indices from patch data
-        grad_coeffs = forward_result['grad_coeffs']
         batch_sizes = forward_result['batch_sizes']
         N = len(batch_sizes)
         k_val = batch_sizes[0].item()
         knn = mesh_batch.vertex_indices.reshape(N, k_val).to(device)
         areas = forward_result['areas'].detach()
 
-        # Assemble Laplacian according to config
         with torch.no_grad():
-            L = assemble_laplacian(grad_coeffs, knn, self._val_lap_config)
+            L = assemble_laplacian(forward_result['grad_coeffs'], knn,
+                                   self._val_lap_config)
 
-        # Convert to scipy for geodesics
         stiffness_matrix = to_scipy_sparse(L)
         mass_matrix = mass_matrix_to_scipy(areas)
-
-        # Store matrices for callback (last mesh in batch)
         self._last_stiffness_matrix = stiffness_matrix
         self._last_mass_matrix = mass_matrix
 
-        # Eigendecomposition: dense L on GPU
-        pred_eigenvalues, pred_eigenvectors = _eigh_full_gram(
-            L, areas, self._num_eigenvalues
-        )
+        pred_evals, pred_evecs = _eigh_full_gram(L, areas, self._num_eigenvalues)
+        gt_evals, gt_evecs = mesh_data.gt_eigen
 
-        # Get ground-truth eigendecomposition (stored as tuple to avoid PyG batching issues)
-        gt_eigenvalues, gt_eigenvectors = mesh_data.gt_eigen
-
-        # Compute spectral comparison metrics
         metrics = self._compute_spectral_comparison_metrics(
-            pred_eigenvalues, pred_eigenvectors,
-            gt_eigenvalues, gt_eigenvectors
-        )
-
-        # Compute geodesic validation metrics if geodesic data is available
-        # Always uses sparse S + G regardless of val_laplacian_mode
-        geodesic_metrics = self._compute_geodesic_validation_metrics(
-            mesh_data, stiffness_matrix, mass_matrix, forward_result, mesh_batch
-        )
-        metrics.update(geodesic_metrics)
-
+            pred_evals, pred_evecs, gt_evals, gt_evecs)
+        metrics.update(self._compute_geodesic_validation_metrics(
+            mesh_data, stiffness_matrix, mass_matrix, forward_result, mesh_batch))
         return metrics
 
     def _compute_geodesic_validation_metrics(
@@ -934,23 +548,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             stiffness_matrix: scipy.sparse.spmatrix,
             mass_matrix: scipy.sparse.spmatrix,
             forward_result: Optional[Dict[str, torch.Tensor]] = None,
-            mesh_batch: Optional[Batch] = None
+            mesh_batch: Optional[Batch] = None,
     ) -> Dict[str, float]:
-        """
-        Compute geodesic validation metrics using Heat Method with multiple sources.
-
-        Assembles G from learned grad_coeffs and uses the formal adjoint divergence.
-
-        Args:
-            mesh_data: PyTorch Geometric Data object with geodesic_data
-            stiffness_matrix: Assembled stiffness matrix (scipy sparse)
-            mass_matrix: Assembled mass matrix (scipy sparse)
-            forward_result: Forward pass output (grad_coeffs)
-            mesh_batch: Batched mesh data (vertex/center indices)
-
-        Returns:
-            Dictionary with geodesic validation metrics (averaged over sources)
-        """
+        """Compute geodesic validation metrics using the Heat Method."""
         geodesic_data = getattr(mesh_data, 'geodesic_data', None)
         if geodesic_data is None or not geodesic_data.get('has_geodesic_data', False):
             return {}
@@ -960,41 +560,29 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             exact_geodesics_dict = geodesic_data['exact_geodesics']
             n_vertices = stiffness_matrix.shape[0]
 
-            # Assemble G from learned grad_coeffs
             batch_indices = getattr(mesh_batch, 'patch_idx', mesh_batch.batch)
             gradient_operator = assemble_gradient_operator(
                 grad_coeffs=forward_result['grad_coeffs'],
                 attention_mask=forward_result['attention_mask'],
                 vertex_indices=mesh_batch.vertex_indices,
                 center_indices=mesh_batch.center_indices,
-                batch_indices=batch_indices
+                batch_indices=batch_indices,
             )
 
-            def compute_pred_geodesics(source_idx):
+            def compute_pred(source_idx):
                 return compute_heat_geodesic_learned(
-                    S=stiffness_matrix,
-                    M=mass_matrix,
-                    G=gradient_operator,
-                    source_idx=source_idx,
-                    n_vertices=n_vertices
-                )
+                    S=stiffness_matrix, M=mass_matrix, G=gradient_operator,
+                    source_idx=source_idx, n_vertices=n_vertices)
 
-            def get_exact_geodesics(source_idx):
+            def get_exact(source_idx):
                 return exact_geodesics_dict.get(source_idx, None)
 
-            # Compute multi-source metrics
-            multi_metrics = compute_multisource_geodesic_metrics(
-                computed_func=compute_pred_geodesics,
-                exact_func=get_exact_geodesics,
-                source_indices=source_indices
-            )
+            return compute_multisource_geodesic_metrics(
+                computed_func=compute_pred, exact_func=get_exact,
+                source_indices=source_indices,
+            ).to_dict(prefix="")
 
-            # Return as dictionary for logging
-            return multi_metrics.to_dict(prefix="")
-
-        except Exception as e:
-            # Silently skip geodesic validation if it fails
-            # (don't want to break training on geodesic errors)
+        except Exception:
             return {}
 
     def _compute_spectral_comparison_metrics(
@@ -1002,23 +590,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             pred_eigenvalues: np.ndarray,
             pred_eigenvectors: np.ndarray,
             gt_eigenvalues: np.ndarray,
-            gt_eigenvectors: np.ndarray
+            gt_eigenvectors: np.ndarray,
     ) -> Dict[str, float]:
-        """
-        Compute metrics comparing predicted vs ground-truth eigendecomposition.
-
-        All computations done in numpy to avoid GPU memory usage.
-
-        Args:
-            pred_eigenvalues: Predicted eigenvalues (k,)
-            pred_eigenvectors: Predicted eigenvectors (N, k)
-            gt_eigenvalues: Ground-truth eigenvalues (k,)
-            gt_eigenvectors: Ground-truth eigenvectors (N, k)
-
-        Returns:
-            Dictionary of comparison metrics (float values)
-        """
-        # Ensure we compare same number of eigenvalues
+        """Compare predicted vs ground-truth eigendecomposition."""
         k = min(len(pred_eigenvalues), len(gt_eigenvalues))
         pred_eig = pred_eigenvalues[:k]
         gt_eig = gt_eigenvalues[:k]
@@ -1026,62 +600,37 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         gt_vec = gt_eigenvectors[:, :k]
 
         metrics = {}
+        eps = 1e-6
 
-        # === Eigenvalue metrics ===
-
-        # 1. Relative MSE (skip first eigenvalue since it's ~0)
         if k > 1:
-            eps = 1e-6
             rel_errors_sq = ((pred_eig[1:] - gt_eig[1:]) / (gt_eig[1:] + eps)) ** 2
             metrics['eigenvalue_rel_mse'] = float(rel_errors_sq.mean())
 
-        # 2. Spectral gap ratio (lambda_1 - lambda_0)
         pred_gap = pred_eig[1] - pred_eig[0] if k > 1 else 0.0
         gt_gap = gt_eig[1] - gt_eig[0] if k > 1 else 1.0
-        metrics['spectral_gap_ratio'] = float(pred_gap / (gt_gap + 1e-6))
+        metrics['spectral_gap_ratio'] = float(pred_gap / (gt_gap + eps))
 
-        # 3. Eigenvalue correlation
         if k > 2:
-            correlation = np.corrcoef(pred_eig, gt_eig)[0, 1]
-            metrics['eigenvalue_correlation'] = float(correlation) if not np.isnan(correlation) else 0.0
+            corr = np.corrcoef(pred_eig, gt_eig)[0, 1]
+            metrics['eigenvalue_correlation'] = float(corr) if not np.isnan(corr) else 0.0
 
-        # 4. First non-zero eigenvalue ratio
         if k > 1:
-            metrics['lambda1_ratio'] = float(pred_eig[1] / (gt_eig[1] + 1e-6))
+            metrics['lambda1_ratio'] = float(pred_eig[1] / (gt_eig[1] + eps))
 
-        # === Eigenvector metrics ===
-
-        # Compute cosine similarity for each eigenvector pair (handle sign ambiguity)
-        cos_similarities = []
+        cos_sims = []
         for i in range(k):
-            pred_v = pred_vec[:, i]
-            gt_v = gt_vec[:, i]
+            pv = pred_vec[:, i] / (np.linalg.norm(pred_vec[:, i]) + 1e-8)
+            gv = gt_vec[:, i] / (np.linalg.norm(gt_vec[:, i]) + 1e-8)
+            cos_sims.append(np.abs(np.dot(pv, gv)))
+        cos_sims = np.array(cos_sims)
 
-            # Normalize vectors
-            pred_v_norm = pred_v / (np.linalg.norm(pred_v) + 1e-8)
-            gt_v_norm = gt_v / (np.linalg.norm(gt_v) + 1e-8)
-
-            # Cosine similarity (absolute value due to sign ambiguity)
-            cos_sim = np.abs(np.dot(pred_v_norm, gt_v_norm))
-            cos_similarities.append(cos_sim)
-
-        cos_similarities = np.array(cos_similarities)
-
-        # Mean eigenvector similarity (all eigenvectors)
-        metrics['eigenvector_similarity_mean'] = float(cos_similarities.mean())
-
-        # Eigenvector similarity excluding first (constant) eigenvector
+        metrics['eigenvector_similarity_mean'] = float(cos_sims.mean())
         if k > 1:
-            metrics['eigenvector_similarity_mean_skip0'] = float(cos_similarities[1:].mean())
-
-        # Individual eigenvector similarities for first few
+            metrics['eigenvector_similarity_mean_skip0'] = float(cos_sims[1:].mean())
         for i in range(k):
-            metrics[f'eigenvector_{i}_similarity'] = float(cos_similarities[i])
+            metrics[f'eigenvector_{i}_similarity'] = float(cos_sims[i])
 
-        # Overall spectral distance (combines eigenvalue and eigenvector differences)
-        # Lower is better
-        eigenvalue_error = float(np.mean(((pred_eig - gt_eig) / (gt_eig + 1e-6)) ** 2)) if k > 0 else 0.0
-        eigenvector_error = 1.0 - float(cos_similarities.mean())
-        metrics['spectral_distance'] = eigenvalue_error + eigenvector_error
+        eig_err = float(np.mean(((pred_eig - gt_eig) / (gt_eig + eps)) ** 2)) if k > 0 else 0.0
+        metrics['spectral_distance'] = eig_err + (1.0 - float(cos_sims.mean()))
 
         return metrics

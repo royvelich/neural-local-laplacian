@@ -86,13 +86,16 @@ def _compute_one_mesh(args) -> Tuple[str, str, bool, int, int, str]:
             return mesh_file_path, mesh_name, True, n_ok, num_sources, \
                 f"cached ({n_ok}/{num_sources} sources)"
 
-        # Compute exact geodesics with per-source timeout
-        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        # Compute exact geodesics with per-source timeout (Unix only)
+        _has_alarm = hasattr(signal, 'SIGALRM')
+        if _has_alarm:
+            old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
         geodesics = {}
         n_timeout = 0
         for src_idx in source_indices:
             try:
-                signal.alarm(timeout_per_source)
+                if _has_alarm:
+                    signal.alarm(timeout_per_source)
                 geodesics[int(src_idx)] = compute_exact_geodesics(
                     vertices, faces, int(src_idx),
                 )
@@ -102,8 +105,10 @@ def _compute_one_mesh(args) -> Tuple[str, str, bool, int, int, str]:
             except Exception:
                 geodesics[int(src_idx)] = None
             finally:
-                signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+                if _has_alarm:
+                    signal.alarm(0)
+        if _has_alarm:
+            signal.signal(signal.SIGALRM, old_handler)
 
         n_ok = sum(1 for v in geodesics.values() if v is not None and len(v) == N)
         timeout_str = f", {n_timeout} timed out" if n_timeout > 0 else ""

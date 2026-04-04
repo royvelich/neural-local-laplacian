@@ -9,3 +9,4 @@ checkpoints/
 fmap_finetune_runs/
 fmaps_finetune_results/
 surface_patch_screenshots*/
+geo_cache/

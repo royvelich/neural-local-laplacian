@@ -34,23 +34,18 @@ module:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-
         mesh_folder_path: 'F:\input\shrec15'
-        max_meshes: 50
+        max_meshes: 20
         file_size_range_mb: [0.5, 4]
-        num_components_range: [1, 1]
-
+        require_manifold: True
 #        mesh_folder_paths:
 #          - 'F:\input\mpz14'
 #          - 'F:\input\deftransfer'
 #          - 'F:\input\shrec15'
 #        max_meshes: 60
 #        file_size_range_mb: [0.3, 5]
-
         shuffle: True
         k: 8
-        pose_transformers:
-          - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
         num_geodesic_sources: 5
         geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
