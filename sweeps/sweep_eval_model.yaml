@@ -1,8 +1,8 @@
-# W&B sweep: evaluate pretrained model on 5 dataset flavors × 2 k values.
-# Grid: k (2) × data_module (5) = 10 runs, each loading one dataset.
+# W&B sweep: model baseline on 5 dataset flavors × 3 k values.
+# Grid: k (3) × data_module (5) = 15 runs.
 #
 # Usage:
-#   wandb sweep fmaps_config/sweeps/eval_5datasets.yaml
+#   wandb sweep fmaps_config/sweeps/eval_model_5datasets.yaml
 #   wandb agent <entity/project/sweep_id>
 
 program: ./train_fmaps.py
@@ -10,9 +10,6 @@ command:
   - python
   - ${program}
 method: grid
-metric:
-  goal: maximize
-  name: val/best_acc
 parameters:
   # ═══════════════════════════════════════════════════════════════════════════
   # Globals
@@ -31,8 +28,9 @@ parameters:
       # ── Swept ─────────────────────────────────────────────────────────────
       k:
         values:
+          - 6
           - 8
-          - 15
+          - 10
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Data module — swept: one dataset per run
@@ -50,7 +48,7 @@ parameters:
                 pair_generator:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
                   root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -71,7 +69,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                   root: '/workspace/datasets/DeformingThings4DMatching'
                   pair_mode: intra
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -92,7 +90,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                   root: '/workspace/datasets/DeformingThings4DMatching'
                   pair_mode: inter
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -113,7 +111,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                   root: '/workspace/datasets/faust'
                   pair_mode: intra
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -134,7 +132,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                   root: '/workspace/datasets/faust'
                   pair_mode: inter
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -144,7 +142,7 @@ parameters:
                 _partial_: true
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Model — eval only, both assembly variants
+  # Model — model baseline only, k swept
   # ═══════════════════════════════════════════════════════════════════════════
   model:
     value:
@@ -156,9 +154,9 @@ parameters:
         seed: ${globals.training_seed}
 
         mode: eval
-        baselines: [robust, model]
-        geo_cache_workers: 4
+        baselines: [model]
         geo_cache_dir: ./geo_cache
+        eval_results_dir: ./eval_results/model
 
         train_laplacian:
           assembly: diagonal_gram
@@ -166,8 +164,8 @@ parameters:
         eval_laplacians:
           - assembly: diagonal_gram
             pruning: none
-          - assembly: full_gram
-            pruning: none
+#          - assembly: full_gram
+#            pruning: none
 
         losses: null
 
@@ -176,7 +174,7 @@ parameters:
         freeze_input_projection: false
         freeze_areas_head: false
 
-        max_vertices: 4000
+        max_vertices: 5000
         max_vertices_val: 0
         vertex_noise: 0.0
         w_prox: 0.0
@@ -199,7 +197,7 @@ parameters:
         geomfum_fmap_resolvent_gamma: 1.0
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Optimizer (unused in eval mode)
+  # Optimizer (unused)
   # ═══════════════════════════════════════════════════════════════════════════
   optimizer:
     value: null
