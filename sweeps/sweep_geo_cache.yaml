@@ -151,7 +151,6 @@ parameters:
 
         mode: geo_cache
         geo_cache_dir: ./geo_cache
-        geo_cache_workers: 4
 
         losses: null
 

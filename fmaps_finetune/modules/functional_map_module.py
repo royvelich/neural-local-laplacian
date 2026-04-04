@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import contextlib
 import time
+from pathlib import Path
 
 import scipy.sparse
 import scipy.sparse.linalg
@@ -1790,7 +1791,6 @@ class FunctionalMapModule(LaplacianModuleBase):
             all_val_datasets: [(ds_name, pairs)] for pair name lookup.
         """
         import csv
-        from pathlib import Path
 
         # Build a unique run directory name
         hp = self.hparams
