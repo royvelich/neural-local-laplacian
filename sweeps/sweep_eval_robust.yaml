@@ -152,6 +152,7 @@ parameters:
         mode: eval
         baselines: [robust]
         geo_cache_dir: ./geo_cache
+        geo_cache_workers: 10
         eval_results_dir: ./eval_results/robust
 
         train_laplacian:

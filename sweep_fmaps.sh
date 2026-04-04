@@ -24,8 +24,13 @@ fi
 export OMP_NUM_THREADS=$THREADS
 export MKL_NUM_THREADS=$THREADS
 
+# Create log directory
+LOG_DIR="sweep_logs/$(date +%Y%m%d_%H%M%S)_${SWEEP_ID##*/}"
+mkdir -p "$LOG_DIR"
+
 echo "Starting infinite training loop with sweep-id: $SWEEP_ID"
 echo "OMP_NUM_THREADS=$OMP_NUM_THREADS  MKL_NUM_THREADS=$MKL_NUM_THREADS  (CPUs=$(nproc), GPUs=${N_GPUS:-manual})"
+echo "Logs: $LOG_DIR/"
 echo "Press Ctrl+C to stop the loop"
 
 # Function to check if any GPU processes are running
@@ -56,17 +61,32 @@ wait_for_gpu_free() {
 # Infinite loop
 iteration=1
 while true; do
+    LOG_FILE="$LOG_DIR/run_$(printf '%03d' $iteration).log"
+
     echo ""
     echo "========================================="
     echo "Starting iteration $iteration"
     echo "Time: $(date)"
+    echo "Log: $LOG_FILE"
     echo "========================================="
 
-    # Run the training script
-    echo "Running: python ./train_fmaps.py --sweep-id $SWEEP_ID"
-    python ./train_fmaps.py --sweep-id "$SWEEP_ID"
+    # Run the training script, logging stdout+stderr to file and terminal
+    python ./train_fmaps.py --sweep-id "$SWEEP_ID" 2>&1 | tee "$LOG_FILE"
+    EXIT_CODE=${PIPESTATUS[0]}
 
-    echo "Training iteration $iteration completed with exit code: $?"
+    echo "" >> "$LOG_FILE"
+    echo "=========================================" >> "$LOG_FILE"
+    echo "Exit code: $EXIT_CODE" >> "$LOG_FILE"
+    echo "Time: $(date)" >> "$LOG_FILE"
+
+    echo "Training iteration $iteration completed with exit code: $EXIT_CODE"
+
+    # Check for OOM kills
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "--- Recent OOM events ---" | tee -a "$LOG_FILE"
+        dmesg | grep -i "oom\|killed" | tail -5 | tee -a "$LOG_FILE"
+        echo "-------------------------" | tee -a "$LOG_FILE"
+    fi
 
     # Wait for GPU to be free before starting next iteration
     wait_for_gpu_free

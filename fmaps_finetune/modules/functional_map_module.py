@@ -2234,6 +2234,8 @@ class FunctionalMapModule(LaplacianModuleBase):
 
                             from concurrent.futures import ThreadPoolExecutor, as_completed
                             rb_n_workers = max(1, _n_cpus // max(world_size, 1))
+                            if hp.geo_cache_workers is not None:
+                                rb_n_workers = min(rb_n_workers, hp.geo_cache_workers)
 
                             def _eval_robust(p):
                                 return evaluate_pair_robust(
