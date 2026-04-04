@@ -2,14 +2,30 @@
 
 # Check if sweep-id argument is provided
 if [ $# -eq 0 ]; then
-    echo "Usage: $0 <sweep-id>"
+    echo "Usage: $0 <sweep-id> [threads-per-rank]"
     echo "Example: $0 my-sweep-123"
+    echo "Example: $0 my-sweep-123 15"
     exit 1
 fi
 
 SWEEP_ID="$1"
 
+# Auto-detect or use provided thread count
+if [ -n "$2" ]; then
+    THREADS="$2"
+else
+    N_CPUS=$(nproc)
+    N_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    N_GPUS=${N_GPUS:-1}
+    THREADS=$(( N_CPUS / (N_GPUS > 0 ? N_GPUS : 1) ))
+    THREADS=$(( THREADS > 0 ? THREADS : 1 ))
+fi
+
+export OMP_NUM_THREADS=$THREADS
+export MKL_NUM_THREADS=$THREADS
+
 echo "Starting infinite training loop with sweep-id: $SWEEP_ID"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS  MKL_NUM_THREADS=$MKL_NUM_THREADS  (CPUs=$(nproc), GPUs=${N_GPUS:-manual})"
 echo "Press Ctrl+C to stop the loop"
 
 # Function to check if any GPU processes are running
