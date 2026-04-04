@@ -8,3 +8,4 @@ checkpoints/
 .venvs/
 fmap_finetune_runs/
 fmaps_finetune_results/
+surface_patch_screenshots*/

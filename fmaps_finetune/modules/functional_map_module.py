@@ -1083,6 +1083,29 @@ class GeodesicCache:
         """Release the pp3d solver to free memory (after precomputation)."""
         self._solver = None
 
+    def save_to_disk(self, path: str) -> None:
+        """Save cache to disk as .npz file."""
+        save_dict = {
+            'sqrt_area': np.array(self._sqrt_area),
+            'idx_b': self._idx_b,
+        }
+        for k, v in self._dist_cache.items():
+            save_dict[f'dist_{k}'] = v
+        np.savez_compressed(path, **save_dict)
+
+    @classmethod
+    def load_from_disk(cls, path: str) -> 'GeodesicCache':
+        """Load cache from .npz file."""
+        data = np.load(path)
+        sqrt_area = float(data['sqrt_area'])
+        idx_b = data['idx_b']
+        dist_cache = {}
+        for k in data.files:
+            if k.startswith('dist_'):
+                target_idx = int(k[5:])
+                dist_cache[target_idx] = data[k]
+        return cls.from_precomputed(dist_cache, sqrt_area, idx_b)
+
     def compute_errors(self, pred_corr: np.ndarray, gt_corr: np.ndarray) -> np.ndarray:
         """Compute normalised geodesic error for each (pred, gt) pair.
 
@@ -1107,6 +1130,13 @@ class GeodesicCache:
             mask = gt_corr == g
             errors[mask] = self._dist_cache[int(g)][pred_corr[mask]]
         return errors
+
+
+def _geo_cache_path(cache_dir: str, pair_name: str, max_vertices: int) -> Path:
+    """Build the disk path for a geo cache file."""
+    mv_label = f"mv{max_vertices}" if max_vertices > 0 else "mv0"
+    safe_name = pair_name.replace(":", "_").replace("/", "_").replace("\\", "_")
+    return Path(cache_dir) / mv_label / f"{safe_name}.npz"
 
 
 def _precompute_geo_cache_worker(args):
@@ -1458,7 +1488,8 @@ class FunctionalMapModule(LaplacianModuleBase):
         profile_steps: int = 0,   # print profiler summary every N steps (0 = off)
         # Evaluation control
         geo_cache_workers: Optional[int] = None,  # max mp.Pool workers per rank (None = auto)
-        eval_only: bool = False,       # run baselines only, then stop (no training)
+        geo_cache_dir: Optional[str] = None,     # disk cache directory (None = in-memory only)
+        mode: str = 'train',                     # 'train', 'eval', or 'geo_cache'
         skip_baselines: bool = False,  # skip baseline computation in on_fit_start
         # GeomFuM evaluation (optional)
         use_geomfum_eval: bool = False,
@@ -1475,6 +1506,12 @@ class FunctionalMapModule(LaplacianModuleBase):
                          scheduler_cfg=scheduler_cfg, **kwargs)
         self.save_hyperparameters(ignore=["losses", "loss_fn", "optimizer_cfg", "scheduler_cfg"])
 
+        # Validate mode
+        if mode not in ('train', 'eval', 'geo_cache'):
+            raise ValueError(f"mode must be 'train', 'eval', or 'geo_cache', got: {mode!r}")
+        if mode == 'geo_cache' and not geo_cache_dir:
+            raise ValueError("mode='geo_cache' requires geo_cache_dir to be set")
+
         # Build loss list: prefer explicit `losses`, fall back to `loss_fn`
         if losses is not None:
             self._losses = nn.ModuleList(losses)
@@ -1482,7 +1519,7 @@ class FunctionalMapModule(LaplacianModuleBase):
             if not hasattr(loss_fn, 'weight'):
                 loss_fn.weight = 1.0
             self._losses = nn.ModuleList([loss_fn])
-        elif eval_only:
+        elif mode != 'train':
             self._losses = nn.ModuleList()
         else:
             raise ValueError("Must provide either `losses` or `loss_fn`")
@@ -1897,6 +1934,35 @@ class FunctionalMapModule(LaplacianModuleBase):
                 print("    (matplotlib not installed — skipping comparison plot)")
 
     # ------------------------------------------------------------------
+    # Geodesic cache helpers
+    # ------------------------------------------------------------------
+
+    def _effective_max_vertices(self) -> int:
+        """Return the effective max_vertices for subsampling."""
+        hp = self.hparams
+        mv = hp.max_vertices_val if hp.max_vertices_val > 0 else hp.max_vertices
+        return mv
+
+    def _get_geo_cache(self, pair_name: str) -> Optional[GeodesicCache]:
+        """Get geo cache for a pair: from memory, or lazy-load from disk.
+
+        In-memory mode (geo_cache_dir=None): looks up self._geo_cache dict.
+        Disk mode (geo_cache_dir set): loads .npz from disk on demand.
+        Returns None if cache is not available.
+        """
+        # In-memory mode: direct dict lookup
+        if not self.hparams.geo_cache_dir:
+            return self._geo_cache.get(pair_name)
+
+        # Disk mode: load on demand (not cached in memory)
+        cache_path = _geo_cache_path(
+            self.hparams.geo_cache_dir, pair_name,
+            self._effective_max_vertices())
+        if cache_path.exists():
+            return GeodesicCache.load_from_disk(str(cache_path))
+        return None
+
+    # ------------------------------------------------------------------
     # Baseline evaluation (runs once before first training epoch)
     # ------------------------------------------------------------------
 
@@ -1932,58 +1998,178 @@ class FunctionalMapModule(LaplacianModuleBase):
             all_val_datasets.append((ds_name, pairs))
 
         # ==================================================================
-        # Precompute geodesic caches (all ranks — needed for DDP validation)
+        # Geodesic caches
         # ==================================================================
         all_pairs = [(name, p) for name, pairs in all_val_datasets for p in pairs]
-        if is_rank0:
-            print(f"\n  Precomputing geodesic caches ({len(all_pairs)} pairs)...",
-                  flush=True)
-        t0_geo = time.perf_counter()
+        mv = self._effective_max_vertices()
 
-        # Prepare worker args
-        worker_args = []
-        pair_meta = []
-        for _, p in all_pairs:
-            if p.name in self._geo_cache:
-                pair_meta.append((p.name, False))
-                continue
-            sub_p = _subsample(p)
-            if sub_p.faces_b is None:
-                pair_meta.append((p.name, False))
-                continue
-            gt_corr = _build_gt_corr_from_pair(sub_p)
+        if hp.mode == 'geo_cache' and hp.geo_cache_dir:
+            # ── Mode: geo_cache — compute all caches and save to disk ────
+            cache_dir = Path(hp.geo_cache_dir)
+            mv_dir = cache_dir / (f"mv{mv}" if mv > 0 else "mv0")
+            mv_dir.mkdir(parents=True, exist_ok=True)
 
-            verts_full = sub_p._verts_b_full if sub_p._verts_b_full is not None else sub_p.verts_b
-            idx_b = sub_p._idx_b if sub_p._idx_b is not None else np.arange(len(sub_p.verts_b))
+            # Filter pairs that need computation (skip existing)
+            to_compute = []
+            for _, p in all_pairs:
+                cache_path = _geo_cache_path(hp.geo_cache_dir, p.name, mv)
+                if cache_path.exists():
+                    continue
+                sub_p = _subsample(p)
+                if sub_p.faces_b is None:
+                    continue
+                gt_corr = _build_gt_corr_from_pair(sub_p)
+                verts_full = sub_p._verts_b_full if sub_p._verts_b_full is not None else sub_p.verts_b
+                idx_b = sub_p._idx_b if sub_p._idx_b is not None else np.arange(len(sub_p.verts_b))
+                unique_targets = np.unique(gt_corr) if gt_corr is not None else np.arange(len(sub_p.verts_b))
+                to_compute.append((
+                    p.name, verts_full, sub_p.faces_b, idx_b, unique_targets,
+                ))
 
-            if gt_corr is not None:
-                unique_targets = np.unique(gt_corr)
-            else:
-                unique_targets = np.arange(len(sub_p.verts_b))
+            if is_rank0:
+                print(f"\n  [geo_cache] {len(to_compute)} pairs to compute "
+                      f"({len(all_pairs) - len(to_compute)} already cached), "
+                      f"saving to {mv_dir}", flush=True)
 
-            worker_args.append((
-                p.name, verts_full, sub_p.faces_b, idx_b, unique_targets,
-            ))
-            pair_meta.append((p.name, True))
+            # Distribute across ranks
+            my_args = to_compute[self.global_rank::world_size]
+            t0_geo = time.perf_counter()
+            _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+            _max_per_rank = max(1, _n_cpus // max(world_size, 1))
+            if hp.geo_cache_workers is not None:
+                _max_per_rank = min(_max_per_rank, hp.geo_cache_workers)
+            n_workers = min(len(my_args), _max_per_rank)
+            n_my = len(my_args)
+            cw = len(str(n_my))
 
-        # Run geo cache workers (limit parallelism in multi-GPU to avoid CPU contention)
-        _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
-        _max_per_rank = max(1, _n_cpus // max(world_size, 1))
-        if hp.geo_cache_workers is not None:
-            _max_per_rank = min(_max_per_rank, hp.geo_cache_workers)
-        n_workers = min(len(worker_args), _max_per_rank)
-        _geo_n = len(worker_args)
-        _geo_cw = len(str(_geo_n))
-        if worker_args:
-            if n_workers > 1:
-                import multiprocessing as _mp
-                if is_rank0:
-                    print(f"    Parallel precomputation: {_geo_n} pairs, "
-                          f"{n_workers} workers", flush=True)
-                with _mp.Pool(n_workers) as pool:
+            if my_args:
+                if n_workers > 1:
+                    import multiprocessing as _mp
+                    print(f"    [rank {self.global_rank}] Computing {n_my} pairs "
+                          f"with {n_workers} workers...", flush=True)
+                    with _mp.Pool(n_workers) as pool:
+                        for i, r in enumerate(pool.imap_unordered(
+                                _precompute_geo_cache_worker, my_args)):
+                            name_r, dist_cache, sqrt_area, idx_b = r
+                            if dist_cache is not None:
+                                gc_obj = GeodesicCache.from_precomputed(
+                                    dist_cache, sqrt_area, idx_b)
+                                gc_obj.save_to_disk(
+                                    str(_geo_cache_path(hp.geo_cache_dir, name_r, mv)))
+                            done = i + 1
+                            if self.global_rank == 0:
+                                dt = time.perf_counter() - t0_geo
+                                eta = (dt / done) * (n_my - done)
+                                print(f"    [{done:>{cw}}/{n_my}] "
+                                      f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                      flush=True)
+                else:
+                    print(f"    [rank {self.global_rank}] Computing {n_my} pairs "
+                          f"sequentially...", flush=True)
+                    for i, args in enumerate(my_args):
+                        r = _precompute_geo_cache_worker(args)
+                        name_r, dist_cache, sqrt_area, idx_b = r
+                        if dist_cache is not None:
+                            gc_obj = GeodesicCache.from_precomputed(
+                                dist_cache, sqrt_area, idx_b)
+                            gc_obj.save_to_disk(
+                                str(_geo_cache_path(hp.geo_cache_dir, name_r, mv)))
+                        done = i + 1
+                        if self.global_rank == 0:
+                            dt = time.perf_counter() - t0_geo
+                            eta = (dt / done) * (n_my - done)
+                            print(f"    [{done:>{cw}}/{n_my}] "
+                                  f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                  flush=True)
+
+            # Synchronize all ranks, then exit
+            if world_size > 1:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    dist.barrier()
+                    dist.destroy_process_group()
+
+            dt_geo = time.perf_counter() - t0_geo
+            if is_rank0:
+                n_files = sum(1 for _ in mv_dir.glob("*.npz"))
+                print(f"\n  [geo_cache] Done: {n_files} cache files "
+                      f"in {mv_dir} ({dt_geo:.1f}s)", flush=True)
+
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.finish()
+            except Exception:
+                pass
+            raise SystemExit(0)
+
+        elif hp.geo_cache_dir:
+            # ── Mode: disk cache — lazy loading, no precomputation ─────
+            cache_dir = Path(hp.geo_cache_dir)
+            n_found = sum(1 for _, p in all_pairs
+                          if _geo_cache_path(hp.geo_cache_dir, p.name, mv).exists())
+            if is_rank0:
+                print(f"\n  Using disk geo cache: {n_found}/{len(all_pairs)} pairs "
+                      f"found in {cache_dir}", flush=True)
+                if n_found < len(all_pairs):
+                    print(f"    WARNING: {len(all_pairs) - n_found} pairs missing — "
+                          f"run with mode=geo_cache first", flush=True)
+
+        else:
+            # ── Mode: in-memory precomputation (no disk cache) ─────────
+            if is_rank0:
+                print(f"\n  Precomputing geodesic caches ({len(all_pairs)} pairs)...",
+                      flush=True)
+            t0_geo = time.perf_counter()
+
+            worker_args = []
+            pair_meta = []
+            for _, p in all_pairs:
+                if p.name in self._geo_cache:
+                    pair_meta.append((p.name, False))
+                    continue
+                sub_p = _subsample(p)
+                if sub_p.faces_b is None:
+                    pair_meta.append((p.name, False))
+                    continue
+                gt_corr = _build_gt_corr_from_pair(sub_p)
+                verts_full = sub_p._verts_b_full if sub_p._verts_b_full is not None else sub_p.verts_b
+                idx_b = sub_p._idx_b if sub_p._idx_b is not None else np.arange(len(sub_p.verts_b))
+                unique_targets = np.unique(gt_corr) if gt_corr is not None else np.arange(len(sub_p.verts_b))
+                worker_args.append((
+                    p.name, verts_full, sub_p.faces_b, idx_b, unique_targets,
+                ))
+                pair_meta.append((p.name, True))
+
+            _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+            _max_per_rank = max(1, _n_cpus // max(world_size, 1))
+            if hp.geo_cache_workers is not None:
+                _max_per_rank = min(_max_per_rank, hp.geo_cache_workers)
+            n_workers = min(len(worker_args), _max_per_rank)
+            _geo_n = len(worker_args)
+            _geo_cw = len(str(_geo_n))
+            if worker_args:
+                if n_workers > 1:
+                    import multiprocessing as _mp
+                    if is_rank0:
+                        print(f"    Parallel precomputation: {_geo_n} pairs, "
+                              f"{n_workers} workers", flush=True)
+                    with _mp.Pool(n_workers) as pool:
+                        results = {}
+                        for i, r in enumerate(pool.imap_unordered(
+                                _precompute_geo_cache_worker, worker_args)):
+                            results[r[0]] = r[1:]
+                            done = i + 1
+                            if is_rank0:
+                                dt = time.perf_counter() - t0_geo
+                                eta = (dt / done) * (_geo_n - done)
+                                print(f"    [{done:>{_geo_cw}}/{_geo_n}] "
+                                      f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                      flush=True)
+                else:
                     results = {}
-                    for i, r in enumerate(pool.imap_unordered(
-                            _precompute_geo_cache_worker, worker_args)):
+                    for i, args in enumerate(worker_args):
+                        r = _precompute_geo_cache_worker(args)
                         results[r[0]] = r[1:]
                         done = i + 1
                         if is_rank0:
@@ -1994,37 +2180,25 @@ class FunctionalMapModule(LaplacianModuleBase):
                                   flush=True)
             else:
                 results = {}
-                for i, args in enumerate(worker_args):
-                    r = _precompute_geo_cache_worker(args)
-                    results[r[0]] = r[1:]
-                    done = i + 1
-                    if is_rank0:
-                        dt = time.perf_counter() - t0_geo
-                        eta = (dt / done) * (_geo_n - done)
-                        print(f"    [{done:>{_geo_cw}}/{_geo_n}] "
-                              f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
-                              flush=True)
-        else:
-            results = {}
 
-        for pair_name, sent_to_worker in pair_meta:
-            if pair_name in self._geo_cache:
-                continue
-            if sent_to_worker and pair_name in results:
-                dist_cache, sqrt_area, idx_b = results[pair_name]
-                if dist_cache is not None:
-                    self._geo_cache[pair_name] = GeodesicCache.from_precomputed(
-                        dist_cache, sqrt_area, idx_b)
+            for pair_name, sent_to_worker in pair_meta:
+                if pair_name in self._geo_cache:
+                    continue
+                if sent_to_worker and pair_name in results:
+                    dist_cache, sqrt_area, idx_b = results[pair_name]
+                    if dist_cache is not None:
+                        self._geo_cache[pair_name] = GeodesicCache.from_precomputed(
+                            dist_cache, sqrt_area, idx_b)
+                    else:
+                        self._geo_cache[pair_name] = None
                 else:
                     self._geo_cache[pair_name] = None
-            else:
-                self._geo_cache[pair_name] = None
 
-        dt_geo = time.perf_counter() - t0_geo
-        n_with_geo = sum(1 for v in self._geo_cache.values() if v is not None)
-        if is_rank0:
-            print(f"    Done: {n_with_geo}/{len(all_pairs)} pairs with faces "
-                  f"({dt_geo:.1f}s)", flush=True)
+            dt_geo = time.perf_counter() - t0_geo
+            n_with_geo = sum(1 for v in self._geo_cache.values() if v is not None)
+            if is_rank0:
+                print(f"    Done: {n_with_geo}/{len(all_pairs)} pairs with faces "
+                      f"({dt_geo:.1f}s)", flush=True)
 
         # ==================================================================
         # Baselines
@@ -2058,7 +2232,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                             return evaluate_pair_robust(
                                 _subsample(p), hp.num_eigenvectors,
                                 evaluators=self._evaluators,
-                                geo_cache=self._geo_cache.get(p.name))
+                                geo_cache=self._get_geo_cache(p.name))
 
                         cw = len(str(n_total))
                         robust_metrics = [None] * n_total
@@ -2116,7 +2290,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                                           hp.k, hp.num_eigenvectors, device,
                                           laplacian_configs=self._eval_lap_configs,
                                           evaluators=self._evaluators,
-                                          geo_cache=self._geo_cache.get(val_pairs[i].name))
+                                          geo_cache=self._get_geo_cache(val_pairs[i].name))
                         my_metrics.append(m)
                         n_my = len(my_indices)
                         if is_rank0:
@@ -2205,12 +2379,12 @@ class FunctionalMapModule(LaplacianModuleBase):
                 for k, v in summary.items():
                     self._baseline_summaries[f"baseline/{method_name}/{ds_name}/{k}"] = v
 
-        # ── Eval-only mode: save CSVs and plots, then stop ────────────────
-        if hp.eval_only:
+        # ── Eval mode: save CSVs and plots, then stop ─────────────────
+        if hp.mode == 'eval':
             if eval_results and is_rank0:
                 self._export_eval_results(eval_results, all_val_datasets)
             if is_rank0:
-                print("\n  [eval_only=true] Baselines complete — stopping.",
+                print("\n  [mode=eval] Baselines complete — stopping.",
                       flush=True)
             # Synchronize all DDP ranks before exit to prevent zombies
             if world_size > 1:
@@ -2361,7 +2535,7 @@ class FunctionalMapModule(LaplacianModuleBase):
             self.hparams.num_eigenvectors, self.device,
             laplacian_configs=self._eval_lap_configs,
             evaluators=self._evaluators,
-            geo_cache=self._geo_cache.get(pair.name),
+            geo_cache=self._get_geo_cache(pair.name),
         ))
 
         # Progress print (rank 0)

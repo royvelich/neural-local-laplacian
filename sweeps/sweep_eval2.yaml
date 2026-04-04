@@ -28,8 +28,9 @@ parameters:
       # ── Swept ─────────────────────────────────────────────────────────────
       k:
         values:
+          - 6
           - 8
-          - 15
+          - 10
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Data module — swept: one dataset per run
@@ -47,7 +48,7 @@ parameters:
                 pair_generator:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
                   root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -68,7 +69,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                   root: '/workspace/datasets/DeformingThings4DMatching'
                   pair_mode: intra
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -89,7 +90,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
                   root: '/workspace/datasets/DeformingThings4DMatching'
                   pair_mode: inter
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -110,7 +111,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                   root: '/workspace/datasets/faust'
                   pair_mode: intra
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -131,7 +132,7 @@ parameters:
                   _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
                   root: '/workspace/datasets/faust'
                   pair_mode: inter
-                val_poses_per_pair: 4
+                val_poses_per_pair: 30
                 seed: ${globals.training_seed}
               batch_size: 1
               num_workers: 0
@@ -162,8 +163,6 @@ parameters:
         eval_laplacians:
           - assembly: diagonal_gram
             pruning: none
-          - assembly: full_gram
-            pruning: none
 
         losses: null
 
@@ -172,7 +171,7 @@ parameters:
         freeze_input_projection: false
         freeze_areas_head: false
 
-        max_vertices: 4000
+        max_vertices: 5000
         max_vertices_val: 0
         vertex_noise: 0.0
         w_prox: 0.0

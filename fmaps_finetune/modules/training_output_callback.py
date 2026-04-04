@@ -152,8 +152,8 @@ class TrainingOutputCallback(pl.Callback):
             print("[TrainingOutput] Warning: no config available — skipping output")
             return
 
-        # Skip for eval_only mode
-        if getattr(pl_module.hparams, 'eval_only', False):
+        # Skip for non-training modes
+        if getattr(pl_module.hparams, 'mode', 'train') != 'train':
             return
 
         # Create output folder

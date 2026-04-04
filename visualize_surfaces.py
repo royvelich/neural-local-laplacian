@@ -47,7 +47,7 @@ class VisualizationConfig:
     pointcloud_scalar_colormap: str
     pointcloud_color: Tuple[float, float, float] = (0.0, 0.8, 0.0)  # Default: green
     # Display scale constants
-    normal_display_scale: float = 2.0  # Multiplier for normal vector display
+    normal_display_scale: float = 8.0  # Multiplier for normal vector display
     origin_indicator_scale: float = 3.0  # Multiplier for origin point radius
     reference_frame_point_radius: float = 0.02
     reference_frame_line_radius: float = 0.01
@@ -346,6 +346,29 @@ class SurfaceVisualizer:
         self._diff_geom_at_origin_only = self._get_initial_origin_only_setting()
         self._include_origin_in_grid = self._get_initial_include_origin_setting()
 
+        # UI display state
+        self._patch_idx = 0          # 0 = regular, 1 = downsampled, ...
+        self._show_mesh = True
+        self._show_pointcloud = False
+        self._show_gt_normal_origin = True
+        self._show_pred_normal_origin = True
+        self._show_gt_normals_all = False
+
+        # Cached prediction results (computed once per surface set)
+        self._prediction_cache = {}  # patch_idx → (pred_normal, pred_weights, pred_mcv)
+        self._show_reference_frame = False
+
+        # Normal display settings (mutable for ImGui)
+        self._gt_normal_color = list(ColorPalette.NORMALS)          # [0, 1, 1] cyan
+        self._pred_normal_color = list(ColorPalette.PREDICTED_NORMALS)  # [1, 0.5, 0] orange
+        self._normal_length = self.vis_config.normal_display_scale   # default 2.0
+        self._normal_radius = self.vis_config.normal_origin_point_radius  # default 0.01
+        self._point_radius = self.vis_config.point_radius            # default 0.008
+
+        # Surface and origin dot colors
+        self._surface_color = [0.5, 0.5, 0.5]  # gray default for mesh + point cloud
+        self._origin_dot_color = [1.0, 0.0, 0.0]  # red default for GT + Pred dots
+
     def _get_initial_origin_only_setting(self) -> bool:
         """Get initial diff_geom_at_origin_only setting from config."""
         try:
@@ -439,17 +462,8 @@ class SurfaceVisualizer:
         print("Regenerating surfaces...")
         new_surfaces = dataset._generate_surfaces()
 
-        # Clear existing structures
-        ps.remove_all_structures()
-
-        # Add reference frame
-        add_reference_frame()
-
-        # Get surface names and visualize
+        # Get surface names and visualize (handles clearing + rendering)
         surface_names = self._get_surface_names(new_surfaces)
-        self._current_surfaces = new_surfaces
-        self._current_surface_names = surface_names
-
         self.visualize_surface_set(new_surfaces, surface_names)
         print("Regeneration complete!")
 
@@ -483,39 +497,6 @@ class SurfaceVisualizer:
 
         return names
 
-    def _compute_translation(self, surface_index: int, surfaces: List) -> np.ndarray:
-        """Compute translation offset for surface visualization, centered around x=0."""
-        grid_factor = self._get_grid_factor_from_surfaces(surfaces=surfaces)
-        num_surfaces = len(surfaces)
-
-        # Center the surfaces around x=0
-        if num_surfaces == 1:
-            # Single surface at origin
-            x_offset = 0.0
-        else:
-            # Multiple surfaces: distribute evenly around x=0
-            # Calculate the total span and center it
-            total_span = (num_surfaces - 1) * self.vis_config.surface_spacing_factor * grid_factor
-            start_x = -total_span / 2
-            x_offset = start_x + surface_index * self.vis_config.surface_spacing_factor * grid_factor
-
-        return np.array([x_offset, 0, 0])
-
-    def _get_grid_factor_from_surfaces(self, surfaces: List) -> float:
-        """Get grid factor from surface data by computing bounding box."""
-        if not surfaces:
-            return 1.0
-
-        # Use the first surface to estimate grid size
-        first_surface = surfaces[0]
-        pos = to_numpy(first_surface.pos)
-
-        # Compute bounding box in X and Y dimensions
-        x_range = pos[:, 0].max() - pos[:, 0].min()
-        y_range = pos[:, 1].max() - pos[:, 1].min()
-
-        # Use the maximum range as grid factor
-        return max(x_range, y_range)
 
     def _get_origin_position(self, surface: Data, translation: np.ndarray) -> np.ndarray:
         """
@@ -622,15 +603,14 @@ class SurfaceVisualizer:
                     vectortype="ambient"
                 )
 
-        # Add scalar quantities with appropriate colormap (only enabled for meshes)
+        # Add scalar quantities (all disabled by default — user can enable in polyscope UI)
         colormap = self._get_scalar_colormap(structure_type)
-        enable_scalars = (structure_type == "mesh")
         for name, scalars in diff_geom['scalars'].items():
             if scalars is not None:
                 structure.add_scalar_quantity(
                     name=name,
                     values=scalars,
-                    enabled=enable_scalars,
+                    enabled=False,
                     cmap=colormap
                 )
 
@@ -719,70 +699,174 @@ class SurfaceVisualizer:
         except Exception as e:
             print(f"Could not add origin indicator: {e}")
 
-    def _add_surface_metrics_ui_callback(self) -> None:
-        """Add ImGui callback to display surface metrics in a floating window."""
+    def _setup_ui_callback(self) -> None:
+        """Register ImGui callback for display controls and metrics."""
 
-        def surface_metrics_callback():
+        def ui_callback():
             import polyscope.imgui as psim
 
-            # Settings section
-            psim.Text("Settings")
+            needs_rerender = False
+
+            # ── Patch selection ──────────────────────────────────────
+            psim.Text("Patch Selection")
             psim.Separator()
 
-            # Checkbox for diff_geom_at_origin_only toggle
-            changed, new_value = psim.Checkbox(
-                "Diff Geom at Origin Only",
-                self._diff_geom_at_origin_only
-            )
-            if changed:
+            if self._current_surfaces and self._current_surface_names:
+                patch_names = self._current_surface_names
+                changed, new_idx = psim.Combo(
+                    "Patch", self._patch_idx, patch_names)
+                if changed:
+                    self._patch_idx = new_idx
+                    needs_rerender = True
+
+                n_pts = self._current_surfaces[self._patch_idx].pos.shape[0]
+                psim.Text(f"  Points: {n_pts}")
+
+            psim.Text("")
+
+            # ── Display mode ─────────────────────────────────────────
+            psim.Text("Display Mode")
+            psim.Separator()
+
+            changed_mesh, new_mesh = psim.Checkbox("Show Mesh", self._show_mesh)
+            if changed_mesh:
+                self._show_mesh = new_mesh
+                needs_rerender = True
+
+            changed_pc, new_pc = psim.Checkbox("Show Point Cloud", self._show_pointcloud)
+            if changed_pc:
+                self._show_pointcloud = new_pc
+                needs_rerender = True
+
+            changed_rf, new_rf = psim.Checkbox("Show Reference Frame", self._show_reference_frame)
+            if changed_rf:
+                self._show_reference_frame = new_rf
+                needs_rerender = True
+
+            changed_sc, new_sc = psim.ColorEdit3("Surface Color", self._surface_color)
+            if changed_sc:
+                self._surface_color = list(new_sc)
+                needs_rerender = True
+
+            changed_pr, new_pr = psim.SliderFloat(
+                "Point Size", self._point_radius, v_min=0.001, v_max=0.05)
+            if changed_pr:
+                self._point_radius = new_pr
+                needs_rerender = True
+
+            psim.Text("")
+
+            # ── Normal display ───────────────────────────────────────
+            psim.Text("Normal Display")
+            psim.Separator()
+
+            changed_gt, new_gt = psim.Checkbox(
+                "GT Normal at Origin", self._show_gt_normal_origin)
+            if changed_gt:
+                self._show_gt_normal_origin = new_gt
+                needs_rerender = True
+
+            if self.trained_model is not None:
+                changed_pred, new_pred = psim.Checkbox(
+                    "Predicted Normal at Origin", self._show_pred_normal_origin)
+                if changed_pred:
+                    self._show_pred_normal_origin = new_pred
+                    needs_rerender = True
+
+            changed_all, new_all = psim.Checkbox(
+                "GT Normals (all points)", self._show_gt_normals_all)
+            if changed_all:
+                self._show_gt_normals_all = new_all
+                needs_rerender = True
+
+            # Normal appearance controls
+            psim.Text("")
+            changed_len, new_len = psim.SliderFloat(
+                "Normal Length", self._normal_length, v_min=0.1, v_max=10.0)
+            if changed_len:
+                self._normal_length = new_len
+                needs_rerender = True
+
+            changed_nr, new_nr = psim.SliderFloat(
+                "Normal Width", self._normal_radius, v_min=0.001, v_max=0.05)
+            if changed_nr:
+                self._normal_radius = new_nr
+                needs_rerender = True
+
+            changed_gtc, new_gtc = psim.ColorEdit3(
+                "GT Normal Color", self._gt_normal_color)
+            if changed_gtc:
+                self._gt_normal_color = list(new_gtc)
+                needs_rerender = True
+
+            if self.trained_model is not None:
+                changed_prc, new_prc = psim.ColorEdit3(
+                    "Pred Normal Color", self._pred_normal_color)
+                if changed_prc:
+                    self._pred_normal_color = list(new_prc)
+                    needs_rerender = True
+
+            changed_dot, new_dot = psim.ColorEdit3(
+                "Origin Dot Color", self._origin_dot_color)
+            if changed_dot:
+                self._origin_dot_color = list(new_dot)
+                needs_rerender = True
+
+            psim.Text("")
+
+            # ── Dataset settings ─────────────────────────────────────
+            psim.Text("Dataset Settings")
+            psim.Separator()
+
+            changed_origin, new_origin = psim.Checkbox(
+                "Diff Geom at Origin Only", self._diff_geom_at_origin_only)
+            if changed_origin:
                 self.toggle_diff_geom_at_origin_only()
 
-            # Checkbox for include_origin_in_grid toggle
-            changed2, new_value2 = psim.Checkbox(
-                "Include Origin in Grid",
-                self._include_origin_in_grid
-            )
-            if changed2:
+            changed_incl, new_incl = psim.Checkbox(
+                "Include Origin in Grid", self._include_origin_in_grid)
+            if changed_incl:
                 self.toggle_include_origin_in_grid()
 
-            psim.Text("")  # Spacing
+            psim.Text("")
 
-            # Surface metrics section
+            # ── Surface metrics ──────────────────────────────────────
             psim.Text("Surface Metrics")
             psim.Separator()
-            psim.Text(f"Number of surfaces: {len(self.surface_metrics)}")
 
-            # Simple loop through metrics
-            for i, metrics in enumerate(self.surface_metrics):
-                surface_name = metrics.get('name', f'Surface {i + 1}')
-                mean_curvature = metrics.get('mean_curvature_at_origin')
-
-                psim.Text(f"Surface: {surface_name}")
-                if mean_curvature is not None:
-                    psim.Text(f"  GT Mean Curvature: {mean_curvature:.6f}")
+            if self._current_surfaces and self._patch_idx < len(self.surface_metrics):
+                metrics = self.surface_metrics[self._patch_idx]
+                H = metrics.get('mean_curvature_at_origin')
+                if H is not None:
+                    psim.Text(f"GT Mean Curvature: {H:.6f}")
                 else:
-                    psim.Text(f"  GT Mean Curvature: Not available")
+                    psim.Text("GT Mean Curvature: N/A")
 
-                # NEW: Display predicted mean curvature if available
-                prediction_metrics = metrics.get('prediction_metrics')
-                if prediction_metrics:
-                    predicted_mean_curvature = prediction_metrics.get('predicted_mean_curvature')
-                    if predicted_mean_curvature is not None:
-                        psim.Text(f"  Predicted Mean Curvature: {predicted_mean_curvature:.6f}")
+                pred = metrics.get('prediction_metrics')
+                if pred:
+                    pred_H = pred.get('predicted_mean_curvature')
+                    if pred_H is not None:
+                        psim.Text(f"Pred Mean Curvature: {pred_H:.6f}")
+                        if H is not None:
+                            psim.Text(f"Curvature Error: {abs(pred_H - H):.6f}")
+                    cosim = pred.get('cosine_similarity')
+                    if cosim is not None:
+                        psim.Text(f"Normal Cosine Sim: {cosim:.4f}")
+                    ang = pred.get('angular_error')
+                    if ang is not None:
+                        psim.Text(f"Angular Error: {ang:.2f} deg")
 
-                        # Show the difference if both are available
-                        if mean_curvature is not None:
-                            error = abs(predicted_mean_curvature - mean_curvature)
-                            psim.Text(f"  Curvature Error: {error:.6f}")
-                    else:
-                        psim.Text(f"  Predicted Mean Curvature: Not available")
-                else:
-                    psim.Text(f"  Predicted Mean Curvature: No model prediction")
+            # ── Screenshot ────────────────────────────────────────────
+            psim.Text("")
+            psim.Separator()
+            if psim.Button("Save All Screenshots"):
+                self._save_all_screenshots()
 
-                psim.Text("")  # Empty line for spacing
+            # ── Rerender if needed ───────────────────────────────────
+            if needs_rerender:
+                self._render()
 
-        # Register the callback with polyscope
-        ps.set_user_callback(surface_metrics_callback)
+        ps.set_user_callback(ui_callback)
 
     def _extract_mean_curvature_at_origin(self, surface: Data) -> Optional[float]:
         """
@@ -812,293 +896,230 @@ class SurfaceVisualizer:
         # Fallback: return first value
         return H_tensor.flatten()[0].item()
 
-    def _add_normal_comparison_visualization(self, surface: Data, surface_name: str,
-                                             gt_normal: np.ndarray,
-                                             predicted_normal: Optional[torch.Tensor],
-                                             predicted_mean_curvature_vector: Optional[torch.Tensor],
-                                             predicted_weights: Optional[torch.Tensor],
-                                             translation: np.ndarray) -> Optional[dict]:
-        """
-        Add GT vs Predicted normal visualization with comparison metrics and mean curvature display.
-
-        Args:
-            surface: Surface data object
-            surface_name: Name of the surface for labeling
-            gt_normal: Ground truth normal vector (1, 3) or (N, 3) - broadcasted for visualization
-            predicted_normal: Predicted normal vector (3,) - single vector at center/origin
-            predicted_mean_curvature_vector: Predicted mean curvature vector (3,) = stiffness_sum / area
-            predicted_weights: Learned stiffness weights (num_points,) or None
-            translation: Translation offset for positioning
-
-        Returns:
-            Dict with prediction metrics, or None if visualization skipped
-        """
-        if not self.vis_config.enable_model_prediction or predicted_normal is None:
-            return None
-
-        # Extract the actual GT normal at origin (first row if broadcasted)
-        if gt_normal.ndim == 2:
-            if self.is_diff_geom_at_origin_only and gt_normal.shape[0] > 1:
-                # In origin-only mode, all rows should be identical (broadcasted)
-                # Take the first row as the actual GT normal at origin
-                gt_normal_at_origin = gt_normal[0]  # Shape: (3,)
-            else:
-                # Take first row or flatten if shape is (1, 3)
-                gt_normal_at_origin = gt_normal[0] if gt_normal.shape[0] > 1 else gt_normal.flatten()
-        else:
-            # Already shape (3,)
-            gt_normal_at_origin = gt_normal
-
-        # Convert predicted normal to numpy
-        pred_normal_np = to_numpy(predicted_normal)  # Shape: (3,)
-
-        # Compute predicted mean curvature as the norm of the mean curvature vector
-        predicted_mean_curvature = torch.norm(predicted_mean_curvature_vector, p=2).item()
-
-        # Get origin point using consistent helper
-        origin_3d = self._get_origin_position(surface, translation)
-
-        # Scale factor for normal visualization
-        normal_scale = self.vis_config.vector_scale * self.vis_config.normal_display_scale
-
-        try:
-            # GT Normal (Cyan) - single point cloud with vector
-            gt_origin_cloud = ps.register_point_cloud(
-                name=f"{surface_name} - GT Normal Origin",
-                points=origin_3d,
-                radius=self.vis_config.normal_origin_point_radius,
-                enabled=True
-            )
-
-            # Add GT normal as vector quantity
-            gt_origin_cloud.add_vector_quantity(
-                name="GT Normal",
-                values=gt_normal_at_origin.reshape(1, 3) * normal_scale,
-                enabled=True,
-                color=self.color_palette.NORMALS,
-                radius=self.vis_config.normal_origin_point_radius,
-                vectortype="ambient"
-            )
-
-            # Predicted Normal (Orange) - single point cloud with vector
-            pred_origin_cloud = ps.register_point_cloud(
-                name=f"{surface_name} - Predicted Normal Origin",
-                points=origin_3d,
-                radius=self.vis_config.normal_origin_point_radius,
-                enabled=True
-            )
-
-            # Add predicted normal as vector quantity
-            pred_origin_cloud.add_vector_quantity(
-                name="Predicted Normal",
-                values=pred_normal_np.reshape(1, 3) * normal_scale,
-                enabled=True,
-                color=self.color_palette.PREDICTED_NORMALS,
-                radius=self.vis_config.normal_origin_point_radius,
-                vectortype="ambient"
-            )
-
-            # Compute and display comparison metrics (compare the single vectors)
-            # Ensure both tensors are on the same device for computation
-            gt_normal_tensor = torch.from_numpy(gt_normal_at_origin).float().to(self.device)
-            pred_normal_tensor = predicted_normal.float().to(self.device)
-
-            cosine_similarity = torch.dot(gt_normal_tensor, pred_normal_tensor).item()
-
-            # Clamp to valid range for arccos
-            cosine_similarity_clamped = np.clip(cosine_similarity, -1.0, 1.0)
-            angular_error = np.arccos(np.abs(cosine_similarity_clamped)) * 180 / np.pi
-
-            # NEW: Extract and display mean curvature at origin
-            mean_curvature_at_origin = self._extract_mean_curvature_at_origin(surface)
-
-            print(f"\n   Normal Comparison for {surface_name}:")
-            print(f"    GT Normal (at origin):    [{gt_normal_at_origin[0]:7.4f}, {gt_normal_at_origin[1]:7.4f}, {gt_normal_at_origin[2]:7.4f}]")
-            print(f"    Predicted Normal:         [{pred_normal_np[0]:7.4f}, {pred_normal_np[1]:7.4f}, {pred_normal_np[2]:7.4f}]")
-            print(f"    Cosine Similarity:        {cosine_similarity:7.4f}")
-            print(f"    Angular Error:            {angular_error:7.2f}deg")
-
-            # NEW: Display both GT and predicted mean curvature values
-            if mean_curvature_at_origin is not None:
-                print(f"     GT Mean Curvature at Origin:     {mean_curvature_at_origin:7.4f}")
-            else:
-                print(f"     GT Mean Curvature at Origin:     Not available")
-
-            print(f"    [Model] Predicted Mean Curvature:       {predicted_mean_curvature:7.4f}")
-
-            # Curvature comparison if both available
-            if mean_curvature_at_origin is not None:
-                curvature_error = abs(predicted_mean_curvature - mean_curvature_at_origin)
-                curvature_relative_error = curvature_error / (abs(mean_curvature_at_origin) + 1e-10) * 100
-                print(f"     Curvature Error:                {curvature_error:7.4f}")
-                print(f"     Curvature Relative Error:       {curvature_relative_error:7.2f}%")
-
-            # Add weight statistics if available
-            if predicted_weights is not None:
-                weights_np = to_numpy(predicted_weights)
-                print(f"    Weight Statistics:")
-                print(f"      Mean:   {weights_np.mean():7.4f}")
-                print(f"      Std:    {weights_np.std():7.4f}")
-                print(f"      Min:    {weights_np.min():7.4f}")
-                print(f"      Max:    {weights_np.max():7.4f}")
-                print(f"      Sum:    {weights_np.sum():7.4f}")
-
-                # Show top 5 weights for insight
-                top_indices = np.argsort(weights_np)[-5:][::-1]
-                print(f"      Top 5 weights: {weights_np[top_indices]}")
-
-            # OPTIONAL: Add predicted normal as vector field on all points for visualization
-            if self.vis_config.enable_point_cloud:
-                num_points = surface.pos.shape[0]
-                predicted_normals_all_points = np.tile(pred_normal_np, (num_points, 1))
-
-                try:
-                    point_cloud_name = f"{surface_name} - Point Cloud"
-                    if hasattr(ps, 'get_point_cloud'):
-                        pc = ps.get_point_cloud(point_cloud_name)
-                        pc.add_vector_quantity(
-                            name="Predicted Normal (all points)",
-                            values=predicted_normals_all_points * self.vis_config.vector_scale,
-                            enabled=False,
-                            color=self.color_palette.PREDICTED_NORMALS,
-                            vectortype="ambient"
-                        )
-                        print(f"    Added predicted normal field to all {num_points} points")
-                except Exception as e:
-                    print(f"    Note: Could not add predicted normal field: {e}")
-
-            # Return metrics instead of mutating surface object
-            return {
-                'cosine_similarity': cosine_similarity,
-                'angular_error': angular_error,
-                'gt_normal': gt_normal_at_origin,
-                'predicted_normal': pred_normal_np,
-                'mean_curvature_at_origin': mean_curvature_at_origin,
-                'predicted_mean_curvature': predicted_mean_curvature
-            }
-
-        except Exception as e:
-            print(f"Warning: Failed to visualize normal comparison for {surface_name}: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
     def visualize_surface_set(self, surfaces: List[Data], surface_names: List[str]) -> None:
-        """Visualize a set of surfaces with their differential geometry and optional model predictions."""
-        # Clear previous metrics
+        """Store surfaces, compute model predictions, then render the current view."""
+        self._current_surfaces = surfaces
+        self._current_surface_names = surface_names
+        self._patch_idx = 0
         self.surface_metrics = []
+        self._prediction_cache = {}
 
-        # Print information about the mode
-        if self.is_diff_geom_at_origin_only:
-            print("Visualizing in origin-only differential geometry mode")
-            print("Note: All differential quantities are computed only at the origin (0,0) and broadcasted for visualization")
-
-        # Print model prediction status
-        if self.trained_model is not None and self.vis_config.enable_model_prediction:
-            print(f"[Model] Model prediction enabled - comparing GT vs predicted normals")
-            print(f"   Model device: {self.device}")
-        else:
-            print(" Visualization only mode - no model predictions")
-
+        # Compute metrics and predictions for ALL surfaces up front
         for i, (name, surface) in enumerate(zip(surface_names, surfaces)):
-            print(f"\nProcessing {name}...")
-
-            # NEW: Extract metrics for UI display
-            surface_metric = {
+            metric = {
                 'name': name,
-                'num_points': surface.pos.shape[0] if hasattr(surface, 'pos') else None
+                'num_points': surface.pos.shape[0] if hasattr(surface, 'pos') else None,
+                'mean_curvature_at_origin': self._extract_mean_curvature_at_origin(surface),
             }
 
-            # NEW: Print mean curvature at origin for each surface
-            mean_curvature_at_origin = self._extract_mean_curvature_at_origin(surface)
-            surface_metric['mean_curvature_at_origin'] = mean_curvature_at_origin
-
-            if mean_curvature_at_origin is not None:
-                print(f"    Mean Curvature at Origin: {mean_curvature_at_origin:.6f}")
-            else:
-                print(f"    Mean Curvature at Origin: Not available")
-
-            # Extract basic data
-            pos, face, normals = self._extract_surface_data(surface)
-
-            # Apply translation for side-by-side visualization
-            translation = self._compute_translation(surface_index=i, surfaces=surfaces)
-            pos_translated = pos + translation
-
-            # Create surface mesh if enabled
-            if self.vis_config.enable_mesh:
-                mesh = visualize_patch(
-                    points=pos_translated,
-                    faces=face,
-                    name=f"{name} - Mesh",
-                    vis_config=self.vis_config
-                )
-                self._add_normals_to_structure(structure=mesh, normals=normals)
-                self._add_vector_quantities(structure=mesh, surface=surface, structure_type="mesh")
-
-            # Create point cloud if enabled
-            if self.vis_config.enable_point_cloud:
-                cloud = visualize_point_cloud(
-                    points=pos_translated,
-                    name=f"{name} - Point Cloud",
-                    vis_config=self.vis_config,
-                    enabled=True
-                )
-                self._add_normals_to_structure(structure=cloud, normals=normals)
-                self._add_vector_quantities(structure=cloud, surface=surface, structure_type="pointcloud")
-
-            # Visualize parametrization domain if available and enabled
-            if hasattr(surface, 'v1_2d') and self.vis_config.enable_parametrization:
-                self._visualize_parametrization(surface, name, pos_translated)
-
-            # Add origin indicator in origin-only mode
-            self._add_origin_indicator(surface, name, translation)
-
-            # NEW: Model prediction and comparison
+            # Run model prediction and cache result
             if (self.trained_model is not None and
                     self.vis_config.enable_model_prediction and
                     hasattr(surface, 'normal')):
-
                 try:
-                    print(f"   Predicting normal using trained model...")
-
-                    # Get ground truth normal (from differential geometry computation)
-                    gt_normal = to_numpy(surface.normal)  # Shape: (1, 3) or (N, 3)
-
-                    # Predict normal using trained model
-                    predicted_normal, predicted_weights, predicted_mcv = predict_normal_from_patch(
+                    pred_normal, pred_weights, pred_mcv = predict_normal_from_patch(
                         model=self.trained_model,
                         surface_data=surface,
-                        device=self.device
-                    )
+                        device=self.device)
+                    self._prediction_cache[i] = (pred_normal, pred_weights, pred_mcv)
 
-                    # Add normal comparison visualization (returns metrics instead of mutating)
-                    prediction_metrics = self._add_normal_comparison_visualization(
-                        surface=surface,
-                        surface_name=name,
-                        gt_normal=gt_normal,
-                        predicted_normal=predicted_normal,
-                        predicted_mean_curvature_vector=predicted_mcv,
-                        predicted_weights=predicted_weights,
-                        translation=translation
-                    )
+                    # Compute prediction metrics for UI display
+                    gt_normal = to_numpy(surface.normal)
+                    if gt_normal.shape[0] == 1:
+                        gt_at_origin = gt_normal[0]
+                    elif hasattr(surface, 'origin_idx'):
+                        gt_at_origin = gt_normal[surface.origin_idx.item()]
+                    else:
+                        gt_at_origin = gt_normal[0]
+                    pred_np = to_numpy(pred_normal)
+                    pred_H = torch.norm(pred_mcv, p=2).item()
 
-                    # Store prediction metrics for UI
-                    if prediction_metrics is not None:
-                        surface_metric['prediction_metrics'] = prediction_metrics
+                    gt_t = torch.from_numpy(gt_at_origin).float().to(self.device)
+                    cosim = torch.dot(gt_t, pred_normal.float().to(self.device)).item()
+                    cosim_c = np.clip(cosim, -1.0, 1.0)
+                    ang_err = np.arccos(np.abs(cosim_c)) * 180 / np.pi
 
-                    print(f"   [OK] Normal prediction completed for {name}")
+                    metric['prediction_metrics'] = {
+                        'cosine_similarity': cosim,
+                        'angular_error': ang_err,
+                        'gt_normal': gt_at_origin,
+                        'predicted_normal': pred_np,
+                        'predicted_mean_curvature': pred_H,
+                    }
+
+                    print(f"  [{name}] pred H={pred_H:.4f}, "
+                          f"cos={cosim:.4f}, ang_err={ang_err:.2f}deg")
 
                 except Exception as e:
-                    print(f"   [Warning]  Failed to predict normal for {name}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"  [{name}] prediction failed: {e}")
 
-            # Add the surface metrics to our list
-            self.surface_metrics.append(surface_metric)
+            self.surface_metrics.append(metric)
 
-        # NEW: Setup UI callback to display metrics
-        self._add_surface_metrics_ui_callback()
+        # Setup UI and render
+        self._setup_ui_callback()
+        self._render()
+
+    def _render(self) -> None:
+        """Clear and redraw the scene based on current UI state."""
+        ps.remove_all_structures()
+        if self._show_reference_frame:
+            add_reference_frame(vis_config=self.vis_config)
+
+        if not self._current_surfaces:
+            return
+
+        idx = self._patch_idx
+        surface = self._current_surfaces[idx]
+        name = self._current_surface_names[idx]
+
+        # Extract data (no translation — everything at origin)
+        pos, face, normals = self._extract_surface_data(surface)
+
+        # ── Mesh ─────────────────────────────────────────────────
+        if self._show_mesh:
+            mesh = ps.register_surface_mesh(
+                name=f"{name} - Mesh",
+                vertices=pos, faces=face,
+                smooth_shade=self.vis_config.smooth_shade,
+                edge_width=self.vis_config.edge_width,
+                color=tuple(self._surface_color),
+                transparency=0.7)
+            self._add_vector_quantities(mesh, surface, "mesh")
+            if self._show_gt_normals_all:
+                self._add_normals_to_structure(mesh, normals)
+
+        # ── Point cloud ──────────────────────────────────────────
+        if self._show_pointcloud:
+            cloud = ps.register_point_cloud(
+                f"{name} - Point Cloud", pos,
+                radius=self._point_radius, enabled=True)
+            darker = tuple(c * 0.5 for c in self._surface_color)
+            cloud.set_color(darker)
+            self._add_vector_quantities(cloud, surface, "pointcloud")
+            if self._show_gt_normals_all:
+                self._add_normals_to_structure(cloud, normals)
+
+        # ── Origin indicator ─────────────────────────────────────
+        translation = np.zeros(3)
+        self._add_origin_indicator(surface, name, translation)
+
+        # ── GT normal at origin ──────────────────────────────────
+        if self._show_gt_normal_origin and hasattr(surface, 'normal'):
+            origin_3d = self._get_origin_position(surface, translation)
+            gt_normal = to_numpy(surface.normal)
+            if gt_normal.shape[0] == 1:
+                gt_at_origin = gt_normal[0]
+            elif hasattr(surface, 'origin_idx'):
+                gt_at_origin = gt_normal[surface.origin_idx.item()]
+            else:
+                gt_at_origin = gt_normal[0]
+            normal_scale = self.vis_config.vector_scale * self._normal_length
+            gt_color = tuple(self._gt_normal_color)
+            dot_color = tuple(self._origin_dot_color)
+
+            gt_cloud = ps.register_point_cloud(
+                f"{name} - GT Normal", origin_3d,
+                radius=self._normal_radius,
+                color=dot_color, enabled=True)
+            gt_cloud.add_vector_quantity(
+                "GT Normal",
+                gt_at_origin.reshape(1, 3) * normal_scale,
+                enabled=True,
+                color=gt_color,
+                radius=self._normal_radius,
+                vectortype="ambient")
+
+        # ── Predicted normal at origin ───────────────────────────
+        if (self._show_pred_normal_origin and
+                idx in self._prediction_cache):
+            pred_normal, pred_weights, pred_mcv = self._prediction_cache[idx]
+            pred_np = to_numpy(pred_normal)
+            origin_3d = self._get_origin_position(surface, translation)
+            normal_scale = self.vis_config.vector_scale * self._normal_length
+            pred_color = tuple(self._pred_normal_color)
+            dot_color = tuple(self._origin_dot_color)
+
+            pred_cloud = ps.register_point_cloud(
+                f"{name} - Pred Normal", origin_3d,
+                radius=self._normal_radius,
+                color=dot_color, enabled=True)
+            pred_cloud.add_vector_quantity(
+                "Predicted Normal",
+                pred_np.reshape(1, 3) * normal_scale,
+                enabled=True,
+                color=pred_color,
+                radius=self._normal_radius,
+                vectortype="ambient")
+
+    def _save_all_screenshots(self) -> None:
+        """Save screenshots for all display combos with transparent background."""
+        import os
+        from datetime import datetime
+
+        if not self._current_surfaces:
+            print("No surfaces loaded — cannot save screenshots.")
+            return
+
+        # Create output directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = Path(f"surface_patch_screenshots_{timestamp}")
+        out_dir.mkdir(exist_ok=True)
+
+        # Save current state
+        saved = (self._patch_idx, self._show_mesh, self._show_pointcloud,
+                 self._show_gt_normal_origin, self._show_pred_normal_origin)
+
+        has_pred = bool(self._prediction_cache)
+        n_patches = len(self._current_surfaces)
+
+        display_modes = [
+            ("surface", True, False),
+            ("pointcloud", False, True),
+            ("surface_and_pointcloud", True, True),
+        ]
+
+        normal_modes = [
+            ("no_normals", False, False),
+            ("gt_normal", True, False),
+        ]
+        if has_pred:
+            normal_modes.append(("pred_normal", False, True))
+            normal_modes.append(("gt_and_pred", True, True))
+
+        total = n_patches * len(display_modes) * len(normal_modes)
+        count = 0
+
+        print(f"\nSaving {total} screenshots to {out_dir}/...")
+
+        for patch_idx in range(n_patches):
+            patch_name = self._current_surface_names[patch_idx]
+            # Sanitize name for filename
+            patch_label = patch_name.replace(" ", "_").replace("(", "").replace(")", "")
+
+            for disp_label, show_mesh, show_pc in display_modes:
+                for norm_label, show_gt, show_pred in normal_modes:
+                    # Set state
+                    self._patch_idx = patch_idx
+                    self._show_mesh = show_mesh
+                    self._show_pointcloud = show_pc
+                    self._show_gt_normal_origin = show_gt
+                    self._show_pred_normal_origin = show_pred
+
+                    # Render and screenshot
+                    self._render()
+                    filename = f"{patch_label}_{disp_label}_{norm_label}.png"
+                    filepath = str(out_dir / filename)
+                    ps.screenshot(filepath, transparent_bg=True)
+
+                    count += 1
+                    print(f"  [{count}/{total}] {filename}")
+
+        # Restore original state
+        (self._patch_idx, self._show_mesh, self._show_pointcloud,
+         self._show_gt_normal_origin, self._show_pred_normal_origin) = saved
+        self._render()
+
+        print(f"Done! {total} screenshots saved to {out_dir}/")
 
 
 def setup_polyscope() -> None:
@@ -1107,6 +1128,7 @@ def setup_polyscope() -> None:
     ps.set_up_dir("z_up")
     ps.look_at(camera_location=[2.4, 2, 3.9], target=[0, 0, 0])
     ps.set_ground_plane_mode("none")
+    ps.set_SSAA_factor(4)
 
     # Set black background
     ps.set_background_color((0.0, 0.0, 0.0))
@@ -1227,25 +1249,15 @@ def main(cfg: DictConfig) -> None:
 
         surface_names = visualizer._get_surface_names(surfaces)
 
-        # Add reference frame for each batch
-        add_reference_frame()
-
-        # Visualize surfaces (with optional model predictions)
+        # Store surfaces, compute predictions, render first view
         visualizer.visualize_surface_set(surfaces, surface_names)
 
         print(f"\n[OK] Batch {batch_idx + 1} visualization complete!")
-        if trained_model is not None:
-            print("   Check the console output above for normal comparison metrics and mean curvature values")
-        else:
-            print("   Check the console output above for mean curvature values at origin")
-        print("   Check the 'Surface Metrics' window in the UI for real-time display")
+        print("   Use the UI panel to switch patches, toggle normals, etc.")
         print("   Close the window to proceed to the next batch, or Ctrl+C to exit")
 
-        # Show visualization
+        # Show visualization (blocks until user closes window)
         ps.show()
-
-        # Clear for next batch
-        ps.remove_all_structures()
 
 
 if __name__ == "__main__":
