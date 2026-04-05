@@ -306,7 +306,13 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         data['x'] = data.pos
 
     def get(self, idx: int) -> List[Data]:
-        """Generate multiple samplings of the same surface."""
+        """Generate multiple samplings of the same surface.
+
+        Each idx produces a unique deterministic surface, ensuring different
+        DDP ranks (which receive different indices from DistributedSampler)
+        generate different training data.
+        """
+        self._rng = np.random.default_rng(self._seed + idx)
         surfaces = self._generate_surfaces()
         return surfaces
 
@@ -423,6 +429,35 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             return torch.from_numpy(Delaunay(points=pos_2d).simplices).T
         except Exception as e:
             raise RuntimeError(f"Failed to create surface mesh: {e}")
+
+    @staticmethod
+    def _compute_barycentric_vertex_areas(
+        pos: torch.Tensor, face: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute barycentric (1/3) vertex areas from a triangle mesh.
+
+        Each vertex gets 1/3 of the area of each adjacent face.
+
+        Args:
+            pos: (N, 3) vertex positions.
+            face: (3, F) face indices (PyG convention).
+
+        Returns:
+            areas: (N,) per-vertex areas.
+        """
+        N = pos.shape[0]
+        # face is (3, F) — columns are triangles
+        v0 = pos[face[0]]  # (F, 3)
+        v1 = pos[face[1]]
+        v2 = pos[face[2]]
+        face_areas = 0.5 * torch.linalg.norm(
+            torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)  # (F,)
+        third_areas = face_areas / 3.0
+        areas = torch.zeros(N, dtype=pos.dtype)
+        areas.scatter_add_(0, face[0], third_areas)
+        areas.scatter_add_(0, face[1], third_areas)
+        areas.scatter_add_(0, face[2], third_areas)
+        return areas
 
     def _compute_first_derivatives(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute first partial derivatives ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡z/ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡x and ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡z/ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡y."""
@@ -634,6 +669,10 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         data = Data()
         data['pos'] = positions.detach()
         data['face'] = self._create_surface_mesh(pos=data.pos).detach()
+
+        # Compute GT barycentric vertex areas from 3D mesh
+        data['gt_vertex_areas'] = self._compute_barycentric_vertex_areas(
+            data['pos'], data['face']).detach()
 
         # Store the origin position (0,0,0) after centering - will be transformed with pose
         data['origin_pos'] = torch.zeros(1, 3)
