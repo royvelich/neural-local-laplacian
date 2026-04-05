@@ -1,5 +1,0 @@
-# fmaps_config/optimizer/animals.yaml
-
-_target_: torch.optim.AdamW
-_partial_: true
-lr: 1.0e-05

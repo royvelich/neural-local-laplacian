@@ -116,20 +116,20 @@ def assemble_laplacian(
     if config.torch_sparse:
         # Torch sparse path — returns torch.sparse_coo_tensor with autograd
         if config.assembly == 'full_gram':
-            return _assemble_full_gram_torch_sparse(grad_coeffs, knn)
+            return _assemble_full_gram_torch_sparse(grad_coeffs, knn, areas)
         else:
             return _assemble_diagonal_gram_torch_sparse(grad_coeffs, knn, areas)
 
     if config.sparse:
         # Scipy sparse path — returns scipy.sparse.csr_matrix (no autograd)
         if config.assembly == 'full_gram':
-            return _assemble_full_gram_sparse(grad_coeffs, knn)
+            return _assemble_full_gram_sparse(grad_coeffs, knn, areas)
         else:
             return _assemble_diagonal_gram_sparse(grad_coeffs, knn, areas)
 
     # Dense path — returns torch.Tensor
     if config.assembly == 'full_gram':
-        L = assemble_full_gram_laplacian(grad_coeffs, knn)
+        L = assemble_full_gram_laplacian(grad_coeffs, knn, areas)
     else:
         L = assemble_diagonal_gram_laplacian(grad_coeffs, knn, areas)
 
@@ -149,15 +149,18 @@ def assemble_laplacian(
 def assemble_full_gram_laplacian(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Assemble dense full-Gram Laplacian L = G^T G.
+    """Assemble dense full-Gram Laplacian L = G^T M_3 G.
 
-    Uses the full Gram structure: L_pq = sum_i <g_ip, g_iq> where
+    Uses the full Gram structure: L_pq = sum_i a_i * <g_ip, g_iq> where
     g_ii = -sum_j g_ij (consistency constraint). Has 2-hop fill-in.
 
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices (long tensor).
+        areas: (N,) per-vertex areas. When provided, Gram is area-weighted:
+               L = G^T diag(a) G. When None, L = G^T G (unweighted).
 
     Returns:
         L: (N, N) dense symmetric PSD Laplacian.
@@ -169,8 +172,13 @@ def assemble_full_gram_laplacian(
     center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)  # (N, 1, 3)
     ext_coeffs = torch.cat([center_coeffs, grad_coeffs], dim=1)  # (N, k+1, 3)
 
-    # Local Gram matrices: ext @ ext^T per vertex
-    gram = torch.bmm(ext_coeffs, ext_coeffs.transpose(1, 2))  # (N, k+1, k+1)
+    # Local Gram matrices: a_i * (ext @ ext^T) per vertex
+    if areas is not None:
+        sqrt_a = areas.sqrt()[:, None, None]  # (N, 1, 1)
+        scaled = sqrt_a * ext_coeffs  # (N, k+1, 3)
+        gram = torch.bmm(scaled, scaled.transpose(1, 2))  # (N, k+1, k+1)
+    else:
+        gram = torch.bmm(ext_coeffs, ext_coeffs.transpose(1, 2))  # (N, k+1, k+1)
 
     # Map local indices to global: [i, knn[i,0], ..., knn[i,k-1]]
     center_idx = torch.arange(N, device=device).unsqueeze(1)  # (N, 1)
@@ -279,8 +287,9 @@ def _build_diagonal_gram_offdiag_sparse(
 def _build_full_gram_offdiag_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Build sparse full-Gram Laplacian L = G^T G on GPU.
+    """Build sparse full-Gram Laplacian L = G^T M_3 G on GPU.
 
     Shared by both scipy and torch sparse paths.
 
@@ -295,8 +304,13 @@ def _build_full_gram_offdiag_sparse(
     center_coeffs = -grad_coeffs.sum(dim=1, keepdim=True)  # (N, 1, 3)
     ext_coeffs = torch.cat([center_coeffs, grad_coeffs], dim=1)  # (N, k+1, 3)
 
-    # Local Gram matrices on GPU
-    gram = torch.bmm(ext_coeffs, ext_coeffs.transpose(1, 2))  # (N, k+1, k+1)
+    # Local Gram matrices on GPU, optionally area-weighted
+    if areas is not None:
+        sqrt_a = areas.sqrt()[:, None, None]  # (N, 1, 1)
+        scaled = sqrt_a * ext_coeffs  # (N, k+1, 3)
+        gram = torch.bmm(scaled, scaled.transpose(1, 2))  # (N, k+1, k+1)
+    else:
+        gram = torch.bmm(ext_coeffs, ext_coeffs.transpose(1, 2))  # (N, k+1, k+1)
 
     # Global indices: [i, knn[i,0], ..., knn[i,k-1]]
     center_idx = torch.arange(N, device=device).unsqueeze(1)  # (N, 1)
@@ -357,6 +371,7 @@ def _assemble_diagonal_gram_torch_sparse(
 def _assemble_full_gram_torch_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Assemble sparse full-Gram Laplacian as torch.sparse_coo_tensor.
 
@@ -365,12 +380,13 @@ def _assemble_full_gram_torch_sparse(
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices (long tensor).
+        areas: (N,) per-vertex areas (optional).
 
     Returns:
         L: (N, N) torch.sparse_coo_tensor, coalesced, symmetric PSD.
     """
     # Full Gram already includes diagonal contributions
-    return _build_full_gram_offdiag_sparse(grad_coeffs, knn)
+    return _build_full_gram_offdiag_sparse(grad_coeffs, knn, areas)
 
 
 # =============================================================================
@@ -422,6 +438,7 @@ def _assemble_diagonal_gram_sparse(
 def _assemble_full_gram_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> scipy.sparse.csr_matrix:
     """Assemble sparse full-Gram Laplacian, returned as scipy CSR.
 
@@ -430,12 +447,13 @@ def _assemble_full_gram_sparse(
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices (long tensor).
+        areas: (N,) per-vertex areas (optional).
 
     Returns:
         L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
     """
     N = grad_coeffs.shape[0]
-    L_sparse = _build_full_gram_offdiag_sparse(grad_coeffs, knn)
+    L_sparse = _build_full_gram_offdiag_sparse(grad_coeffs, knn, areas)
     return _torch_sparse_to_scipy(L_sparse, N)
 
 

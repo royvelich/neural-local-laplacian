@@ -171,7 +171,8 @@ def compute_laplacian_differentiable(
     batch_data = Batch.from_data_list([build_patch_data(vertices_t, knn, device)]).to(device)
     fwd        = model(batch_data)
 
-    L = assemble_full_gram_laplacian(fwd['grad_coeffs'], knn_t)
+    L = assemble_full_gram_laplacian(fwd['grad_coeffs'], knn_t,
+                                     areas=fwd['areas'].detach())
     if sparsify:
         L = prune_to_knn(L, knn_t)
     return L, fwd['areas'].detach()
@@ -2224,46 +2225,100 @@ class FunctionalMapModule(LaplacianModuleBase):
                 n_total = len(val_pairs)
                 ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
 
-                # ── Robust Laplacian baseline (rank 0, ThreadPoolExecutor) ──
+                # ── Robust Laplacian baseline (all ranks, distributed) ────
                 if 'robust' in baselines_to_run:
-                    if is_rank0:
-                        try:
-                            import robust_laplacian  # noqa: F401
+                    try:
+                        import robust_laplacian  # noqa: F401
+                        if is_rank0:
                             print(f"\n  Computing robust Laplacian baseline{ds_label} "
-                                  f"({n_total} pairs)...", flush=True)
-                            t0_rb = time.perf_counter()
+                                  f"({n_total} pairs, {world_size} rank(s))...", flush=True)
 
-                            from concurrent.futures import ThreadPoolExecutor, as_completed
-                            rb_n_workers = max(1, _n_cpus // max(world_size, 1))
-                            if hp.geo_cache_workers is not None:
-                                rb_n_workers = min(rb_n_workers, hp.geo_cache_workers)
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        rb_n_workers = max(1, _n_cpus // max(world_size, 1))
+                        if hp.geo_cache_workers is not None:
+                            rb_n_workers = min(rb_n_workers, hp.geo_cache_workers)
 
-                            def _eval_robust(p):
-                                return evaluate_pair_robust(
-                                    _subsample(p), hp.num_eigenvectors,
-                                    evaluators=self._evaluators,
-                                    geo_cache=self._get_geo_cache(p.name))
+                        def _eval_robust(p):
+                            return evaluate_pair_robust(
+                                _subsample(p), hp.num_eigenvectors,
+                                evaluators=self._evaluators,
+                                geo_cache=self._get_geo_cache(p.name))
 
-                            cw = len(str(n_total))
-                            robust_metrics = [None] * n_total
-                            with ThreadPoolExecutor(max_workers=rb_n_workers) as executor:
-                                futures = {executor.submit(_eval_robust, p): i
-                                           for i, p in enumerate(val_pairs)}
-                                done_count = 0
-                                for future in as_completed(futures):
-                                    idx = futures[future]
-                                    robust_metrics[idx] = future.result()
-                                    done_count += 1
+                        # Distribute pairs across ranks (same pattern as model baseline)
+                        my_indices = list(range(self.global_rank, n_total, world_size))
+                        my_pairs = [val_pairs[i] for i in my_indices]
+                        t0_rb = time.perf_counter()
+
+                        my_robust_metrics = [None] * len(my_pairs)
+                        with ThreadPoolExecutor(max_workers=rb_n_workers) as executor:
+                            futures = {executor.submit(_eval_robust, p): j
+                                       for j, p in enumerate(my_pairs)}
+                            done_count = 0
+                            for future in as_completed(futures):
+                                j = futures[future]
+                                my_robust_metrics[j] = future.result()
+                                done_count += 1
+                                if is_rank0:
                                     dt = time.perf_counter() - t0_rb
-                                    eta = (dt / done_count) * (n_total - done_count)
-                                    print(f"    [robust {done_count:>{cw}}/{n_total}] "
-                                          f"{val_pairs[idx].name}... "
+                                    total_done = done_count * world_size
+                                    n_my = len(my_pairs)
+                                    eta = (dt / done_count) * (n_my - done_count)
+                                    cw = len(str(n_total))
+                                    print(f"    [robust ~{min(total_done, n_total):>{cw}}/{n_total}] "
+                                          f"{my_pairs[j].name}... "
                                           f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
                                           flush=True)
 
+                        # Gather from all ranks
+                        if world_size > 1:
+                            max_per_rank = (n_total + world_size - 1) // world_size
+                            if my_robust_metrics and my_robust_metrics[0] is not None:
+                                float_keys = sorted(k for k, v in my_robust_metrics[0].items()
+                                                    if isinstance(v, (int, float)))
+                            else:
+                                float_keys = []
+
+                            n_keys_t = torch.tensor(
+                                [len(float_keys)], device=device, dtype=torch.long)
+                            import torch.distributed as dist
+                            if dist.is_initialized():
+                                dist.broadcast(n_keys_t, src=0)
+                            n_keys = n_keys_t.item()
+
+                            if n_keys > 0:
+                                local_t = torch.full(
+                                    (max_per_rank, n_keys),
+                                    float("nan"), device=device, dtype=torch.float32)
+                                for j, m in enumerate(my_robust_metrics):
+                                    if m is not None:
+                                        for ki, k in enumerate(float_keys):
+                                            local_t[j, ki] = m.get(k, float("nan"))
+
+                                gathered = self.all_gather(local_t)
+                                if gathered.dim() == 2:
+                                    gathered = gathered.unsqueeze(0)
+
+                                if is_rank0:
+                                    robust_metrics = [{}] * n_total
+                                    for rank in range(world_size):
+                                        rank_indices = list(range(rank, n_total, world_size))
+                                        for j, orig_idx in enumerate(rank_indices):
+                                            row = gathered[rank, j]
+                                            if not torch.isnan(row).all():
+                                                robust_metrics[orig_idx] = {
+                                                    k: row[ki].item()
+                                                    for ki, k in enumerate(float_keys)
+                                                }
+                            else:
+                                robust_metrics = []
+                        else:
+                            robust_metrics = my_robust_metrics
+
+                        if is_rank0:
                             dt_rb = time.perf_counter() - t0_rb
                             print(f"    Done: {n_total} pairs in {dt_rb:.1f}s "
-                                  f"({rb_n_workers} threads)", flush=True)
+                                  f"({rb_n_workers} threads/rank × {world_size} ranks)",
+                                  flush=True)
 
                             rb_summary = self._summarise_and_print(
                                 robust_metrics, f"Robust baseline{ds_label}")
@@ -2271,13 +2326,12 @@ class FunctionalMapModule(LaplacianModuleBase):
                                 {f"baseline/robust/{ds_name}/{k}": v
                                  for k, v in rb_summary.items()}, step=0)
                             eval_results[ds_name]["robust"] = (robust_metrics, rb_summary)
-                        except ImportError:
+                    except ImportError:
+                        if is_rank0:
                             print("  (robust_laplacian not installed — "
                                   "skipping robust baseline)")
 
-                # Synchronise: rank 0 must finish robust before all ranks
-                # enter the model baseline (which uses all_gather).
-                if 'robust' in baselines_to_run and 'model' in baselines_to_run:
+                    # Synchronise ranks after robust baseline
                     if world_size > 1:
                         import torch.distributed as dist
                         if dist.is_initialized():
