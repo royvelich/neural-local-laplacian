@@ -765,13 +765,13 @@ def cuda_warmup(model, device: torch.device, k: int):
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     with torch.no_grad():
         with torch.autocast(device_type='cuda', dtype=amp_dtype):
-            warmup_result = model._forward_pass(warmup_data)
+            warmup_result = model(warmup_data)
         torch.cuda.synchronize()
 
     # Warmup assembly (scatter ops have their own cold start)
-    from neural_local_laplacian.utils.laplacian_assembly import assemble_isotropic_laplacian
+    from neural_local_laplacian.utils.laplacian_assembly import assemble_diagonal_gram_laplacian
     knn_warmup = warmup_data.vertex_indices.reshape(num_patches, k)
-    _ = assemble_isotropic_laplacian(
+    _ = assemble_diagonal_gram_laplacian(
         warmup_result['grad_coeffs'].float(),
         knn_warmup,
     )
