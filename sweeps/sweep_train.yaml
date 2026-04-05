@@ -27,11 +27,10 @@ parameters:
       checkpoint_path:
         values:
           - '/workspace/models/model.ckpt'
-          - '/workspace/models/model2.ckpt'
       num_eigenvectors:
         value: 100
       k:
-        value: 8
+        value: 15
       lr:
         value: 1.0e-5
       gradient_clip_val:
@@ -40,7 +39,9 @@ parameters:
         value:
           - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
             weight: 1.0
-            landmark_ratio: 0.25
+            num_landmarks: 256
+            num_sample_vertices: 1024
+#            landmark_ratio: 0.25
             alphas: [0.1, 1.0, 10.0]
             normalize: false
 
@@ -60,9 +61,9 @@ parameters:
                 _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
                 root: '/workspace/datasets/DeformingThings4DMatching-Animals'
                 pairs: [0.7]
-              num_samples: 210
+              num_samples: 120
               seed: ${globals.training_seed}
-            batch_size: 7
+            batch_size: 6
             num_workers: 0
             shuffle: true
             collate_fn:
@@ -97,9 +98,9 @@ parameters:
                 root: '/workspace/datasets/DeformingThings4DMatching'
                 pair_mode: intra
                 pairs: [0.7]
-              num_samples: 210
+              num_samples: 120
               seed: ${globals.training_seed}
-            batch_size: 7
+            batch_size: 6
             num_workers: 0
             shuffle: true
             collate_fn:
@@ -135,9 +136,9 @@ parameters:
                 root: '/workspace/datasets/DeformingThings4DMatching'
                 pair_mode: inter
                 pairs: [0.7]
-              num_samples: 210
+              num_samples: 120
               seed: ${globals.training_seed}
-            batch_size: 7
+            batch_size: 6
             num_workers: 0
             shuffle: true
             collate_fn:
@@ -173,9 +174,9 @@ parameters:
                 root: '/workspace/datasets/faust'
                 pair_mode: intra
                 pairs: [0.7]
-              num_samples: 210
+              num_samples: 120
               seed: ${globals.training_seed}
-            batch_size: 7
+            batch_size: 6
             num_workers: 0
             shuffle: true
             collate_fn:
@@ -211,9 +212,9 @@ parameters:
                 root: '/workspace/datasets/faust'
                 pair_mode: inter
                 pairs: [0.7]
-              num_samples: 210
+              num_samples: 120
               seed: ${globals.training_seed}
-            batch_size: 7
+            batch_size: 6
             num_workers: 0
             shuffle: true
             collate_fn:
@@ -255,8 +256,8 @@ parameters:
         eval_results_dir: ./eval_results/train
 
         train_laplacian:
-          assembly: diagonal_gram
-          pruning: none
+          assembly: full_gram
+          pruning: knn
         eval_laplacians:
           - assembly: diagonal_gram
             pruning: none
