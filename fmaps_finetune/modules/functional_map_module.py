@@ -2668,7 +2668,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                 silent=not self.trainer.is_global_zero)
 
             # --- Log to W&B / Lightning ---
-            prefix = f"val/{ds_name}" if len(val_specs) > 1 else "val"
+            prefix = f"val/{ds_name}"
             for mk, mv in summary.items():
                 self.log(f"{prefix}/{mk}", mv, sync_dist=True,
                          add_dataloader_idx=False)
