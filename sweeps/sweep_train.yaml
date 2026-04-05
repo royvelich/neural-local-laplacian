@@ -30,7 +30,7 @@ parameters:
       num_eigenvectors:
         value: 100
       k:
-        value: 15
+        value: 20
       lr:
         value: 1.0e-5
       gradient_clip_val:
@@ -39,9 +39,9 @@ parameters:
         value:
           - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
             weight: 1.0
-#            num_landmarks: 256
-#            num_sample_vertices: 1024
-            landmark_ratio: 0.25
+            num_landmarks: 256
+            num_sample_vertices: 1024
+#            landmark_ratio: 0.25
             alphas: [0.1, 1.0, 10.0]
             normalize: false
 
@@ -251,7 +251,7 @@ parameters:
         seed: ${globals.training_seed}
 
         mode: train
-        baselines: [model]
+        baselines: [model, robust]
         geo_cache_dir: ./geo_cache
         eval_results_dir: ./eval_results/train
 
@@ -272,7 +272,7 @@ parameters:
         max_vertices: 5000
         max_vertices_val: 0
         vertex_noise: 0.0
-        w_prox: 2.0
+        w_prox: 0.0
 
         use_lora: false
         lora_rank: 8

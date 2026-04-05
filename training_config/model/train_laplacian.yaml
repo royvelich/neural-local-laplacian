@@ -14,13 +14,14 @@ module:
   output_projection_hidden_dims: null
 #  mcv_mode: 'full_gram'      # anisotropic, can be negative
   mcv_mode: 'diagonal_gram'  # isotropic, always positive (default)
+  geo_area_weighted: false
 #  val_laplacian:
 #    assembly: diagonal_gram
 #    pruning: none
 
   val_laplacian:
-    assembly: diagonal_gram
-    pruning: none
+    assembly: full_gram
+    pruning: knn
 
   feature_extractor: null
   loss_configs:

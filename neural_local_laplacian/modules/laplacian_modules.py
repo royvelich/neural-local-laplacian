@@ -102,6 +102,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  normalize_patch_features: bool = True,
                  scale_areas_by_patch_size: bool = True,
                  mcv_mode: str = 'diagonal_gram',
+                 geo_area_weighted: bool = True,
                  val_laplacian: Optional[Dict] = None,
                  **kwargs):
         # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
@@ -149,6 +150,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._normalize_patch_features = normalize_patch_features
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
         self._mcv_mode = mcv_mode
+        self._geo_area_weighted = geo_area_weighted
 
         # Validation Laplacian config
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
@@ -524,6 +526,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         knn = mesh_batch.vertex_indices.reshape(N, k_val).to(device)
         areas = forward_result['areas'].detach()
 
+        # Eigendecomposition: always area-weighted
         with torch.no_grad():
             L = assemble_laplacian(forward_result['grad_coeffs'], knn,
                                    self._val_lap_config, areas=areas)
@@ -538,8 +541,18 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         metrics = self._compute_spectral_comparison_metrics(
             pred_evals, pred_evecs, gt_evals, gt_evecs)
+
+        # Geodesics: optionally use area-free S (old behavior)
+        if self._geo_area_weighted:
+            geo_S = stiffness_matrix
+        else:
+            with torch.no_grad():
+                L_raw = assemble_laplacian(forward_result['grad_coeffs'], knn,
+                                           self._val_lap_config)
+            geo_S = to_scipy_sparse(L_raw)
+
         metrics.update(self._compute_geodesic_validation_metrics(
-            mesh_data, stiffness_matrix, mass_matrix, forward_result, mesh_batch))
+            mesh_data, geo_S, mass_matrix, forward_result, mesh_batch))
         return metrics
 
     def _compute_geodesic_validation_metrics(
