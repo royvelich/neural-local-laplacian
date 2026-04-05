@@ -94,6 +94,7 @@ def assemble_laplacian(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
     config: LaplacianConfig,
+    areas: Optional[torch.Tensor] = None,
     knn_prune: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, scipy.sparse.csr_matrix]:
     """Assemble a Laplacian matrix according to config.
@@ -102,6 +103,9 @@ def assemble_laplacian(
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices used for assembly.
         config: LaplacianConfig specifying assembly + pruning + sparse.
+        areas: (N,) per-vertex areas. When provided, edge weights are
+               scaled by areas (w_ij *= a_i), matching the proper
+               Galerkin discretization L = G^T M G.
         knn_prune: (N, k') optional kNN indices for pruning='knn'.
                    If None and pruning='knn', uses the assembly knn.
 
@@ -114,20 +118,20 @@ def assemble_laplacian(
         if config.assembly == 'full_gram':
             return _assemble_full_gram_torch_sparse(grad_coeffs, knn)
         else:
-            return _assemble_diagonal_gram_torch_sparse(grad_coeffs, knn)
+            return _assemble_diagonal_gram_torch_sparse(grad_coeffs, knn, areas)
 
     if config.sparse:
         # Scipy sparse path — returns scipy.sparse.csr_matrix (no autograd)
         if config.assembly == 'full_gram':
             return _assemble_full_gram_sparse(grad_coeffs, knn)
         else:
-            return _assemble_diagonal_gram_sparse(grad_coeffs, knn)
+            return _assemble_diagonal_gram_sparse(grad_coeffs, knn, areas)
 
     # Dense path — returns torch.Tensor
     if config.assembly == 'full_gram':
         L = assemble_full_gram_laplacian(grad_coeffs, knn)
     else:
-        L = assemble_diagonal_gram_laplacian(grad_coeffs, knn)
+        L = assemble_diagonal_gram_laplacian(grad_coeffs, knn, areas)
 
     # Pruning (dense only)
     if config.pruning == 'knn':
@@ -188,15 +192,18 @@ def assemble_full_gram_laplacian(
 def assemble_diagonal_gram_laplacian(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Assemble dense diagonal-Gram graph Laplacian from gradient coefficients.
 
-    Drops cross-terms, keeps only w_ij = ||g_ij||^2. Produces a standard
+    Drops cross-terms, keeps only w_ij = a_i * ||g_ij||^2. Produces a standard
     graph Laplacian L = D - W. Guaranteed PSD and kNN-sparse (no 2-hop).
 
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices (long tensor).
+        areas: (N,) per-vertex areas. When provided, w_ij = a_i * ||g_ij||^2.
+               When None, w_ij = ||g_ij||^2 (unweighted).
 
     Returns:
         L: (N, N) dense symmetric PSD Laplacian (structurally kNN-sparse).
@@ -204,8 +211,10 @@ def assemble_diagonal_gram_laplacian(
     N, k, _ = grad_coeffs.shape
     device = grad_coeffs.device
 
-    # w_ij = ||g_ij||^2
+    # w_ij = ||g_ij||^2, optionally area-weighted
     edge_weights = (grad_coeffs ** 2).sum(dim=2)  # (N, k)
+    if areas is not None:
+        edge_weights = areas[:, None] * edge_weights
 
     # Build graph Laplacian: L_ij = -w_ij, symmetrized
     L = torch.zeros(N, N, device=device, dtype=grad_coeffs.dtype)
@@ -228,6 +237,7 @@ def assemble_diagonal_gram_laplacian(
 def _build_diagonal_gram_offdiag_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build sparse off-diagonal Laplacian (no diagonal) on GPU.
 
@@ -240,8 +250,10 @@ def _build_diagonal_gram_offdiag_sparse(
     N, k, _ = grad_coeffs.shape
     device = grad_coeffs.device
 
-    # w_ij = ||g_ij||^2
+    # w_ij = ||g_ij||^2, optionally area-weighted
     edge_weights = (grad_coeffs ** 2).sum(dim=2)  # (N, k)
+    if areas is not None:
+        edge_weights = areas[:, None] * edge_weights
 
     # Build COO indices on GPU: both (i→j) and (j→i)
     row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn).reshape(-1)
@@ -314,6 +326,7 @@ def _build_full_gram_offdiag_sparse(
 def _assemble_diagonal_gram_torch_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Assemble sparse diagonal-Gram Laplacian as torch.sparse_coo_tensor.
 
@@ -323,6 +336,7 @@ def _assemble_diagonal_gram_torch_sparse(
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices (long tensor).
+        areas: (N,) per-vertex areas (optional).
 
     Returns:
         L: (N, N) torch.sparse_coo_tensor, coalesced, symmetric PSD.
@@ -330,7 +344,7 @@ def _assemble_diagonal_gram_torch_sparse(
     N = grad_coeffs.shape[0]
     device = grad_coeffs.device
 
-    L_offdiag = _build_diagonal_gram_offdiag_sparse(grad_coeffs, knn)
+    L_offdiag = _build_diagonal_gram_offdiag_sparse(grad_coeffs, knn, areas)
 
     # Diagonal fix in torch: L_ii = -sum of off-diagonal in row i
     row_sums = torch.sparse.sum(L_offdiag, dim=1).to_dense()  # (N,)
@@ -376,6 +390,7 @@ def _torch_sparse_to_scipy(L_sparse: torch.Tensor, N: int) -> scipy.sparse.csr_m
 def _assemble_diagonal_gram_sparse(
     grad_coeffs: torch.Tensor,
     knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
 ) -> scipy.sparse.csr_matrix:
     """Assemble sparse diagonal-Gram Laplacian, returned as scipy CSR.
 
@@ -384,12 +399,13 @@ def _assemble_diagonal_gram_sparse(
     Args:
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices (long tensor).
+        areas: (N,) per-vertex areas (optional).
 
     Returns:
         L: (N, N) scipy.sparse.csr_matrix, symmetric PSD.
     """
     N = grad_coeffs.shape[0]
-    L_offdiag = _build_diagonal_gram_offdiag_sparse(grad_coeffs, knn)
+    L_offdiag = _build_diagonal_gram_offdiag_sparse(grad_coeffs, knn, areas)
 
     # Convert to scipy for diagonal fix
     L_csr = _torch_sparse_to_scipy(L_offdiag, N)

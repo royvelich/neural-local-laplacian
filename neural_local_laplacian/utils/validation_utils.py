@@ -201,7 +201,7 @@ def step_pred_inference(
     knn = vi.reshape(N, k_val)
 
     t0 = time.perf_counter()
-    L = assemble_laplacian(grad_coeffs, knn, laplacian_config)
+    L = assemble_laplacian(grad_coeffs, knn, laplacian_config, areas=areas)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t_assembly = time.perf_counter() - t0
@@ -269,7 +269,7 @@ def step_pred_reassemble(
     knn = vi.reshape(N, k_val)
 
     t0 = time.perf_counter()
-    L = assemble_laplacian(grad_coeffs, knn, laplacian_config)
+    L = assemble_laplacian(grad_coeffs, knn, laplacian_config, areas=areas)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t_assembly = time.perf_counter() - t0

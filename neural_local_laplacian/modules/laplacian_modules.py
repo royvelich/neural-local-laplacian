@@ -526,7 +526,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         with torch.no_grad():
             L = assemble_laplacian(forward_result['grad_coeffs'], knn,
-                                   self._val_lap_config)
+                                   self._val_lap_config, areas=areas)
 
         stiffness_matrix = to_scipy_sparse(L)
         mass_matrix = mass_matrix_to_scipy(areas)
