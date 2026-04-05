@@ -5,7 +5,7 @@ accelerator: 'auto'
 strategy: 'auto'
 num_sanity_val_steps: 0
 log_every_n_steps: 1
-check_val_every_n_epoch: 50
+check_val_every_n_epoch: 100
 enable_progress_bar: True
 #logger: False
 logger:
@@ -14,21 +14,21 @@ logger:
  save_dir: 'wandb'
  log_model: 'all'
 callbacks:
-#  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
-#    dirpath: "./checkpoints"
-#    filename: "best-model-{epoch:010d}"
-#    monitor: "val/geodesic_correlation_mean"
-#    mode: "max"
-#    save_top_k: 1
-#    save_last: False
-#    verbose: False
-#    save_on_train_epoch_end: True
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: "./checkpoints"
-    filename: "last-model-{epoch:010d}"
-#    monitor: "val/geodesic_correlation_mean"
-#    mode: "max"
-    every_n_epochs: 50
-    save_top_k: -1
+    filename: "best-model-{epoch:010d}"
+    monitor: "val/geodesic_correlation_mean"
+    mode: "max"
+    save_top_k: 1
+    save_last: False
     verbose: False
     save_on_train_epoch_end: True
+#  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+#    dirpath: "./checkpoints"
+#    filename: "last-model-{epoch:010d}"
+#    monitor: "val/geodesic_correlation_mean"
+#    mode: "max"
+##    every_n_epochs: 200
+#    save_top_k: 1
+#    verbose: False
+#    save_on_train_epoch_end: True

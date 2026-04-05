@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 256
+  d_model: 512
   nhead: 8
-  num_encoder_layers: 6
-  dim_feedforward: 256
+  num_encoder_layers: 1
+  dim_feedforward: 512
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.0
   normalize_loss_weights: False
@@ -12,9 +12,17 @@ module:
   scale_areas_by_patch_size: True
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
-  patch_mcv_mode: 'isotropic'
-  operator_mode: 'gradient'
-  val_laplacian_mode: 'sparse_anisotropic'
+#  mcv_mode: 'full_gram'      # anisotropic, can be negative
+  mcv_mode: 'diagonal_gram'  # isotropic, always positive (default)
+  geo_area_weighted: true
+#  val_laplacian:
+#    assembly: diagonal_gram
+#    pruning: none
+
+  val_laplacian:
+    assembly: diagonal_gram
+    pruning: none
+
   feature_extractor: null
   loss_configs:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
@@ -23,15 +31,5 @@ module:
       weight: 20.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
-      weight: 0.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-      weight: 0.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
-        num_random_probes: 1000
-        probe_mode: 'random'
-      weight: 0.25
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+      weight: 1.0
