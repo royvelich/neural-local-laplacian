@@ -447,6 +447,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         """
         N = pos.shape[0]
         # face is (3, F) — columns are triangles
+        face = face.long()  # scatter_add_ requires int64
         v0 = pos[face[0]]  # (F, 3)
         v1 = pos[face[1]]
         v2 = pos[face[2]]
