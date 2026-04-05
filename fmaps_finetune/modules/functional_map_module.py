@@ -2256,6 +2256,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                                     dt = time.perf_counter() - t0_rb
                                     eta = (dt / done_count) * (n_total - done_count)
                                     print(f"    [robust {done_count:>{cw}}/{n_total}] "
+                                          f"{val_pairs[idx].name}... "
                                           f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
                                           flush=True)
 
@@ -2296,6 +2297,7 @@ class FunctionalMapModule(LaplacianModuleBase):
 
                     with torch.no_grad():
                         for count, i in enumerate(my_indices, 1):
+                            t0_pair = time.perf_counter()
                             sub_p = _subsample(val_pairs[i])
                             m = evaluate_pair(self.model, sub_p,
                                               hp.k, hp.num_eigenvectors, device,
@@ -2305,11 +2307,13 @@ class FunctionalMapModule(LaplacianModuleBase):
                             my_metrics.append(m)
                             n_my = len(my_indices)
                             if is_rank0:
+                                dt_pair = time.perf_counter() - t0_pair
                                 dt = time.perf_counter() - t0_ep0
                                 total_done = count * world_size
                                 eta = (dt / count) * (n_my - count)
-                                print(f"    [model {min(total_done, n_total):>{len(str(n_total))}}/{n_total}] "
-                                      f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                cw = len(str(n_total))
+                                print(f"    [model {min(total_done, n_total):>{cw}}/{n_total}] "
+                                      f"{val_pairs[i].name}... {dt_pair:.1f}s",
                                       flush=True)
                     self.model.train()
 
