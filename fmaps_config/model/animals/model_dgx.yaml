@@ -7,17 +7,17 @@ module:
   num_eigenvectors: ${globals.num_eigenvectors}
   seed: ${globals.training_seed}
 
-  mode: eval
-  baselines: [model]
+  mode: train
+  baselines: [model, robust]
   geo_cache_dir: ./geo_cache
   eval_results_dir: ./eval_results/model
 
   geo_cache_workers: 4
 
-  area_weighted_laplacian: false
+  area_weighted_laplacian: true
 
   train_laplacian:
-    assembly: diagonal_gram
+    assembly: full_gram
     pruning: knn
 
   eval_laplacians:
