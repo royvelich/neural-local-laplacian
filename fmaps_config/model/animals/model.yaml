@@ -14,6 +14,8 @@ module:
 
   geo_cache_workers: 4
 
+  area_weighted_laplacian: true
+
   train_laplacian:
     assembly: full_gram
     pruning: knn

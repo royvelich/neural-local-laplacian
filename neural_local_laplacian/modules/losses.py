@@ -79,6 +79,44 @@ class VectorMSELoss(nn.Module):
         return F.mse_loss(ctx.predicted_mcv, ctx.target_mcv, reduction=self.reduction)
 
 
+class AreaWeightedMSELoss(nn.Module):
+    """
+    Area-weighted MSE loss between predicted and target mean curvature vectors.
+
+    Loss:
+        L = (1/N) Σ_i  A_i · || pred_mcv_i - target_mcv_i ||^2
+
+    Weights each vertex's MCV error by its area, so vertices representing
+    more surface contribute proportionally more. Uses gt_vertex_areas when
+    available (synthetic data), falls back to predicted areas otherwise.
+    """
+
+    def __init__(self, use_gt_areas: bool = True):
+        """
+        Args:
+            use_gt_areas: If True, use gt_vertex_areas when available.
+                         If False, always use predicted areas.
+        """
+        super().__init__()
+        self.use_gt_areas = use_gt_areas
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.areas is None:
+            raise ValueError("AreaWeightedMSELoss requires ctx.areas to be set")
+
+        # Choose area weights
+        if self.use_gt_areas and ctx.gt_vertex_areas is not None:
+            weights = ctx.gt_vertex_areas
+        else:
+            weights = ctx.areas
+
+        # Per-vertex squared error: ||pred - target||^2, shape (batch_size,)
+        sq_error = ((ctx.predicted_mcv - ctx.target_mcv) ** 2).sum(dim=1)
+
+        # Area-weighted mean
+        return (weights * sq_error).mean()
+
+
 class DirectionMSELoss(nn.Module):
     """
     MSE loss between normalized vectors (direction only, ignoring magnitude).
@@ -369,17 +407,44 @@ class AreaOnlyLogMagnitudeLoss(nn.Module):
 
 class AreaSupervisionLoss(nn.Module):
     """
-    Direct area supervision using log-space MSE against GT barycentric areas.
+    Direct area supervision using MSE against GT barycentric areas.
 
-    Supervises the area head with ground-truth vertex areas computed from the
-    training mesh (barycentric 1/3 areas from Delaunay triangulation).
+    Loss:
+        L = mean_i (a_i^pred - a_i^gt)^2
+
+    Requires gt_vertex_areas in the LossContext (set by synthetic datasets).
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.gt_vertex_areas is None:
+            raise ValueError("AreaSupervisionLoss requires ctx.gt_vertex_areas to be set")
+        if ctx.areas is None:
+            raise ValueError("AreaSupervisionLoss requires ctx.areas to be set")
+
+        error_sq = (ctx.areas - ctx.gt_vertex_areas) ** 2
+
+        if self.reduction == 'mean':
+            return torch.mean(error_sq)
+        elif self.reduction == 'sum':
+            return torch.sum(error_sq)
+        elif self.reduction == 'none':
+            return error_sq
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class LogAreaSupervisionLoss(nn.Module):
+    """
+    Direct area supervision using log-space MSE against GT barycentric areas.
 
     Loss:
         L = mean_i (log(a_i^pred) - log(a_i^gt))^2
 
-    This trains the area head to predict geometric vertex areas rather than
-    curvature-compensating scale factors (which is what AreaOnlyLogMagnitudeLoss
-    learns). Log space ensures equal relative-error penalty across vertices
+    Log space ensures equal relative-error penalty across vertices
     regardless of absolute area magnitude.
 
     Requires gt_vertex_areas in the LossContext (set by synthetic datasets).
@@ -392,9 +457,9 @@ class AreaSupervisionLoss(nn.Module):
 
     def forward(self, ctx: LossContext) -> torch.Tensor:
         if ctx.gt_vertex_areas is None:
-            raise ValueError("AreaSupervisionLoss requires ctx.gt_vertex_areas to be set")
+            raise ValueError("LogAreaSupervisionLoss requires ctx.gt_vertex_areas to be set")
         if ctx.areas is None:
-            raise ValueError("AreaSupervisionLoss requires ctx.areas to be set")
+            raise ValueError("LogAreaSupervisionLoss requires ctx.areas to be set")
 
         log_pred = torch.log(ctx.areas + self.eps)
         log_gt = torch.log(ctx.gt_vertex_areas + self.eps)

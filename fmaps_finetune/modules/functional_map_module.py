@@ -1229,6 +1229,7 @@ def evaluate_pair(
     laplacian_configs: Optional[List[LaplacianConfig]] = None,
     evaluators: Optional[List] = None,
     geo_cache = None,
+    area_weighted_laplacian: bool = True,
 ) -> Dict[str, float]:
     """Evaluate correspondence quality using functional maps (non-differentiable).
 
@@ -1238,6 +1239,7 @@ def evaluate_pair(
             Defaults to [LaplacianConfig(assembly='diagonal_gram')].
         evaluators: List of ShapePairEvaluator instances.
         geo_cache: Precomputed GeodesicCache for mesh B.
+        area_weighted_laplacian: If True, multiply areas into L assembly.
     """
     if laplacian_configs is None:
         laplacian_configs = [LaplacianConfig(assembly='diagonal_gram')]
@@ -1273,7 +1275,8 @@ def evaluate_pair(
                 knn_prune_np = compute_knn(verts, cfg.k_prune)
                 knn_prune = torch.from_numpy(knn_prune_np).long().to(device)
 
-            L = assemble_laplacian(grad_coeffs, knn_t, cfg, areas=M_diag,
+            L = assemble_laplacian(grad_coeffs, knn_t, cfg,
+                                   areas=M_diag if area_weighted_laplacian else None,
                                    knn_prune=knn_prune)
             evals, evecs = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
 
@@ -1495,6 +1498,8 @@ class FunctionalMapModule(LaplacianModuleBase):
         eval_results_dir: Optional[str] = None,  # eval output directory (None = {default_root_dir}/eval_results)
         mode: str = 'train',                     # 'train', 'eval', or 'geo_cache'
         baselines: Optional[List[str]] = None,   # ['robust', 'model'] (default), or subset
+        # Area weighting
+        area_weighted_laplacian: bool = True,    # multiply areas into L assembly
         # GeomFuM evaluation (optional)
         use_geomfum_eval: bool = False,
         geomfum_descriptors: Optional[List[str]] = None,
@@ -2358,7 +2363,8 @@ class FunctionalMapModule(LaplacianModuleBase):
                                               hp.k, hp.num_eigenvectors, device,
                                               laplacian_configs=self._eval_lap_configs,
                                               evaluators=self._evaluators,
-                                              geo_cache=self._get_geo_cache(val_pairs[i].name))
+                                              geo_cache=self._get_geo_cache(val_pairs[i].name),
+                                              area_weighted_laplacian=hp.area_weighted_laplacian)
                             my_metrics.append(m)
                             n_my = len(my_indices)
                             if is_rank0:
@@ -2521,10 +2527,12 @@ class FunctionalMapModule(LaplacianModuleBase):
                     knn_sp_a_t = torch.from_numpy(knn_sp_a).long().to(device)
                     knn_sp_b_t = torch.from_numpy(knn_sp_b).long().to(device)
                 S_A = assemble_laplacian(fwd_a['grad_coeffs'], knn_a_t, lap_cfg,
-                                        areas=fwd_a['areas'], knn_prune=knn_sp_a_t)
+                                        areas=fwd_a['areas'] if hp.area_weighted_laplacian else None,
+                                        knn_prune=knn_sp_a_t)
                 M_A = fwd_a['areas']
                 S_B = assemble_laplacian(fwd_b['grad_coeffs'], knn_b_t, lap_cfg,
-                                        areas=fwd_b['areas'], knn_prune=knn_sp_b_t)
+                                        areas=fwd_b['areas'] if hp.area_weighted_laplacian else None,
+                                        knn_prune=knn_sp_b_t)
                 M_B = fwd_b['areas']
 
             with prof.phase("losses"):
@@ -2608,6 +2616,7 @@ class FunctionalMapModule(LaplacianModuleBase):
             laplacian_configs=self._eval_lap_configs,
             evaluators=self._evaluators,
             geo_cache=self._get_geo_cache(pair.name),
+            area_weighted_laplacian=self.hparams.area_weighted_laplacian,
         ))
 
         # Progress print (rank 0)
