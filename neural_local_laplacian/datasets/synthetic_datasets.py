@@ -672,8 +672,14 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         data['face'] = self._create_surface_mesh(pos=data.pos).detach()
 
         # Compute GT barycentric vertex areas from 3D mesh
-        data['gt_vertex_areas'] = self._compute_barycentric_vertex_areas(
-            data['pos'], data['face']).detach()
+        all_vertex_areas = self._compute_barycentric_vertex_areas(
+            data['pos'], data['face'])
+        if self._diff_geom_at_origin_only:
+            # Store only origin vertex's area (same batching as H, normals)
+            origin_idx = (positions.detach() ** 2).sum(dim=1).argmin().item()
+            data['gt_vertex_areas'] = all_vertex_areas[origin_idx:origin_idx+1].detach()
+        else:
+            data['gt_vertex_areas'] = all_vertex_areas.detach()
 
         # Store the origin position (0,0,0) after centering - will be transformed with pose
         data['origin_pos'] = torch.zeros(1, 3)

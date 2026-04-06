@@ -1,0 +1,6 @@
+folder: "F:/input/shrec19_mh"
+require_manifold: true
+num_sources: 15
+seed: 42
+num_workers: 18
+timeout_per_source: 60

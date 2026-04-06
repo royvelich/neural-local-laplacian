@@ -71,13 +71,18 @@ import pytorch_lightning as pl
 from neural_local_laplacian.modules.laplacian_modules import LaplacianTransformerModule
 from neural_local_laplacian.utils.utils import (
     normalize_mesh_vertices,
-    assemble_stiffness_and_mass_matrices,
     assemble_gradient_operator,
     compute_laplacian_eigendecomposition,
     build_patches_from_vertices,
     set_knn_backend,
     cuda_warmup,
     load_mesh,
+)
+from neural_local_laplacian.utils.laplacian_assembly import (
+    LaplacianConfig,
+    assemble_laplacian,
+    to_scipy_sparse,
+    mass_matrix_to_scipy,
 )
 from neural_local_laplacian.utils.geodesic_utils import (
     compute_heat_geodesics_batch,
@@ -190,6 +195,10 @@ class ReconstructionSettings:
     use_pred_areas: bool = True  # Required for M-orthonormal eigenvectors from generalized EVP
     current_pred_k: int = 20  # Will be updated with actual k from dataset
     current_robust_k: int = 20  # Independent k for robust-laplacian
+
+    # Area weighting toggles
+    area_weighted_laplacian: bool = True   # Multiply edge weights by areas in L assembly
+    area_weighted_geodesics: bool = True   # Use area-weighted S for geodesic heat method
 
     # Top-k weight pruning for PRED
     enable_top_k_pruning: bool = False  # When enabled, prune to top_k highest weights per patch
@@ -471,8 +480,12 @@ class RealTimeEigenanalysisVisualizer:
         self.current_predicted_data = None
         self.current_mesh_structure = None
 
+        # Store cached forward result and knn for cheap reassembly
+        self.current_forward_result = None  # full forward result with grad_coeffs, areas
+        self.current_knn = None             # (N, k) knn indices tensor
+        self.current_lap_config = LaplacianConfig(assembly='diagonal_gram')
+
         # Store raw data for k-NN slider updates
-        self.current_stiffness_weights = None
         self.current_areas = None
         self.current_original_vertices = None
         self._current_vertices_tensor = None  # cached GPU tensor of vertices
@@ -487,7 +500,7 @@ class RealTimeEigenanalysisVisualizer:
         self.current_mesh_file_path = None
         self.current_faces = None
 
-        # Store learned gradient operator (gradient mode only)
+        # Store learned gradient operator
         self.current_learned_gradient_op = None
 
         # NEW: Track reconstruction structure names for removal
@@ -720,6 +733,105 @@ class RealTimeEigenanalysisVisualizer:
                 f"k2={self.reconstruction_settings.pred_top_k} (operator support), "
                 f"policy={self.reconstruction_settings.symmetry_policy}"
             )
+
+        # --- Laplacian Assembly Config ---
+        psim.Text("")
+        psim.Separator()
+        psim.Text("PRED Laplacian Assembly:")
+
+        # Area weighting toggles
+        area_lap_changed, new_area_lap = psim.Checkbox(
+            "Area-weighted Laplacian",
+            self.reconstruction_settings.area_weighted_laplacian
+        )
+        if area_lap_changed:
+            self.reconstruction_settings.area_weighted_laplacian = new_area_lap
+            print(f"[*] Area-weighted Laplacian: {new_area_lap}")
+            if self._has_current_batch_data():
+                self._reassemble_with_config(self.current_lap_config)
+                self.current_predicted_data = self.compute_predicted_quantities_from_laplacian(
+                    self.current_inference_result['stiffness_matrix'],
+                    self.current_gt_data['vertices'],
+                    mass_matrix=self.current_inference_result.get('mass_matrix')
+                )
+                self._remove_existing_reconstructions()
+                self._update_mesh_reconstructions(self.current_gt_data, self.current_inference_result)
+                self._update_eigenvector_visualizations()
+                if self.current_mesh_structure is not None:
+                    self.add_comprehensive_curvature_visualizations(
+                        self.current_mesh_structure, self.current_gt_data,
+                        self.current_predicted_data, self.current_inference_result
+                    )
+                self._recompute_validations_after_k_change("PRED")
+
+        area_geo_changed, new_area_geo = psim.Checkbox(
+            "Area-weighted Geodesics",
+            self.reconstruction_settings.area_weighted_geodesics
+        )
+        if area_geo_changed:
+            self.reconstruction_settings.area_weighted_geodesics = new_area_geo
+            print(f"[*] Area-weighted Geodesics: {new_area_geo}")
+            if self._has_current_batch_data():
+                self._update_geodesics_for_method("PRED")
+
+        psim.Text("")
+
+        assembly_options = ['diagonal_gram', 'full_gram']
+        current_assembly_idx = assembly_options.index(self.current_lap_config.assembly) \
+            if self.current_lap_config.assembly in assembly_options else 0
+        assembly_changed, new_assembly_idx = psim.Combo(
+            "Assembly", current_assembly_idx, assembly_options
+        )
+
+        pruning_options = ['none', 'knn', 'topk']
+        current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
+            if self.current_lap_config.pruning in pruning_options else 0
+        pruning_changed, new_pruning_idx = psim.Combo(
+            "Pruning", current_pruning_idx, pruning_options
+        )
+
+        k_prune_changed = False
+        new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
+        if pruning_options[new_pruning_idx] in ('knn', 'topk'):
+            k_prune_changed, new_k_prune = psim.InputInt(
+                "k_prune",
+                new_k_prune,
+                flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+            )
+            new_k_prune = max(3, min(100, new_k_prune))
+
+        if assembly_changed or pruning_changed or k_prune_changed:
+            new_pruning = pruning_options[new_pruning_idx]
+            new_config = LaplacianConfig(
+                assembly=assembly_options[new_assembly_idx],
+                pruning=new_pruning,
+                k_prune=new_k_prune if new_pruning in ('knn', 'topk') else None,
+            )
+            if new_config.tag != self.current_lap_config.tag:
+                print(f"[*] Laplacian config changed: {self.current_lap_config.tag} -> {new_config.tag}")
+                if self._has_current_batch_data():
+                    self._reassemble_with_config(new_config)
+                    # Recompute all dependent quantities
+                    self.current_predicted_data = self.compute_predicted_quantities_from_laplacian(
+                        self.current_inference_result['stiffness_matrix'],
+                        self.current_gt_data['vertices'],
+                        mass_matrix=self.current_inference_result.get('mass_matrix')
+                    )
+                    self._remove_existing_reconstructions()
+                    self._update_mesh_reconstructions(self.current_gt_data, self.current_inference_result)
+                    self._update_eigenvector_visualizations()
+                    if self.current_mesh_structure is not None:
+                        self.add_comprehensive_curvature_visualizations(
+                            self.current_mesh_structure, self.current_gt_data,
+                            self.current_predicted_data, self.current_inference_result
+                        )
+                    self._recompute_validations_after_k_change("PRED")
+                else:
+                    self.current_lap_config = new_config
+
+        psim.TextColored((0.7, 0.7, 0.7, 1.0),
+            f"Current: {self.current_lap_config.tag}"
+        )
 
         # --- Weyl's Law Eigenvalue Calibration ---
         psim.Text("")
@@ -1302,7 +1414,7 @@ class RealTimeEigenanalysisVisualizer:
         return (self.current_gt_data is not None and
                 self.current_inference_result is not None and
                 self.current_predicted_data is not None and
-                self.current_stiffness_weights is not None and
+                self.current_forward_result is not None and
                 self.current_areas is not None and
                 self.current_original_vertices is not None)
 
@@ -1423,6 +1535,28 @@ class RealTimeEigenanalysisVisualizer:
             return self.current_nelo_L, self.current_nelo_M
 
         return None, None
+
+    def _get_geodesic_L_M(self, method_key: str) -> Tuple[Optional[Any], Optional[Any]]:
+        """Return (L, M) for geodesic computation, respecting area_weighted_geodesics toggle.
+
+        For PRED: when area_weighted_geodesics is False, reassembles L without areas.
+        For other methods: delegates to _get_method_L_M.
+        """
+        if method_key != 'PRED':
+            return self._get_method_L_M(method_key)
+
+        if self.current_forward_result is None or self.current_knn is None:
+            return self._get_method_L_M(method_key)
+
+        if self.reconstruction_settings.area_weighted_geodesics:
+            # Use the same L as eigendecomposition (already assembled)
+            return self._get_method_L_M(method_key)
+
+        # Reassemble L without areas for geodesics
+        grad_coeffs = self.current_forward_result['grad_coeffs'].float()
+        areas = self.current_forward_result['areas'].float()
+        L = assemble_laplacian(grad_coeffs, self.current_knn, self.current_lap_config)
+        return to_scipy_sparse(L), mass_matrix_to_scipy(areas)
 
     def _update_sparsity_for_method(self, method_key: str):
         """Recompute sparsity stats for a single method, keeping others unchanged."""
@@ -1608,7 +1742,6 @@ class RealTimeEigenanalysisVisualizer:
         Returns distances array (N,) or None if computation fails.
         """
         n = len(vertices)
-        operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
 
         if method_key == 'GT':
             if HAS_IGL and L is not None and M is not None and mesh_grad_op is not None:
@@ -1618,19 +1751,12 @@ class RealTimeEigenanalysisVisualizer:
                 )
 
         elif method_key == 'PRED':
-            if L is not None and M is not None:
-                if operator_mode == "gradient" and self.current_learned_gradient_op is not None:
-                    return compute_heat_geodesic_learned(
-                        S=L, M=M, G=self.current_learned_gradient_op,
-                        source_idx=source_idx, n_vertices=n,
-                        device=self.current_device
-                    )
-                elif self._pc_grad_op is not None and self._pc_div_op is not None:
-                    return compute_heat_geodesic_pointcloud(
-                        L=L, M=M, grad_op=self._pc_grad_op, div_op=self._pc_div_op,
-                        source_idx=source_idx, n_vertices=n,
-                        device=self.current_device
-                    )
+            if L is not None and M is not None and self.current_learned_gradient_op is not None:
+                return compute_heat_geodesic_learned(
+                    S=L, M=M, G=self.current_learned_gradient_op,
+                    source_idx=source_idx, n_vertices=n,
+                    device=self.current_device
+                )
 
         elif method_key == 'Robust':
             if self._robust_geodesic_heat:
@@ -1668,7 +1794,7 @@ class RealTimeEigenanalysisVisualizer:
 
         vertices = self.current_gt_data['vertices'].astype(np.float64)
         n = len(vertices)
-        L, M = self._get_method_L_M(method_key)
+        L, M = self._get_geodesic_L_M(method_key)
 
         result_key = method_key
         if method_key == "Robust" and not self._robust_geodesic_heat:
@@ -1690,12 +1816,10 @@ class RealTimeEigenanalysisVisualizer:
             n_sources = len(self._source_indices)
             print(f"\nRecomputing Heat Method geodesic for {method_key} ({n_sources} sources)...")
 
-            operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
-
             _t_solve = time.perf_counter()
 
-            # Use batch solve for PRED with gradient operator (factorize once, solve N times)
-            if (method_key == 'PRED' and operator_mode == 'gradient'
+            # Use batch solve for PRED with learned gradient operator (factorize once, solve N times)
+            if (method_key == 'PRED'
                     and self.current_learned_gradient_op is not None and L is not None and M is not None):
                 all_distances = compute_heat_geodesic_learned_batch(
                     S=L, M=M, G=self.current_learned_gradient_op,
@@ -1728,7 +1852,7 @@ class RealTimeEigenanalysisVisualizer:
                             self._all_geodesic_distances[source_idx] = {}
                         self._all_geodesic_distances[source_idx][result_key] = distances
             else:
-                # Per-source loop for other methods (GT, Robust, NeLo, PRED stiffness mode)
+                # Per-source loop for other methods (GT, Robust, NeLo)
                 for source_idx in self._source_indices:
                     exact_distances = self._exact_geodesics.get(source_idx)
                     if exact_distances is None:
@@ -1885,7 +2009,8 @@ class RealTimeEigenanalysisVisualizer:
         memory accumulation from affecting performance.
         """
         # Clear GPU tensors
-        self.current_stiffness_weights = None
+        self.current_forward_result = None
+        self.current_knn = None
         self.current_areas = None
         self._current_vertices_tensor = None
         self.current_vertex_indices = None
@@ -2055,57 +2180,50 @@ class RealTimeEigenanalysisVisualizer:
 
     def _recompute_pred_laplacian_with_k(self, new_k: int):
         """
-        Recompute PRED stiffness/mass matrices and eigendata with new k.
+        Recompute PRED Laplacian with new k via full model re-inference.
+
+        Changing k requires new patches and a new forward pass since
+        grad_coeffs are specific to the kNN neighborhood.
 
         Args:
             new_k: New number of neighbors per patch
         """
-        print(f"  Recomputing PRED matrices with k={new_k}...")
+        if self.current_model is None or self.current_original_vertices is None:
+            print("[!] Cannot recompute: no model or vertices loaded")
+            return
 
-        # Get new k-NN connectivity
-        new_vertex_indices, new_center_indices, new_batch_indices = self._recompute_knn_connectivity_for_k(new_k)
+        print(f"  Re-running model inference with k={new_k}...")
+        device = self.current_device
+        model = self.current_model
+        vertices = self.current_original_vertices
 
-        # Clone stiffness weights for modification
-        corrected_weights = self.current_stiffness_weights.clone()
+        # Build new patches with new k
+        vertices_t = torch.from_numpy(vertices).float().to(device)
+        patch_data = build_patches_from_vertices(vertices_t, new_k, device=device)
+        batch_data = Batch.from_data_list([patch_data]).to(device)
 
-        # Resize stiffness weights to match new k if necessary
-        current_k = corrected_weights.shape[1]
-        if new_k != current_k:
-            if new_k < current_k:
-                # Truncate to new_k
-                corrected_weights = corrected_weights[:, :new_k]
-                print(f"  Truncated stiffness weights from {current_k} to {new_k}")
-            else:
-                # Pad with zeros or repeat existing weights
-                num_patches = corrected_weights.shape[0]
-                padding_size = new_k - current_k
-                # Use mean of existing weights for padding
-                mean_weights = corrected_weights.mean(dim=1, keepdim=True)
-                padding = mean_weights.expand(-1, padding_size)
-                corrected_weights = torch.cat([corrected_weights, padding], dim=1)
-                print(f"  Padded stiffness weights from {current_k} to {new_k} using mean weights")
+        # Forward pass
+        model.eval()
+        with torch.no_grad():
+            forward_result = model(batch_data)
 
-        # Create attention mask (all True for uniform k)
-        num_patches = corrected_weights.shape[0]
-        attention_mask = torch.ones(num_patches, new_k, dtype=torch.bool, device=corrected_weights.device)
+        # Extract knn
+        batch_sizes = forward_result['batch_sizes']
+        N = len(batch_sizes)
+        k_val = batch_sizes[0].item()
+        knn_t = batch_data.vertex_indices.reshape(N, k_val).to(device)
+        areas = forward_result['areas'].float()
+        grad_coeffs = forward_result['grad_coeffs'].float()
 
-        # Assemble new stiffness and mass matrices
-        top_k = self.reconstruction_settings.pred_top_k if self.reconstruction_settings.enable_top_k_pruning else None
-        sym_policy = self.reconstruction_settings.symmetry_policy
-        new_stiffness_matrix, new_mass_matrix = assemble_stiffness_and_mass_matrices(
-            stiffness_weights=corrected_weights,
-            areas=self.current_areas,
-            attention_mask=attention_mask,
-            vertex_indices=new_vertex_indices,
-            center_indices=new_center_indices,
-            batch_indices=new_batch_indices,
-            top_k=top_k,
-            symmetry_policy=sym_policy
-        )
+        # Assemble with current config
+        lap_areas = areas if self.reconstruction_settings.area_weighted_laplacian else None
+        L = assemble_laplacian(grad_coeffs, knn_t, self.current_lap_config, areas=lap_areas)
+        new_stiffness_matrix = to_scipy_sparse(L)
+        new_mass_matrix = mass_matrix_to_scipy(areas)
 
         print(f"  Assembled new stiffness matrix: {new_stiffness_matrix.shape} ({new_stiffness_matrix.nnz} non-zeros)")
 
-        # Compute new eigendecomposition using generalized problem
+        # Compute new eigendecomposition
         new_eigenvalues, new_eigenvectors = self.compute_eigendecomposition(
             new_stiffness_matrix, k=self.config.num_eigenvectors_to_show, mass_matrix=new_mass_matrix
         )
@@ -2114,13 +2232,73 @@ class RealTimeEigenanalysisVisualizer:
             print(f"  Computed {len(new_eigenvalues)} new eigenvalues")
             print(f"  New eigenvalue range: [{new_eigenvalues[0]:.2e}, {new_eigenvalues[-1]:.6f}]")
 
-            # Update current inference result
+            # Update cached state
             self.current_inference_result['stiffness_matrix'] = new_stiffness_matrix
             self.current_inference_result['mass_matrix'] = new_mass_matrix
             self.current_inference_result['predicted_eigenvalues'] = new_eigenvalues
             self.current_inference_result['predicted_eigenvectors'] = new_eigenvectors
+            self.current_inference_result['forward_result'] = forward_result
+            self.current_forward_result = forward_result
+            self.current_knn = knn_t
+            self.current_areas = areas
+            self.current_vertex_indices = batch_data.vertex_indices.to(device)
+            self.current_center_indices = batch_data.center_indices.to(device)
+            self.current_batch_indices = batch_data.patch_idx.to(device)
+
+            # Reassemble gradient operator
+            try:
+                self.current_learned_gradient_op = assemble_gradient_operator(
+                    grad_coeffs=forward_result['grad_coeffs'],
+                    attention_mask=forward_result['attention_mask'],
+                    vertex_indices=self.current_vertex_indices,
+                    center_indices=self.current_center_indices,
+                    batch_indices=self.current_batch_indices,
+                )
+                print(f"  Updated learned G: {self.current_learned_gradient_op.shape}")
+            except Exception as e:
+                print(f"  [!] Failed to assemble gradient operator: {e}")
+                self.current_learned_gradient_op = None
         else:
             print(f"  Failed to compute eigendecomposition for k={new_k}")
+
+    def _reassemble_with_config(self, new_config: LaplacianConfig):
+        """
+        Reassemble Laplacian from cached forward result with a new config.
+
+        Cheap operation: no kNN or model inference, just matrix assembly.
+        Used when the user changes assembly variant or pruning in the UI.
+        """
+        if self.current_forward_result is None or self.current_knn is None:
+            print("[!] Cannot reassemble: no cached forward result")
+            return
+
+        print(f"  Reassembling with config: {new_config.tag}...")
+        grad_coeffs = self.current_forward_result['grad_coeffs'].float()
+        areas = self.current_forward_result['areas'].float()
+
+        # Pass areas only if area-weighted Laplacian is enabled
+        lap_areas = areas if self.reconstruction_settings.area_weighted_laplacian else None
+        L = assemble_laplacian(grad_coeffs, self.current_knn, new_config, areas=lap_areas)
+        new_stiffness_matrix = to_scipy_sparse(L)
+        new_mass_matrix = mass_matrix_to_scipy(areas)
+
+        print(f"  Assembled: {new_stiffness_matrix.shape} ({new_stiffness_matrix.nnz} non-zeros)")
+
+        # Recompute eigendecomposition
+        new_eigenvalues, new_eigenvectors = self.compute_eigendecomposition(
+            new_stiffness_matrix, k=self.config.num_eigenvectors_to_show,
+            mass_matrix=new_mass_matrix
+        )
+
+        if new_eigenvalues is not None:
+            self.current_lap_config = new_config
+            self.current_inference_result['stiffness_matrix'] = new_stiffness_matrix
+            self.current_inference_result['mass_matrix'] = new_mass_matrix
+            self.current_inference_result['predicted_eigenvalues'] = new_eigenvalues
+            self.current_inference_result['predicted_eigenvectors'] = new_eigenvectors
+            print(f"  Eigenvalue range: [{new_eigenvalues[0]:.2e}, {new_eigenvalues[-1]:.6f}]")
+        else:
+            print(f"  [!] Failed to compute eigendecomposition with config {new_config.tag}")
 
     def _extract_patches_for_mesh_with_k(self, vertices: np.ndarray, k: int) -> Data:
         """
@@ -3170,30 +3348,36 @@ class RealTimeEigenanalysisVisualizer:
         self.current_inference_result = new_inference_result
         print(f"  PRED eigenvalue range: [{new_inference_result['predicted_eigenvalues'][0]:.2e}, {new_inference_result['predicted_eigenvalues'][-1]:.6f}]")
 
-        # Update stored raw weights and areas to stay in sync
-        self.current_stiffness_weights = new_inference_result['stiffness_weights']
+        # Update cached forward result, knn, and areas
+        new_forward_result = new_inference_result.get('forward_result')
+        self.current_forward_result = new_forward_result
         self.current_areas = new_inference_result['areas']
+        if new_forward_result is not None:
+            batch_sizes = new_forward_result['batch_sizes']
+            N = len(batch_sizes)
+            k_val = batch_sizes[0].item()
+            self.current_knn = self.current_vertex_indices.reshape(N, k_val)
 
         # Weight distribution diagnostic for new k
+        stiffness_weights = new_inference_result.get('stiffness_weights')
         mask = new_inference_result.get('attention_mask')
-        if mask is None:
-            mask = torch.ones_like(self.current_stiffness_weights, dtype=torch.bool)
-        self._print_weight_distribution_diagnostic(self.current_stiffness_weights, mask)
+        if mask is None and stiffness_weights is not None:
+            mask = torch.ones_like(stiffness_weights, dtype=torch.bool)
+        if stiffness_weights is not None and mask is not None:
+            self._print_weight_distribution_diagnostic(stiffness_weights, mask)
 
-        # Reassemble learned gradient operator if in gradient mode
-        operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness')
+        # Reassemble learned gradient operator
         new_forward_result = new_inference_result.get('forward_result')
-        if operator_mode == "gradient" and new_forward_result is not None and new_forward_result.get('grad_coeffs') is not None:
+        if new_forward_result is not None and new_forward_result.get('grad_coeffs') is not None:
             try:
                 print("  Reassembling learned gradient operator G for new k...")
                 _t_grad_op = time.perf_counter()
-                batch_indices_for_g = self.current_batch_indices.clone()
                 self.current_learned_gradient_op = assemble_gradient_operator(
                     grad_coeffs=new_forward_result['grad_coeffs'],
                     attention_mask=new_forward_result['attention_mask'],
                     vertex_indices=self.current_vertex_indices,
                     center_indices=self.current_center_indices,
-                    batch_indices=batch_indices_for_g
+                    batch_indices=self.current_batch_indices,
                 )
                 self.timing_results.pred_grad_op_time = time.perf_counter() - _t_grad_op
                 print(f"  Updated learned G: {self.current_learned_gradient_op.shape} ({self.current_learned_gradient_op.nnz} non-zeros)")
@@ -3641,7 +3825,8 @@ class RealTimeEigenanalysisVisualizer:
         import polyscope as ps
 
         vertices = self.current_original_vertices
-        weights = self.current_stiffness_weights  # (N, k)
+        weights = (self.current_forward_result.get('stiffness_weights')
+                   if self.current_forward_result is not None else None)  # (N, k)
         vertex_indices = self.current_vertex_indices  # (N*k,) flat
         center_indices = self.current_center_indices  # (N,)
         batch_indices = self.current_batch_indices    # (N*k,)
@@ -3895,9 +4080,9 @@ class RealTimeEigenanalysisVisualizer:
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                    forward_result = model._forward_pass(batch_data)
+                    forward_result = model(batch_data)
             else:
-                forward_result = model._forward_pass(batch_data)
+                forward_result = model(batch_data)
 
             if device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -3937,19 +4122,18 @@ class RealTimeEigenanalysisVisualizer:
                 torch.cuda.synchronize()
             t_assembly_start = time.perf_counter()
 
-            # Assemble separate stiffness and mass matrices
-            top_k = self.reconstruction_settings.pred_top_k if self.reconstruction_settings.enable_top_k_pruning else None
-            sym_policy = self.reconstruction_settings.symmetry_policy
-            stiffness_matrix, mass_matrix = assemble_stiffness_and_mass_matrices(
-                stiffness_weights=stiffness_weights,
-                areas=areas,
-                attention_mask=attention_mask,
-                vertex_indices=batch_data.vertex_indices,
-                center_indices=batch_data.center_indices,
-                batch_indices=batch_indices,
-                top_k=top_k,
-                symmetry_policy=sym_policy
-            )
+            # Assemble Laplacian using gradient coefficients
+            grad_coeffs = forward_result['grad_coeffs'].float()
+            N = len(batch_sizes)
+            k_val = batch_sizes[0].item()
+            knn_t = batch_data.vertex_indices.reshape(N, k_val).to(device)
+            val_lap_config = getattr(model, '_val_lap_config',
+                                     LaplacianConfig(assembly='diagonal_gram'))
+            self.current_lap_config = val_lap_config
+            lap_areas = areas if self.reconstruction_settings.area_weighted_laplacian else None
+            L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config, areas=lap_areas)
+            stiffness_matrix = to_scipy_sparse(L)
+            mass_matrix = mass_matrix_to_scipy(areas)
 
             t_assembly_end = time.perf_counter()
             pred_assembly_time = t_assembly_end - t_assembly_start
@@ -4807,11 +4991,7 @@ class RealTimeEigenanalysisVisualizer:
                     cmap='viridis'
                 )
         elif self.current_learned_gradient_op is None:
-            operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
-            if operator_mode != "gradient":
-                print("  [i] Curvature gradient vector fields via learned G: skipped (model is in stiffness mode)")
-            else:
-                print("  [!] Learned gradient operator not available")
+            print("  [!] Learned gradient operator not available")
 
     def _compute_eigenvector_cosine_similarities(
             self,
@@ -6064,15 +6244,6 @@ class RealTimeEigenanalysisVisualizer:
         print("STEP 9: HEAT METHOD GEODESIC DISTANCE VALIDATION")
         print("=" * 70)
 
-        # Detect operator mode from the loaded model
-        operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
-        print(f"  Model operator mode: {operator_mode}")
-
-        if not HAS_PCDIFF and operator_mode == "stiffness":
-            print("[!] pcdiff not available and model is in stiffness mode - skipping Heat Method geodesics")
-            print("    Install with: pip install pcdiff")
-            return {}
-
         n = len(vertices)
         vertices = vertices.astype(np.float64)
 
@@ -6286,53 +6457,36 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print(f"\n[GT] Mesh gradient not available, skipping")
 
-        # PRED Laplacian: branch on operator mode
-        if L_pred is not None and M_pred is not None:
-            if operator_mode == "gradient":
-                # === Gradient mode: self-consistent heat method using learned G ===
-                print(f"\nComputing Heat Method geodesic with PRED Laplacian (learned gradient operator)...")
-                try:
-                    # Reuse the gradient operator already assembled in step 5
-                    gradient_operator = self.current_learned_gradient_op
-                    if gradient_operator is not None:
-                        print(f"  Using cached gradient operator G: {gradient_operator.shape} ({gradient_operator.nnz} non-zeros)")
+        # PRED Laplacian: use learned gradient operator for heat method
+        L_pred_geo, M_pred_geo = self._get_geodesic_L_M('PRED')
+        if L_pred_geo is not None and M_pred_geo is not None:
+            print(f"\nComputing Heat Method geodesic with PRED Laplacian (learned gradient operator)...")
+            try:
+                gradient_operator = self.current_learned_gradient_op
+                if gradient_operator is not None:
+                    print(f"  Using cached gradient operator G: {gradient_operator.shape} ({gradient_operator.nnz} non-zeros)")
 
-                        start_time = time.time()
-                        distances = compute_heat_geodesic_learned(
-                            S=L_pred, M=M_pred, G=gradient_operator,
-                            source_idx=source_vertex_idx, n_vertices=n,
-                            device=self.current_device
-                        )
-                        elapsed_ms = (time.time() - start_time) * 1000
-
-                        if distances is not None:
-                            geodesic_distances["PRED"] = distances
-                            self.timing_results.pred_geodesic_solve_time = elapsed_ms / 1000.0
-                            print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
-                            print(f"  Time: {elapsed_ms:.1f} ms")
-                        else:
-                            print(f"  [!] Learned heat method returned None")
-                    else:
-                        print(f"  [!] Learned gradient operator not available, skipping")
-                except Exception as e:
-                    print(f"  [!] Learned heat method failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                # === Stiffness mode: frankenstein heat method (pcdiff grad/div) ===
-                if pc_grad_op is not None and pc_div_op is not None:
-                    print(f"\nComputing Heat Method geodesic with PRED Laplacian (matched k-NN)...")
-                    distances, t, elapsed_ms = compute_heat_geodesic_pointcloud_local(
-                        L_pred, M_pred, pc_grad_op, pc_div_op, "PRED",
+                    start_time = time.time()
+                    distances = compute_heat_geodesic_learned(
+                        S=L_pred_geo, M=M_pred_geo, G=gradient_operator,
+                        source_idx=source_vertex_idx, n_vertices=n,
                         device=self.current_device
                     )
+                    elapsed_ms = (time.time() - start_time) * 1000
+
                     if distances is not None:
                         geodesic_distances["PRED"] = distances
                         self.timing_results.pred_geodesic_solve_time = elapsed_ms / 1000.0
                         print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
                         print(f"  Time: {elapsed_ms:.1f} ms")
+                    else:
+                        print(f"  [!] Learned heat method returned None")
                 else:
-                    print(f"\n[PRED] Point cloud gradient not available, skipping Heat Method")
+                    print(f"  [!] Learned gradient operator not available, skipping")
+            except Exception as e:
+                print(f"  [!] Learned heat method failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         # Robust Laplacian geodesics: pp3d solver (default) or heat method with matched operators
         if L_robust is not None and M_robust is not None:
@@ -6669,14 +6823,21 @@ class RealTimeEigenanalysisVisualizer:
         self.current_inference_result = inference_result
         self.current_predicted_data = predicted_data
 
-        # Store raw data for k-NN slider updates
-        self.current_stiffness_weights = inference_result['stiffness_weights']
+        # Store cached forward result and knn for cheap reassembly
+        forward_result = inference_result.get('forward_result')
+        self.current_forward_result = forward_result
         self.current_areas = inference_result['areas']
         self.current_original_vertices = gt_data['vertices']
-        self.original_k = original_k  # Use the k calculated earlier
+        self.original_k = original_k
         self.current_vertex_indices = patch_data.vertex_indices.to(device)
         self.current_center_indices = patch_data.center_indices.to(device)
-        self.current_batch_indices = patch_data.patch_idx.to(device)  # MeshPatchData uses patch_idx
+        self.current_batch_indices = patch_data.patch_idx.to(device)
+
+        if forward_result is not None:
+            batch_sizes = forward_result['batch_sizes']
+            N = len(batch_sizes)
+            k_val = batch_sizes[0].item()
+            self.current_knn = self.current_vertex_indices.reshape(N, k_val)
 
         # Store model, device, and mesh info for k updates
         self.current_model = model
@@ -6684,21 +6845,18 @@ class RealTimeEigenanalysisVisualizer:
         self.current_mesh_file_path = mesh_file_path
         self.current_faces = gt_data['faces']
 
-        # Assemble learned gradient operator G if in gradient mode
+        # Assemble learned gradient operator
         self.current_learned_gradient_op = None
-        operator_mode = getattr(model, '_operator_mode', 'stiffness')
-        forward_result = inference_result.get('forward_result')
-        if operator_mode == "gradient" and forward_result is not None and forward_result.get('grad_coeffs') is not None:
+        if forward_result is not None and forward_result.get('grad_coeffs') is not None:
             try:
                 print("Assembling learned gradient operator G...")
                 _t_grad_op = time.perf_counter()
-                batch_indices_for_g = self.current_batch_indices.clone()
                 self.current_learned_gradient_op = assemble_gradient_operator(
                     grad_coeffs=forward_result['grad_coeffs'],
                     attention_mask=forward_result['attention_mask'],
                     vertex_indices=self.current_vertex_indices,
                     center_indices=self.current_center_indices,
-                    batch_indices=batch_indices_for_g
+                    batch_indices=self.current_batch_indices,
                 )
                 self.timing_results.pred_grad_op_time = time.perf_counter() - _t_grad_op
                 print(f"  Learned G: {self.current_learned_gradient_op.shape} ({self.current_learned_gradient_op.nnz} non-zeros)")
@@ -6952,8 +7110,6 @@ class RealTimeEigenanalysisVisualizer:
             n = len(vertices)
             all_sources = self._source_indices
 
-            operator_mode = getattr(self.current_model, '_operator_mode', 'stiffness') if self.current_model else 'stiffness'
-
             # ---- Build gradient operators once ----
             gt_grad_div_fn = None
             gt_t = None
@@ -6968,23 +7124,11 @@ class RealTimeEigenanalysisVisualizer:
                 gt_grad_div_fn = make_grad_div_mesh(mesh_grad_op, mesh_face_areas)
                 gt_t = (1.52 * np.sqrt(mesh_face_areas.mean())) ** 2
 
-            # PRED: learned gradient operator or pointcloud fallback
+            # PRED: always use learned gradient operator
             pred_grad_div_fn = None
-            L_pred_geo = inference_result.get('stiffness_matrix')
-            M_pred_geo = inference_result.get('mass_matrix')
-            if L_pred_geo is not None and M_pred_geo is not None:
-                if operator_mode == 'gradient' and self.current_learned_gradient_op is not None:
-                    pred_grad_div_fn = make_grad_div_learned(self.current_learned_gradient_op, M_pred_geo)
-                elif HAS_PCDIFF and self.current_vertex_indices is not None:
-                    # Build pointcloud operators from PRED's k-NN
-                    vertex_indices_np = self.current_vertex_indices.cpu().numpy()
-                    center_indices_np = self.current_center_indices.cpu().numpy()
-                    k_pred = len(vertex_indices_np) // len(center_indices_np)
-                    edge_index = edge_index_from_knn_indices(vertex_indices_np, center_indices_np, k_pred)
-                    pc_grad_op, pc_div_op = build_pointcloud_grad_div_operators(vertices, edge_index)
-                    self._pc_grad_op = pc_grad_op
-                    self._pc_div_op = pc_div_op
-                    pred_grad_div_fn = make_grad_div_pointcloud(pc_grad_op, pc_div_op)
+            L_pred_geo, M_pred_geo = self._get_geodesic_L_M('PRED')
+            if L_pred_geo is not None and M_pred_geo is not None and self.current_learned_gradient_op is not None:
+                pred_grad_div_fn = make_grad_div_learned(self.current_learned_gradient_op, M_pred_geo)
 
             # NeLo: build pointcloud operators from NeLo's own k-NN
             nelo_grad_div_fn = None

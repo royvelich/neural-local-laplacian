@@ -29,6 +29,7 @@ class LossContext:
     attention_mask: Optional[torch.Tensor] = None
     areas: Optional[torch.Tensor] = None
     stiffness_weights: Optional[torch.Tensor] = None
+    gt_vertex_areas: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -362,6 +363,88 @@ class AreaOnlyLogMagnitudeLoss(nn.Module):
             return torch.sum(log_error_sq)
         elif self.reduction == 'none':
             return log_error_sq
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class AreaSupervisionLoss(nn.Module):
+    """
+    Direct area supervision using log-space MSE against GT barycentric areas.
+
+    Supervises the area head with ground-truth vertex areas computed from the
+    training mesh (barycentric 1/3 areas from Delaunay triangulation).
+
+    Loss:
+        L = mean_i (log(a_i^pred) - log(a_i^gt))^2
+
+    This trains the area head to predict geometric vertex areas rather than
+    curvature-compensating scale factors (which is what AreaOnlyLogMagnitudeLoss
+    learns). Log space ensures equal relative-error penalty across vertices
+    regardless of absolute area magnitude.
+
+    Requires gt_vertex_areas in the LossContext (set by synthetic datasets).
+    """
+
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8):
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.gt_vertex_areas is None:
+            raise ValueError("AreaSupervisionLoss requires ctx.gt_vertex_areas to be set")
+        if ctx.areas is None:
+            raise ValueError("AreaSupervisionLoss requires ctx.areas to be set")
+
+        log_pred = torch.log(ctx.areas + self.eps)
+        log_gt = torch.log(ctx.gt_vertex_areas + self.eps)
+        log_error_sq = (log_pred - log_gt) ** 2
+
+        if self.reduction == 'mean':
+            return torch.mean(log_error_sq)
+        elif self.reduction == 'sum':
+            return torch.sum(log_error_sq)
+        elif self.reduction == 'none':
+            return log_error_sq
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class GradientL2RegularizationLoss(nn.Module):
+    """
+    L2 regularization on gradient coefficients to prevent scale drift.
+
+    Without this, g_ij can grow unboundedly because cosine loss is
+    scale-invariant and AreaOnlyLogMagnitudeLoss detaches the numerator.
+    This anchors ||g_ij|| to a reasonable magnitude.
+
+    Loss:
+        L = mean_i (1/k) sum_j ||g_ij||^2
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.grad_coeffs is None:
+            raise ValueError("GradientL2RegularizationLoss requires ctx.grad_coeffs")
+
+        # ||g_ij||^2 averaged over all (i, j) pairs
+        # grad_coeffs: (batch_size, max_k, 3)
+        sq_norms = (ctx.grad_coeffs ** 2).sum(dim=2)  # (batch_size, max_k)
+
+        if ctx.attention_mask is not None:
+            sq_norms = sq_norms.masked_fill(~ctx.attention_mask, 0.0)
+            n_valid = ctx.attention_mask.sum()
+            if n_valid > 0:
+                return sq_norms.sum() / n_valid
+            return sq_norms.sum() * 0.0  # no valid entries
+
+        if self.reduction == 'mean':
+            return sq_norms.mean()
+        elif self.reduction == 'sum':
+            return sq_norms.sum()
         else:
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
 

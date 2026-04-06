@@ -444,6 +444,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             attention_mask=forward_result['attention_mask'],
             areas=forward_result['areas'],
             stiffness_weights=forward_result['stiffness_weights'],
+            gt_vertex_areas=getattr(batch_data, 'gt_vertex_areas', None),
         )
 
         total_loss = 0.0
