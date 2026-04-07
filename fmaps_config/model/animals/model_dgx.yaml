@@ -13,8 +13,6 @@ module:
 
   geo_cache_workers: 4
 
-  area_weighted_laplacian: false
-
   train_laplacian:
     assembly: diagonal_gram
     pruning: none
