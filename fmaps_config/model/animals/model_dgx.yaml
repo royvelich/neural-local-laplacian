@@ -8,7 +8,7 @@ module:
   seed: ${globals.training_seed}
 
   mode: train
-  baselines: [model]
+  baselines: [robust, model]
   geo_cache_dir: ./geo_cache
   eval_results_dir: ./eval_results/model
 
