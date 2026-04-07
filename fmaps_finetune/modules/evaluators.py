@@ -429,13 +429,10 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
         shape_b = self._build_shape_with_basis(
             vertices_b, eigvals_b, eigvecs_b, mass_b)
 
-        # Set use_k for the initial fmap (smaller basis for solving)
-        k_init = self.zoomout_k_init if self.use_zoomout else k_total
-        k_init = min(k_init, k_total)
-        shape_a.basis.use_k = k_init
-        shape_b.basis.use_k = k_init
-
-        # --- Step 2: Compute descriptors via GeomFuM ---
+        # --- Step 2: Compute descriptors using FULL eigenbasis ---
+        # HKS/WKS quality depends on having high-frequency eigenvectors.
+        # use_k is already k_total from _build_shape_with_basis, so
+        # descriptors see all available eigenvectors.
         descr_a = self._compute_descriptors(shape_a)
         descr_b = self._compute_descriptors(shape_b)
 
@@ -450,14 +447,20 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
                 f"Eigenvalues may be too large for stable HKS/WKS computation."
             )
 
-        # --- Step 3: Solve for C via ForwardFunctionalMap ---
+        # --- Step 3: Truncate basis for initial fmap solve ---
+        k_init = self.zoomout_k_init if self.use_zoomout else k_total
+        k_init = min(k_init, k_total)
+        shape_a.basis.use_k = k_init
+        shape_b.basis.use_k = k_init
+
+        # --- Step 4: Solve for C via ForwardFunctionalMap ---
         ffm = ForwardFunctionalMap(
             lmbda=self.fmap_lmbda,
             resolvent_gamma=self.fmap_resolvent_gamma,
         )
         fmap_matrix, _ = ffm(shape_a, shape_b, descr_a, descr_b)
 
-        # --- Step 4: Optional ZoomOut refinement ---
+        # --- Step 5: Optional ZoomOut refinement ---
         if self.use_zoomout:
             k_final = min(self.zoomout_k_final, k_total)
             if k_final > k_init:
@@ -473,7 +476,7 @@ class FunctionalMapEvaluator(ShapePairEvaluator):
         # Convert to numpy for metrics computation
         fmap_np = np.array(fmap_matrix)
 
-        # --- Step 5: Compute metrics ---
+        # --- Step 6: Compute metrics ---
         k_eval_a = min(fmap_np.shape[1], eigvecs_a.shape[1])
         k_eval_b = min(fmap_np.shape[0], eigvecs_b.shape[1])
 
