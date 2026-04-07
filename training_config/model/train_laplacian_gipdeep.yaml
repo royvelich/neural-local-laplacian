@@ -14,6 +14,11 @@ module:
   output_projection_hidden_dims: null
 #  mcv_mode: 'full_gram'      # anisotropic, can be negative
   mcv_mode: 'diagonal_gram'  # isotropic, always positive (default)
+#  val_laplacian:
+#    assembly: diagonal_gram
+#    pruning: none
+
+  normalize_grad_by_k: true
 
   val_laplacian:
     assembly: diagonal_gram
@@ -23,9 +28,22 @@ module:
   loss_configs:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 2.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaWeightedMSELoss
+#      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
       weight: 1.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
-      weight: 50.0
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+      weight: 5.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GradientL2RegularizationLoss
+#      weight: 0.001
+

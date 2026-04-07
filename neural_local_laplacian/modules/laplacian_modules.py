@@ -102,6 +102,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  normalize_patch_features: bool = True,
                  scale_areas_by_patch_size: bool = True,
                  mcv_mode: str = 'diagonal_gram',
+                 normalize_grad_by_k: bool = False,
                  val_laplacian: Optional[Dict] = None,
                  **kwargs):
         # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
@@ -149,6 +150,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._normalize_patch_features = normalize_patch_features
         self._scale_areas_by_patch_size = scale_areas_by_patch_size
         self._mcv_mode = mcv_mode
+        self._normalize_grad_by_k = normalize_grad_by_k
 
         # Validation Laplacian config
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
@@ -393,6 +395,14 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # ── Output heads ─────────────────────────────────────────────
         grad_coeffs = self.grad_projection(encoded)
+
+        # Normalize grad_coeffs by 1/sqrt(k) so that the Laplacian's
+        # eigenvalues stay stable as k changes.  ||g_ij/sqrt(k)||^2 = ||g_ij||^2/k
+        # turns the neighbor sum into a mean.
+        if self._normalize_grad_by_k:
+            k_per_patch = batch_sizes.float()  # (batch_size,)
+            grad_coeffs = grad_coeffs / k_per_patch[:, None, None].sqrt()
+
         stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)
 
         # ── Area prediction ──────────────────────────────────────────
