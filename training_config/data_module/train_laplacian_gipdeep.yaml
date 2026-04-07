@@ -5,7 +5,7 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
       seed: ${globals.training_seed}
-      epoch_size: 900
+      epoch_size: 2100
       grid_radius_range: [1.0]
       polynomial_offset_range: [0.0]
       points_scale_range: [1.0]
@@ -27,7 +27,7 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_area: False
-    batch_size: 50
+    batch_size: 70
     num_workers: 0
     shuffle: True
   val_dataset_specifications:
@@ -35,7 +35,7 @@ module:
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
         mesh_folder_path: '/mnt/gipnetapp_public/neural-cotangent-weights/shrec15'
-        max_meshes: 50
+        max_meshes: 20
         file_size_range_mb: [0.5, 4]
         require_manifold: True
 #        mesh_folder_paths:
