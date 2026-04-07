@@ -257,13 +257,14 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                 attention_mask.view(batch_size, max_k))
 
     def _compute_mean_curvature_vectors(self, forward_result: Dict[str, torch.Tensor],
-                                        batch_data: Batch) -> torch.Tensor:
+                                        batch_data: Batch) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute predicted mean curvature vectors from gradient coefficients and areas.
 
-        Mode determines how weights are computed:
-        - 'diagonal_gram': w_ij = ||g_ij||^2  (always positive, isotropic)
-        - 'full_gram':     w_ij = g_ii . g_ij  (can be negative, anisotropic)
+        Returns:
+            Tuple of (predicted_mcv, raw_stiffness_action):
+            - predicted_mcv: MCV = (Σ w_ij (p_j - p_i)) / A_i, shape (batch_size, 3)
+            - raw_stiffness_action: Σ w_ij (p_j - p_i), shape (batch_size, 3)
         """
         areas = forward_result['areas']
         attention_mask = forward_result['attention_mask']
@@ -301,7 +302,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         stiffness_sum.scatter_add_(
             0, valid_batch_idx.unsqueeze(-1).expand(-1, 3), weighted_pos)
 
-        return stiffness_sum / areas.unsqueeze(-1)
+        predicted_mcv = stiffness_sum / areas.unsqueeze(-1)
+        return predicted_mcv, stiffness_sum
 
     def _reshape_positions_to_batched(self, pos_flat: torch.Tensor,
                                       batch_sizes: torch.Tensor) -> torch.Tensor:
@@ -424,7 +426,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         """Training step with variable-sized patch support."""
         batch_data = batch[0]
         forward_result = self.forward(batch_data)
-        predicted_mcv = self._compute_mean_curvature_vectors(forward_result, batch_data)
+        predicted_mcv, predicted_raw_mcv = self._compute_mean_curvature_vectors(forward_result, batch_data)
 
         batch_size = len(forward_result['batch_sizes'])
         normals = batch_data.normal
@@ -434,6 +436,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         loss_context = LossContext(
             predicted_mcv=predicted_mcv,
             target_mcv=target_mcv,
+            predicted_raw_mcv=predicted_raw_mcv,
             grad_coeffs=forward_result.get('grad_coeffs'),
             positions=(self._reshape_positions_to_batched(
                            batch_data.pos, forward_result['batch_sizes'])

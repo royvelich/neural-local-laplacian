@@ -23,6 +23,7 @@ class LossContext:
     """
     predicted_mcv: torch.Tensor
     target_mcv: torch.Tensor
+    predicted_raw_mcv: Optional[torch.Tensor] = None  # areas * predicted_mcv (before area division)
     grad_coeffs: Optional[torch.Tensor] = None
     positions: Optional[torch.Tensor] = None
     normals: Optional[torch.Tensor] = None
@@ -115,6 +116,46 @@ class AreaWeightedMSELoss(nn.Module):
 
         # Area-weighted mean
         return (weights * sq_error).mean()
+
+
+class StiffnessActionLoss(nn.Module):
+    """
+    Direct supervision of the stiffness matrix action on positions.
+
+    Compares the raw Laplacian action (before area division):
+        pred: A_i^pred * MCV_i^pred  =  sum_j w_ij (p_j - p_i)
+        gt:   A_i^gt   * MCV_i^gt
+
+    Loss:
+        L = mean_i || A_i^pred * MCV_i^pred  -  A_i^gt * MCV_i^gt ||^2
+
+    This directly supervises the stiffness weights' action on positions,
+    decoupling from area head accuracy. Requires gt_vertex_areas.
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.predicted_raw_mcv is None:
+            raise ValueError("StiffnessActionLoss requires ctx.predicted_raw_mcv")
+        if ctx.gt_vertex_areas is None:
+            raise ValueError("StiffnessActionLoss requires ctx.gt_vertex_areas")
+
+        # Target: A_gt * MCV_gt
+        target_raw = ctx.gt_vertex_areas[:, None] * ctx.target_mcv
+
+        sq_error = ((ctx.predicted_raw_mcv - target_raw) ** 2).sum(dim=1)
+
+        if self.reduction == 'mean':
+            return torch.mean(sq_error)
+        elif self.reduction == 'sum':
+            return torch.sum(sq_error)
+        elif self.reduction == 'none':
+            return sq_error
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
 
 
 class DirectionMSELoss(nn.Module):
