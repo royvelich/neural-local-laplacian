@@ -11,3 +11,4 @@ fmaps_finetune_results/
 surface_patch_screenshots*/
 geo_cache/
 eval_results/
+wandb_models/
