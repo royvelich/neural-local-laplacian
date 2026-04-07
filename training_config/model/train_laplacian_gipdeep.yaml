@@ -20,8 +20,8 @@ module:
 #    pruning: none
 
   val_laplacian:
-    assembly: diagonal_gram
-    pruning: none
+    assembly: full_gram
+    pruning: knn
 
   feature_extractor: null
   loss_configs:

@@ -28,7 +28,7 @@ module:
         root: "/workspace/datasets/DeformingThings4DMatching-Animals"
         pairs:
           - ':10'
-      val_poses_per_pair: 5
+      val_poses_per_pair: 8
       seed: ${globals.training_seed}
     batch_size: 1
     num_workers: 0
