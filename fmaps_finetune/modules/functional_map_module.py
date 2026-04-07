@@ -974,8 +974,8 @@ def _correspondence_metrics(
 ) -> Dict[str, float]:
     """Functional map metrics from eigenbases."""
     n_a = eigvecs_a.shape[0]
-    weighted_phi_b = eigvecs_b[gt_corr[:n_a]] * mass_b[gt_corr[:n_a], None] \
-        if gt_corr is not None else eigvecs_b[:n_a] * mass_b[:n_a, None]
+    weighted_phi_b = eigvecs_b[gt_corr[:n_a]] * mass_a[:n_a, None] \
+        if gt_corr is not None else eigvecs_b[:n_a] * mass_a[:n_a, None]
     C    = weighted_phi_b.T @ eigvecs_a[:n_a]
     k_fm = C.shape[0]
     I    = np.eye(k_fm)

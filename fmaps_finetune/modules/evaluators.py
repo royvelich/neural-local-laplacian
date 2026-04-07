@@ -181,7 +181,7 @@ class SpectralNNEvaluator(ShapePairEvaluator):
     """Evaluate via ground-truth functional map + NN in spectral space.
 
     This is the current evaluation pipeline:
-    1. Build GT functional map C = Φ_B^T M_B Π Φ_A
+    1. Build GT functional map C = Φ_B(T)^T M_A Φ_A
     2. Project A's spectral embedding through C
     3. Find nearest neighbours in B's spectral embedding
     4. Measure accuracy and error against GT correspondence
@@ -207,8 +207,8 @@ class SpectralNNEvaluator(ShapePairEvaluator):
         if gt_corr is None:
             gt_corr = np.arange(n_a)
 
-        # Build GT functional map: C = Φ_B^T M_B Π Φ_A
-        weighted_phi_b = eigvecs_b[gt_corr[:n_a]] * mass_b[gt_corr[:n_a], None]
+        # Build GT functional map: C = Φ_B(T)^T M_A Φ_A
+        weighted_phi_b = eigvecs_b[gt_corr[:n_a]] * mass_a[:n_a, None]
         C = weighted_phi_b.T @ eigvecs_a[:n_a]
 
         # Quality metrics on C itself
