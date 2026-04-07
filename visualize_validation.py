@@ -192,7 +192,6 @@ class VisualizationConfig:
 @dataclass
 class ReconstructionSettings:
     """Settings for mesh reconstruction visualization."""
-    use_pred_areas: bool = True  # Required for M-orthonormal eigenvectors from generalized EVP
     current_pred_k: int = 20  # Will be updated with actual k from dataset
     current_robust_k: int = 20  # Independent k for robust-laplacian
 
@@ -528,7 +527,7 @@ class RealTimeEigenanalysisVisualizer:
         self._exact_geodesics: Optional[Dict[int, np.ndarray]] = None  # source_idx -> exact distances
         self._greens_gt_values: Optional[Dict[int, np.ndarray]] = None  # source_idx -> GT Green's fn
 
-        # Per-source results (all sources × all methods)
+        # Per-source results (all sources x all methods)
         self._all_greens_results: Dict[int, Dict[str, 'GreensFunctionResult']] = {}  # source_idx -> {method -> result}
         self._all_geodesic_results: Dict[int, Dict[str, 'HeatMethodGeodesicResult']] = {}
 
@@ -596,24 +595,8 @@ class RealTimeEigenanalysisVisualizer:
         """ImGui callback for reconstruction settings window."""
         import polyscope.imgui as psim
 
-        # Checkbox for using predicted areas for area-weighted reconstruction
         psim.Text("PRED Mesh Reconstruction Options:")
         psim.Separator()
-
-        changed, new_setting = psim.Checkbox(
-            "Use Predicted Areas (Area-Weighted)",
-            self.reconstruction_settings.use_pred_areas
-        )
-
-        if changed:
-            self.reconstruction_settings.use_pred_areas = new_setting
-            print(f"[*] Reconstruction setting changed: use_pred_areas = {new_setting}")
-
-            # Re-compute and update reconstructions if we have current data
-            if self._has_current_batch_data():
-                self._recompute_and_update_reconstructions()
-
-        psim.Text("")
 
         # k-NN input fields for PRED and Robust (independent)
         if self.original_k is not None:
@@ -855,12 +838,6 @@ class RealTimeEigenanalysisVisualizer:
 
         psim.Text("")
         psim.Text("Current Settings:")
-        if self.reconstruction_settings.use_pred_areas:
-            psim.TextColored((0.0, 1.0, 0.0, 1.0), "[OK] Using predicted areas from model")
-            psim.Text("  (Area-weighted reconstruction for PRED)")
-        else:
-            psim.TextColored((1.0, 0.5, 0.0, 1.0), "[o] Using standard Euclidean reconstruction")
-            psim.Text("  (Standard L2 projection for PRED)")
 
         if self.original_k is not None:
             psim.Text(f"Dataset k: {self.original_k}, PRED k: {self.reconstruction_settings.current_pred_k}, Robust k: {self.reconstruction_settings.current_robust_k}, NeLo k: {self.nelo_k}")
@@ -899,7 +876,7 @@ class RealTimeEigenanalysisVisualizer:
             psim.Text("")
 
             # Table header
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<20} {'Time (ms)':>12}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<22} {'Time (ms)':>12}")
             psim.Separator()
 
             # PRED breakdown
@@ -965,7 +942,7 @@ class RealTimeEigenanalysisVisualizer:
                 psim.Text("")
                 psim.Separator()
                 psim.Text(f"Geodesic E2E: L,M + Grad + Solve{src_note} (ms):")
-                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<12} {'L,M':>7} {'Grad':>7} {'Solve':>7} {'TOTAL':>7}")
+                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<14} {'L,M':>7} {'Grad':>7} {'Solve':>7} {'TOTAL':>7}")
 
                 for label, color, lm_t, grad_t, geo_t in [
                     ('GT',     (0.0, 1.0, 0.0, 1.0), t.gt_matrix_assembly_time,     t.gt_grad_op_time,   t.gt_geodesic_solve_time),
@@ -975,20 +952,20 @@ class RealTimeEigenanalysisVisualizer:
                     if geo_t > 0:
                         geo_avg = geo_t / n_src
                         total = lm_t + grad_t + geo_avg
-                        psim.TextColored(color, f"{label:<12} {lm_t*1000:>7.0f} {grad_t*1000:>7.0f} {geo_avg*1000:>7.0f} {total*1000:>7.0f}")
+                        psim.TextColored(color, f"  {label:<14} {lm_t*1000:>7.0f} {grad_t*1000:>7.0f} {geo_avg*1000:>7.0f} {total*1000:>7.0f}")
 
                 # Robust pp3d: self-contained
                 if t.robust_geodesic_solve_time > 0:
                     geo_avg = t.robust_geodesic_solve_time / n_src
                     if self._robust_geodesic_heat:
                         total = t.robust_matrix_assembly_time + geo_avg
-                        psim.TextColored((0.0, 0.7, 1.0, 1.0), f"{'Robust':<12} {t.robust_matrix_assembly_time*1000:>7.0f} {'incl.':>7} {geo_avg*1000:>7.0f} {total*1000:>7.0f}")
+                        psim.TextColored((0.0, 0.7, 1.0, 1.0), f"  {'Robust':<14} {t.robust_matrix_assembly_time*1000:>7.0f} {'incl.':>7} {geo_avg*1000:>7.0f} {total*1000:>7.0f}")
                     else:
-                        psim.TextColored((0.0, 0.7, 1.0, 1.0), f"{'Robust(pp3d)':<12} {'—':>7} {'—':>7} {geo_avg*1000:>7.0f} {geo_avg*1000:>7.0f}")
+                        psim.TextColored((0.0, 0.7, 1.0, 1.0), f"  {'Robust(pp3d)':<14} {'---':>7} {'---':>7} {geo_avg*1000:>7.0f} {geo_avg*1000:>7.0f}")
 
                 psim.Text("")
                 psim.Text(f"Green's E2E: L,M + Solve{src_note} (ms):")
-                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"{'Method':<12} {'L,M':>7} {'Solve':>7} {'TOTAL':>7}")
+                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<14} {'L,M':>7} {'Solve':>7} {'TOTAL':>7}")
 
                 for label, color, lm_t, grn_t in [
                     ('GT',     (0.0, 1.0, 0.0, 1.0), t.gt_matrix_assembly_time,     t.gt_greens_solve_time),
@@ -999,7 +976,7 @@ class RealTimeEigenanalysisVisualizer:
                     if grn_t > 0:
                         grn_avg = grn_t / n_src
                         total = lm_t + grn_avg
-                        psim.TextColored(color, f"{label:<12} {lm_t*1000:>7.0f} {grn_avg*1000:>7.0f} {total*1000:>7.0f}")
+                        psim.TextColored(color, f"  {label:<14} {lm_t*1000:>7.0f} {grn_avg*1000:>7.0f} {total*1000:>7.0f}")
         else:
             psim.Text("(No timing data yet)")
 
@@ -1038,7 +1015,7 @@ class RealTimeEigenanalysisVisualizer:
 
         if self.current_heat_geodesic_results is not None and len(self.current_heat_geodesic_results) > 0:
             # Header
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<16} {'Corr':>7} {'MAE':>7} {'MaxErr':>7} {'Mono':>7}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<14} {'Corr':>7} {'MAE':>7} {'MaxErr':>7} {'Mono':>7}")
             psim.Separator()
 
             for method_name, result in self.current_heat_geodesic_results.items():
@@ -1052,7 +1029,7 @@ class RealTimeEigenanalysisVisualizer:
 
                 if is_unreasonable:
                     color = (1.0, 0.0, 0.0, 1.0)  # Red for unreasonable
-                    label = f"  {method_name + ' [!]':<16} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}"
+                    label = f"  {method_name + ' [!]':<14} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}"
                 else:
                     # Color code by correlation quality
                     if corr > 0.99:
@@ -1061,7 +1038,7 @@ class RealTimeEigenanalysisVisualizer:
                         color = (1.0, 1.0, 0.0, 1.0)  # Yellow
                     else:
                         color = (1.0, 0.3, 0.0, 1.0)  # Orange-red
-                    label = f"  {method_name:<16} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}"
+                    label = f"  {method_name:<14} {corr:>7.4f} {mae:>7.4f} {max_err:>7.4f} {mono:>7.4f}"
 
                 psim.TextColored(color, label)
 
@@ -1069,12 +1046,13 @@ class RealTimeEigenanalysisVisualizer:
             if self._aggregated_geodesic_metrics:
                 psim.Text("")
                 n_src = len(self._source_indices) if self._source_indices else 0
-                psim.Text(f"Aggregated ({n_src} sources, mean±std):")
-                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<16} {'Corr':>14} {'MAE':>14} {'Mono':>14}")
+                psim.Text(f"Aggregated ({n_src} sources, mean+/-std):")
+                psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<14} {'Corr':>14} {'MAE':>14} {'Mono':>14}")
                 for method, agg in self._aggregated_geodesic_metrics.items():
-                    psim.Text(f"  {method:<16} {agg.corr_mean:.3f}±{agg.corr_std:.3f}"
-                              f"  {agg.mae_mean:.3f}±{agg.mae_std:.3f}"
-                              f"  {agg.mono_mean:.3f}±{agg.mono_std:.3f}")
+                    corr_s = f"{agg.corr_mean:>6.3f}+/-{agg.corr_std:.3f}"
+                    mae_s  = f"{agg.mae_mean:>6.3f}+/-{agg.mae_std:.3f}"
+                    mono_s = f"{agg.mono_mean:>6.3f}+/-{agg.mono_std:.3f}"
+                    psim.Text(f"  {method:<14} {corr_s:>14} {mae_s:>14} {mono_s:>14}")
 
             # Source vertex selector
             if self._source_indices and len(self._source_indices) > 1:
@@ -1157,7 +1135,7 @@ class RealTimeEigenanalysisVisualizer:
         psim.Text("Probe Function MSE (Lf error, NeLo Table 1):")
 
         if self._probe_function_results:
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<16} {'Raw MSE':>10} {'Cos Sim':>10} {'R_MSE>1':>10}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<14} {'Raw MSE':>10} {'Cos Sim':>10} {'R_MSE>1':>10}")
             for method, res in self._probe_function_results.items():
                 raw_mse = res['mse']
                 cos_sim = res.get('cosine_similarity', 0.0)
@@ -1170,7 +1148,7 @@ class RealTimeEigenanalysisVisualizer:
                     color = (1.0, 1.0, 0.0, 1.0)
                 else:
                     color = (1.0, 0.3, 0.0, 1.0)
-                psim.TextColored(color, f"  {method:<16} {raw_mse:>10.6f} {cos_sim:>10.6f} {fr:>9.1%}")
+                psim.TextColored(color, f"  {method:<14} {raw_mse:>10.6f} {cos_sim:>10.6f} {fr:>9.1%}")
         else:
             psim.Text("(Not computed yet)")
 
@@ -1184,7 +1162,7 @@ class RealTimeEigenanalysisVisualizer:
             psim.Text("Shape Descriptors (HKS/WKS vs GT):")
 
         if self._descriptor_results:
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<12} {'HKS L2':>8} {'HKS Corr':>9} {'WKS L2':>8} {'WKS Corr':>9}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<14} {'HKS L2':>8} {'HKS Corr':>9} {'WKS L2':>8} {'WKS Corr':>9}")
             for method, res in self._descriptor_results.items():
                 h_l2 = res['hks_l2_error']
                 h_c = res['hks_correlation']
@@ -1196,7 +1174,7 @@ class RealTimeEigenanalysisVisualizer:
                     color = (1.0, 1.0, 0.0, 1.0)
                 else:
                     color = (1.0, 0.3, 0.0, 1.0)
-                psim.TextColored(color, f"  {method:<12} {h_l2:>8.4f} {h_c:>9.4f} {w_l2:>8.4f} {w_c:>9.4f}")
+                psim.TextColored(color, f"  {method:<14} {h_l2:>8.4f} {h_c:>9.4f} {w_l2:>8.4f} {w_c:>9.4f}")
         else:
             psim.Text("(Not computed yet)")
 
@@ -1259,7 +1237,7 @@ class RealTimeEigenanalysisVisualizer:
         if gt_evals is not None:
             gt_np = gt_evals.cpu().numpy() if torch.is_tensor(gt_evals) else np.asarray(gt_evals)
 
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<12} {'λ₁(Fiedler)':>12} {'λ_max':>12} {'Scale':>8}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Method':<14} {'Fiedler':>12} {'Max':>12} {'Scale':>8}")
             psim.Separator()
 
             for label, evals, color in [
@@ -1278,10 +1256,10 @@ class RealTimeEigenanalysisVisualizer:
                             gt_pos = gt_np[1:]
                             m_pos = e_np[1:min(len(e_np), len(gt_np))]
                             valid = (gt_pos[:len(m_pos)] > 1e-10) & (m_pos > 1e-10)
-                            ratio_str = f"{float(np.median(m_pos[valid] / gt_pos[:len(m_pos)][valid])):.1f}×" if valid.sum() > 0 else "N/A"
+                            ratio_str = f"{float(np.median(m_pos[valid] / gt_pos[:len(m_pos)][valid])):.1f}x" if valid.sum() > 0 else "N/A"
                         else:
-                            ratio_str = "1.0×"
-                        psim.TextColored(color, f"  {label:<12} {fiedler:>12.4f} {emax:>12.4f} {ratio_str:>8}")
+                            ratio_str = "1.0x"
+                        psim.TextColored(color, f"  {label:<14} {fiedler:>12.4f} {emax:>12.4f} {ratio_str:>8}")
         else:
             psim.Text("(Not computed yet)")
 
@@ -1294,17 +1272,17 @@ class RealTimeEigenanalysisVisualizer:
         pred_areas_raw = self.current_inference_result.get('areas') if self.current_inference_result else None
 
         if gt_areas is not None or pred_areas_raw is not None:
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Source':<12} {'Total':>12} {'Mean':>12} {'Std':>12}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Source':<14} {'Total':>12} {'Mean':>12} {'Std':>12}")
             psim.Separator()
 
             if gt_areas is not None:
                 psim.TextColored((0.0, 1.0, 0.0, 1.0),
-                    f"  {'GT':<12} {float(np.sum(gt_areas)):>12.6f} {float(np.mean(gt_areas)):>12.6f} {float(np.std(gt_areas)):>12.6f}")
+                    f"  {'GT':<14} {float(np.sum(gt_areas)):>12.6f} {float(np.mean(gt_areas)):>12.6f} {float(np.std(gt_areas)):>12.6f}")
 
             if pred_areas_raw is not None:
                 pa = pred_areas_raw.cpu().numpy() if torch.is_tensor(pred_areas_raw) else np.asarray(pred_areas_raw)
                 psim.TextColored((1.0, 0.5, 0.0, 1.0),
-                    f"  {'PRED':<12} {float(np.sum(pa)):>12.6f} {float(np.mean(pa)):>12.6f} {float(np.std(pa)):>12.6f}")
+                    f"  {'PRED':<14} {float(np.sum(pa)):>12.6f} {float(np.mean(pa)):>12.6f} {float(np.std(pa)):>12.6f}")
 
                 if gt_areas is not None:
                     ratio = float(np.sum(pa)) / float(np.sum(gt_areas)) if float(np.sum(gt_areas)) > 1e-15 else 0.0
@@ -1327,16 +1305,16 @@ class RealTimeEigenanalysisVisualizer:
         pred_H = self.current_predicted_data.get('predicted_mean_curvature') if self.current_predicted_data else None
 
         if gt_H is not None or pred_H is not None:
-            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Source':<12} {'Min':>10} {'Max':>10} {'Mean':>10} {'Std':>10}")
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), f"  {'Source':<14} {'Min':>10} {'Max':>10} {'Mean':>10} {'Std':>10}")
             psim.Separator()
 
             if gt_H is not None:
                 psim.TextColored((0.0, 1.0, 0.0, 1.0),
-                    f"  {'GT':<12} {float(gt_H.min()):>10.4f} {float(gt_H.max()):>10.4f} {float(np.mean(gt_H)):>10.4f} {float(np.std(gt_H)):>10.4f}")
+                    f"  {'GT':<14} {float(gt_H.min()):>10.4f} {float(gt_H.max()):>10.4f} {float(np.mean(gt_H)):>10.4f} {float(np.std(gt_H)):>10.4f}")
 
             if pred_H is not None:
                 psim.TextColored((1.0, 0.5, 0.0, 1.0),
-                    f"  {'PRED |H|':<12} {float(pred_H.min()):>10.4f} {float(pred_H.max()):>10.4f} {float(np.mean(pred_H)):>10.4f} {float(np.std(pred_H)):>10.4f}")
+                    f"  {'PRED |H|':<14} {float(pred_H.min()):>10.4f} {float(pred_H.max()):>10.4f} {float(np.mean(pred_H)):>10.4f} {float(np.std(pred_H)):>10.4f}")
 
             if gt_H is not None and pred_H is not None:
                 valid = np.isfinite(gt_H) & np.isfinite(pred_H)
@@ -2002,20 +1980,14 @@ class RealTimeEigenanalysisVisualizer:
             torch.cuda.empty_cache()
 
     def _compute_predicted_vertex_areas(self, inference_result: Dict) -> Optional[np.ndarray]:
-        """Compute predicted vertex areas based on current settings.
-
-        Uses the areas predicted by the model's area head.
-        """
-        if not self.reconstruction_settings.use_pred_areas:
-            return None
-
+        """Extract predicted vertex areas from inference result."""
         if inference_result.get('areas') is not None:
             areas = inference_result['areas']
             predicted_vertex_areas = areas.cpu().numpy() if torch.is_tensor(areas) else areas
             print(f"Using predicted areas from model (range: [{predicted_vertex_areas.min():.6f}, {predicted_vertex_areas.max():.6f}])")
             return predicted_vertex_areas
         else:
-            print(f"[!] No predicted areas available, falling back to standard reconstruction")
+            print(f"[!] No predicted areas available")
             return None
 
     def _compute_all_reconstructions(self, gt_data: Dict, inference_result: Dict) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
@@ -2035,15 +2007,15 @@ class RealTimeEigenanalysisVisualizer:
                 vertex_areas=gt_data.get('vertex_areas')  # Always use PyFM areas
             )
 
-        # Compute predicted reconstructions (respecting current setting)
+        # Compute predicted reconstructions (always M-weighted)
         if inference_result['predicted_eigenvectors'] is not None:
             predicted_vertex_areas = self._compute_predicted_vertex_areas(inference_result)
             pred_reconstructions = self.compute_mesh_reconstruction(
-                gt_data['vertices'],  # Use original vertices as reference
+                gt_data['vertices'],
                 inference_result['predicted_eigenvectors'],
                 inference_result['predicted_eigenvalues'],
                 self.config.num_eigenvectors_to_show,
-                vertex_areas=predicted_vertex_areas  # None for standard, or predicted areas from model
+                vertex_areas=predicted_vertex_areas
             )
 
         # Compute robust-laplacian reconstructions (always use area weighting with robust areas)
@@ -2690,7 +2662,7 @@ class RealTimeEigenanalysisVisualizer:
 
         src_label = "PRED areas" if area_source == "pred" else "GT areas"
         print(f"\n  [Weyl Calibration] Area source: {src_label}, total area: {total_area:.6f}")
-        print(f"  [Weyl Calibration] Factor α = {alpha:.2f} (PRED evals are {alpha:.1f}× Weyl expectation)")
+        print(f"  [Weyl Calibration] Factor α = {alpha:.2f} (PRED evals are {alpha:.1f}x Weyl expectation)")
         print(f"  [Weyl Calibration] Calibrated eigenvalue range: [{self._weyl_calibrated_evals[0]:.4e}, {self._weyl_calibrated_evals[-1]:.4f}]")
         if self.current_gt_data.get('gt_eigenvalues') is not None:
             gt_evals = self.current_gt_data['gt_eigenvalues']
@@ -3087,24 +3059,25 @@ class RealTimeEigenanalysisVisualizer:
         if self._aggregated_geodesic_metrics:
             print(f"\nGEODESIC QUALITY (averaged over {n_sources} sources, normalized [0,1])")
             print(f"{'-' * 80}")
-            print(f"{'Method':<16} {'Corr':>14} {'MAE':>14} {'MaxErr':>14} {'Mono':>14}")
+            print(f"{'Method':<18} {'Corr':>14} {'MAE':>14} {'MaxErr':>14} {'Mono':>14}")
             print(f"{'-' * 80}")
             for method, agg in self._aggregated_geodesic_metrics.items():
-                print(f"{method:<16} {agg.corr_mean:>6.4f}±{agg.corr_std:<5.4f}"
-                      f" {agg.mae_mean:>6.4f}±{agg.mae_std:<5.4f}"
-                      f" {agg.max_err_mean:>6.4f}±{agg.max_err_std:<5.4f}"
-                      f" {agg.mono_mean:>6.4f}±{agg.mono_std:<5.4f}")
+                corr_s   = f"{agg.corr_mean:>7.4f}±{agg.corr_std:.4f}"
+                mae_s    = f"{agg.mae_mean:>7.4f}±{agg.mae_std:.4f}"
+                maxerr_s = f"{agg.max_err_mean:>7.4f}±{agg.max_err_std:.4f}"
+                mono_s   = f"{agg.mono_mean:>7.4f}±{agg.mono_std:.4f}"
+                print(f"{method:<18} {corr_s:>14} {mae_s:>14} {maxerr_s:>14} {mono_s:>14}")
 
         # Green's function table
         if self._aggregated_greens_metrics:
             print(f"\nGREEN'S FUNCTION QUALITY (averaged over {n_sources} sources)")
             print(f"{'-' * 80}")
-            print(f"{'Method':<16} {'GT Corr':>14} {'Mono':>14} {'MaxPrinc Pass':>14}")
+            print(f"{'Method':<18} {'GT Corr':>14} {'Mono':>14} {'MaxPrinc Pass':>14}")
             print(f"{'-' * 80}")
             for method, agg in self._aggregated_greens_metrics.items():
-                print(f"{method:<16} {agg.greens_corr_with_gt_mean:>6.4f}±{agg.greens_corr_with_gt_std:<5.4f}"
-                      f" {agg.greens_mono_mean:>6.4f}±{agg.greens_mono_std:<5.4f}"
-                      f" {agg.greens_max_principle_pass_rate:>12.0%}")
+                corr_s = f"{agg.greens_corr_with_gt_mean:>7.4f}±{agg.greens_corr_with_gt_std:.4f}"
+                mono_s = f"{agg.greens_mono_mean:>7.4f}±{agg.greens_mono_std:.4f}"
+                print(f"{method:<18} {corr_s:>14} {mono_s:>14} {agg.greens_max_principle_pass_rate:>13.0%}")
 
         print(f"{'=' * 80}\n")
 
@@ -4471,9 +4444,7 @@ class RealTimeEigenanalysisVisualizer:
             # Position all PRED reconstructions at the same location (front)
             offset_vertices = pred_vertices + pred_offset
 
-            # Include reconstruction method in name
-            method_suffix = " (Pred Areas)" if self.reconstruction_settings.use_pred_areas else " (Standard)"
-            mesh_name = f"PRED Recon {num_eigenvecs:02d} eigenvec (lambda={pred_eigenval:.3f}){method_suffix}"
+            mesh_name = f"PRED Recon {num_eigenvecs:02d} eigenvec (lambda={pred_eigenval:.3f}) (Pred Areas)"
 
             try:
                 pred_mesh = ps.register_surface_mesh(
