@@ -2,6 +2,6 @@
 
 training_seed: 42
 ckpt_path: null
-checkpoint_path: "/workspace/models/model31.ckpt"
+checkpoint_path: "/workspace/models/model32.ckpt"
 num_eigenvectors: 100
 k: 15
