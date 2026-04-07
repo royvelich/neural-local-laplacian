@@ -8,16 +8,16 @@ module:
   seed: ${globals.training_seed}
 
   mode: train
-  baselines: [model, robust]
+  baselines: [model]
   geo_cache_dir: ./geo_cache
   eval_results_dir: ./eval_results/model
 
   geo_cache_workers: 4
 
-  area_weighted_laplacian: true
+  area_weighted_laplacian: false
 
   train_laplacian:
-    assembly: full_gram
+    assembly: diagonal_gram
     pruning: knn
 
   eval_laplacians:
