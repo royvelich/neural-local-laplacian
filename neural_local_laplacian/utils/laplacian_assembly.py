@@ -5,11 +5,14 @@ Takes gradient coefficients (N, k, 3) and kNN indices (N, k) and returns
 either a dense (N, N) torch tensor or a scipy.sparse.csr_matrix, controlled
 by the `sparse` flag in LaplacianConfig.
 
-Areas are NOT included in L — the learned g_ij already carry the integration
-measure from training against cotangent weights.
+Area weighting is controlled by config.area_weighted:
+    False (default): S has pure gradient weights (FEM-like, analogous to cotangent).
+                     Eigenvalue problem: S v = λ M v (areas only in M).
+    True:            S includes area scaling (graph-Laplacian-like).
+                     Eigenvalue problem: M·S₀ v = λ M v → areas partially cancel.
 
-The eigenvalue problem is: L v = λ M v, where M = diag(areas) is
-constructed separately by the caller from fwd['areas'].
+The mass matrix M = diag(areas) is always constructed separately by the
+caller from fwd['areas'].
 
 Assembly variants:
     diagonal_gram: scalar w_ij = ||g_ij||^2, kNN-sparse (no 2-hop)
@@ -56,6 +59,7 @@ class LaplacianConfig:
     k_prune: Optional[int] = None
     sparse: bool = False
     torch_sparse: bool = False
+    area_weighted: bool = False  # If True, multiply areas into S (graph-Laplacian-like)
 
     def __post_init__(self):
         if self.assembly not in ('diagonal_gram', 'full_gram'):
@@ -75,6 +79,8 @@ class LaplacianConfig:
     def tag(self) -> str:
         """Short string tag for logging/metric prefixes."""
         t = self.assembly
+        if self.area_weighted:
+            t += '_aw'
         if self.pruning == 'knn':
             t += f'_knn{self.k_prune}'
         elif self.pruning == 'topk':
@@ -103,9 +109,8 @@ def assemble_laplacian(
         grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
         knn: (N, k) kNN indices used for assembly.
         config: LaplacianConfig specifying assembly + pruning + sparse.
-        areas: (N,) per-vertex areas. When provided, edge weights are
-               scaled by areas (w_ij *= a_i), matching the proper
-               Galerkin discretization L = G^T M G.
+        areas: (N,) per-vertex areas. Always pass this (needed for M).
+               Only multiplied into S when config.area_weighted is True.
         knn_prune: (N, k') optional kNN indices for pruning='knn'.
                    If None and pruning='knn', uses the assembly knn.
 
@@ -113,25 +118,26 @@ def assemble_laplacian(
         Dense torch.Tensor, scipy.sparse.csr_matrix, or torch sparse
         COO tensor depending on config.sparse / config.torch_sparse.
     """
+    # Only pass areas into S assembly when area_weighted is set
+    s_areas = areas if config.area_weighted else None
+
     if config.torch_sparse:
-        # Torch sparse path — returns torch.sparse_coo_tensor with autograd
         if config.assembly == 'full_gram':
-            return _assemble_full_gram_torch_sparse(grad_coeffs, knn, areas)
+            return _assemble_full_gram_torch_sparse(grad_coeffs, knn, s_areas)
         else:
-            return _assemble_diagonal_gram_torch_sparse(grad_coeffs, knn, areas)
+            return _assemble_diagonal_gram_torch_sparse(grad_coeffs, knn, s_areas)
 
     if config.sparse:
-        # Scipy sparse path — returns scipy.sparse.csr_matrix (no autograd)
         if config.assembly == 'full_gram':
-            return _assemble_full_gram_sparse(grad_coeffs, knn, areas)
+            return _assemble_full_gram_sparse(grad_coeffs, knn, s_areas)
         else:
-            return _assemble_diagonal_gram_sparse(grad_coeffs, knn, areas)
+            return _assemble_diagonal_gram_sparse(grad_coeffs, knn, s_areas)
 
-    # Dense path — returns torch.Tensor
+    # Dense path
     if config.assembly == 'full_gram':
-        L = assemble_full_gram_laplacian(grad_coeffs, knn, areas)
+        L = assemble_full_gram_laplacian(grad_coeffs, knn, s_areas)
     else:
-        L = assemble_diagonal_gram_laplacian(grad_coeffs, knn, areas)
+        L = assemble_diagonal_gram_laplacian(grad_coeffs, knn, s_areas)
 
     # Pruning (dense only)
     if config.pruning == 'knn':

@@ -196,10 +196,6 @@ class ReconstructionSettings:
     current_pred_k: int = 20  # Will be updated with actual k from dataset
     current_robust_k: int = 20  # Independent k for robust-laplacian
 
-    # Area weighting toggles
-    area_weighted_laplacian: bool = True   # Multiply edge weights by areas in L assembly
-    area_weighted_geodesics: bool = True   # Use area-weighted S for geodesic heat method
-
     # Top-k weight pruning for PRED
     enable_top_k_pruning: bool = False  # When enabled, prune to top_k highest weights per patch
     pred_top_k: int = 6  # Number of highest weights to keep per patch
@@ -739,41 +735,6 @@ class RealTimeEigenanalysisVisualizer:
         psim.Separator()
         psim.Text("PRED Laplacian Assembly:")
 
-        # Area weighting toggles
-        area_lap_changed, new_area_lap = psim.Checkbox(
-            "Area-weighted Laplacian",
-            self.reconstruction_settings.area_weighted_laplacian
-        )
-        if area_lap_changed:
-            self.reconstruction_settings.area_weighted_laplacian = new_area_lap
-            print(f"[*] Area-weighted Laplacian: {new_area_lap}")
-            if self._has_current_batch_data():
-                self._reassemble_with_config(self.current_lap_config)
-                self.current_predicted_data = self.compute_predicted_quantities_from_laplacian(
-                    self.current_inference_result['stiffness_matrix'],
-                    self.current_gt_data['vertices'],
-                    mass_matrix=self.current_inference_result.get('mass_matrix')
-                )
-                self._remove_existing_reconstructions()
-                self._update_mesh_reconstructions(self.current_gt_data, self.current_inference_result)
-                self._update_eigenvector_visualizations()
-                if self.current_mesh_structure is not None:
-                    self.add_comprehensive_curvature_visualizations(
-                        self.current_mesh_structure, self.current_gt_data,
-                        self.current_predicted_data, self.current_inference_result
-                    )
-                self._recompute_validations_after_k_change("PRED")
-
-        area_geo_changed, new_area_geo = psim.Checkbox(
-            "Area-weighted Geodesics",
-            self.reconstruction_settings.area_weighted_geodesics
-        )
-        if area_geo_changed:
-            self.reconstruction_settings.area_weighted_geodesics = new_area_geo
-            print(f"[*] Area-weighted Geodesics: {new_area_geo}")
-            if self._has_current_batch_data():
-                self._update_geodesics_for_method("PRED")
-
         psim.Text("")
 
         assembly_options = ['diagonal_gram', 'full_gram']
@@ -781,6 +742,12 @@ class RealTimeEigenanalysisVisualizer:
             if self.current_lap_config.assembly in assembly_options else 0
         assembly_changed, new_assembly_idx = psim.Combo(
             "Assembly", current_assembly_idx, assembly_options
+        )
+
+        # Area-weighted checkbox (part of LaplacianConfig)
+        aw_changed, new_aw = psim.Checkbox(
+            "Area-weighted (areas in S)",
+            self.current_lap_config.area_weighted
         )
 
         pruning_options = ['none', 'knn', 'topk']
@@ -800,12 +767,13 @@ class RealTimeEigenanalysisVisualizer:
             )
             new_k_prune = max(3, min(100, new_k_prune))
 
-        if assembly_changed or pruning_changed or k_prune_changed:
+        if assembly_changed or pruning_changed or k_prune_changed or aw_changed:
             new_pruning = pruning_options[new_pruning_idx]
             new_config = LaplacianConfig(
                 assembly=assembly_options[new_assembly_idx],
                 pruning=new_pruning,
                 k_prune=new_k_prune if new_pruning in ('knn', 'topk') else None,
+                area_weighted=new_aw,
             )
             if new_config.tag != self.current_lap_config.tag:
                 print(f"[*] Laplacian config changed: {self.current_lap_config.tag} -> {new_config.tag}")
@@ -1536,28 +1504,6 @@ class RealTimeEigenanalysisVisualizer:
 
         return None, None
 
-    def _get_geodesic_L_M(self, method_key: str) -> Tuple[Optional[Any], Optional[Any]]:
-        """Return (L, M) for geodesic computation, respecting area_weighted_geodesics toggle.
-
-        For PRED: when area_weighted_geodesics is False, reassembles L without areas.
-        For other methods: delegates to _get_method_L_M.
-        """
-        if method_key != 'PRED':
-            return self._get_method_L_M(method_key)
-
-        if self.current_forward_result is None or self.current_knn is None:
-            return self._get_method_L_M(method_key)
-
-        if self.reconstruction_settings.area_weighted_geodesics:
-            # Use the same L as eigendecomposition (already assembled)
-            return self._get_method_L_M(method_key)
-
-        # Reassemble L without areas for geodesics
-        grad_coeffs = self.current_forward_result['grad_coeffs'].float()
-        areas = self.current_forward_result['areas'].float()
-        L = assemble_laplacian(grad_coeffs, self.current_knn, self.current_lap_config)
-        return to_scipy_sparse(L), mass_matrix_to_scipy(areas)
-
     def _update_sparsity_for_method(self, method_key: str):
         """Recompute sparsity stats for a single method, keeping others unchanged."""
         L, _ = self._get_method_L_M(method_key)
@@ -1794,7 +1740,7 @@ class RealTimeEigenanalysisVisualizer:
 
         vertices = self.current_gt_data['vertices'].astype(np.float64)
         n = len(vertices)
-        L, M = self._get_geodesic_L_M(method_key)
+        L, M = self._get_method_L_M(method_key)
 
         result_key = method_key
         if method_key == "Robust" and not self._robust_geodesic_heat:
@@ -2215,9 +2161,8 @@ class RealTimeEigenanalysisVisualizer:
         areas = forward_result['areas'].float()
         grad_coeffs = forward_result['grad_coeffs'].float()
 
-        # Assemble with current config
-        lap_areas = areas if self.reconstruction_settings.area_weighted_laplacian else None
-        L = assemble_laplacian(grad_coeffs, knn_t, self.current_lap_config, areas=lap_areas)
+        # Assemble with current config (config.area_weighted controls whether areas go into S)
+        L = assemble_laplacian(grad_coeffs, knn_t, self.current_lap_config, areas=areas)
         new_stiffness_matrix = to_scipy_sparse(L)
         new_mass_matrix = mass_matrix_to_scipy(areas)
 
@@ -2276,9 +2221,8 @@ class RealTimeEigenanalysisVisualizer:
         grad_coeffs = self.current_forward_result['grad_coeffs'].float()
         areas = self.current_forward_result['areas'].float()
 
-        # Pass areas only if area-weighted Laplacian is enabled
-        lap_areas = areas if self.reconstruction_settings.area_weighted_laplacian else None
-        L = assemble_laplacian(grad_coeffs, self.current_knn, new_config, areas=lap_areas)
+        # config.area_weighted controls whether areas go into S
+        L = assemble_laplacian(grad_coeffs, self.current_knn, new_config, areas=areas)
         new_stiffness_matrix = to_scipy_sparse(L)
         new_mass_matrix = mass_matrix_to_scipy(areas)
 
@@ -4130,8 +4074,7 @@ class RealTimeEigenanalysisVisualizer:
             val_lap_config = getattr(model, '_val_lap_config',
                                      LaplacianConfig(assembly='diagonal_gram'))
             self.current_lap_config = val_lap_config
-            lap_areas = areas if self.reconstruction_settings.area_weighted_laplacian else None
-            L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config, areas=lap_areas)
+            L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config, areas=areas)
             stiffness_matrix = to_scipy_sparse(L)
             mass_matrix = mass_matrix_to_scipy(areas)
 
@@ -6458,7 +6401,7 @@ class RealTimeEigenanalysisVisualizer:
             print(f"\n[GT] Mesh gradient not available, skipping")
 
         # PRED Laplacian: use learned gradient operator for heat method
-        L_pred_geo, M_pred_geo = self._get_geodesic_L_M('PRED')
+        L_pred_geo, M_pred_geo = self._get_method_L_M('PRED')
         if L_pred_geo is not None and M_pred_geo is not None:
             print(f"\nComputing Heat Method geodesic with PRED Laplacian (learned gradient operator)...")
             try:
@@ -7126,7 +7069,7 @@ class RealTimeEigenanalysisVisualizer:
 
             # PRED: always use learned gradient operator
             pred_grad_div_fn = None
-            L_pred_geo, M_pred_geo = self._get_geodesic_L_M('PRED')
+            L_pred_geo, M_pred_geo = self._get_method_L_M('PRED')
             if L_pred_geo is not None and M_pred_geo is not None and self.current_learned_gradient_op is not None:
                 pred_grad_div_fn = make_grad_div_learned(self.current_learned_gradient_op, M_pred_geo)
 

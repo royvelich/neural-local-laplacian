@@ -1229,7 +1229,6 @@ def evaluate_pair(
     laplacian_configs: Optional[List[LaplacianConfig]] = None,
     evaluators: Optional[List] = None,
     geo_cache = None,
-    area_weighted_laplacian: bool = True,
 ) -> Dict[str, float]:
     """Evaluate correspondence quality using functional maps (non-differentiable).
 
@@ -1239,7 +1238,6 @@ def evaluate_pair(
             Defaults to [LaplacianConfig(assembly='diagonal_gram')].
         evaluators: List of ShapePairEvaluator instances.
         geo_cache: Precomputed GeodesicCache for mesh B.
-        area_weighted_laplacian: If True, multiply areas into L assembly.
     """
     if laplacian_configs is None:
         laplacian_configs = [LaplacianConfig(assembly='diagonal_gram')]
@@ -1275,8 +1273,7 @@ def evaluate_pair(
                 knn_prune_np = compute_knn(verts, cfg.k_prune)
                 knn_prune = torch.from_numpy(knn_prune_np).long().to(device)
 
-            L = assemble_laplacian(grad_coeffs, knn_t, cfg,
-                                   areas=M_diag if area_weighted_laplacian else None,
+            L = assemble_laplacian(grad_coeffs, knn_t, cfg, areas=M_diag,
                                    knn_prune=knn_prune)
             evals, evecs = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
 
@@ -1326,6 +1323,7 @@ def evaluate_pair_robust(
     n_neighbors: int = 30,
     evaluators: Optional[List] = None,
     geo_cache = None,
+    area_weighted: bool = False,
 ) -> Dict[str, float]:
     """Evaluate using robust Laplacian (baseline, no model).
 
@@ -1335,12 +1333,17 @@ def evaluate_pair_robust(
             When None, uses the legacy _correspondence_metrics path.
         geo_cache: Precomputed GeodesicCache for mesh B.
             If None and pair has faces_b, builds on the fly.
+        area_weighted: If True, multiply S by diag(areas) to get
+            graph-Laplacian-like behaviour (areas in both S and M).
     """
     import robust_laplacian
     n_a = len(pair.verts_a)
     bases: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
         S, M     = robust_laplacian.point_cloud_laplacian(verts, n_neighbors=n_neighbors)
+        if area_weighted:
+            M_diag = np.array(M.diagonal()).flatten()
+            S = scipy.sparse.diags(M_diag) @ S
         evals, evecs = compute_laplacian_eigendecomposition(S, num_eigenvectors, mass_matrix=M)
         bases[label] = (evecs, evals, np.array(M.diagonal()).flatten())
 
@@ -1498,8 +1501,6 @@ class FunctionalMapModule(LaplacianModuleBase):
         eval_results_dir: Optional[str] = None,  # eval output directory (None = {default_root_dir}/eval_results)
         mode: str = 'train',                     # 'train', 'eval', or 'geo_cache'
         baselines: Optional[List[str]] = None,   # ['robust', 'model'] (default), or subset
-        # Area weighting
-        area_weighted_laplacian: bool = True,    # multiply areas into L assembly
         # GeomFuM evaluation (optional)
         use_geomfum_eval: bool = False,
         geomfum_descriptors: Optional[List[str]] = None,
@@ -2231,11 +2232,17 @@ class FunctionalMapModule(LaplacianModuleBase):
                 ds_label = f" [{ds_name}]" if len(all_val_datasets) > 1 else ""
 
                 # ── Robust Laplacian baseline (all ranks, distributed) ────
+                robust_variants = []
                 if 'robust' in baselines_to_run:
+                    robust_variants.append(('robust', False))
+                if 'robust_aw' in baselines_to_run:
+                    robust_variants.append(('robust_aw', True))
+
+                for rb_name, rb_area_weighted in robust_variants:
                     try:
                         import robust_laplacian  # noqa: F401
                         if is_rank0:
-                            print(f"\n  Computing robust Laplacian baseline{ds_label} "
+                            print(f"\n  Computing {rb_name} Laplacian baseline{ds_label} "
                                   f"({n_total} pairs, {world_size} rank(s))...", flush=True)
 
                         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2243,11 +2250,12 @@ class FunctionalMapModule(LaplacianModuleBase):
                         if hp.geo_cache_workers is not None:
                             rb_n_workers = min(rb_n_workers, hp.geo_cache_workers)
 
-                        def _eval_robust(p):
+                        def _eval_robust(p, _aw=rb_area_weighted):
                             return evaluate_pair_robust(
                                 _subsample(p), hp.num_eigenvectors,
                                 evaluators=self._evaluators,
-                                geo_cache=self._get_geo_cache(p.name))
+                                geo_cache=self._get_geo_cache(p.name),
+                                area_weighted=_aw)
 
                         # Distribute pairs across ranks (same pattern as model baseline)
                         my_indices = list(range(self.global_rank, n_total, world_size))
@@ -2269,7 +2277,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                                     n_my = len(my_pairs)
                                     eta = (dt / done_count) * (n_my - done_count)
                                     cw = len(str(n_total))
-                                    print(f"    [robust ~{min(total_done, n_total):>{cw}}/{n_total}] "
+                                    print(f"    [{rb_name} ~{min(total_done, n_total):>{cw}}/{n_total}] "
                                           f"{my_pairs[j].name}... "
                                           f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
                                           flush=True)
@@ -2326,15 +2334,15 @@ class FunctionalMapModule(LaplacianModuleBase):
                                   flush=True)
 
                             rb_summary = self._summarise_and_print(
-                                robust_metrics, f"Robust baseline{ds_label}")
+                                robust_metrics, f"{rb_name} baseline{ds_label}")
                             self.logger.log_metrics(
-                                {f"baseline/robust/{ds_name}/{k}": v
+                                {f"baseline/{rb_name}/{ds_name}/{k}": v
                                  for k, v in rb_summary.items()}, step=0)
-                            eval_results[ds_name]["robust"] = (robust_metrics, rb_summary)
+                            eval_results[ds_name][rb_name] = (robust_metrics, rb_summary)
                     except ImportError:
                         if is_rank0:
                             print("  (robust_laplacian not installed — "
-                                  "skipping robust baseline)")
+                                  f"skipping {rb_name} baseline)")
 
                     # Synchronise ranks after robust baseline
                     if world_size > 1:
@@ -2363,8 +2371,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                                               hp.k, hp.num_eigenvectors, device,
                                               laplacian_configs=self._eval_lap_configs,
                                               evaluators=self._evaluators,
-                                              geo_cache=self._get_geo_cache(val_pairs[i].name),
-                                              area_weighted_laplacian=hp.area_weighted_laplacian)
+                                              geo_cache=self._get_geo_cache(val_pairs[i].name))
                             my_metrics.append(m)
                             n_my = len(my_indices)
                             if is_rank0:
@@ -2527,12 +2534,10 @@ class FunctionalMapModule(LaplacianModuleBase):
                     knn_sp_a_t = torch.from_numpy(knn_sp_a).long().to(device)
                     knn_sp_b_t = torch.from_numpy(knn_sp_b).long().to(device)
                 S_A = assemble_laplacian(fwd_a['grad_coeffs'], knn_a_t, lap_cfg,
-                                        areas=fwd_a['areas'] if hp.area_weighted_laplacian else None,
-                                        knn_prune=knn_sp_a_t)
+                                        areas=fwd_a['areas'], knn_prune=knn_sp_a_t)
                 M_A = fwd_a['areas']
                 S_B = assemble_laplacian(fwd_b['grad_coeffs'], knn_b_t, lap_cfg,
-                                        areas=fwd_b['areas'] if hp.area_weighted_laplacian else None,
-                                        knn_prune=knn_sp_b_t)
+                                        areas=fwd_b['areas'], knn_prune=knn_sp_b_t)
                 M_B = fwd_b['areas']
 
             with prof.phase("losses"):
@@ -2616,7 +2621,6 @@ class FunctionalMapModule(LaplacianModuleBase):
             laplacian_configs=self._eval_lap_configs,
             evaluators=self._evaluators,
             geo_cache=self._get_geo_cache(pair.name),
-            area_weighted_laplacian=self.hparams.area_weighted_laplacian,
         ))
 
         # Progress print (rank 0)
