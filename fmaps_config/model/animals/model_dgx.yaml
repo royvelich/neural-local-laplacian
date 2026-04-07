@@ -23,7 +23,7 @@ module:
     - assembly: diagonal_gram
       area_weighted: true                  # graph-Laplacian-like
 
-  baselines: ['robust', 'robust_aw', 'model']
+  baselines: ['model']
 
   losses:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
