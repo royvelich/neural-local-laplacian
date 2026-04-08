@@ -12,7 +12,7 @@ module:
         pairs: [0.7]
       num_samples: 640
       seed: ${globals.training_seed}
-    batch_size: 2
+    batch_size: 4
     num_workers: 0
     shuffle: true
     collate_fn:
