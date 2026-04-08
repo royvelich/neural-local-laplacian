@@ -4,7 +4,7 @@ _target_: lightning.pytorch.Trainer
 accelerator: auto
 devices: auto
 strategy: auto
-max_epochs: 500
+max_epochs: -1
 accumulate_grad_batches: 1
 gradient_clip_val: 0.0
 gradient_clip_algorithm: norm
