@@ -715,7 +715,7 @@ class HeatMethodGeodesicLoss(nn.Module):
         num_sample_vertices: int = 512,
         landmark_ratio: Optional[float] = None,
         landmark_seed: int = 0,
-        eps: float = 1e-4,
+        eps: float = 1e-6,
         normalize: bool = True,
         weight: float = 1.0,
     ):
