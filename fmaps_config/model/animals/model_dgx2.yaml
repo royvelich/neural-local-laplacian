@@ -56,7 +56,7 @@ module:
   geomfum_descriptors:
     - hks
     - wks
-  geomfum_zoomout: true
+  geomfum_zoomout: false
   geomfum_zoomout_k_init: 20
   geomfum_zoomout_k_final: 50
   geomfum_zoomout_n_iters: 10
