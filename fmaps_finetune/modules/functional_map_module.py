@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 
 import scipy.sparse
-import scipy.sparse.linalg
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -35,10 +34,6 @@ from neural_local_laplacian.utils.utils import (
 from neural_local_laplacian.utils.laplacian_assembly import (
     LaplacianConfig,
     assemble_laplacian,
-    assemble_full_gram_laplacian,
-    assemble_diagonal_gram_laplacian,
-    prune_to_knn,
-    prune_to_topk,
 )
 
 from fmaps_finetune.datasets.functional_map_dataset import (
@@ -143,96 +138,6 @@ def build_patch_data(vertices_t: torch.Tensor, knn: np.ndarray, device: torch.de
         vertex_indices=knn_t.flatten(),
         center_indices=torch.arange(N, device=device),
     )
-
-
-def compute_laplacian_differentiable(
-    model: LaplacianTransformerModule,
-    vertices_np: np.ndarray,
-    k: int,
-    device: torch.device,
-    sparsify: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Full forward pass: vertices → dense differentiable (L, M_diag).
-
-    Args:
-        model: LaplacianTransformerModule in gradient mode.
-        vertices_np: (N, 3) vertex positions.
-        k: kNN neighborhood size.
-        device: torch device.
-        sparsify: If True, prune L to kNN sparsity pattern.
-
-    Returns:
-        L: (N, N) dense Laplacian.
-        M_diag: (N,) mass diagonal (areas).
-    """
-    vertices_t = torch.from_numpy(vertices_np).float().to(device)
-    knn        = compute_knn(vertices_np, k)
-    knn_t      = torch.from_numpy(knn).long().to(device)
-    batch_data = Batch.from_data_list([build_patch_data(vertices_t, knn, device)]).to(device)
-    fwd        = model(batch_data)
-
-    L = assemble_full_gram_laplacian(fwd['grad_coeffs'], knn_t,
-                                     areas=fwd['areas'].detach())
-    if sparsify:
-        L = prune_to_knn(L, knn_t)
-    return L, fwd['areas'].detach()
-
-
-# =============================================================================
-# Differentiable eigendecomposition (stable backward)
-# =============================================================================
-
-class _StableEigh(torch.autograd.Function):
-    """eigh with clamped eigenvalue gaps in backward to prevent NaN."""
-
-    @staticmethod
-    def forward(ctx, A, min_gap):
-        eigenvalues, eigenvectors = torch.linalg.eigh(A)
-        ctx.save_for_backward(eigenvalues, eigenvectors)
-        ctx.min_gap = min_gap
-        return eigenvalues, eigenvectors
-
-    @staticmethod
-    def backward(ctx, grad_evals, grad_evecs):
-        evals, evecs = ctx.saved_tensors
-        min_gap      = ctx.min_gap
-        N            = evals.shape[0]
-
-        col_norms    = grad_evecs.norm(dim=0)
-        active_mask  = col_norms > 0
-        if grad_evals is not None:
-            active_mask = active_mask | (grad_evals.abs() > 0)
-        active_idx  = torch.where(active_mask)[0]
-        if len(active_idx) == 0:
-            return torch.zeros_like(evecs @ evecs.T), None
-
-        dV_active = grad_evecs[:, active_idx]
-        VtdV      = evecs.T @ dV_active
-        deval     = grad_evals if grad_evals is not None else torch.zeros(N, device=evals.device)
-        gaps      = evals[:, None] - evals[None, active_idx]
-        gaps_clamped = gaps.sign() * gaps.abs().clamp(min=min_gap)
-        F_active  = VtdV / gaps_clamped
-        for j_local, j_global in enumerate(active_idx):
-            F_active[j_global, j_local] = deval[j_global]
-
-        V_active = evecs[:, active_idx]
-        grad_A   = (evecs @ F_active) @ V_active.T
-        return 0.5 * (grad_A + grad_A.T), None
-
-
-def stable_eigh(A: torch.Tensor, min_gap: float = 1.0):
-    return _StableEigh.apply(A, min_gap)
-
-
-def differentiable_eigh(
-    S: torch.Tensor, M_diag: torch.Tensor, k: int, min_gap: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Differentiable generalized eigendecomposition with stable backward."""
-    M_sqrt_inv = 1.0 / M_diag.sqrt().clamp(min=1e-8)
-    S_std      = (S * M_sqrt_inv[None, :]) * M_sqrt_inv[:, None]
-    S_std      = 0.5 * (S_std + S_std.T)
-    evals_all, evecs_all = stable_eigh(S_std, min_gap)
-    return evals_all[1:k+1], evecs_all[:, 1:k+1] * M_sqrt_inv[:, None]
 
 
 # =============================================================================
@@ -1187,39 +1092,6 @@ def _build_geo_cache(pair: PairSample) -> Optional['GeodesicCache']:
 
 
 @torch.no_grad()
-def _eigh_from_dense_L(
-    L: torch.Tensor, M_diag_t: torch.Tensor, num_eigenvectors: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    M_inv_sqrt = 1.0 / M_diag_t.sqrt().clamp(min=1e-8)
-    L_std      = L * M_inv_sqrt[:, None] * M_inv_sqrt[None, :]
-    L_std      = 0.5 * (L_std + L_std.T)
-    evals_all, evecs_all = torch.linalg.eigh(L_std)
-    evals = evals_all[:num_eigenvectors].cpu().numpy()
-    evecs = (M_inv_sqrt[:, None] * evecs_all[:, :num_eigenvectors]).cpu().numpy()
-    return evals, evecs
-
-
-@torch.no_grad()
-def _eigh_from_sparse_L(
-    L_sp: torch.Tensor, M_diag_t: torch.Tensor, num_eigenvectors: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    N      = L_sp.shape[0]
-    L_np   = L_sp.cpu().numpy()
-    M_np   = M_diag_t.cpu().numpy()
-    rows, cols = np.nonzero(L_np)
-    L_scipy = scipy.sparse.csc_matrix((L_np[rows, cols], (rows, cols)), shape=(N, N))
-    M_scipy = scipy.sparse.diags(M_np)
-    try:
-        evals, evecs = scipy.sparse.linalg.eigsh(
-            L_scipy, k=num_eigenvectors, M=M_scipy,
-            sigma=-1e-6, which='LM', v0=np.ones(N))
-        order = np.argsort(evals)
-        return evals[order], evecs[:, order]
-    except Exception:
-        return _eigh_from_dense_L(L_sp, M_diag_t, num_eigenvectors)
-
-
-@torch.no_grad()
 def evaluate_pair(
     model: LaplacianTransformerModule,
     pair: PairSample,
@@ -1267,15 +1139,36 @@ def evaluate_pair(
         for cfg in laplacian_configs:
             tag = cfg.tag
 
+            # Force sparse assembly for eval (no gradients needed).
+            # Pruning is only supported in dense mode, so fall back for pruned configs.
+            use_sparse = cfg.pruning == 'none'
+            eval_cfg = LaplacianConfig(
+                assembly=cfg.assembly,
+                pruning=cfg.pruning,
+                k_prune=cfg.k_prune,
+                sparse=use_sparse,
+                area_weighted=cfg.area_weighted,
+            )
+
             # Compute knn_prune if needed
             knn_prune = None
             if cfg.pruning == 'knn' and cfg.k_prune is not None and cfg.k_prune != k:
                 knn_prune_np = compute_knn(verts, cfg.k_prune)
                 knn_prune = torch.from_numpy(knn_prune_np).long().to(device)
 
-            L = assemble_laplacian(grad_coeffs, knn_t, cfg, areas=M_diag,
-                                   knn_prune=knn_prune)
-            evals, evecs = _eigh_from_sparse_L(L, M_diag, num_eigenvectors)
+            L_assembled = assemble_laplacian(grad_coeffs, knn_t, eval_cfg, areas=M_diag,
+                                             knn_prune=knn_prune)
+
+            # Convert to scipy sparse if dense (pruned configs)
+            if use_sparse:
+                L_scipy = L_assembled
+            else:
+                L_np = L_assembled.detach().cpu().numpy()
+                L_scipy = scipy.sparse.csr_matrix(L_np)
+
+            M_scipy = scipy.sparse.diags(M_np)
+            evals, evecs = compute_laplacian_eigendecomposition(
+                L_scipy, num_eigenvectors, mass_matrix=M_scipy)
 
             if tag not in bases_by_config:
                 bases_by_config[tag] = {}
