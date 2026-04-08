@@ -1076,6 +1076,31 @@ def _precompute_geo_cache_worker(args):
         return name, None, None, None
 
 
+def _eval_robust_worker(args):
+    """Multiprocessing worker for robust Laplacian baseline evaluation.
+
+    Runs in a separate process for true CPU parallelism.
+
+    Args:
+        args: (pair, num_eigenvectors, evaluators, geo_cache, area_weighted)
+
+    Returns:
+        Dict of metrics from evaluate_pair_robust.
+    """
+    pair, num_eigenvectors, evaluators, geo_cache, area_weighted = args
+    try:
+        return evaluate_pair_robust(
+            pair, num_eigenvectors,
+            evaluators=evaluators,
+            geo_cache=geo_cache,
+            area_weighted=area_weighted,
+        )
+    except Exception as e:
+        print(f"    [robust worker] FAILED on {getattr(pair, 'name', '?')}: {e}",
+              flush=True)
+        return {}
+
+
 def _build_geo_cache(pair: PairSample) -> Optional['GeodesicCache']:
     """Build a GeodesicCache for pair, or None if faces/potpourri3d unavailable."""
     if pair.faces_b is None:
@@ -1875,7 +1900,7 @@ class FunctionalMapModule(LaplacianModuleBase):
 
         All ranks participate in geo cache precomputation and model baseline
         (distributed across GPUs). Robust baseline runs on rank 0 only
-        (CPU-parallelised with ThreadPoolExecutor).
+        (CPU-parallelised with multiprocessing.Pool).
         """
         hp     = self.hparams
         device = self.device
@@ -2138,34 +2163,49 @@ class FunctionalMapModule(LaplacianModuleBase):
                             print(f"\n  Computing {rb_name} Laplacian baseline{ds_label} "
                                   f"({n_total} pairs, {world_size} rank(s))...", flush=True)
 
-                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        import multiprocessing as _mp_rb
                         rb_n_workers = max(1, _n_cpus // max(world_size, 1))
                         if hp.geo_cache_workers is not None:
                             rb_n_workers = min(rb_n_workers, hp.geo_cache_workers)
-
-                        def _eval_robust(p, _aw=rb_area_weighted):
-                            return evaluate_pair_robust(
-                                _subsample(p), hp.num_eigenvectors,
-                                evaluators=self._evaluators,
-                                geo_cache=self._get_geo_cache(p.name),
-                                area_weighted=_aw)
 
                         # Distribute pairs across ranks (same pattern as model baseline)
                         my_indices = list(range(self.global_rank, n_total, world_size))
                         my_pairs = [val_pairs[i] for i in my_indices]
                         t0_rb = time.perf_counter()
 
+                        # Pre-build worker args (subsample + fetch geo cache)
+                        worker_args = [
+                            (_subsample(p), hp.num_eigenvectors,
+                             self._evaluators, self._get_geo_cache(p.name),
+                             rb_area_weighted)
+                            for p in my_pairs
+                        ]
+
                         my_robust_metrics = [None] * len(my_pairs)
-                        with ThreadPoolExecutor(max_workers=rb_n_workers) as executor:
-                            futures = {executor.submit(_eval_robust, p): j
-                                       for j, p in enumerate(my_pairs)}
-                            done_count = 0
-                            for future in as_completed(futures):
-                                j = futures[future]
-                                my_robust_metrics[j] = future.result()
-                                done_count += 1
+                        n_workers_actual = min(rb_n_workers, len(worker_args)) if worker_args else 0
+
+                        if n_workers_actual > 1:
+                            with _mp_rb.Pool(n_workers_actual) as pool:
+                                for done_count, (j, result) in enumerate(
+                                    enumerate(pool.imap(_eval_robust_worker, worker_args)), 1
+                                ):
+                                    my_robust_metrics[j] = result
+                                    if is_rank0:
+                                        dt = time.perf_counter() - t0_rb
+                                        total_done = done_count * world_size
+                                        n_my = len(my_pairs)
+                                        eta = (dt / done_count) * (n_my - done_count)
+                                        cw = len(str(n_total))
+                                        print(f"    [{rb_name} ~{min(total_done, n_total):>{cw}}/{n_total}] "
+                                              f"{my_pairs[j].name}... "
+                                              f"{dt:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                              flush=True)
+                        else:
+                            for j, args in enumerate(worker_args):
+                                my_robust_metrics[j] = _eval_robust_worker(args)
                                 if is_rank0:
                                     dt = time.perf_counter() - t0_rb
+                                    done_count = j + 1
                                     total_done = done_count * world_size
                                     n_my = len(my_pairs)
                                     eta = (dt / done_count) * (n_my - done_count)
@@ -2223,7 +2263,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                         if is_rank0:
                             dt_rb = time.perf_counter() - t0_rb
                             print(f"    Done: {n_total} pairs in {dt_rb:.1f}s "
-                                  f"({rb_n_workers} threads/rank × {world_size} ranks)",
+                                  f"({rb_n_workers} workers/rank x {world_size} ranks)",
                                   flush=True)
 
                             rb_summary = self._summarise_and_print(
