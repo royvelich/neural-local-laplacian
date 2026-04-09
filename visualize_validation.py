@@ -1836,10 +1836,10 @@ class RealTimeEigenanalysisVisualizer:
                     d_norm = normalize_distances(distances)
                     is_bad = distances.max() > 1e3
                     label_suffix = " [!]" if is_bad else ""
-                    cmap = 'hot' if is_bad else 'viridis'
+                    cmap = 'reds' if is_bad else 'viridis'
                     mesh_structure.add_scalar_quantity(
                         name=f"K1 Geodesic (norm) - {result_key}{label_suffix}",
-                        values=d_norm, enabled=False, cmap=cmap
+                        values=d_norm, enabled=(result_key == 'PRED'), cmap=cmap
                     )
                     exact_norm = normalize_distances(exact_distances)
                     error = np.abs(d_norm - exact_norm)
@@ -2557,10 +2557,10 @@ class RealTimeEigenanalysisVisualizer:
             d_norm = normalize_distances(dists)
             is_bad = dists.max() > 1e3
             label_suffix = " [!]" if is_bad else ""
-            cmap = 'hot' if is_bad else 'viridis'
+            cmap = 'reds' if is_bad else 'viridis'
             mesh.add_scalar_quantity(
                 f"K1 Geodesic (norm) - {method}{label_suffix}",
-                d_norm, enabled=False, cmap=cmap
+                d_norm, enabled=(method == 'PRED'), cmap=cmap
             )
             if exact is not None:
                 exact_norm = normalize_distances(exact)
@@ -6554,12 +6554,12 @@ class RealTimeEigenanalysisVisualizer:
                 # Use different colormap for unreasonable results
                 is_bad = method_name in unreasonable_methods
                 label_suffix = " [!]" if is_bad else ""
-                cmap = 'hot' if is_bad else 'viridis'
+                cmap = 'reds' if is_bad else 'viridis'
 
                 mesh_structure.add_scalar_quantity(
                     name=f"K1 Geodesic (norm) - {method_name}{label_suffix}",
                     values=d_norm,
-                    enabled=(method_name == "Exact"),
+                    enabled=(method_name == "PRED"),
                     cmap=cmap
                 )
 
@@ -7196,16 +7196,16 @@ class RealTimeEigenanalysisVisualizer:
                         d_norm = normalize_distances(distances)
                         is_bad = distances.max() > 1e3
                         label_suffix = " [!]" if is_bad else ""
-                        cmap = 'hot' if is_bad else 'viridis'
+                        cmap = 'reds' if is_bad else 'viridis'
                         mesh_structure.add_scalar_quantity(
                             name=f"K1 Geodesic (norm) - {method_key}{label_suffix}",
-                            values=d_norm, enabled=False, cmap=cmap
+                            values=d_norm, enabled=(method_key == 'PRED'), cmap=cmap
                         )
                         exact_norm = normalize_distances(exact_distances)
                         error = np.abs(d_norm - exact_norm)
                         mesh_structure.add_scalar_quantity(
                             name=f"K2 Geodesic Error - {method_key}",
-                            values=error, enabled=False, cmap='hot'
+                            values=error, enabled=False, cmap='reds'
                         )
 
         except Exception as e:
