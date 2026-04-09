@@ -28,13 +28,13 @@ module:
   loss_configs:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
       weight: 1.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
-      weight: 0.1
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 3.0
+        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
+      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+#      weight: 3.0
