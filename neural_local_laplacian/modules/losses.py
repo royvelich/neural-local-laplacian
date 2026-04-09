@@ -490,6 +490,44 @@ class MeanCurvatureOnlyLogMagnitudeLoss(nn.Module):
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
 
 
+class AreaEntropyRegularizer(nn.Module):
+    """
+    Regularizer that penalizes areas deviating from uniform distribution.
+
+    Without ground-truth area supervision, the area head can drift to become
+    a curvature-compensating scalar (absorbing the gradient head's unconstrained
+    absolute scale). This regularizer softly encourages areas to stay close to
+    a uniform distribution via KL divergence: KL(p || uniform), where
+    p_i = A_i / sum(A).
+
+    The KL divergence is zero when all areas are equal, and increases as
+    areas become non-uniform. This prevents pathological drift while still
+    allowing the area head to learn moderate per-vertex variation.
+
+    Mathematically:
+        KL(p || u) = sum_i p_i * log(p_i * N)
+
+    where p_i = A_i / sum(A) and u_i = 1/N.
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.areas is None:
+            raise ValueError("AreaEntropyRegularizer requires ctx.areas")
+
+        areas = ctx.areas
+        n = len(areas)
+
+        # Normalize areas to a probability distribution
+        p = areas / (areas.sum() + self.eps)
+
+        # KL(p || uniform) = sum(p_i * log(p_i * N))
+        return (p * torch.log(p * n + self.eps)).sum()
+
+
 class AreaSupervisionLoss(nn.Module):
     """
     Direct area supervision using MSE against GT barycentric areas.
