@@ -197,14 +197,17 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         Args:
             areas_raw: (batch_size,) raw logits from area head.
             batch_sizes: (batch_size,) number of neighbors per patch (k).
+                         Currently unused but kept for API compatibility.
 
         Returns:
             (batch_size,) positive area values.
         """
         if self._area_activation == 'bounded_sigmoid':
-            # A_max = C / k -- geometric upper bound for unit-sphere patches
-            A_max = self._area_bound_C / batch_sizes.float()
-            return A_max * torch.sigmoid(areas_raw)
+            # A_max = C (constant) — center vertex area on a unit-sphere patch
+            # is O(1) regardless of k.  Do NOT divide by k: that would make
+            # M_ii ~ 1/k while S_ii ~ 1 (with normalize_grad_by_k), causing
+            # eigenvalues to grow as O(k).
+            return self._area_bound_C * torch.sigmoid(areas_raw)
         else:
             # Default: unbounded softplus
             return F.softplus(areas_raw)

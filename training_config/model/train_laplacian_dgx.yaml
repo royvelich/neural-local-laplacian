@@ -14,7 +14,7 @@ module:
   output_projection_hidden_dims: null
 
   area_activation: bounded_sigmoid
-  area_bound_C: 40.0   # 4π
+  area_bound_C: 30.0   # 4π
 
 #  mcv_mode: 'full_gram'      # anisotropic, can be negative
   mcv_mode: 'diagonal_gram'  # isotropic, always positive (default)
