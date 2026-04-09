@@ -20,24 +20,21 @@ module:
   # Eval with both variants
   eval_laplacians:
     - assembly: diagonal_gram              # FEM-like (default)
-    - assembly: diagonal_gram
-      area_weighted: true                  # graph-Laplacian-like
+#    - assembly: diagonal_gram
+#      area_weighted: true                  # graph-Laplacian-like
 
   baselines: []
 
   losses:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
       weight: 1.0
-      landmark_ratio: 0.2
-#      num_landmarks: 256
+#      landmark_ratio: 0.2
+      num_landmarks: 256
       alphas:
-        - 0.001
-        - 0.01
         - 0.1
         - 1.0
         - 10.0
-        - 100.0
-#      num_sample_vertices: 1024
+      num_sample_vertices: 1024
       normalize: false
   random_init: false
   keep_areas_head: false
