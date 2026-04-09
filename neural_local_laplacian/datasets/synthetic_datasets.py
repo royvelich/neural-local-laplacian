@@ -251,19 +251,19 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         Normalize a surface patch so positions lie within the unit sphere.
 
         Divides positions by d = max(||p||) and rescales all differential
-        geometry quantities to remain consistent:
+        geometry quantities to remain consistent under uniform scaling by 1/d:
 
-            pos       -> pos / d
-            H         -> H * d          (mean curvature ~ 1/length)
-            K         -> K * d^2        (Gaussian curvature ~ 1/length^2)
-            k1, k2    -> k1 * d, k2 * d
+            pos             -> pos / d
+            H               -> H * d            (mean curvature ~ 1/length)
+            K               -> K * d^2           (Gaussian curvature ~ 1/length^2)
+            k1, k2          -> k1 * d, k2 * d
             gt_vertex_areas -> areas / d^2
-            normals   -> unchanged      (unit vectors)
-            v1, v2    -> unchanged      (direction only)
-            grad_H    -> grad_H * d^2   (curvature gradient ~ 1/length^2)
-            grad_K    -> grad_K * d^3   (curvature gradient ~ 1/length^3)
+            normals         -> unchanged         (unit vectors)
+            v1, v2          -> unchanged         (direction only)
+            grad_H          -> grad_H * d^2      (curvature gradient ~ 1/length^2)
+            grad_K          -> grad_K * d^3      (curvature gradient ~ 1/length^3)
 
-        Stores d as data.patch_scale_factor for potential undo during inference.
+        Stores d as data.patch_scale_factor for area rescaling during inference.
         Operates in-place.
         """
         d = torch.norm(data.pos, dim=1).max().clamp(min=1e-8)
@@ -310,7 +310,6 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             data['grad_K_2d'] = data['grad_K_2d'] * (d ** 3)
 
         # Normals, principal directions (v1, v2): unchanged (unit/direction vectors)
-        # Signature: composite quantity, skip (recomputed if needed)
 
     @abstractmethod
     def _generate_raw_surfaces(self) -> List[Data]:
@@ -381,7 +380,13 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         data['x'] = data.pos
 
     def get(self, idx: int) -> List[Data]:
-        """Generate multiple samplings of the same surface."""
+        """Generate multiple samplings of the same surface.
+
+        Each idx produces a unique deterministic surface, ensuring different
+        DDP ranks (which receive different indices from DistributedSampler)
+        generate different training data.
+        """
+        self._rng = np.random.default_rng(self._seed + idx)
         surfaces = self._generate_surfaces()
         return surfaces
 
@@ -498,6 +503,36 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             return torch.from_numpy(Delaunay(points=pos_2d).simplices).T
         except Exception as e:
             raise RuntimeError(f"Failed to create surface mesh: {e}")
+
+    @staticmethod
+    def _compute_barycentric_vertex_areas(
+        pos: torch.Tensor, face: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute barycentric (1/3) vertex areas from a triangle mesh.
+
+        Each vertex gets 1/3 of the area of each adjacent face.
+
+        Args:
+            pos: (N, 3) vertex positions.
+            face: (3, F) face indices (PyG convention).
+
+        Returns:
+            areas: (N,) per-vertex areas.
+        """
+        N = pos.shape[0]
+        # face is (3, F) — columns are triangles
+        face = face.long()  # scatter_add_ requires int64
+        v0 = pos[face[0]]  # (F, 3)
+        v1 = pos[face[1]]
+        v2 = pos[face[2]]
+        face_areas = 0.5 * torch.linalg.norm(
+            torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)  # (F,)
+        third_areas = face_areas / 3.0
+        areas = torch.zeros(N, dtype=pos.dtype)
+        areas.scatter_add_(0, face[0], third_areas)
+        areas.scatter_add_(0, face[1], third_areas)
+        areas.scatter_add_(0, face[2], third_areas)
+        return areas
 
     def _compute_first_derivatives(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute first partial derivatives ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡z/ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡x and ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡z/ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡y."""
@@ -709,6 +744,16 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         data = Data()
         data['pos'] = positions.detach()
         data['face'] = self._create_surface_mesh(pos=data.pos).detach()
+
+        # Compute GT barycentric vertex areas from 3D mesh
+        all_vertex_areas = self._compute_barycentric_vertex_areas(
+            data['pos'], data['face'])
+        if self._diff_geom_at_origin_only:
+            # Store only origin vertex's area (same batching as H, normals)
+            origin_idx = (positions.detach() ** 2).sum(dim=1).argmin().item()
+            data['gt_vertex_areas'] = all_vertex_areas[origin_idx:origin_idx+1].detach()
+        else:
+            data['gt_vertex_areas'] = all_vertex_areas.detach()
 
         # Store the origin position (0,0,0) after centering - will be transformed with pose
         data['origin_pos'] = torch.zeros(1, 3)
