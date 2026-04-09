@@ -202,6 +202,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             pose_transformers: Optional[List[PoseTransformer]] = None,
             seed: int = 0,
             conv_k_nearest: Optional[int] = None,
+            normalize_to_unit_sphere: bool = False,
     ):
         super().__init__()
         self._seed = seed
@@ -209,6 +210,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         self._epoch_size = epoch_size
         self._pose_transformers = pose_transformers if pose_transformers is not None else []
         self._conv_k_nearest = conv_k_nearest
+        self._normalize_to_unit_sphere = normalize_to_unit_sphere
 
     def reset_rng(self) -> None:
         """Reset random number generator to initial seed."""
@@ -223,7 +225,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
 
         This is the main orchestration method that:
         1. Calls the derived class implementation to generate raw surface data
-        2. Adds features to each surface using the feature extractor
+        2. Optionally normalizes each surface to the unit sphere
+        3. Adds features to each surface using the feature extractor
 
         Returns:
             List of Data objects with positions, normals, differential geometry, and features
@@ -231,11 +234,83 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         # Generate raw surfaces using derived class implementation
         surfaces = self._generate_raw_surfaces()
 
+        # Optionally normalize to unit sphere (before adding features)
+        if self._normalize_to_unit_sphere:
+            for surface in surfaces:
+                self._normalize_surface_to_unit_sphere(surface)
+
         # Add features to each surface
         for surface in surfaces:
             self._add_surface_features(surface)
 
         return surfaces
+
+    @staticmethod
+    def _normalize_surface_to_unit_sphere(data: Data) -> None:
+        """
+        Normalize a surface patch so positions lie within the unit sphere.
+
+        Divides positions by d = max(||p||) and rescales all differential
+        geometry quantities to remain consistent:
+
+            pos       -> pos / d
+            H         -> H * d          (mean curvature ~ 1/length)
+            K         -> K * d^2        (Gaussian curvature ~ 1/length^2)
+            k1, k2    -> k1 * d, k2 * d
+            gt_vertex_areas -> areas / d^2
+            normals   -> unchanged      (unit vectors)
+            v1, v2    -> unchanged      (direction only)
+            grad_H    -> grad_H * d^2   (curvature gradient ~ 1/length^2)
+            grad_K    -> grad_K * d^3   (curvature gradient ~ 1/length^3)
+
+        Stores d as data.patch_scale_factor for potential undo during inference.
+        Operates in-place.
+        """
+        d = torch.norm(data.pos, dim=1).max().clamp(min=1e-8)
+
+        # Rescale positions
+        data.pos = data.pos / d
+
+        # Store scale factor for area rescaling during inference
+        data['patch_scale_factor'] = d.unsqueeze(0)
+
+        # Rescale origin position (if present)
+        if 'origin_pos' in data:
+            data['origin_pos'] = data['origin_pos'] / d
+
+        # --- Differential geometry rescaling ---
+        # Mean curvature: H ~ 1/length
+        if 'H' in data:
+            data['H'] = data['H'] * d
+
+        # Gaussian curvature: K ~ 1/length^2
+        if 'K' in data:
+            data['K'] = data['K'] * (d ** 2)
+
+        # Principal curvatures: k ~ 1/length
+        if 'k1' in data:
+            data['k1'] = data['k1'] * d
+        if 'k2' in data:
+            data['k2'] = data['k2'] * d
+
+        # GT vertex areas: area ~ length^2
+        if 'gt_vertex_areas' in data:
+            data['gt_vertex_areas'] = data['gt_vertex_areas'] / (d ** 2)
+
+        # Curvature gradients in 3D: grad(H) ~ 1/length^2, grad(K) ~ 1/length^3
+        if 'grad_H_3d' in data:
+            data['grad_H_3d'] = data['grad_H_3d'] * (d ** 2)
+        if 'grad_K_3d' in data:
+            data['grad_K_3d'] = data['grad_K_3d'] * (d ** 3)
+
+        # Curvature gradients in 2D parameter space (same scaling)
+        if 'grad_H_2d' in data:
+            data['grad_H_2d'] = data['grad_H_2d'] * (d ** 2)
+        if 'grad_K_2d' in data:
+            data['grad_K_2d'] = data['grad_K_2d'] * (d ** 3)
+
+        # Normals, principal directions (v1, v2): unchanged (unit/direction vectors)
+        # Signature: composite quantity, skip (recomputed if needed)
 
     @abstractmethod
     def _generate_raw_surfaces(self) -> List[Data]:
@@ -306,13 +381,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         data['x'] = data.pos
 
     def get(self, idx: int) -> List[Data]:
-        """Generate multiple samplings of the same surface.
-
-        Each idx produces a unique deterministic surface, ensuring different
-        DDP ranks (which receive different indices from DistributedSampler)
-        generate different training data.
-        """
-        self._rng = np.random.default_rng(self._seed + idx)
+        """Generate multiple samplings of the same surface."""
         surfaces = self._generate_surfaces()
         return surfaces
 
@@ -429,36 +498,6 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             return torch.from_numpy(Delaunay(points=pos_2d).simplices).T
         except Exception as e:
             raise RuntimeError(f"Failed to create surface mesh: {e}")
-
-    @staticmethod
-    def _compute_barycentric_vertex_areas(
-        pos: torch.Tensor, face: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute barycentric (1/3) vertex areas from a triangle mesh.
-
-        Each vertex gets 1/3 of the area of each adjacent face.
-
-        Args:
-            pos: (N, 3) vertex positions.
-            face: (3, F) face indices (PyG convention).
-
-        Returns:
-            areas: (N,) per-vertex areas.
-        """
-        N = pos.shape[0]
-        # face is (3, F) — columns are triangles
-        face = face.long()  # scatter_add_ requires int64
-        v0 = pos[face[0]]  # (F, 3)
-        v1 = pos[face[1]]
-        v2 = pos[face[2]]
-        face_areas = 0.5 * torch.linalg.norm(
-            torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)  # (F,)
-        third_areas = face_areas / 3.0
-        areas = torch.zeros(N, dtype=pos.dtype)
-        areas.scatter_add_(0, face[0], third_areas)
-        areas.scatter_add_(0, face[1], third_areas)
-        areas.scatter_add_(0, face[2], third_areas)
-        return areas
 
     def _compute_first_derivatives(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute first partial derivatives ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡z/ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡x and ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡z/ÃƒÂ¢Ã‹â€ Ã¢â‚¬Å¡y."""
@@ -671,16 +710,6 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         data['pos'] = positions.detach()
         data['face'] = self._create_surface_mesh(pos=data.pos).detach()
 
-        # Compute GT barycentric vertex areas from 3D mesh
-        all_vertex_areas = self._compute_barycentric_vertex_areas(
-            data['pos'], data['face'])
-        if self._diff_geom_at_origin_only:
-            # Store only origin vertex's area (same batching as H, normals)
-            origin_idx = (positions.detach() ** 2).sum(dim=1).argmin().item()
-            data['gt_vertex_areas'] = all_vertex_areas[origin_idx:origin_idx+1].detach()
-        else:
-            data['gt_vertex_areas'] = all_vertex_areas.detach()
-
         # Store the origin position (0,0,0) after centering - will be transformed with pose
         data['origin_pos'] = torch.zeros(1, 3)
 
@@ -816,8 +845,6 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
             coefficient_scale_range: Tuple[float, float],
             coeff_generation_method: CoeffGenerationMethod,
             polynomial_offset_range: Tuple[float, float] = (0.0, 0.0),
-            normalize_to_unit_area: bool = True,
-            area_estimation_grid_size: int = 64,
             **kwargs
     ):
         """
@@ -830,9 +857,6 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
             polynomial_offset_range: Range for random offset applied to polynomial evaluation.
                                      The polynomial is evaluated at (x + offset_x, y + offset_y),
                                      effectively "sliding" the surface under the grid.
-            normalize_to_unit_area: If True, scale coefficients and grid so surface area ≈ 1.
-                                    When enabled, points_scale_range is ignored.
-            area_estimation_grid_size: Grid resolution (N×N) for area estimation quadrature.
             **kwargs: Additional arguments passed to ParametricSurfaceDataset
         """
         super().__init__(**kwargs)
@@ -840,8 +864,6 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         self._coefficient_scale_range = self._validate_range(param_range=coefficient_scale_range, name="coefficient_scale_range")
         self._polynomial_offset_range = self._validate_range(param_range=polynomial_offset_range, name="polynomial_offset_range")
         self._coeff_generation_method = coeff_generation_method
-        self._normalize_to_unit_area = normalize_to_unit_area
-        self._area_estimation_grid_size = area_estimation_grid_size
 
     def _validate_order_range(self, order_range: Tuple[int, int]) -> Tuple[int, int]:
         """Validate polynomial order range."""
@@ -857,98 +879,6 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
     def _get_polynomial_pairs(order: int) -> List[Tuple[int, int]]:
         """Get list of (i, j) exponent pairs for polynomial of given order."""
         return [(i, j) for i in range(order + 1) for j in range(order + 1) if 0 < i + j <= order]
-
-    def _estimate_surface_area(
-            self,
-            coefficients: torch.Tensor,
-            pairs: List[Tuple[int, int]],
-            grid_radius: float,
-            offset: Tuple[float, float] = (0.0, 0.0)
-    ) -> float:
-        """
-        Estimate surface area using numerical quadrature on a regular grid.
-
-        Uses the surface area formula: A = ∬ √(1 + (∂z/∂x)² + (∂z/∂y)²) dx dy
-
-        Derivatives are computed analytically for efficiency:
-            ∂z/∂x = Σ i·cᵢⱼ x^(i-1) yʲ
-            ∂z/∂y = Σ j·cᵢⱼ xⁱ y^(j-1)
-
-        Args:
-            coefficients: Polynomial coefficients
-            pairs: List of (i, j) exponent pairs
-            grid_radius: Radius of the integration domain [-r, r] × [-r, r]
-            offset: Coordinate offset (offset_x, offset_y) for polynomial evaluation
-
-        Returns:
-            Estimated surface area
-        """
-        grid_size = self._area_estimation_grid_size
-        offset_x, offset_y = offset
-
-        # Create regular grid for integration
-        x = torch.linspace(-grid_radius, grid_radius, grid_size)
-        y = torch.linspace(-grid_radius, grid_radius, grid_size)
-        X, Y = torch.meshgrid(x, y, indexing='ij')
-        X, Y = X.flatten(), Y.flatten()
-
-        # Apply offset (same as in surface evaluation)
-        X_shifted = X + offset_x
-        Y_shifted = Y + offset_y
-
-        # Compute derivatives analytically (faster than autograd)
-        # For z = Σ cᵢⱼ xⁱ yʲ:
-        #   ∂z/∂x = Σ i·cᵢⱼ x^(i-1) yʲ
-        #   ∂z/∂y = Σ j·cᵢⱼ xⁱ y^(j-1)
-        dz_dx = torch.zeros_like(X)
-        dz_dy = torch.zeros_like(Y)
-
-        for c, (i, j) in zip(coefficients, pairs):
-            if i > 0:
-                dz_dx = dz_dx + c * i * (X_shifted ** (i - 1)) * (Y_shifted ** j)
-            if j > 0:
-                dz_dy = dz_dy + c * j * (X_shifted ** i) * (Y_shifted ** (j - 1))
-
-        # Area element: √(1 + (∂z/∂x)² + (∂z/∂y)²)
-        area_elements = torch.sqrt(1 + dz_dx ** 2 + dz_dy ** 2)
-
-        # Numerical integration (simple quadrature)
-        delta = (2 * grid_radius) / (grid_size - 1)
-        total_area = area_elements.sum() * (delta ** 2)
-
-        return total_area.item()
-
-    @staticmethod
-    def _scale_coefficients_for_position_scaling(
-            coefficients: torch.Tensor,
-            pairs: List[Tuple[int, int]],
-            scale: float
-    ) -> torch.Tensor:
-        """
-        Transform polynomial coefficients to be equivalent to uniform position scaling.
-
-        For uniform scaling (x,y,z) → (s·x, s·y, s·z), the polynomial
-        z = Σ cᵢⱼ xⁱ yʲ transforms as:
-            z' = s · f(x'/s, y'/s) = Σ cᵢⱼ · s^(1-i-j) · x'ⁱ y'ʲ
-
-        Therefore: cᵢⱼ → cᵢⱼ · s^(1-i-j)
-
-        This preserves the geometric shape while scaling the surface.
-        Area scales as s², curvature scales as 1/s.
-
-        Args:
-            coefficients: Original polynomial coefficients
-            pairs: List of (i, j) exponent pairs
-            scale: Uniform scaling factor
-
-        Returns:
-            Scaled coefficients
-        """
-        scaled_coefficients = torch.empty_like(coefficients)
-        for idx, (i, j) in enumerate(pairs):
-            exponent = 1 - i - j
-            scaled_coefficients[idx] = coefficients[idx] * (scale ** exponent)
-        return scaled_coefficients
 
     def _generate_surface_parameters(self) -> Dict[str, Any]:
         """Generate random polynomial coefficients, order, and coordinate offsets."""
@@ -990,104 +920,3 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         for c, (i, j) in zip(coefficients, pairs):
             z += c * (x_shifted ** i) * (y_shifted ** j)
         return z
-
-    def _generate_raw_surfaces(self) -> List[Data]:
-        """
-        Generate polynomial surfaces with optional unit area normalization.
-
-        When normalize_to_unit_area=True:
-        1. Generate surface parameters (coefficients, order, offset)
-        2. Sample grid_radius
-        3. Estimate surface area using numerical quadrature
-        4. Compute scale s = 1/√A to achieve unit area
-        5. Transform coefficients: cᵢⱼ → cᵢⱼ · s^(1-i-j)
-        6. Scale grid_radius: r → s·r
-        7. Generate surfaces with points_scale=1.0
-
-        When normalize_to_unit_area=False:
-        Falls back to parent class behavior using points_scale_range.
-
-        Returns:
-            List of Data objects containing surface patches
-        """
-        if not self._normalize_to_unit_area:
-            # Use parent class implementation with points_scale_range
-            return super()._generate_raw_surfaces()
-
-        # Generate surface parameters once (shared across all samplings)
-        surface_params = self._generate_surface_parameters()
-        coefficients = surface_params['coefficients']
-        pairs = surface_params['pairs']
-        offset = surface_params['offset']
-
-        # Sample grid radius
-        grid_radius = self._sample_parameter(param_range=self._grid_radius_range)
-
-        # Estimate surface area with current parameters
-        estimated_area = self._estimate_surface_area(
-            coefficients=coefficients,
-            pairs=pairs,
-            grid_radius=grid_radius,
-            offset=offset
-        )
-
-        # Compute scale factor for unit area: A' = A * s² = 1 → s = 1/√A
-        scale = 1.0 / np.sqrt(estimated_area)
-
-        # Transform coefficients to be equivalent to position scaling
-        scaled_coefficients = self._scale_coefficients_for_position_scaling(
-            coefficients=coefficients,
-            pairs=pairs,
-            scale=scale
-        )
-
-        # Scale grid radius (domain scales with surface)
-        scaled_grid_radius = grid_radius * scale
-
-        # Update surface params with scaled coefficients
-        scaled_surface_params = {
-            'coefficients': scaled_coefficients,
-            'order': surface_params['order'],
-            'pairs': pairs,
-            'offset': offset
-        }
-
-        # Grid range is centered at (0, 0)
-        grid_range = (-scaled_grid_radius, scaled_grid_radius)
-
-        surfaces = []
-        for grid_sampler in self._grid_samplers:
-            # Generate grid for this sampling
-            x, y = grid_sampler.sample(grid_range=grid_range, rng=self._rng)
-
-            # Optionally ensure origin is in the grid
-            origin_idx = None
-            if self._include_origin_in_grid:
-                x, y, origin_idx = self._ensure_origin_in_grid(x, y, grid_range)
-
-            with torch.enable_grad():
-                # Convert to float32 and enable gradients
-                x = x.to(dtype=torch.float32).requires_grad_(True)
-                y = y.to(dtype=torch.float32).requires_grad_(True)
-
-                # Evaluate surface using scaled parameters
-                z = self._evaluate_surface_with_parameters(
-                    x=x, y=y, surface_params=scaled_surface_params
-                ).to(dtype=torch.float32)
-
-                # Compute first derivatives
-                dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
-
-                # Create surface data with points_scale=1.0 (scaling already applied to coefficients)
-                data = self._create_raw_surface_data(
-                    x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
-                    points_scale=1.0, surface_params=scaled_surface_params
-                )
-
-            # Store origin index if present
-            if origin_idx is not None:
-                data['origin_idx'] = torch.tensor([origin_idx])
-
-            surfaces.append(data)
-
-        return surfaces
