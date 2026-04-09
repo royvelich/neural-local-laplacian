@@ -30,20 +30,11 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
       weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.AreaWeightedMSELoss
-#      weight: 1.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
       weight: 0.1
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.MeanCurvatureOnlyLogMagnitudeLoss
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 3.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.GradientL2RegularizationLoss
-#      weight: 0.001
-

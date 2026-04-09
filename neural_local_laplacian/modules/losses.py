@@ -415,23 +415,19 @@ class AreaOnlyLogMagnitudeLoss(nn.Module):
         """
         Compute log-magnitude loss with gradients only through areas.
 
-        Requires ctx.areas to be set (predicted areas from the area head).
+        Requires ctx.areas and ctx.predicted_raw_mcv.
         """
         if ctx.areas is None:
-            raise ValueError("AreaOnlyLogMagnitudeLoss requires ctx.areas to be set")
+            raise ValueError("AreaOnlyLogMagnitudeLoss requires ctx.areas")
+        if ctx.predicted_raw_mcv is None:
+            raise ValueError("AreaOnlyLogMagnitudeLoss requires ctx.predicted_raw_mcv")
 
-        # Reconstruct stiffness_sum = mcv * areas, then detach
-        # This removes gradient flow through g_ij / stiffness_weights
-        stiffness_sum = ctx.predicted_mcv * ctx.areas.unsqueeze(-1)  # (batch_size, 3)
-        stiffness_sum_detached = stiffness_sum.detach()  # no grad through weights
+        # Detach stiffness action so gradients only flow through areas
+        numerator_magnitude = torch.norm(ctx.predicted_raw_mcv.detach(), p=2, dim=1)
+        predicted_magnitude = numerator_magnitude / (ctx.areas + self.eps)
 
-        # Recompute magnitude with detached numerator: ||detach(sum)|| / areas
-        numerator_magnitude = torch.norm(stiffness_sum_detached, p=2, dim=1)  # (batch_size,)
-        predicted_magnitude = numerator_magnitude / (ctx.areas + self.eps)  # (batch_size,)
+        target_magnitude = torch.norm(ctx.target_mcv, p=2, dim=1)
 
-        target_magnitude = torch.norm(ctx.target_mcv, p=2, dim=1)  # (batch_size,)
-
-        # Log-space MSE (same as LogMagnitudeLoss)
         log_pred = torch.log(predicted_magnitude + self.eps)
         log_target = torch.log(target_magnitude + self.eps)
         log_error_sq = (log_pred - log_target) ** 2
