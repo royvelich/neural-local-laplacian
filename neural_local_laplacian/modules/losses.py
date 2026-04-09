@@ -446,6 +446,54 @@ class AreaOnlyLogMagnitudeLoss(nn.Module):
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
 
 
+class MeanCurvatureOnlyLogMagnitudeLoss(nn.Module):
+    """
+    Log-magnitude loss that backpropagates ONLY through the gradient head.
+
+    The MCV magnitude is ||mcv|| = ||Σ w_ij p_j|| / a_i.
+    This loss detaches the area contribution (denominator), so gradients
+    flow only through w_ij (gradient coefficients). The gradient head learns
+    to produce the correct stiffness action magnitude without disturbing
+    the area head.
+
+    Mathematically:
+        loss = (log(||Σ w_ij p_j|| / detach(a_i)) - log(||target_mcv||))^2
+
+    Only d/d(w_ij) is non-zero.
+    """
+
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8):
+        super().__init__()
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.areas is None:
+            raise ValueError("MeanCurvatureOnlyLogMagnitudeLoss requires ctx.areas")
+        if ctx.predicted_raw_mcv is None:
+            raise ValueError("MeanCurvatureOnlyLogMagnitudeLoss requires ctx.predicted_raw_mcv")
+
+        # predicted_raw_mcv = Σ w_ij (p_j - p_i), no areas in the graph
+        # Divide by detached areas so only gradient head gets gradients
+        areas_detached = ctx.areas.detach()
+        predicted_magnitude = torch.norm(ctx.predicted_raw_mcv, p=2, dim=1) / (areas_detached + self.eps)
+
+        target_magnitude = torch.norm(ctx.target_mcv, p=2, dim=1)
+
+        log_pred = torch.log(predicted_magnitude + self.eps)
+        log_target = torch.log(target_magnitude + self.eps)
+        log_error_sq = (log_pred - log_target) ** 2
+
+        if self.reduction == 'mean':
+            return torch.mean(log_error_sq)
+        elif self.reduction == 'sum':
+            return torch.sum(log_error_sq)
+        elif self.reduction == 'none':
+            return log_error_sq
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
 class AreaSupervisionLoss(nn.Module):
     """
     Direct area supervision using MSE against GT barycentric areas.

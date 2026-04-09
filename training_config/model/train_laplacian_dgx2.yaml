@@ -3,7 +3,7 @@ module:
   input_dim: 3
   d_model: 512
   nhead: 8
-  num_encoder_layers: 1
+  num_encoder_layers: 2
   dim_feedforward: 512
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.0
@@ -29,16 +29,21 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 5.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 2.0
+      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaWeightedMSELoss
+#      weight: 1.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
       weight: 0.1
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
-      weight: 0.1
+        _target_: neural_local_laplacian.modules.losses.MeanCurvatureOnlyLogMagnitudeLoss
+      weight: 3.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GradientL2RegularizationLoss
+#      weight: 0.001
+
