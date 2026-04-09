@@ -20,8 +20,8 @@ module:
   # Eval with both variants
   eval_laplacians:
     - assembly: diagonal_gram              # FEM-like (default)
-    - assembly: diagonal_gram
-      area_weighted: true                  # graph-Laplacian-like
+#    - assembly: diagonal_gram
+#      area_weighted: true                  # graph-Laplacian-like
 
   baselines: []
 
