@@ -478,7 +478,7 @@ class RealTimeEigenanalysisVisualizer:
         # Store cached forward result and knn for cheap reassembly
         self.current_forward_result = None  # full forward result with grad_coeffs, areas
         self.current_knn = None             # (N, k) knn indices tensor
-        self.current_lap_config = LaplacianConfig(assembly='diagonal_gram')
+        self.current_lap_config = LaplacianConfig(assembly='diagonal_gram', sparse=True)
 
         # Store raw data for k-NN slider updates
         self.current_areas = None
@@ -757,6 +757,7 @@ class RealTimeEigenanalysisVisualizer:
                 pruning=new_pruning,
                 k_prune=new_k_prune if new_pruning in ('knn', 'topk') else None,
                 area_weighted=new_aw,
+                sparse=(new_pruning == 'none'),
             )
             if new_config.tag != self.current_lap_config.tag:
                 print(f"[*] Laplacian config changed: {self.current_lap_config.tag} -> {new_config.tag}")
@@ -4046,6 +4047,14 @@ class RealTimeEigenanalysisVisualizer:
             knn_t = batch_data.vertex_indices.reshape(N, k_val).to(device)
             val_lap_config = getattr(model, '_val_lap_config',
                                      LaplacianConfig(assembly='diagonal_gram'))
+            # Always use sparse assembly in the visualizer (dense N×N is wasteful)
+            val_lap_config = LaplacianConfig(
+                assembly=val_lap_config.assembly,
+                pruning=val_lap_config.pruning,
+                k_prune=val_lap_config.k_prune,
+                area_weighted=val_lap_config.area_weighted,
+                sparse=(val_lap_config.pruning == 'none'),
+            )
             self.current_lap_config = val_lap_config
             L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config, areas=areas)
             stiffness_matrix = to_scipy_sparse(L)
