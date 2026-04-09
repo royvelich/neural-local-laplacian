@@ -35,7 +35,7 @@ parameters:
 #          - 20
 #          - 30
       lr:
-        value: 1.0e-4
+        value: 1.0e-5
       gradient_clip_val:
         value: 0.0
 
