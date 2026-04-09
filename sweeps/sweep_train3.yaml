@@ -25,7 +25,7 @@ parameters:
         value: null
       checkpoint_path:
         values:
-          - '/workspace/models/model300.ckpt'
+          - '/workspace/models/model500.ckpt'
       num_eigenvectors:
         value: 100
       k:
@@ -265,7 +265,7 @@ parameters:
         num_eigenvectors: ${globals.num_eigenvectors}
         seed: ${globals.training_seed}
 
-        mode: train
+        mode: eval
         baselines: [model]
         geo_cache_dir: ./geo_cache
         eval_results_dir: ./eval_results/train
