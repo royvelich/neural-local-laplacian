@@ -1,5 +1,5 @@
 module:
-  _target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
+  _target_: neural_local_laplacian.data_modules.common.GenericMixedDataModule
   train_dataset_specification:
     _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
     dataset:
@@ -16,7 +16,6 @@ module:
           num_points_range: [5, 40]
       conv_k_nearest: null
       pose_transformers: null
-#        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
       coeff_generation_method:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
         _args_: ['uniform']
@@ -31,23 +30,107 @@ module:
     num_workers: 0
     shuffle: True
   val_dataset_specifications:
+#    # --- [0] Mesh spectral/geodesic validation (existing, PyG) ---
+#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+#      dataset:
+#        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+#        mesh_folder_path: '/workspace/datasets/shrec15'
+#        max_meshes: 80
+#        file_size_range_mb: [0.5, 4]
+#        require_manifold: True
+#        shuffle: True
+#        k: 8
+#        num_geodesic_sources: 5
+#        geodesic_source_method: "farthest_point_sampling"
+#      batch_size: 1
+#      num_workers: 0
+#      shuffle: False
+
+    # --- [1] Fmap: DT4D Animals intra ---
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
-        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        mesh_folder_path: '/workspace/datasets/shrec15'
-        max_meshes: 80
-        file_size_range_mb: [0.5, 4]
-        require_manifold: True
-#        mesh_folder_paths:
-#          - 'F:\input\mpz14'
-#          - 'F:\input\deftransfer'
-#          - 'F:\input\shrec15'
-#        max_meshes: 60
-#        file_size_range_mb: [0.3, 5]
-        shuffle: True
-        k: 8
-        num_geodesic_sources: 5
-        geodesic_source_method: "farthest_point_sampling"
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+          root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+          pairs: ["0.7:1.0"]
+        val_poses_per_pair: 2
+        seed: ${globals.training_seed}
       batch_size: 1
-      num_workers: 0
-      shuffle: False
+      num_workers: 5
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
+
+#    # --- [2] Fmap: DT4D Humanoids intra ---
+#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+#      dataset:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+#        pair_generator:
+#          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+#          root: '/workspace/datasets/DeformingThings4DMatching'
+#          pair_mode: intra
+#          pairs: ["0.7:1.0"]
+#        val_poses_per_pair: 15
+#        seed: ${globals.training_seed}
+#      batch_size: 1
+#      num_workers: 0
+#      shuffle: false
+#      collate_fn:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+#        _partial_: true
+#
+#    # --- [3] Fmap: DT4D Humanoids inter ---
+#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+#      dataset:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+#        pair_generator:
+#          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DHumanoidPairGenerator
+#          root: '/workspace/datasets/DeformingThings4DMatching'
+#          pair_mode: inter
+#          pairs: ["0.7:1.0"]
+#        val_poses_per_pair: 15
+#        seed: ${globals.training_seed}
+#      batch_size: 1
+#      num_workers: 0
+#      shuffle: false
+#      collate_fn:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+#        _partial_: true
+#
+#    # --- [4] Fmap: FAUST intra ---
+#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+#      dataset:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+#        pair_generator:
+#          _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
+#          root: '/workspace/datasets/faust'
+#          pair_mode: intra
+#          pairs: ["0.7:1.0"]
+#        val_poses_per_pair: 15
+#        seed: ${globals.training_seed}
+#      batch_size: 1
+#      num_workers: 0
+#      shuffle: false
+#      collate_fn:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+#        _partial_: true
+#
+#    # --- [5] Fmap: FAUST inter ---
+#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+#      dataset:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+#        pair_generator:
+#          _target_: fmaps_finetune.datasets.functional_map_dataset.FAUSTPairGenerator
+#          root: '/workspace/datasets/faust'
+#          pair_mode: inter
+#          pairs: ["0.7:1.0"]
+#        val_poses_per_pair: 15
+#        seed: ${globals.training_seed}
+#      batch_size: 1
+#      num_workers: 0
+#      shuffle: false
+#      collate_fn:
+#        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+#        _partial_: true
