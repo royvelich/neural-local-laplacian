@@ -311,6 +311,7 @@ def evaluate_pair(
     laplacian_configs: Optional[List[LaplacianConfig]] = None,
     evaluators: Optional[List] = None,
     geo_cache: Optional[GeodesicCache] = None,
+    verbose_timing: bool = False,
 ) -> Dict[str, float]:
     """Evaluate correspondence quality using functional maps (non-differentiable).
 
@@ -328,22 +329,35 @@ def evaluate_pair(
             Defaults to [LaplacianConfig(assembly='diagonal_gram')].
         evaluators: List of ShapePairEvaluator instances.
         geo_cache: Precomputed GeodesicCache for mesh B.
+        verbose_timing: If True, print per-phase wall-clock timings.
     """
+    import time as _time
+
     if laplacian_configs is None:
         laplacian_configs = [LaplacianConfig(assembly='diagonal_gram')]
 
     n_a = len(pair.verts_a)
+    _t = {}  # timing accumulator
 
     # bases_by_config[config_tag][label] = (evecs, evals, M_np)
     bases_by_config: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
     M_np_shared: Dict[str, np.ndarray] = {}
 
     for label, verts in [('A', pair.verts_a), ('B', pair.verts_b)]:
+        t0 = _time.perf_counter()
         verts_t = torch.from_numpy(verts).float().to(device)
         knn_np = compute_knn(verts, k)
+        _t[f'knn_{label}'] = _time.perf_counter() - t0
+
+        t0 = _time.perf_counter()
         batch_data = Batch.from_data_list(
             [build_patch_data(verts_t, knn_np, device)]).to(device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         fwd = model(batch_data)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t[f'forward_{label}'] = _time.perf_counter() - t0
 
         knn_t = torch.from_numpy(knn_np).long().to(device)
         M_diag = fwd['areas'].detach()
@@ -371,6 +385,7 @@ def evaluate_pair(
                 knn_prune_np = compute_knn(verts, cfg.k_prune)
                 knn_prune = torch.from_numpy(knn_prune_np).long().to(device)
 
+            t0 = _time.perf_counter()
             L_assembled = assemble_laplacian(
                 grad_coeffs, knn_t, eval_cfg, areas=M_diag, knn_prune=knn_prune)
 
@@ -380,15 +395,19 @@ def evaluate_pair(
             else:
                 L_np = L_assembled.detach().cpu().numpy()
                 L_scipy = scipy.sparse.csr_matrix(L_np)
+            _t[f'assembly_{label}'] = _t.get(f'assembly_{label}', 0) + _time.perf_counter() - t0
 
+            t0 = _time.perf_counter()
             M_scipy = scipy.sparse.diags(M_np)
             evals, evecs = compute_laplacian_eigendecomposition(
                 L_scipy, num_eigenvectors, mass_matrix=M_scipy)
+            _t[f'eigen_{label}'] = _t.get(f'eigen_{label}', 0) + _time.perf_counter() - t0
 
             if tag not in bases_by_config:
                 bases_by_config[tag] = {}
             bases_by_config[tag][label] = (evecs, evals, M_np)
 
+    t0 = _time.perf_counter()
     gt_corr = build_gt_corr_from_pair(pair)
     if geo_cache is None:
         geo_cache = build_geo_cache(pair)
@@ -411,6 +430,19 @@ def evaluate_pair(
                 )
                 for mk, mv in ev_metrics.items():
                     metrics[f"{prefix}{evaluator.name}/{mk}"] = mv
+        _t['evaluators'] = _time.perf_counter() - t0
+
+        if verbose_timing:
+            total = sum(_t.values())
+            name = getattr(pair, 'name', '?')
+            parts = [f"{name} ({n_a}v, total={total:.2f}s):"]
+            for phase in ['knn_A', 'forward_A', 'assembly_A', 'eigen_A',
+                          'knn_B', 'forward_B', 'assembly_B', 'eigen_B',
+                          'evaluators']:
+                if phase in _t:
+                    parts.append(f"{phase}={_t[phase]*1e3:.0f}ms")
+            print("    [timing] " + "  ".join(parts), flush=True)
+
         return metrics
 
     # --- Legacy path (backward compatible) ---

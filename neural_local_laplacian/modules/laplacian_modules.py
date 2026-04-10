@@ -888,6 +888,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                 laplacian_configs=self._fmap_val_eval_lap_configs,
                 evaluators=self._fmap_val_evaluators,
                 geo_cache=self._get_fmap_geo_cache(pair.name),
+                verbose_timing=(self.global_rank == 0),
             )
 
             if dataloader_idx not in self._fmap_val_outputs:
