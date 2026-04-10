@@ -28,7 +28,7 @@ module:
   fmap_val_cfg:
     k: 15
     num_eigenvectors: 100
-    max_vertices_val: 4000
+    max_vertices_val: 5000
     eval_laplacians:
       - assembly: diagonal_gram
         pruning: none
