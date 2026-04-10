@@ -14,18 +14,18 @@ check_val_every_n_epoch: 25
 log_every_n_steps: 1
 enable_progress_bar: true
 default_root_dir: fmap_finetune_runs
-logger:
-  _target_: lightning.pytorch.loggers.WandbLogger
-  project: neural-local-laplacian-fmaps
-  save_dir: fmap_finetune_runs
-  log_model: all
-callbacks:
-#  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
-#    monitor: val/best_acc
-#    mode: max
-#    save_top_k: 1
-#    save_last: false
-#    filename: best-epoch={epoch:04d}-acc={val/best_acc:.4f}
-#    auto_insert_metric_name: false
-  - _target_: lightning.pytorch.callbacks.LearningRateMonitor
-    logging_interval: epoch
+#logger:
+#  _target_: lightning.pytorch.loggers.WandbLogger
+#  project: neural-local-laplacian-fmaps
+#  save_dir: fmap_finetune_runs
+#  log_model: all
+#callbacks:
+##  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+##    monitor: val/best_acc
+##    mode: max
+##    save_top_k: 1
+##    save_last: false
+##    filename: best-epoch={epoch:04d}-acc={val/best_acc:.4f}
+##    auto_insert_metric_name: false
+#  - _target_: lightning.pytorch.callbacks.LearningRateMonitor
+#    logging_interval: epoch

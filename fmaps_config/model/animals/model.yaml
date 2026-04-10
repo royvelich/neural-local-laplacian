@@ -1,5 +1,3 @@
-# fmaps_config/model/humanoids_inter.yaml
-
 module:
   _target_: fmaps_finetune.modules.functional_map_module.FunctionalMapModule
   checkpoint_path: ${globals.checkpoint_path}
@@ -8,56 +6,47 @@ module:
   seed: ${globals.training_seed}
 
   mode: eval
+  baselines: [model]
   geo_cache_dir: ./geo_cache
-  eval_results_dir: ./eval_results/model
+  eval_results_dir: ./eval_results/train
 
-  geo_cache_workers: 4
-
+  # Laplacian assembly (config-driven)
   train_laplacian:
     assembly: diagonal_gram
     pruning: none
-
-  # Eval with both variants
+    area_weighted: false
   eval_laplacians:
-    - assembly: diagonal_gram              # FEM-like (default)
-#    - assembly: diagonal_gram
-#      area_weighted: true                  # graph-Laplacian-like
+    - assembly: diagonal_gram
+      pruning: none
+      area_weighted: false
 
-  baselines: []
+  losses: ${globals.loss_preset}
 
-  losses:
-    - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
-      weight: 1.0
-#      landmark_ratio: 0.2
-      num_landmarks: 256
-      alphas:
-        - 0.1
-        - 1.0
-        - 10.0
-      num_sample_vertices: 1024
-      normalize: false
   random_init: false
   keep_areas_head: false
   freeze_input_projection: false
   freeze_areas_head: false
-  max_vertices: 5000
-  max_vertices_val: 0
+
+  max_vertices: 4000
   vertex_noise: 0.0
   w_prox: 0.0
+
   use_lora: false
   lora_rank: 8
   lora_alpha: 16
   lora_dropout: 0.0
-  lora_target_modules: all-linear
+  lora_target_modules: "all-linear"
   lora_dora: false
   lora_rslora: false
+
+  profile_steps: 0
+
+  # GeomFuM functional map evaluation
   use_geomfum_eval: true
-  geomfum_descriptors:
-    - hks
-    - wks
+  geomfum_descriptors: [hks, wks]
   geomfum_zoomout: false
   geomfum_zoomout_k_init: 20
   geomfum_zoomout_k_final: 50
   geomfum_zoomout_n_iters: 10
-  geomfum_fmap_lmbda: 1000.0
+  geomfum_fmap_lmbda: 1.0           # relaxed from 1e3 for neural Laplacians
   geomfum_fmap_resolvent_gamma: 1.0

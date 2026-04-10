@@ -25,13 +25,12 @@ parameters:
         value: null
       checkpoint_path:
         values:
-          - '/workspace/models/model2.ckpt'
+          - '/workspace/models/model800.ckpt'
       num_eigenvectors:
         value: 100
       k:
         values:
           - 15
-          - 20
       lr:
         value: 1.0e-5
       gradient_clip_val:

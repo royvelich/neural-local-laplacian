@@ -1,5 +1,3 @@
-# fmaps_config/data_module/humanoids_inter.yaml
-
 module:
   _target_: neural_local_laplacian.data_modules.common.GenericPlainDataModule
   train_dataset_specification:
@@ -9,30 +7,28 @@ module:
       pair_generator:
         _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
         root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
-        pairs:
-          - '15:'
-      num_samples: 30
+        pairs: ${globals.train_pairs}
+      num_samples: ${globals.num_samples}
       seed: ${globals.training_seed}
-    batch_size: 5
+    batch_size: ${globals.train_batch_size}
     num_workers: 0
     shuffle: true
     collate_fn:
       _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
       _partial_: true
   val_dataset_specifications:
-  - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
-    dataset:
-      _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
-      pair_generator:
-        _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
-        root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
-        pairs:
-          - ':15'
-      val_poses_per_pair: 5
-      seed: ${globals.training_seed}
-    batch_size: 1
-    num_workers: 0
-    shuffle: false
-    collate_fn:
-      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
-      _partial_: true
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+          root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
+          pairs: ${globals.val_pairs}
+        val_poses_per_pair: ${globals.val_poses_per_pair}
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true

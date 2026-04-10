@@ -2,6 +2,22 @@
 
 training_seed: 42
 ckpt_path: null
-checkpoint_path: "C:/Users/Roy/Downloads/model900.ckpt"
+checkpoint_path: "C:/Users/Roy/Downloads/model2100.ckpt"
 num_eigenvectors: 100
-k: 15
+k: 20
+
+# --- Dataset globals (referenced by all data_module entries) ---
+num_samples: 160
+train_batch_size: 2
+train_pairs: [0.7]
+val_pairs: ["0.7:1.0"]
+val_poses_per_pair: 1
+
+loss_preset:
+  - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
+    weight: 1.0
+    landmark_ratio: 0.2
+  #            num_landmarks: 256
+  #            num_sample_vertices: 2048
+    alphas: [0.01, 0.1, 1.0, 10.0]
+    normalize: false
