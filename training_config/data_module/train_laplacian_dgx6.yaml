@@ -1,0 +1,53 @@
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+      seed: ${globals.training_seed}
+      epoch_size: 2400
+      grid_radius_range: [1.0]
+      polynomial_offset_range: [0.0]
+      points_scale_range: [1.0]
+      coefficient_scale_range: [1.0]
+      order_range: [2, 3]
+      grid_samplers:
+        - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+          num_points_range: [5, 40]
+      conv_k_nearest: null
+      pose_transformers: null
+#        - _target_: neural_local_laplacian.utils.pose_transformers.RandomRotationTransformer
+      coeff_generation_method:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+        _args_: ['uniform']
+      diff_geom_components:
+        - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+          _args_: ['mean_curvature']
+      diff_geom_at_origin_only: True
+      include_origin_in_grid: False
+      flip_normal_if_negative_curvature: False
+      normalize_to_unit_sphere: True
+    batch_size: 4
+    num_workers: 0
+    shuffle: True
+  val_dataset_specifications:
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+        mesh_folder_path: '/workspace/datasets/shrec15'
+        max_meshes: 80
+        file_size_range_mb: [0.5, 4]
+        require_manifold: True
+#        mesh_folder_paths:
+#          - 'F:\input\mpz14'
+#          - 'F:\input\deftransfer'
+#          - 'F:\input\shrec15'
+#        max_meshes: 60
+#        file_size_range_mb: [0.3, 5]
+        shuffle: True
+        k: 8
+        num_geodesic_sources: 5
+        geodesic_source_method: "farthest_point_sampling"
+      batch_size: 1
+      num_workers: 0
+      shuffle: False
