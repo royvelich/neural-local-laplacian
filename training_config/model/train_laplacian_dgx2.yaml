@@ -18,15 +18,29 @@ module:
 
 #  mcv_mode: 'full_gram'      # anisotropic, can be negative
   mcv_mode: 'diagonal_gram'  # isotropic, always positive (default)
-#  val_laplacian:
-#    assembly: diagonal_gram
-#    pruning: none
 
   normalize_grad_by_k: true
 
   val_laplacian:
     assembly: diagonal_gram
     pruning: none
+
+  fmap_val_cfg:
+    k: 15
+    num_eigenvectors: 100
+    max_vertices_val: 4000
+    eval_laplacians:
+      - assembly: diagonal_gram
+        pruning: none
+        area_weighted: false
+    geo_cache_dir: ./geo_cache
+    # GeomFuM evaluation (matches sweep_train6 settings)
+    use_geomfum_eval: true
+    geomfum_descriptors: [hks, wks]
+    geomfum_zoomout: false
+    geomfum_zoomout_k_init: 20
+    geomfum_zoomout_k_final: 50
+    geomfum_zoomout_n_iters: 10
 
   feature_extractor: null
   loss_configs:

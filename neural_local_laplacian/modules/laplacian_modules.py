@@ -30,6 +30,18 @@ from neural_local_laplacian.utils.geodesic_utils import (
     compute_multisource_geodesic_metrics,
 )
 
+# Shared fmap evaluation utilities (used when fmap_val_cfg is set)
+from fmaps_finetune.utils.fmap_eval_utils import (
+    evaluate_pair as _fmap_evaluate_pair,
+    build_gt_corr_from_pair as _fmap_build_gt_corr,
+    build_geo_cache as _fmap_build_geo_cache,
+    GeodesicCache as _FmapGeodesicCache,
+    geo_cache_path as _fmap_geo_cache_path,
+    precompute_geo_cache_worker as _fmap_precompute_geo_cache_worker,
+    summarise_fmap_metrics as _fmap_summarise,
+)
+from fmaps_finetune.modules.evaluators import SpectralNNEvaluator, FunctionalMapEvaluator
+
 
 def _eigh_full_gram(L: torch.Tensor, M_diag: torch.Tensor,
                     num_eigenvectors: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -106,6 +118,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  mcv_mode: str = 'diagonal_gram',
                  normalize_grad_by_k: bool = False,
                  val_laplacian: Optional[Dict] = None,
+                 fmap_val_cfg: Optional[Dict] = None,
                  **kwargs):
         # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
         # val_laplacian_mode) from old checkpoints.
@@ -159,6 +172,28 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # Validation Laplacian config
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
         self._val_lap_config = LaplacianConfig(**_val_lap)
+
+        # Fmap validation config (optional — enables pair-based correspondence eval)
+        self._fmap_val_cfg = fmap_val_cfg
+        self._fmap_val_evaluators: Optional[List] = None
+        self._fmap_val_eval_lap_configs: Optional[List[LaplacianConfig]] = None
+        self._fmap_val_geo_cache: Dict[str, Optional[_FmapGeodesicCache]] = {}
+        self._fmap_val_outputs: Dict[int, List[Dict[str, float]]] = {}
+        if fmap_val_cfg is not None:
+            # Build evaluators
+            self._fmap_val_evaluators = [SpectralNNEvaluator()]
+            if fmap_val_cfg.get('use_geomfum_eval', False):
+                self._fmap_val_evaluators.append(FunctionalMapEvaluator(
+                    descriptors=fmap_val_cfg.get('geomfum_descriptors', ['hks', 'wks']),
+                    use_zoomout=fmap_val_cfg.get('geomfum_zoomout', True),
+                    zoomout_k_init=fmap_val_cfg.get('geomfum_zoomout_k_init', 20),
+                    zoomout_k_final=fmap_val_cfg.get('geomfum_zoomout_k_final', 50),
+                    zoomout_n_iters=fmap_val_cfg.get('geomfum_zoomout_n_iters', 10),
+                ))
+            # Build eval Laplacian configs
+            _eval_laps = fmap_val_cfg.get('eval_laplacians',
+                                          [{'assembly': 'diagonal_gram', 'pruning': 'none'}])
+            self._fmap_val_eval_lap_configs = [LaplacianConfig(**d) for d in _eval_laps]
 
         # Store loss configs (optionally normalized)
         if normalize_loss_weights:
@@ -527,11 +562,153 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         return result
 
     # ------------------------------------------------------------------
+    # Fmap validation: setup
+    # ------------------------------------------------------------------
+
+    def _fmap_val_enabled(self) -> bool:
+        """Check if fmap pair validation is enabled."""
+        return self._fmap_val_cfg is not None and self._fmap_val_evaluators is not None
+
+    def _get_fmap_val_pairs_from_dm(self):
+        """Collect fmap pair datasets from the data module's val specs.
+
+        Fmap pair datasets are identified by having a collate_fn set on the
+        DatasetSpecification (plain DataLoader) and items that are not PyG Data.
+        Returns list of (ds_name, dataloader_idx, pairs).
+        """
+        dm = self.trainer.datamodule
+        if dm is None or not hasattr(dm, '_val_dataset_specifications'):
+            return []
+
+        results = []
+        for idx, spec in enumerate(dm._val_dataset_specifications):
+            if spec.collate_fn is not None:
+                # This is a plain (non-PyG) dataset — assumed to be fmap pairs
+                ds = spec.dataset
+                ds_name = getattr(ds, 'name', ds.__class__.__name__)
+                pairs = [ds[i] for i in range(len(ds))]
+                results.append((ds_name, idx, pairs))
+        return results
+
+    def on_fit_start(self) -> None:
+        """Precompute geodesic caches for fmap validation pairs (if enabled)."""
+        if not self._fmap_val_enabled():
+            return
+
+        import os
+        import time
+
+        cfg = self._fmap_val_cfg
+        is_rank0 = self.trainer.is_global_zero
+        fmap_datasets = self._get_fmap_val_pairs_from_dm()
+
+        if not fmap_datasets:
+            return
+
+        all_pairs = [(name, p) for name, _, pairs in fmap_datasets for p in pairs]
+        mv = cfg.get('max_vertices_val', 0)
+        geo_cache_dir = cfg.get('geo_cache_dir', None)
+
+        if geo_cache_dir:
+            # Disk cache mode: lazy loading
+            n_found = sum(
+                1 for _, p in all_pairs
+                if _fmap_geo_cache_path(geo_cache_dir, p.name, mv).exists()
+            )
+            if is_rank0:
+                print(f"\n  [fmap val] Using disk geo cache: {n_found}/{len(all_pairs)} "
+                      f"pairs found in {geo_cache_dir}", flush=True)
+        else:
+            # In-memory precomputation
+            if is_rank0:
+                print(f"\n  [fmap val] Precomputing geodesic caches "
+                      f"({len(all_pairs)} pairs)...", flush=True)
+
+            from fmaps_finetune.datasets.functional_map_dataset import subsample_pair, _stable_hash
+
+            t0 = time.perf_counter()
+            worker_args = []
+            for _, p in all_pairs:
+                if p.name in self._fmap_val_geo_cache:
+                    continue
+                sub_p = p
+                if mv > 0:
+                    sub_p = subsample_pair(p, mv, np.random.RandomState(_stable_hash(p.name)))
+                if sub_p.faces_b is None:
+                    continue
+                gt_corr = _fmap_build_gt_corr(sub_p)
+                verts_full = sub_p._verts_b_full if sub_p._verts_b_full is not None else sub_p.verts_b
+                idx_b = sub_p._idx_b if sub_p._idx_b is not None else np.arange(len(sub_p.verts_b))
+                unique_targets = np.unique(gt_corr) if gt_corr is not None else np.arange(len(sub_p.verts_b))
+                worker_args.append((p.name, verts_full, sub_p.faces_b, idx_b, unique_targets))
+
+            _n_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+            max_workers = cfg.get('geo_cache_workers', None)
+            n_workers = min(len(worker_args), max_workers or _n_cpus)
+
+            if worker_args:
+                if n_workers > 1:
+                    import multiprocessing as _mp
+                    if is_rank0:
+                        print(f"    Parallel precomputation: {len(worker_args)} pairs, "
+                              f"{n_workers} workers", flush=True)
+                    with _mp.Pool(n_workers) as pool:
+                        results = {}
+                        for r in pool.imap_unordered(_fmap_precompute_geo_cache_worker, worker_args):
+                            results[r[0]] = r[1:]
+                else:
+                    results = {}
+                    for args in worker_args:
+                        r = _fmap_precompute_geo_cache_worker(args)
+                        results[r[0]] = r[1:]
+
+                for name, (dist_cache, sqrt_area, idx_b) in results.items():
+                    if dist_cache is not None:
+                        self._fmap_val_geo_cache[name] = _FmapGeodesicCache.from_precomputed(
+                            dist_cache, sqrt_area, idx_b)
+
+            dt = time.perf_counter() - t0
+            if is_rank0:
+                print(f"    Done: {len(self._fmap_val_geo_cache)} caches in {dt:.1f}s",
+                      flush=True)
+
+    def _get_fmap_geo_cache(self, pair_name: str) -> Optional[_FmapGeodesicCache]:
+        """Get geo cache for a pair: from memory or disk."""
+        cfg = self._fmap_val_cfg
+        geo_cache_dir = cfg.get('geo_cache_dir', None) if cfg else None
+
+        if not geo_cache_dir:
+            return self._fmap_val_geo_cache.get(pair_name)
+
+        mv = cfg.get('max_vertices_val', 0)
+        cache_path = _fmap_geo_cache_path(geo_cache_dir, pair_name, mv)
+        if cache_path.exists():
+            return _FmapGeodesicCache.load_from_disk(str(cache_path))
+        return None
+
+    # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
 
-    def validation_step(self, batch: Batch, batch_idx: int) -> Dict[str, float]:
-        """Validate against ground-truth eigendecomposition and geodesics."""
+    def on_validation_epoch_start(self) -> None:
+        """Reset fmap validation output buffers."""
+        self._fmap_val_outputs = {}
+
+    def validation_step(self, batch, batch_idx: int,
+                        dataloader_idx: int = 0) -> Optional[Dict[str, float]]:
+        """Validate against GT eigendecomposition/geodesics (mesh batches)
+        or functional map correspondence (pair batches)."""
+        # Detect batch type: PyG Batch vs list of PairSample
+        if isinstance(batch, Batch):
+            return self._validation_step_mesh(batch, batch_idx, dataloader_idx)
+        elif isinstance(batch, list):
+            return self._validation_step_fmap(batch, batch_idx, dataloader_idx)
+        else:
+            return None
+
+    def _validation_step_mesh(self, batch: Batch, batch_idx: int,
+                              dataloader_idx: int) -> Dict[str, float]:
+        """Original mesh validation: eigendecomposition + geodesics."""
         mesh_list = batch.to_data_list()
         all_metrics = []
         for mesh_data in mesh_list:
@@ -677,3 +854,107 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         metrics['spectral_distance'] = eig_err + (1.0 - float(cos_sims.mean()))
 
         return metrics
+
+    # ------------------------------------------------------------------
+    # Fmap pair validation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _validation_step_fmap(self, batch: list, batch_idx: int,
+                              dataloader_idx: int) -> None:
+        """Run fmap correspondence evaluation on a shape pair batch."""
+        if not self._fmap_val_enabled():
+            return None
+
+        cfg = self._fmap_val_cfg
+        k = cfg.get('k', 20)
+        num_eigenvectors = cfg.get('num_eigenvectors', 50)
+        mv = cfg.get('max_vertices_val', 0)
+
+        from fmaps_finetune.datasets.functional_map_dataset import (
+            PairSample, subsample_pair, _stable_hash,
+        )
+
+        for pair in batch:
+            if not isinstance(pair, PairSample):
+                continue
+
+            if mv > 0:
+                pair = subsample_pair(
+                    pair, mv, np.random.RandomState(_stable_hash(pair.name)))
+
+            metrics = _fmap_evaluate_pair(
+                self, pair, k, num_eigenvectors, self.device,
+                laplacian_configs=self._fmap_val_eval_lap_configs,
+                evaluators=self._fmap_val_evaluators,
+                geo_cache=self._get_fmap_geo_cache(pair.name),
+            )
+
+            if dataloader_idx not in self._fmap_val_outputs:
+                self._fmap_val_outputs[dataloader_idx] = []
+            self._fmap_val_outputs[dataloader_idx].append(metrics)
+
+    def on_validation_epoch_end(self) -> None:
+        """Aggregate and log fmap pair validation metrics."""
+        if not self._fmap_val_outputs:
+            return
+
+        dm = self.trainer.datamodule
+        val_specs = (dm._val_dataset_specifications
+                     if hasattr(dm, '_val_dataset_specifications') else [])
+
+        for dl_idx, outputs in sorted(self._fmap_val_outputs.items()):
+            if not outputs:
+                continue
+
+            ds = val_specs[dl_idx].dataset if dl_idx < len(val_specs) else None
+            ds_name = getattr(ds, 'name', f'fmap_val_{dl_idx}')
+
+            # DDP gather
+            sample = outputs[0]
+            float_keys = sorted(
+                k for k, v in sample.items()
+                if isinstance(v, (int, float)) and not k.startswith("_")
+            )
+            if not float_keys:
+                continue
+
+            local_t = torch.tensor(
+                [[d.get(k, float("nan")) for k in float_keys] for d in outputs],
+                device=self.device, dtype=torch.float32,
+            )
+            gathered = self.all_gather(local_t)
+            if gathered.dim() == 2:
+                gathered = gathered.unsqueeze(0)
+            all_flat = gathered.reshape(-1, len(float_keys))
+
+            # Trim to true dataset size
+            true_size = len(val_specs[dl_idx].dataset) if dl_idx < len(val_specs) else len(outputs)
+            all_flat = all_flat[:true_size]
+
+            all_metrics = [
+                {k: all_flat[i, j].item() for j, k in enumerate(float_keys)}
+                for i in range(all_flat.shape[0])
+            ]
+
+            # Summarise and print
+            summary = _fmap_summarise(
+                all_metrics, self._fmap_val_evaluators,
+                f"Val epoch {self.current_epoch} [{ds_name}]",
+                silent=not self.trainer.is_global_zero,
+            )
+
+            # Log to W&B / Lightning
+            prefix = f"val_fmap/{ds_name}"
+            for mk, mv in summary.items():
+                self.log(f"{prefix}/{mk}", mv, sync_dist=True,
+                         on_step=False, on_epoch=True, add_dataloader_idx=False)
+
+            # Log primary fmap metric to prog_bar
+            for ev in self._fmap_val_evaluators:
+                geo_key = f"{ev.name}/geo_at_05pct"
+                if geo_key in summary:
+                    self.log(f"val_fmap/geo@5%", summary[geo_key],
+                             prog_bar=True, sync_dist=True,
+                             on_step=False, on_epoch=True, add_dataloader_idx=False)
+                    break
