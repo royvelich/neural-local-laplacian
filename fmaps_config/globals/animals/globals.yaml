@@ -2,9 +2,9 @@
 
 training_seed: 42
 ckpt_path: null
-checkpoint_path: "C:/Users/Roy/Downloads/model2300.ckpt"
+checkpoint_path: "C:/Users/Roy/Downloads/model3400.ckpt"
 num_eigenvectors: 100
-k: 20
+k: 15
 
 # --- Dataset globals (referenced by all data_module entries) ---
 num_samples: 160

@@ -25,7 +25,7 @@ parameters:
         value: null
       checkpoint_path:
         values:
-          - '/workspace/models/model800.ckpt'
+          - '/workspace/models/model3400.ckpt'
       num_eigenvectors:
         value: 100
       k:
