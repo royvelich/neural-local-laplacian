@@ -2,7 +2,7 @@
 
 training_seed: 42
 ckpt_path: null
-checkpoint_path: "C:/Users/Roy/Downloads/model5000.ckpt"
+checkpoint_path: "C:/Users/Roy/Downloads/model5100.ckpt"
 num_eigenvectors: 100
 k: 15
 

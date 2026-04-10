@@ -30,21 +30,21 @@ module:
     num_workers: 0
     shuffle: True
   val_dataset_specifications:
-    # --- [0] Mesh spectral/geodesic validation (existing, PyG) ---
-    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
-      dataset:
-        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        mesh_folder_path: '/workspace/datasets/shrec15'
-        max_meshes: 80
-        file_size_range_mb: [0.5, 4]
-        require_manifold: True
-        shuffle: True
-        k: 8
-        num_geodesic_sources: 5
-        geodesic_source_method: "farthest_point_sampling"
-      batch_size: 1
-      num_workers: 0
-      shuffle: False
+#    # --- [0] Mesh spectral/geodesic validation (existing, PyG) ---
+#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+#      dataset:
+#        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+#        mesh_folder_path: '/workspace/datasets/shrec15'
+#        max_meshes: 80
+#        file_size_range_mb: [0.5, 4]
+#        require_manifold: True
+#        shuffle: True
+#        k: 8
+#        num_geodesic_sources: 5
+#        geodesic_source_method: "farthest_point_sampling"
+#      batch_size: 1
+#      num_workers: 0
+#      shuffle: False
 
     # --- [1] Fmap: DT4D Animals intra ---
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
@@ -54,7 +54,7 @@ module:
           _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
           root: '/workspace/datasets/DeformingThings4DMatching-Animals'
           pairs: ["0.7:1.0"]
-        val_poses_per_pair: 1
+        val_poses_per_pair: 2
         seed: ${globals.training_seed}
       batch_size: 1
       num_workers: 5
