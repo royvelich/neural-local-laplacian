@@ -1,20 +1,20 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 512
+  d_model: 768
   nhead: 8
   num_encoder_layers: 1
-  dim_feedforward: 512
+  dim_feedforward: 768
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.0
+  dropout: 0.1
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
-  input_projection_hidden_dims: null
-  output_projection_hidden_dims: null
+  input_projection_hidden_dims: [32, 128]
+  output_projection_hidden_dims: [128, 32]
 
   area_activation: bounded_sigmoid
-  area_bound_C: 4.0   # 4π
+  area_bound_C: 6.0   # 4π
 
 #  mcv_mode: 'full_gram'      # anisotropic, can be negative
   mcv_mode: 'diagonal_gram'  # isotropic, always positive (default)
@@ -33,11 +33,11 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 1.0
+      weight: 2.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 2.0
+      weight: 1.0
 
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
