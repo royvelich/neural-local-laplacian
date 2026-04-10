@@ -26,7 +26,7 @@ module:
       diff_geom_at_origin_only: True
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
-      normalize_to_unit_area: False
+      normalize_to_unit_sphere: True
     batch_size: 4
     num_workers: 0
     shuffle: True
