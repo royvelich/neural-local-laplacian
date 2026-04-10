@@ -176,11 +176,13 @@ class SurfaceVisualizer:
         self._show_reference_frame = False
         self._gt_normal_color = list(ColorPalette.NORMALS)
         self._pred_normal_color = list(ColorPalette.PREDICTED_NORMALS)
-        self._normal_length = self.vis_config.normal_display_scale
+        self._gt_normal_length = 8.5
+        self._pred_normal_length = 8.5
         self._normal_radius = self.vis_config.normal_origin_point_radius
         self._point_radius = self.vis_config.point_radius
         self._surface_color = [0.3, 0.3, 0.3]
         self._origin_dot_color = [1.0, 0.0, 0.0]
+        self._edge_width = 0.0  # toggled in screenshots
 
     def _has_hybrid_option(self):
         return self._current_surfaces is not None and len(self._current_surfaces) >= 2
@@ -388,6 +390,8 @@ class SurfaceVisualizer:
             if c4: self._surface_color = list(v4); needs_rerender = True
             c5, v5 = psim.SliderFloat("Point Size", self._point_radius, v_min=0.001, v_max=0.05)
             if c5: self._point_radius = v5; needs_rerender = True
+            c5b, v5b = psim.SliderFloat("Edge Width", self._edge_width, v_min=0.0, v_max=2.0)
+            if c5b: self._edge_width = v5b; needs_rerender = True
             psim.Text("")
 
             # ── Normal display ───────────────────────────────────────
@@ -401,8 +405,10 @@ class SurfaceVisualizer:
             c8, v8 = psim.Checkbox("GT Normals (all points)", self._show_gt_normals_all)
             if c8: self._show_gt_normals_all = v8; needs_rerender = True
             psim.Text("")
-            c9, v9 = psim.SliderFloat("Normal Length", self._normal_length, v_min=0.1, v_max=10.0)
-            if c9: self._normal_length = v9; needs_rerender = True
+            c9, v9 = psim.SliderFloat("GT Normal Length", self._gt_normal_length, v_min=0.1, v_max=20.0)
+            if c9: self._gt_normal_length = v9; needs_rerender = True
+            c9b, v9b = psim.SliderFloat("Pred Normal Length", self._pred_normal_length, v_min=0.1, v_max=20.0)
+            if c9b: self._pred_normal_length = v9b; needs_rerender = True
             c10, v10 = psim.SliderFloat("Normal Width", self._normal_radius, v_min=0.001, v_max=0.05)
             if c10: self._normal_radius = v10; needs_rerender = True
             c11, v11 = psim.ColorEdit3("GT Normal Color", self._gt_normal_color)
@@ -504,8 +510,9 @@ class SurfaceVisualizer:
         pos, face, normals = self._extract_surface_data(surface)
         if self._show_mesh:
             mesh = ps.register_surface_mesh(f"{name} - Mesh", pos, face,
-                smooth_shade=self.vis_config.smooth_shade, edge_width=self.vis_config.edge_width,
+                smooth_shade=self.vis_config.smooth_shade, edge_width=self._edge_width,
                 color=tuple(self._surface_color), transparency=0.5)
+            mesh.set_material("candy")
             self._add_vector_quantities(mesh, surface, "mesh")
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(mesh, normals)
@@ -528,8 +535,9 @@ class SurfaceVisualizer:
 
         # Smooth mesh from regular grid (surface 0)
         mesh = ps.register_surface_mesh(f"Hybrid Mesh ({name_mesh})", pos_mesh, face_mesh,
-            smooth_shade=self.vis_config.smooth_shade, edge_width=self.vis_config.edge_width,
+            smooth_shade=self.vis_config.smooth_shade, edge_width=self._edge_width,
             color=tuple(self._surface_color), transparency=0.5)
+        mesh.set_material("candy")
         self._add_vector_quantities(mesh, surf_mesh, "mesh")
         if self._show_gt_normals_all:
             self._add_normals_to_structure(mesh, normals_mesh)
@@ -552,10 +560,10 @@ class SurfaceVisualizer:
             origin_3d = self._get_origin_position(surface, translation)
             gt_normal = to_numpy(surface.normal)
             gt_at_origin = gt_normal[0] if gt_normal.shape[0] == 1 else (gt_normal[surface.origin_idx.item()] if hasattr(surface, 'origin_idx') else gt_normal[0])
-            normal_scale = self.vis_config.vector_scale * self._normal_length
+            gt_scale = self.vis_config.vector_scale * self._gt_normal_length
             gt_cloud = ps.register_point_cloud(f"{name} - GT Normal", origin_3d,
                 radius=self._normal_radius, color=tuple(self._origin_dot_color), enabled=True)
-            gt_cloud.add_vector_quantity("GT Normal", gt_at_origin.reshape(1, 3) * normal_scale,
+            gt_cloud.add_vector_quantity("GT Normal", gt_at_origin.reshape(1, 3) * gt_scale,
                 enabled=True, color=tuple(self._gt_normal_color), radius=self._normal_radius, vectortype="ambient")
 
         cache_key = pred_cache_idx if pred_cache_idx is not None else self._patch_idx
@@ -563,10 +571,10 @@ class SurfaceVisualizer:
             pred_normal, _, _ = self._prediction_cache[cache_key]
             pred_np = to_numpy(pred_normal)
             origin_3d = self._get_origin_position(surface, translation)
-            normal_scale = self.vis_config.vector_scale * self._normal_length
+            pred_scale = self.vis_config.vector_scale * self._pred_normal_length
             pred_cloud = ps.register_point_cloud(f"{name} - Pred Normal", origin_3d,
                 radius=self._normal_radius, color=tuple(self._origin_dot_color), enabled=True)
-            pred_cloud.add_vector_quantity("Predicted Normal", pred_np.reshape(1, 3) * normal_scale,
+            pred_cloud.add_vector_quantity("Predicted Normal", pred_np.reshape(1, 3) * pred_scale,
                 enabled=True, color=tuple(self._pred_normal_color), radius=self._normal_radius, vectortype="ambient")
 
     def _save_all_screenshots(self):
@@ -578,7 +586,8 @@ class SurfaceVisualizer:
         out_dir = Path(f"surface_patch_screenshots_{timestamp}")
         out_dir.mkdir(exist_ok=True)
         saved = (self._patch_idx, self._show_mesh, self._show_pointcloud,
-                 self._show_gt_normal_origin, self._show_pred_normal_origin)
+                 self._show_gt_normal_origin, self._show_pred_normal_origin,
+                 self._edge_width)
         has_pred = bool(self._prediction_cache)
 
         # Build patch index list: individual patches + hybrid
@@ -592,10 +601,17 @@ class SurfaceVisualizer:
         if has_pred:
             normal_modes += [("pred_normal", False, True), ("gt_and_pred", True, True)]
 
-        total = sum(
-            len(hybrid_display_modes if pidx == _HYBRID_IDX else display_modes) * len(normal_modes)
-            for pidx in patch_indices
-        )
+        # Edge styles for mesh-visible screenshots
+        edge_styles = [("no_edges", 0.0), ("edges", 1.0)]
+
+        # Count total screenshots
+        total = 0
+        for pidx in patch_indices:
+            modes = hybrid_display_modes if pidx == _HYBRID_IDX else display_modes
+            for _, show_mesh, _ in modes:
+                n_edge = len(edge_styles) if show_mesh else 1
+                total += n_edge * len(normal_modes)
+
         count = 0
         print(f"\nSaving {total} screenshots to {out_dir}/...")
 
@@ -607,20 +623,28 @@ class SurfaceVisualizer:
                 patch_label = self._current_surface_names[pidx].replace(" ", "_").replace("(", "").replace(")", "")
                 modes = display_modes
             for disp_label, show_mesh, show_pc in modes:
-                for norm_label, show_gt, show_pred in normal_modes:
-                    self._patch_idx = pidx
-                    self._show_mesh = show_mesh
-                    self._show_pointcloud = show_pc
-                    self._show_gt_normal_origin = show_gt
-                    self._show_pred_normal_origin = show_pred
-                    self._render()
-                    filename = f"{patch_label}_{disp_label}_{norm_label}.png"
-                    ps.screenshot(str(out_dir / filename), transparent_bg=True)
-                    count += 1
-                    print(f"  [{count}/{total}] {filename}")
+                # Determine edge variations for this display mode
+                cur_edge_styles = edge_styles if show_mesh else [("", 0.0)]
+                for edge_label, edge_w in cur_edge_styles:
+                    for norm_label, show_gt, show_pred in normal_modes:
+                        self._patch_idx = pidx
+                        self._show_mesh = show_mesh
+                        self._show_pointcloud = show_pc
+                        self._show_gt_normal_origin = show_gt
+                        self._show_pred_normal_origin = show_pred
+                        self._edge_width = edge_w
+                        self._render()
+                        if edge_label:
+                            filename = f"{patch_label}_{disp_label}_{edge_label}_{norm_label}.png"
+                        else:
+                            filename = f"{patch_label}_{disp_label}_{norm_label}.png"
+                        ps.screenshot(str(out_dir / filename), transparent_bg=True)
+                        count += 1
+                        print(f"  [{count}/{total}] {filename}")
 
         (self._patch_idx, self._show_mesh, self._show_pointcloud,
-         self._show_gt_normal_origin, self._show_pred_normal_origin) = saved
+         self._show_gt_normal_origin, self._show_pred_normal_origin,
+         self._edge_width) = saved
         self._render()
         print(f"Done! {total} screenshots saved to {out_dir}/")
 
@@ -629,7 +653,9 @@ def setup_polyscope():
     ps.init()
     ps.set_up_dir("z_up")
     ps.look_at(camera_location=[2.4, 2, 3.9], target=[0, 0, 0])
-    ps.set_ground_plane_mode("none")
+    ps.set_ground_plane_mode("shadow_only")
+    ps.set_shadow_blur_iters(20)
+    ps.set_shadow_darkness(0.15)
     ps.set_SSAA_factor(4)
     ps.set_background_color((0.0, 0.0, 0.0))
 

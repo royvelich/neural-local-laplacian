@@ -10,7 +10,7 @@ module:
         _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
         root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
         pairs:
-          - '10:'
+          - '15:'
       num_samples: 30
       seed: ${globals.training_seed}
     batch_size: 5
@@ -27,7 +27,7 @@ module:
         _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
         root: "F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals"
         pairs:
-          - ':10'
+          - ':15'
       val_poses_per_pair: 5
       seed: ${globals.training_seed}
     batch_size: 1

@@ -26,14 +26,13 @@ parameters:
       checkpoint_path:
         values:
           - '/workspace/models/model900.ckpt'
-          - '/workspace/models/model800.ckpt'
+#          - '/workspace/models/model2.ckpt'
       num_eigenvectors:
         value: 100
       k:
         values:
-          - 15
-#          - 20
-#          - 30
+          - 10
+          - 20
       lr:
         value: 1.0e-5
       gradient_clip_val:
@@ -266,8 +265,8 @@ parameters:
         num_eigenvectors: ${globals.num_eigenvectors}
         seed: ${globals.training_seed}
 
-        mode: train
-        baselines: [model, robust]
+        mode: eval
+        baselines: [model]
         geo_cache_dir: ./geo_cache
         eval_results_dir: ./eval_results/train
 
