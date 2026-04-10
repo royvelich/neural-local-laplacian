@@ -109,6 +109,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  **kwargs):
         # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
         # val_laplacian_mode) from old checkpoints.
+        normalize_grad_by_k = True
         super().__init__(**{k: v for k, v in kwargs.items()
                            if k in ('optimizer_cfg', 'scheduler_cfg')})
 
