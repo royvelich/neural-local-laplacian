@@ -30,7 +30,8 @@ parameters:
         value: 100
       k:
         values:
-          - 10
+          - 15
+          - 20
       lr:
         value: 1.0e-5
       gradient_clip_val:
@@ -40,7 +41,7 @@ parameters:
       num_samples:
         value: 160
       train_batch_size:
-        value: 5
+        value: 2
       train_pairs:
         value: [0.7]
       val_pairs:
@@ -52,9 +53,9 @@ parameters:
         value:
           - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
             weight: 1.0
-#            landmark_ratio: 0.2
-            num_landmarks: 256
-            num_sample_vertices: 2048
+            landmark_ratio: 0.2
+#            num_landmarks: 256
+#            num_sample_vertices: 2048
             alphas: [0.01, 0.1, 1.0, 10.0]
             normalize: false
 
@@ -327,7 +328,7 @@ parameters:
       accelerator: auto
       devices: auto
       strategy: auto
-      max_epochs: 300
+      max_epochs: 50
       accumulate_grad_batches: 1
       gradient_clip_val: ${globals.gradient_clip_val}
       gradient_clip_algorithm: norm
