@@ -73,4 +73,4 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
-      weight: 10.0
+      weight: 50.0
