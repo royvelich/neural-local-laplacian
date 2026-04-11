@@ -6,14 +6,14 @@ module:
   num_encoder_layers: 2
   dim_feedforward: 128
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.0
+  dropout: 0.2
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  area_activation: softplus
+  area_activation: bounded_sigmoid
   area_bound_C: 20.0   # 4π
 
 #  mcv_mode: 'full_gram'      # anisotropic, can be negative
@@ -44,6 +44,28 @@ module:
 
   feature_extractor: null
   loss_configs:
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 2.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+#      weight: 0.01
+
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+#      weight: 2.0
+
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 1.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
