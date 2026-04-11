@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 64
-  nhead: 8
+  d_model: 128
+  nhead: 4
   num_encoder_layers: 2
-  dim_feedforward: 64
+  dim_feedforward: 128
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.2
   normalize_loss_weights: False
@@ -47,7 +47,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 1.0
+      weight: 2.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
@@ -70,7 +70,7 @@ module:
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
 #      weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
-#      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
+      weight: 10.0
