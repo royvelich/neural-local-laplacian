@@ -521,7 +521,6 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         )
 
         total_loss = 0.0
-        loss_components_weighted = {}
         loss_components_unweighted = {}
 
         for loss_config in self._loss_configs:
@@ -529,9 +528,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             loss_name = loss_config.loss_module.__class__.__name__
             loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
             if loss_config.weight is not None:
-                weighted_loss = loss_config.weight * unweighted_loss
-                total_loss = total_loss + weighted_loss
-                loss_components_weighted[f"train/{loss_name}_weighted"] = weighted_loss
+                total_loss = total_loss + loss_config.weight * unweighted_loss
 
         if not isinstance(total_loss, torch.Tensor):
             raise ValueError("At least one loss must have a non-None weight for training")
@@ -552,12 +549,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         for name, val in loss_components_unweighted.items():
             self.log(name, val, on_step=False, on_epoch=True, logger=True,
                      batch_size=batch_size, sync_dist=True)
-        for name, val in loss_components_weighted.items():
-            self.log(name, val, on_step=False, on_epoch=True, logger=True,
-                     batch_size=batch_size, sync_dist=True)
 
         result = {"loss": total_loss}
-        result.update(loss_components_weighted)
         result.update(loss_components_unweighted)
         return result
 
