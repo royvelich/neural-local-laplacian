@@ -20,6 +20,373 @@ from neural_local_laplacian.utils.pose_transformers import PoseTransformer
 
 
 # =============================================
+# Polynomial evaluation (reusable)
+# =============================================
+
+def get_polynomial_pairs(order: int) -> List[Tuple[int, int]]:
+    """Get list of (i, j) exponent pairs for polynomial of given order."""
+    return [(i, j) for i in range(order + 1) for j in range(order + 1) if 0 < i + j <= order]
+
+
+def evaluate_polynomial(x: torch.Tensor, y: torch.Tensor,
+                        coefficients: torch.Tensor,
+                        pairs: List[Tuple[int, int]]) -> torch.Tensor:
+    """Evaluate a 2D polynomial z = Σ c_mn x^m y^n.
+
+    Args:
+        x, y: Coordinate tensors (any shape, must be broadcastable).
+        coefficients: Tensor of coefficients matching ``pairs``.
+        pairs: List of (m, n) exponent pairs.
+
+    Returns:
+        Polynomial values with the same shape as x.
+    """
+    z = torch.zeros_like(x)
+    for c, (i, j) in zip(coefficients, pairs):
+        z = z + c * (x ** i) * (y ** j)
+    return z
+
+
+# =============================================
+# Laplace-Beltrami via autograd
+# =============================================
+
+def compute_laplace_beltrami(surface_func, h_func, x, y):
+    """Compute Δ_LB(h) on surface z = surface_func(x, y) using autograd.
+
+    Both ``surface_func`` and ``h_func`` must be autograd-compatible
+    callables ``(x, y) -> scalar_tensor``.
+
+    Args:
+        surface_func: Callable defining the surface z = f(x, y).
+        h_func: Callable defining the test function h(x, y).
+        x, y: (N, 1) tensors with ``requires_grad=True``.
+
+    Returns:
+        (N,) tensor of Δ_LB(h) values.
+    """
+    # Surface derivatives → metric
+    z = surface_func(x, y)
+    f_x = torch.autograd.grad(z.sum(), x, create_graph=True)[0]
+    f_y = torch.autograd.grad(z.sum(), y, create_graph=True)[0]
+
+    det_g = 1.0 + f_x ** 2 + f_y ** 2
+    sqrt_det_g = det_g.sqrt()
+
+    # Inverse metric
+    g11 = (1.0 + f_y ** 2) / det_g
+    g12 = -(f_x * f_y) / det_g
+    g22 = (1.0 + f_x ** 2) / det_g
+
+    # Test function derivatives
+    h = h_func(x, y)
+    h_x = torch.autograd.grad(h.sum(), x, create_graph=True)[0]
+    h_y = torch.autograd.grad(h.sum(), y, create_graph=True)[0]
+
+    # Flux: F_i = √det(g) · g^{ij} · h_j
+    F_x = sqrt_det_g * (g11 * h_x + g12 * h_y)
+    F_y = sqrt_det_g * (g12 * h_x + g22 * h_y)
+
+    # Divergence
+    dFx_dx = torch.autograd.grad(F_x.sum(), x, create_graph=True)[0]
+    dFy_dy = torch.autograd.grad(F_y.sum(), y, create_graph=True)[0]
+
+    # Δ_LB(h) = (1/√det(g)) · (∂F_x/∂x + ∂F_y/∂y)
+    lb_h = (dFx_dx + dFy_dy) / sqrt_det_g
+
+    return lb_h.squeeze(-1)
+
+
+def compute_surface_gradient(surface_func, h_func, x, y):
+    """Compute the surface gradient ∇_S(h) in ℝ³ on surface z = f(x,y).
+
+    The surface gradient is the Jacobian J times the contravariant
+    gradient components: ∇_S(h) = J · g^{ij} h_j.
+
+    Args:
+        surface_func, h_func: Autograd-compatible callables.
+        x, y: (N, 1) tensors with requires_grad=True.
+
+    Returns:
+        (N, 3) surface gradient vectors in ℝ³.
+    """
+    z = surface_func(x, y)
+    f_x = torch.autograd.grad(z.sum(), x, create_graph=True)[0]
+    f_y = torch.autograd.grad(z.sum(), y, create_graph=True)[0]
+
+    det_g = 1.0 + f_x ** 2 + f_y ** 2
+
+    g11 = (1.0 + f_y ** 2) / det_g
+    g12 = -(f_x * f_y) / det_g
+    g22 = (1.0 + f_x ** 2) / det_g
+
+    h = h_func(x, y)
+    h_x = torch.autograd.grad(h.sum(), x, create_graph=True)[0]
+    h_y = torch.autograd.grad(h.sum(), y, create_graph=True)[0]
+
+    # Contravariant components
+    c1 = g11 * h_x + g12 * h_y
+    c2 = g12 * h_x + g22 * h_y
+
+    # Jacobian columns: ∂(x,y,z)/∂u = (1,0,f_x), ∂(x,y,z)/∂v = (0,1,f_y)
+    grad_3d = torch.cat([c1, c2, c1 * f_x + c2 * f_y], dim=-1)
+
+    return grad_3d
+
+
+def compute_lb_and_gradient_batch(surface_func, h_funcs, x0, y0):
+    """Compute Δ_LB(h) and ∇_S(h) for multiple test functions, sharing the metric.
+
+    The surface metric (f_x, f_y, inverse metric, √det(g)) is computed once
+    from ``surface_func`` and reused for every test function in ``h_funcs``.
+
+    Args:
+        surface_func: Callable ``(x, y) -> z`` defining the surface.
+        h_funcs: List of callables ``(x, y) -> scalar``.
+        x0, y0: (1, 1) tensors with requires_grad=True (evaluation point).
+
+    Returns:
+        laplacians: (P,) tensor of Δ_LB(h_p) values (detached).
+        gradients:  (P, 3) tensor of ∇_S(h_p) vectors (detached).
+    """
+    P = len(h_funcs)
+
+    # --- Surface metric (computed once) ---
+    z = surface_func(x0, y0)
+    f_x = torch.autograd.grad(z.sum(), x0, create_graph=True)[0]
+    f_y = torch.autograd.grad(z.sum(), y0, create_graph=True)[0]
+
+    det_g = 1.0 + f_x ** 2 + f_y ** 2
+    sqrt_det_g = det_g.sqrt()
+    g11 = (1.0 + f_y ** 2) / det_g
+    g12 = -(f_x * f_y) / det_g
+    g22 = (1.0 + f_x ** 2) / det_g
+
+    laplacians = torch.zeros(P, dtype=torch.float32)
+    gradients = torch.zeros(P, 3, dtype=torch.float32)
+
+    for p, h in enumerate(h_funcs):
+        h_val = h(x0, y0)
+        h_x = torch.autograd.grad(h_val.sum(), x0, create_graph=True)[0]
+        h_y = torch.autograd.grad(h_val.sum(), y0, create_graph=True)[0]
+
+        # --- Laplace-Beltrami ---
+        F_x = sqrt_det_g * (g11 * h_x + g12 * h_y)
+        F_y = sqrt_det_g * (g12 * h_x + g22 * h_y)
+        dFx_dx = torch.autograd.grad(F_x.sum(), x0, create_graph=True)[0]
+        dFy_dy = torch.autograd.grad(F_y.sum(), y0, create_graph=True)[0]
+        lb_h = (dFx_dx + dFy_dy) / sqrt_det_g
+        laplacians[p] = lb_h.detach().squeeze()
+
+        # --- Surface gradient in ℝ³ ---
+        c1 = g11 * h_x + g12 * h_y
+        c2 = g12 * h_x + g22 * h_y
+        grad_3d = torch.cat([c1, c2, c1 * f_x + c2 * f_y], dim=-1)
+        gradients[p] = grad_3d.detach().squeeze(0)
+
+    return laplacians, gradients
+
+
+# =============================================
+# Test function sampling
+# =============================================
+
+class TestFunctionSampler:
+    """Samples random test functions and computes Δ_LB + deltas + gradients.
+
+    Supports three families:
+      - ``poly``: Random polynomials h(x,y) = Σ c_mn x^m y^n.
+      - ``trig``: Trigonometric h(x,y) = sin(ωx·x + φx) · cos(ωy·y + φy).
+      - ``exp``:  Gaussian h(x,y) = exp(-((x-cx)² + (y-cy)²) / (2σ²)).
+
+    Optionally appends coordinate functions x, y, z as extra test functions.
+
+    Args:
+        num_test_funcs: Number of random test functions per patch.
+        include_coordinates: If True, append x, y, z (3 extra functions).
+        families: Dict of family configs. Keys: 'poly', 'trig', 'exp'.
+            Each value is a dict with 'weight' (sampling probability) plus
+            family-specific parameters.
+        normalize_target: Target normalization mode.
+            'none': raw Δ_LB values.
+            'unit_magnitude': divide Δ_LB by |Δ_LB| per function.
+            'unit_variance': divide deltas and Δ_LB so deltas have unit var.
+    """
+
+    def __init__(
+            self,
+            num_test_funcs: int = 10,
+            include_coordinates: bool = False,
+            families: Optional[Dict[str, Any]] = None,
+            normalize_target: str = 'none',
+    ):
+        self.num_test_funcs = num_test_funcs
+        self.include_coordinates = include_coordinates
+        self.normalize_target = normalize_target
+
+        if families is None:
+            families = {
+                'poly': {'weight': 0.4, 'order_range': [1, 4],
+                         'coeff_scale': 1.0, 'coeff_method': 'uniform'},
+                'trig': {'weight': 0.4, 'frequency_range': [0.5, 4.0],
+                         'phase_range': [0.0, 6.283]},
+                'exp':  {'weight': 0.2, 'sigma_range': [0.3, 2.0],
+                         'center_range': [-1.0, 1.0]},
+            }
+
+        self._families = {}
+        self._family_weights = []
+        self._family_names = []
+        for name, cfg in families.items():
+            w = cfg.get('weight', 1.0)
+            self._families[name] = cfg
+            self._family_names.append(name)
+            self._family_weights.append(w)
+
+        total_w = sum(self._family_weights)
+        self._family_probs = [w / total_w for w in self._family_weights]
+
+    # ----- family samplers ------------------------------------------------
+
+    def _sample_poly_func(self, rng: np.random.Generator):
+        """Return a polynomial test function callable."""
+        cfg = self._families['poly']
+        order_lo, order_hi = cfg.get('order_range', [1, 4])
+        scale = cfg.get('coeff_scale', 1.0)
+        method = cfg.get('coeff_method', 'uniform')
+
+        order = int(rng.integers(order_lo, order_hi + 1))
+        pairs = get_polynomial_pairs(order)
+        if method == 'normal':
+            coeffs = torch.tensor(rng.normal(size=len(pairs)) * scale,
+                                  dtype=torch.float32)
+        else:
+            coeffs = torch.tensor(
+                (2 * rng.uniform(size=len(pairs)) - 1) * scale,
+                dtype=torch.float32)
+
+        def h(x, y):
+            return evaluate_polynomial(x, y, coeffs, pairs)
+        return h
+
+    def _sample_trig_func(self, rng: np.random.Generator):
+        """Return a trigonometric test function callable."""
+        cfg = self._families['trig']
+        freq_lo, freq_hi = cfg.get('frequency_range', [0.5, 4.0])
+        phase_lo, phase_hi = cfg.get('phase_range', [0.0, 6.283])
+
+        wx = float(rng.uniform(freq_lo, freq_hi))
+        wy = float(rng.uniform(freq_lo, freq_hi))
+        px = float(rng.uniform(phase_lo, phase_hi))
+        py = float(rng.uniform(phase_lo, phase_hi))
+
+        def h(x, y):
+            return torch.sin(wx * x + px) * torch.cos(wy * y + py)
+        return h
+
+    def _sample_exp_func(self, rng: np.random.Generator):
+        """Return a Gaussian test function callable."""
+        cfg = self._families['exp']
+        sigma_lo, sigma_hi = cfg.get('sigma_range', [0.3, 2.0])
+        ctr_lo, ctr_hi = cfg.get('center_range', [-1.0, 1.0])
+
+        sigma = float(rng.uniform(sigma_lo, sigma_hi))
+        cx = float(rng.uniform(ctr_lo, ctr_hi))
+        cy = float(rng.uniform(ctr_lo, ctr_hi))
+
+        def h(x, y):
+            return torch.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * sigma ** 2))
+        return h
+
+    def _sample_func(self, rng: np.random.Generator):
+        """Sample one random test function from the configured families."""
+        family = rng.choice(self._family_names, p=self._family_probs)
+        if family == 'poly':
+            return self._sample_poly_func(rng)
+        elif family == 'trig':
+            return self._sample_trig_func(rng)
+        elif family == 'exp':
+            return self._sample_exp_func(rng)
+        else:
+            raise ValueError(f"Unknown test function family: {family}")
+
+    # ----- main API -------------------------------------------------------
+
+    def sample(
+            self,
+            surface_func,
+            x_grid: torch.Tensor,
+            y_grid: torch.Tensor,
+            rng: np.random.Generator,
+    ) -> Dict[str, torch.Tensor]:
+        """Sample test functions and compute deltas, Δ_LB, and gradients.
+
+        All quantities are evaluated at the **origin** (0, 0) for the
+        Laplacian and gradient targets.  Deltas are computed for every
+        grid point relative to the origin.
+
+        Args:
+            surface_func: Callable ``(x, y) -> z`` defining the surface.
+            x_grid, y_grid: (K,) grid-point coordinates (*without* grad).
+            rng: Numpy random generator for reproducibility.
+
+        Returns:
+            Dict with:
+              - ``test_func_deltas``:     (K, P) float32
+              - ``test_func_laplacians``: (P,) float32
+              - ``test_func_gradients``:  (P, 3) float32
+            where P = num_test_funcs (+ 3 if include_coordinates).
+        """
+        # Collect test function callables
+        h_funcs = [self._sample_func(rng) for _ in range(self.num_test_funcs)]
+
+        if self.include_coordinates:
+            h_funcs.append(lambda x, y: x.squeeze(-1) if x.dim() > 1 else x)
+            h_funcs.append(lambda x, y: y.squeeze(-1) if y.dim() > 1 else y)
+            h_funcs.append(lambda x, y: surface_func(x, y).squeeze(-1)
+                           if surface_func(x, y).dim() > 1
+                           else surface_func(x, y))
+
+        P = len(h_funcs)
+        K = len(x_grid)
+
+        deltas = torch.zeros(K, P, dtype=torch.float32)
+        laplacians = torch.zeros(P, dtype=torch.float32)
+        gradients = torch.zeros(P, 3, dtype=torch.float32)
+
+        # Evaluate deltas at grid points (no grad needed)
+        with torch.no_grad():
+            for p, h in enumerate(h_funcs):
+                h_grid = h(x_grid, y_grid)            # (K,)
+                h_center = h(torch.tensor(0.0), torch.tensor(0.0))
+                deltas[:, p] = h_grid - h_center
+
+        # Evaluate Δ_LB(h) and ∇_S(h) at origin via autograd (metric computed once)
+        x0 = torch.tensor([[0.0]], requires_grad=True)
+        y0 = torch.tensor([[0.0]], requires_grad=True)
+        laplacians, gradients = compute_lb_and_gradient_batch(
+            surface_func, h_funcs, x0, y0)
+
+        # Optional normalisation
+        if self.normalize_target == 'unit_magnitude':
+            mag = laplacians.abs().clamp(min=1e-8)
+            laplacians = laplacians / mag
+            deltas = deltas / mag.unsqueeze(0)
+        elif self.normalize_target == 'unit_variance':
+            var = deltas.var(dim=0).clamp(min=1e-8)
+            std = var.sqrt()
+            deltas = deltas / std.unsqueeze(0)
+            laplacians = laplacians / std
+            gradients = gradients / std.unsqueeze(-1)
+
+        return {
+            'test_func_deltas': deltas,         # (K, P)
+            'test_func_laplacians': laplacians,  # (P,)
+            'test_func_gradients': gradients,    # (P, 3)
+        }
+
+
+# =============================================
 # Grid Sampler Classes
 # =============================================
 
@@ -311,6 +678,13 @@ class SyntheticSurfaceDataset(ABC, Dataset):
 
         # Normals, principal directions (v1, v2): unchanged (unit/direction vectors)
 
+        # Test function targets: Δ_LB ~ 1/length², surface gradient ~ 1/length
+        # Deltas (function value differences) are unchanged.
+        if 'test_func_laplacians' in data:
+            data['test_func_laplacians'] = data['test_func_laplacians'] * (d ** 2)
+        if 'test_func_gradients' in data:
+            data['test_func_gradients'] = data['test_func_gradients'] * d
+
     @abstractmethod
     def _generate_raw_surfaces(self) -> List[Data]:
         """
@@ -403,6 +777,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             diff_geom_at_origin_only: bool = False,
             flip_normal_if_negative_curvature: bool = False,
             include_origin_in_grid: bool = False,
+            test_func_cfg: Optional[Dict[str, Any]] = None,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -412,6 +787,20 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         self._diff_geom_at_origin_only = diff_geom_at_origin_only
         self._flip_normal_if_negative_curvature = flip_normal_if_negative_curvature
         self._include_origin_in_grid = include_origin_in_grid
+
+        # Test function sampler (optional)
+        if test_func_cfg is not None:
+            # Convert OmegaConf to plain dict if needed
+            try:
+                from omegaconf import DictConfig
+                if isinstance(test_func_cfg, DictConfig):
+                    from omegaconf import OmegaConf
+                    test_func_cfg = OmegaConf.to_container(test_func_cfg, resolve=True)
+            except ImportError:
+                pass
+            self._test_func_sampler = TestFunctionSampler(**test_func_cfg)
+        else:
+            self._test_func_sampler = None
 
         # Available differential geometry components
         available_components = list(DifferentialGeometryComponent)
@@ -862,6 +1251,23 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                     points_scale=points_scale, surface_params=surface_params
                 )
 
+                # Compute test function data (if sampler is configured)
+                if self._test_func_sampler is not None:
+                    # Build a surface callable from the current surface_params
+                    def surface_func(xv, yv, _sp=surface_params):
+                        return self._evaluate_surface_with_parameters(xv, yv, _sp)
+
+                    # Use original (x, y) grid coordinates (detached, no grad needed for deltas)
+                    tf_data = self._test_func_sampler.sample(
+                        surface_func=surface_func,
+                        x_grid=x.detach(),
+                        y_grid=y.detach(),
+                        rng=self._rng,
+                    )
+                    data['test_func_deltas'] = tf_data['test_func_deltas']
+                    data['test_func_laplacians'] = tf_data['test_func_laplacians'].unsqueeze(0)  # (1, P) for batching
+                    data['test_func_gradients'] = tf_data['test_func_gradients'].unsqueeze(0)    # (1, P, 3) for batching
+
             # Store origin index if we added/found one
             if origin_idx is not None:
                 data['origin_idx'] = torch.tensor([origin_idx])
@@ -923,7 +1329,7 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
     @staticmethod
     def _get_polynomial_pairs(order: int) -> List[Tuple[int, int]]:
         """Get list of (i, j) exponent pairs for polynomial of given order."""
-        return [(i, j) for i in range(order + 1) for j in range(order + 1) if 0 < i + j <= order]
+        return get_polynomial_pairs(order)
 
     def _generate_surface_parameters(self) -> Dict[str, Any]:
         """Generate random polynomial coefficients, order, and coordinate offsets."""
@@ -961,7 +1367,4 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         x_shifted = x + offset_x
         y_shifted = y + offset_y
 
-        z = torch.zeros_like(x)
-        for c, (i, j) in zip(coefficients, pairs):
-            z += c * (x_shifted ** i) * (y_shifted ** j)
-        return z
+        return evaluate_polynomial(x_shifted, y_shifted, coefficients, pairs)

@@ -44,39 +44,35 @@ module:
 
   feature_extractor: null
   loss_configs:
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 3.0
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
-        w_symmetry: 1.0
-        w_idempotency: 1.0
-        w_trace: 1.0
+        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
       weight: 1.0
 
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
+#        w_symmetry: 1.0
+#        w_idempotency: 1.0
+#        w_trace: 1.0
+#      weight: 1.0
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.SelfSupervisedGradientTangentPlaneLoss
+#      weight: 1.0
 
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
-      weight: 10.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
+#      weight: 1.0
+#
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
       weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-#      weight: 1.0
-
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
-#        num_random_probes: 1000
-#        probe_mode: 'random''
-#      weight: 1.0
-#
-#
-#
-#
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-#      weight: 0.01

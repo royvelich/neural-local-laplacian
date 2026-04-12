@@ -31,6 +31,10 @@ class LossContext:
     areas: Optional[torch.Tensor] = None
     stiffness_weights: Optional[torch.Tensor] = None
     gt_vertex_areas: Optional[torch.Tensor] = None
+    # Test function probe data (from TestFunctionSampler)
+    test_func_deltas: Optional[torch.Tensor] = None      # (B, max_k, P)
+    test_func_laplacians: Optional[torch.Tensor] = None   # (B, P)
+    test_func_gradients: Optional[torch.Tensor] = None    # (B, P, 3)
 
 
 @dataclass
@@ -726,8 +730,8 @@ class DirichletEnergyConsistencyLoss(nn.Module):
     def __init__(self, probe_mode: str = 'random', num_random_probes: int = 8,
                  reduction: str = 'mean', eps: float = 1e-8):
         super().__init__()
-        if probe_mode not in ('random', 'coordinates'):
-            raise ValueError(f"probe_mode must be 'random' or 'coordinates', got '{probe_mode}'")
+        if probe_mode not in ('random', 'coordinates', 'test_functions'):
+            raise ValueError(f"probe_mode must be 'random', 'coordinates', or 'test_functions', got '{probe_mode}'")
         self.probe_mode = probe_mode
         self.num_random_probes = num_random_probes
         self.reduction = reduction
@@ -761,6 +765,11 @@ class DirichletEnergyConsistencyLoss(nn.Module):
         if self.probe_mode == 'coordinates':
             # δf_j = p_j (positions relative to center) — 3 probes
             delta_f = ctx.positions * mask_3d  # (B, K, 3) — P=3
+        elif self.probe_mode == 'test_functions':
+            # Use precomputed test function deltas from dataset
+            if ctx.test_func_deltas is None:
+                raise ValueError("probe_mode='test_functions' requires ctx.test_func_deltas")
+            delta_f = ctx.test_func_deltas * mask_3d  # (B, K, P)
         else:
             # Random probes: δf ~ N(0, 1)
             P = self.num_random_probes
@@ -1124,5 +1133,202 @@ class ProjectorRegularizationLoss(nn.Module):
             return loss.sum()
         elif self.reduction == 'none':
             return loss
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+# =============================================
+# Shared helpers for test-function losses
+# =============================================
+
+def _masked_grad_and_stiffness(ctx: LossContext):
+    """Extract masked grad_coeffs, stiffness_weights, and positions.
+
+    Returns:
+        grad_masked: (B, K, 3)
+        weights_masked: (B, K)
+        pos_masked: (B, K, 3)
+        mask_3d: (B, K, 1)
+    """
+    mask_3d = ctx.attention_mask.unsqueeze(-1).float()
+    grad_masked = ctx.grad_coeffs * mask_3d
+    weights_masked = ctx.stiffness_weights * ctx.attention_mask.float()
+    pos_masked = ctx.positions * mask_3d
+    return grad_masked, weights_masked, pos_masked, mask_3d
+
+
+def _compute_discrete_gradient(grad_masked, deltas):
+    """Compute discrete surface gradient ∇h = Σ_j g_ij δh_j.
+
+    Args:
+        grad_masked: (B, K, 3) masked gradient coefficients.
+        deltas: (B, K, P) function differences per probe.
+
+    Returns:
+        (B, P, 3) discrete gradient vectors per probe.
+    """
+    # (B, K, 3) x (B, K, P) → (B, 3, P) → transpose → (B, P, 3)
+    return torch.einsum('bkd,bkp->bpd', grad_masked, deltas)
+
+
+# =============================================
+# Generalized Laplacian test loss
+# =============================================
+
+class GeneralizedLaplacianTestLoss(nn.Module):
+    """Supervise the discrete Laplacian on multiple test functions.
+
+    For each test function h_p, compares the discrete Laplacian action:
+
+        predicted_p = (Σ_j s_ij · δh_p_j) / A_i
+
+    against the analytic ground-truth:
+
+        target_p = Δ_LB(h_p)
+
+    This generalises MCV supervision (which tests h = x, y, z only) to
+    arbitrary smooth functions, reducing the null-space ambiguity in the
+    learned stiffness weights.
+
+    Requires test_func_deltas and test_func_laplacians in the LossContext.
+
+    Args:
+        reduction: 'mean' | 'sum' | 'none'
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.test_func_deltas is None:
+            raise ValueError("GeneralizedLaplacianTestLoss requires ctx.test_func_deltas")
+        if ctx.test_func_laplacians is None:
+            raise ValueError("GeneralizedLaplacianTestLoss requires ctx.test_func_laplacians")
+
+        # s_ij: (B, K),  deltas: (B, K, P),  areas: (B,)
+        weights = ctx.stiffness_weights * ctx.attention_mask.float()  # (B, K)
+        deltas = ctx.test_func_deltas  # (B, K, P)
+
+        # Discrete Laplacian: (Σ_j s_ij · δh_j) / A_i  →  (B, P)
+        numerator = (weights.unsqueeze(-1) * deltas).sum(dim=1)  # (B, P)
+        predicted = numerator / ctx.areas.unsqueeze(-1)           # (B, P)
+
+        target = ctx.test_func_laplacians  # (B, P)
+
+        per_func_error = (predicted - target) ** 2  # (B, P)
+        per_patch = per_func_error.mean(dim=-1)      # (B,)
+
+        if self.reduction == 'mean':
+            return per_patch.mean()
+        elif self.reduction == 'sum':
+            return per_patch.sum()
+        elif self.reduction == 'none':
+            return per_patch
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+# =============================================
+# Gradient tangent-plane losses
+# =============================================
+
+class GradientTangentPlaneLoss(nn.Module):
+    """Supervised loss: discrete gradient of test functions should be tangential.
+
+    Checks that (n̂ · ∇h_p)² = 0 for every test function h_p, using the
+    ground-truth surface normal n̂.
+
+    This generalises TangentPlaneProjectorLoss (which only tests coordinate
+    functions) to arbitrary test functions — a stronger constraint on the
+    gradient operator.
+
+    Requires test_func_deltas and normals in the LossContext.
+
+    Args:
+        reduction: 'mean' | 'sum' | 'none'
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.test_func_deltas is None:
+            raise ValueError("GradientTangentPlaneLoss requires ctx.test_func_deltas")
+        if ctx.normals is None:
+            raise ValueError("GradientTangentPlaneLoss requires ctx.normals")
+
+        grad_masked, _, _, mask_3d = _masked_grad_and_stiffness(ctx)
+        deltas = ctx.test_func_deltas * mask_3d  # (B, K, P) masked
+
+        # Discrete gradient: ∇h_p = Σ_j g_ij δh_p_j  →  (B, P, 3)
+        grad_h = _compute_discrete_gradient(grad_masked, deltas)
+
+        # Normal component: (n̂ · ∇h_p)²  →  (B, P)
+        normals = F.normalize(ctx.normals, p=2, dim=1)            # (B, 3)
+        normal_component = torch.einsum('bd,bpd->bp', normals, grad_h)  # (B, P)
+
+        per_patch = (normal_component ** 2).mean(dim=-1)  # (B,)
+
+        if self.reduction == 'mean':
+            return per_patch.mean()
+        elif self.reduction == 'sum':
+            return per_patch.sum()
+        elif self.reduction == 'none':
+            return per_patch
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class SelfSupervisedGradientTangentPlaneLoss(nn.Module):
+    """Unsupervised loss: discrete gradient of test functions should be tangential.
+
+    Uses the predicted tangent-plane projector P = Σ_j g_ij ⊗ p_jᵀ to
+    extract the normal direction as (I - P), then checks:
+
+        ‖(I - P) · ∇h_p‖² = 0
+
+    No ground-truth normal needed.  Should be combined with
+    ProjectorRegularizationLoss to prevent P from collapsing.
+
+    Requires test_func_deltas, grad_coeffs, positions, attention_mask.
+
+    Args:
+        reduction: 'mean' | 'sum' | 'none'
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.test_func_deltas is None:
+            raise ValueError("SelfSupervisedGradientTangentPlaneLoss requires ctx.test_func_deltas")
+
+        grad_masked, _, pos_masked, mask_3d = _masked_grad_and_stiffness(ctx)
+        deltas = ctx.test_func_deltas * mask_3d  # (B, K, P) masked
+
+        # Predicted projector: P = Σ_j g_ij ⊗ p_jᵀ  →  (B, 3, 3)
+        P = torch.einsum('bkd,bkc->bdc', grad_masked, pos_masked)
+
+        # Normal projector: I - P  →  (B, 3, 3)
+        I = torch.eye(3, device=P.device, dtype=P.dtype).unsqueeze(0)
+        N_proj = I - P
+
+        # Discrete gradient: ∇h_p = Σ_j g_ij δh_p_j  →  (B, P, 3)
+        grad_h = _compute_discrete_gradient(grad_masked, deltas)
+
+        # Normal component: (I - P) · ∇h_p  →  (B, P, 3)
+        normal_component = torch.einsum('bdc,bpc->bpd', N_proj, grad_h)
+
+        per_patch = (normal_component ** 2).sum(dim=-1).mean(dim=-1)  # (B,)
+
+        if self.reduction == 'mean':
+            return per_patch.mean()
+        elif self.reduction == 'sum':
+            return per_patch.sum()
+        elif self.reduction == 'none':
+            return per_patch
         else:
             raise ValueError(f"Invalid reduction mode: {self.reduction}")

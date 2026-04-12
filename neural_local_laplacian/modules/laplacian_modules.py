@@ -370,12 +370,13 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
     def _reshape_positions_to_batched(self, pos_flat: torch.Tensor,
                                       batch_sizes: torch.Tensor) -> torch.Tensor:
-        """Reshape flat positions to padded (batch_size, max_k, 3)."""
+        """Reshape flat (total_points, D) to padded (batch_size, max_k, D)."""
         batch_size = len(batch_sizes)
         max_k = batch_sizes.max().item()
+        D = pos_flat.shape[-1]
         if torch.all(batch_sizes == batch_sizes[0]):
-            return pos_flat.view(batch_size, max_k, 3)
-        out = torch.zeros(batch_size, max_k, 3, device=pos_flat.device,
+            return pos_flat.view(batch_size, max_k, D)
+        out = torch.zeros(batch_size, max_k, D, device=pos_flat.device,
                           dtype=pos_flat.dtype)
         offset = 0
         for i in range(batch_size):
@@ -505,6 +506,13 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         mean_curvatures = batch_data.H
         target_mcv = 2.0 * mean_curvatures.unsqueeze(-1) * F.normalize(normals, p=2, dim=1)
 
+        # Reshape test function deltas from flat (total_points, P) to (B, max_k, P)
+        tf_deltas = None
+        if hasattr(batch_data, 'test_func_deltas') and batch_data.test_func_deltas is not None:
+            P = batch_data.test_func_deltas.shape[-1]
+            tf_deltas = self._reshape_positions_to_batched(
+                batch_data.test_func_deltas, forward_result['batch_sizes'])  # (B, max_k, P)
+
         loss_context = LossContext(
             predicted_mcv=predicted_mcv,
             target_mcv=target_mcv,
@@ -518,6 +526,9 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             areas=forward_result['areas'],
             stiffness_weights=forward_result['stiffness_weights'],
             gt_vertex_areas=getattr(batch_data, 'gt_vertex_areas', None),
+            test_func_deltas=tf_deltas,
+            test_func_laplacians=getattr(batch_data, 'test_func_laplacians', None),
+            test_func_gradients=getattr(batch_data, 'test_func_gradients', None),
         )
 
         total_loss = 0.0
