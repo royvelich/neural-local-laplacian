@@ -995,3 +995,134 @@ class WeightL1Loss(nn.Module):
             return inv_cv
         else:
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class StiffnessNormalAlignmentLoss(nn.Module):
+    """
+    Self-supervised loss enforcing that the stiffness action points along the normal.
+
+    Uses the predicted tangent plane projector P = Σ_j g_ij ⊗ p_jᵀ to check
+    that the stiffness action Σ_j s_ij p_j has zero tangent component:
+
+        L = mean_i || P_i · (Σ_j s_ij p_j) ||²
+
+    If P is a valid projector (tangent plane) and the stiffness action points
+    along the normal, then P · action = 0.
+
+    No GT normal or MCV target needed — purely self-supervised from the
+    learned g_ij vectors. Should be combined with TangentPlaneProjectorLoss
+    (or ProjectorIdempotencyLoss) to ensure P is a valid projector, otherwise
+    the model can trivially satisfy this by collapsing P to zero.
+
+    Requires: grad_coeffs, stiffness_weights, positions, attention_mask.
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.grad_coeffs is None:
+            raise ValueError("StiffnessNormalAlignmentLoss requires ctx.grad_coeffs")
+        if ctx.stiffness_weights is None:
+            raise ValueError("StiffnessNormalAlignmentLoss requires ctx.stiffness_weights")
+        if ctx.positions is None:
+            raise ValueError("StiffnessNormalAlignmentLoss requires ctx.positions")
+
+        mask_3d = ctx.attention_mask.unsqueeze(-1).float()  # (B, K, 1)
+        grad_masked = ctx.grad_coeffs * mask_3d              # (B, K, 3)
+        pos_masked = ctx.positions * mask_3d                  # (B, K, 3)
+
+        # Predicted tangent plane projector: P[d, c] = Σ_j g_ij[d] * p_j[c]
+        P_pred = torch.einsum('bkd,bkc->bdc', grad_masked, pos_masked)  # (B, 3, 3)
+
+        # Stiffness action: Σ_j s_ij * p_j
+        weights_masked = ctx.stiffness_weights * ctx.attention_mask.float()  # (B, K)
+        stiffness_action = (weights_masked.unsqueeze(-1) * pos_masked).sum(dim=1)  # (B, 3)
+
+        # Tangent component: P · stiffness_action — should be zero
+        tangent_component = torch.einsum('bdc,bc->bd', P_pred, stiffness_action)  # (B, 3)
+
+        per_patch = (tangent_component ** 2).sum(dim=-1)  # (B,)
+
+        if self.reduction == 'mean':
+            return per_patch.mean()
+        elif self.reduction == 'sum':
+            return per_patch.sum()
+        elif self.reduction == 'none':
+            return per_patch
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
+class ProjectorRegularizationLoss(nn.Module):
+    """
+    Self-supervised regularizer enforcing that the predicted gradient projector
+    P = Σ_j g_ij ⊗ p_jᵀ is a valid rank-2 orthogonal projector (tangent plane).
+
+    Combines three properties of the tangent plane projector P = I - n̂n̂ᵀ:
+
+        1. Symmetry:    ‖P - Pᵀ‖²         (orthogonal, not oblique)
+        2. Idempotency: ‖P² - P‖²         (projecting twice = projecting once)
+        3. Trace:       (tr(P) - 2)²       (rank 2 = tangent plane, not collapse)
+
+    No GT normal needed. Should be combined with StiffnessNormalAlignmentLoss
+    to jointly enforce: (a) gradient operator recovers tangent plane, and
+    (b) stiffness action points along the normal.
+
+    Args:
+        w_symmetry: Weight for symmetry term (default: 1.0)
+        w_idempotency: Weight for idempotency term (default: 1.0)
+        w_trace: Weight for trace term (default: 1.0)
+        reduction: 'mean' | 'sum' | 'none'
+    """
+
+    def __init__(self, w_symmetry: float = 1.0, w_idempotency: float = 1.0,
+                 w_trace: float = 1.0, reduction: str = 'mean'):
+        super().__init__()
+        self.w_symmetry = w_symmetry
+        self.w_idempotency = w_idempotency
+        self.w_trace = w_trace
+        self.reduction = reduction
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.grad_coeffs is None:
+            raise ValueError("ProjectorRegularizationLoss requires ctx.grad_coeffs")
+        if ctx.positions is None:
+            raise ValueError("ProjectorRegularizationLoss requires ctx.positions")
+
+        mask_3d = ctx.attention_mask.unsqueeze(-1).float()  # (B, K, 1)
+        grad_masked = ctx.grad_coeffs * mask_3d              # (B, K, 3)
+        pos_masked = ctx.positions * mask_3d                  # (B, K, 3)
+
+        # Predicted projector: P[d, c] = Σ_j g_ij[d] * p_j[c]
+        P = torch.einsum('bkd,bkc->bdc', grad_masked, pos_masked)  # (B, 3, 3)
+
+        loss = torch.zeros(P.shape[0], device=P.device, dtype=P.dtype)  # (B,)
+
+        # 1. Symmetry: ‖P - Pᵀ‖²_F
+        if self.w_symmetry > 0:
+            P_t = P.transpose(-1, -2)
+            sym_err = ((P - P_t) ** 2).sum(dim=(-1, -2))  # (B,)
+            loss = loss + self.w_symmetry * sym_err
+
+        # 2. Idempotency: ‖P² - P‖²_F
+        if self.w_idempotency > 0:
+            P_sq = torch.bmm(P, P)
+            idem_err = ((P_sq - P) ** 2).sum(dim=(-1, -2))  # (B,)
+            loss = loss + self.w_idempotency * idem_err
+
+        # 3. Trace: (tr(P) - 2)²
+        if self.w_trace > 0:
+            trace = P.diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # (B,)
+            trace_err = (trace - 2.0) ** 2  # (B,)
+            loss = loss + self.w_trace * trace_err
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        elif self.reduction == 'none':
+            return loss
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
