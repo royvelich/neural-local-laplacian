@@ -46,8 +46,8 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_sphere: True
-    batch_size: 300
-    num_workers: 8
+    batch_size: 5
+    num_workers: 2
     shuffle: True
   val_dataset_specifications:
 #    # --- [0] Mesh spectral/geodesic validation (existing, PyG) ---
