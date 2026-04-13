@@ -8,7 +8,8 @@ module:
       test_func_cfg:
         num_test_funcs: 50
         include_coordinates: false
-        normalize_target: 'none'
+        verbose: false
+        normalize_target: 'unit_magnitude'
         families:
           poly:
             weight: 0.4
@@ -17,7 +18,7 @@ module:
             coeff_method: uniform
           trig:
             weight: 0.4
-            frequency_range: [0.2, 6.0]
+            frequency_range: [0.2, 12.0]
             phase_range: [0.0, 6.283]
           exp:
             weight: 0.2

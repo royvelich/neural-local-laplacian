@@ -134,55 +134,165 @@ def compute_surface_gradient(surface_func, h_func, x, y):
     return grad_3d
 
 
-def compute_lb_and_gradient_batch(surface_func, h_funcs, x0, y0):
-    """Compute Δ_LB(h) and ∇_S(h) for multiple test functions, sharing the metric.
+def compute_lb_coefficients(surface_func, x, y):
+    """Precompute LB operator coefficients from surface metric.
 
-    The surface metric (f_x, f_y, inverse metric, √det(g)) is computed once
-    from ``surface_func`` and reused for every test function in ``h_funcs``.
+    On a parametric surface z = f(x,y), the Laplace-Beltrami operator has
+    the form:
+
+        Δ_LB(h) = A·h_xx + 2B·h_xy + C·h_yy + D·h_x + E·h_y
+
+    where A, B, C, D, E depend only on the surface (not on h).
+
+    Args:
+        surface_func: Callable ``(x, y) -> z``.
+        x, y: (N, 1) tensors with requires_grad=True.
+
+    Returns:
+        Dict with detached tensors (each shape (N, 1) or squeezed):
+        A, B, C (inverse metric), D, E (Christoffel-like), f_x, f_y.
+    """
+    z = surface_func(x, y)
+    f_x = torch.autograd.grad(z.sum(), x, create_graph=True)[0]
+    f_y = torch.autograd.grad(z.sum(), y, create_graph=True)[0]
+
+    # Second derivatives of surface
+    f_xx, f_xy = torch.autograd.grad(f_x.sum(), [x, y], create_graph=True)
+    _, f_yy = torch.autograd.grad(f_y.sum(), [x, y], create_graph=True)
+
+    # Metric quantities
+    det_g = 1.0 + f_x ** 2 + f_y ** 2
+    sqrt_det_g = det_g.sqrt()
+
+    # Inverse metric = LB second-order coefficients
+    A = (1.0 + f_y ** 2) / det_g     # g^11
+    B = -(f_x * f_y) / det_g          # g^12
+    C = (1.0 + f_x ** 2) / det_g     # g^22
+
+    # First-order coefficients: D, E from derivatives of (√det · g^ij)
+    # α₁ = √det · g^11, α₂ = √det · g^12, α₃ = √det · g^22
+    # D = (∂α₁/∂x + ∂α₂/∂y) / √det,  E = (∂α₂/∂x + ∂α₃/∂y) / √det
+    a1 = (1.0 + f_y ** 2) / sqrt_det_g
+    a2 = -(f_x * f_y) / sqrt_det_g
+    a3 = (1.0 + f_x ** 2) / sqrt_det_g
+
+    da1_dx = torch.autograd.grad(a1.sum(), x, create_graph=True)[0]
+    da2_dx = torch.autograd.grad(a2.sum(), x, create_graph=True)[0]
+    da2_dy = torch.autograd.grad(a2.sum(), y, create_graph=True)[0]
+    da3_dy = torch.autograd.grad(a3.sum(), y, create_graph=True)[0]
+
+    D = (da1_dx + da2_dy) / sqrt_det_g
+    E = (da2_dx + da3_dy) / sqrt_det_g
+
+    return {
+        'A': A.detach(), 'B': B.detach(), 'C': C.detach(),
+        'D': D.detach(), 'E': E.detach(),
+        'f_x': f_x.detach(), 'f_y': f_y.detach(),
+    }
+
+
+def compute_h_derivatives(h_func, x, y):
+    """Compute h and its first/second derivatives on a fresh autograd graph.
+
+    Args:
+        h_func: Callable ``(x, y) -> scalar tensor``.
+        x, y: (N, 1) tensors (will be cloned with requires_grad).
+
+    Returns:
+        Dict with detached tensors: h, h_x, h_y, h_xx, h_xy, h_yy.
+    """
+    x_h = x.clone().detach().requires_grad_(True)
+    y_h = y.clone().detach().requires_grad_(True)
+
+    h = h_func(x_h, y_h)
+    if h.dim() == 1:
+        h = h.unsqueeze(-1)
+
+    h_x = torch.autograd.grad(h.sum(), x_h, create_graph=True)[0]
+    h_y = torch.autograd.grad(h.sum(), y_h, create_graph=True)[0]
+    h_xx, h_xy = torch.autograd.grad(h_x.sum(), [x_h, y_h], retain_graph=True)
+    _, h_yy = torch.autograd.grad(h_y.sum(), [x_h, y_h], create_graph=False)
+
+    return {
+        'h': h.detach(), 'h_x': h_x.detach(), 'h_y': h_y.detach(),
+        'h_xx': h_xx.detach(), 'h_xy': h_xy.detach(), 'h_yy': h_yy.detach(),
+    }
+
+
+def apply_lb_from_coefficients(coeffs, h_derivs):
+    """Compute Δ_LB(h) = A·h_xx + 2B·h_xy + C·h_yy + D·h_x + E·h_y.
+
+    Args:
+        coeffs: Dict from compute_lb_coefficients (A, B, C, D, E, f_x, f_y).
+        h_derivs: Dict from compute_h_derivatives (h_x, h_y, h_xx, h_xy, h_yy).
+
+    Returns:
+        lb: (N,) Laplace-Beltrami values.
+        grad_3d: (N, 3) surface gradient vectors.
+    """
+    lb = (coeffs['A'] * h_derivs['h_xx']
+          + 2.0 * coeffs['B'] * h_derivs['h_xy']
+          + coeffs['C'] * h_derivs['h_yy']
+          + coeffs['D'] * h_derivs['h_x']
+          + coeffs['E'] * h_derivs['h_y']).squeeze(-1)
+
+    # Surface gradient: (c1, c2, c1*f_x + c2*f_y)
+    c1 = coeffs['A'] * h_derivs['h_x'] + coeffs['B'] * h_derivs['h_y']
+    c2 = coeffs['B'] * h_derivs['h_x'] + coeffs['C'] * h_derivs['h_y']
+    grad_3d = torch.cat([c1, c2, c1 * coeffs['f_x'] + c2 * coeffs['f_y']], dim=-1)
+
+    return lb, grad_3d
+
+
+def compute_lb_and_gradient_batch(surface_func, h_funcs, x0, y0, verbose=False):
+    """Compute Δ_LB(h) and ∇_S(h) for multiple test functions.
+
+    Precomputes LB operator coefficients from the surface once, then evaluates
+    each test function on a fresh autograd graph.  No graph accumulation.
 
     Args:
         surface_func: Callable ``(x, y) -> z`` defining the surface.
         h_funcs: List of callables ``(x, y) -> scalar``.
-        x0, y0: (1, 1) tensors with requires_grad=True (evaluation point).
+        x0, y0: (N, 1) tensors with requires_grad=True (evaluation points).
+        verbose: If True, print per-phase timing.
 
     Returns:
-        laplacians: (P,) tensor of Δ_LB(h_p) values (detached).
-        gradients:  (P, 3) tensor of ∇_S(h_p) vectors (detached).
+        laplacians: (P,) or (N, P) tensor of Δ_LB(h_p) values (detached).
+        gradients:  (P, 3) or (N, P, 3) tensor of ∇_S(h_p) vectors (detached).
     """
+    import time as _time
     P = len(h_funcs)
+    N = x0.shape[0]
 
-    # --- Surface metric (computed once) ---
-    z = surface_func(x0, y0)
-    f_x = torch.autograd.grad(z.sum(), x0, create_graph=True)[0]
-    f_y = torch.autograd.grad(z.sum(), y0, create_graph=True)[0]
+    # Precompute LB coefficients from surface (once, then detached)
+    t0 = _time.perf_counter()
+    coeffs = compute_lb_coefficients(surface_func, x0, y0)
+    t_coeffs = _time.perf_counter() - t0
 
-    det_g = 1.0 + f_x ** 2 + f_y ** 2
-    sqrt_det_g = det_g.sqrt()
-    g11 = (1.0 + f_y ** 2) / det_g
-    g12 = -(f_x * f_y) / det_g
-    g22 = (1.0 + f_x ** 2) / det_g
+    t0 = _time.perf_counter()
+    if N == 1:
+        # Single point (origin) — return (P,) and (P, 3)
+        laplacians = torch.zeros(P, dtype=torch.float32)
+        gradients = torch.zeros(P, 3, dtype=torch.float32)
+        for p, h in enumerate(h_funcs):
+            h_derivs = compute_h_derivatives(h, x0, y0)
+            lb, grad_3d = apply_lb_from_coefficients(coeffs, h_derivs)
+            laplacians[p] = lb.squeeze()
+            gradients[p] = grad_3d.squeeze(0)
+    else:
+        # Multiple points — return (N, P) and (N, P, 3)
+        laplacians = torch.zeros(N, P, dtype=torch.float32)
+        gradients = torch.zeros(N, P, 3, dtype=torch.float32)
+        for p, h in enumerate(h_funcs):
+            h_derivs = compute_h_derivatives(h, x0, y0)
+            lb, grad_3d = apply_lb_from_coefficients(coeffs, h_derivs)
+            laplacians[:, p] = lb
+            gradients[:, p] = grad_3d
+    t_funcs = _time.perf_counter() - t0
 
-    laplacians = torch.zeros(P, dtype=torch.float32)
-    gradients = torch.zeros(P, 3, dtype=torch.float32)
-
-    for p, h in enumerate(h_funcs):
-        h_val = h(x0, y0)
-        h_x = torch.autograd.grad(h_val.sum(), x0, create_graph=True)[0]
-        h_y = torch.autograd.grad(h_val.sum(), y0, create_graph=True)[0]
-
-        # --- Laplace-Beltrami ---
-        F_x = sqrt_det_g * (g11 * h_x + g12 * h_y)
-        F_y = sqrt_det_g * (g12 * h_x + g22 * h_y)
-        dFx_dx = torch.autograd.grad(F_x.sum(), x0, create_graph=True)[0]
-        dFy_dy = torch.autograd.grad(F_y.sum(), y0, create_graph=True)[0]
-        lb_h = (dFx_dx + dFy_dy) / sqrt_det_g
-        laplacians[p] = lb_h.detach().squeeze()
-
-        # --- Surface gradient in ℝ³ ---
-        c1 = g11 * h_x + g12 * h_y
-        c2 = g12 * h_x + g22 * h_y
-        grad_3d = torch.cat([c1, c2, c1 * f_x + c2 * f_y], dim=-1)
-        gradients[p] = grad_3d.detach().squeeze(0)
+    if verbose:
+        print(f"      [lb_batch] N={N}, P={P}: coeffs={t_coeffs*1e3:.0f}ms, "
+              f"h_derivs_loop={t_funcs*1e3:.0f}ms ({t_funcs/P*1e3:.1f}ms/func)")
 
     return laplacians, gradients
 
@@ -219,10 +329,18 @@ class TestFunctionSampler:
             include_coordinates: bool = False,
             families: Optional[Dict[str, Any]] = None,
             normalize_target: str = 'none',
+            compute_lb_all_points: bool = False,
+            verbose: bool = False,
+            derivative_mode: str = 'analytic',
     ):
         self.num_test_funcs = num_test_funcs
         self.include_coordinates = include_coordinates
         self.normalize_target = normalize_target
+        self.compute_lb_all_points = compute_lb_all_points
+        self.verbose = verbose
+        if derivative_mode not in ('analytic', 'autograd'):
+            raise ValueError(f"derivative_mode must be 'analytic' or 'autograd', got '{derivative_mode}'")
+        self.derivative_mode = derivative_mode
 
         if families is None:
             families = {
@@ -310,6 +428,246 @@ class TestFunctionSampler:
         else:
             raise ValueError(f"Unknown test function family: {family}")
 
+    # ----- param-based sampling (for analytic mode) -----------------------
+
+    def _sample_func_params(self, rng: np.random.Generator) -> Dict[str, Any]:
+        """Sample one test function, returning a parameter dict."""
+        family = rng.choice(self._family_names, p=self._family_probs)
+        if family == 'poly':
+            cfg = self._families['poly']
+            order_lo, order_hi = cfg.get('order_range', [1, 4])
+            scale = cfg.get('coeff_scale', 1.0)
+            method = cfg.get('coeff_method', 'uniform')
+            order = int(rng.integers(order_lo, order_hi + 1))
+            pairs = get_polynomial_pairs(order)
+            if method == 'normal':
+                coeffs = torch.tensor(rng.normal(size=len(pairs)) * scale, dtype=torch.float32)
+            else:
+                coeffs = torch.tensor((2 * rng.uniform(size=len(pairs)) - 1) * scale, dtype=torch.float32)
+            return {'family': 'poly', 'coeffs': coeffs, 'pairs': pairs, 'order': order}
+        elif family == 'trig':
+            cfg = self._families['trig']
+            flo, fhi = cfg.get('frequency_range', [0.5, 4.0])
+            plo, phi = cfg.get('phase_range', [0.0, 6.283])
+            return {'family': 'trig',
+                    'wx': float(rng.uniform(flo, fhi)), 'wy': float(rng.uniform(flo, fhi)),
+                    'px': float(rng.uniform(plo, phi)), 'py': float(rng.uniform(plo, phi))}
+        elif family == 'exp':
+            cfg = self._families['exp']
+            slo, shi = cfg.get('sigma_range', [0.3, 2.0])
+            clo, chi = cfg.get('center_range', [-1.0, 1.0])
+            return {'family': 'exp',
+                    'cx': float(rng.uniform(clo, chi)), 'cy': float(rng.uniform(clo, chi)),
+                    'sigma': float(rng.uniform(slo, shi))}
+        else:
+            raise ValueError(f"Unknown family: {family}")
+
+    @staticmethod
+    def _params_to_callable(params: Dict[str, Any]):
+        """Convert a parameter dict to a callable h(x, y)."""
+        if params['family'] == 'poly':
+            coeffs, pairs = params['coeffs'], params['pairs']
+            return lambda x, y: evaluate_polynomial(x, y, coeffs, pairs)
+        elif params['family'] == 'trig':
+            wx, wy, px, py = params['wx'], params['wy'], params['px'], params['py']
+            return lambda x, y: torch.sin(wx * x + px) * torch.cos(wy * y + py)
+        elif params['family'] == 'exp':
+            cx, cy, sigma = params['cx'], params['cy'], params['sigma']
+            return lambda x, y: torch.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * sigma ** 2))
+
+    # ----- vectorized batch evaluation ------------------------------------
+
+    @staticmethod
+    def _eval_poly_batch(params_list, x, y):
+        """Evaluate all polynomials at grid points. Returns (N, K)."""
+        if not params_list:
+            return torch.zeros(0, len(x))
+        max_order = max(p['order'] for p in params_list)
+        all_pairs = get_polynomial_pairs(max_order)
+        pair_to_idx = {pair: i for i, pair in enumerate(all_pairs)}
+        N, T, K = len(params_list), len(all_pairs), len(x)
+        coeff_mat = torch.zeros(N, T)
+        for i, p in enumerate(params_list):
+            for c, pair in zip(p['coeffs'], p['pairs']):
+                coeff_mat[i, pair_to_idx[pair]] = c
+        monomials = torch.stack([x ** m * y ** n for m, n in all_pairs])  # (T, K)
+        return coeff_mat @ monomials  # (N, K)
+
+    @staticmethod
+    def _eval_trig_batch(params_list, x, y):
+        """Evaluate all trig functions at grid points. Returns (N, K)."""
+        if not params_list:
+            return torch.zeros(0, len(x))
+        wx = torch.tensor([p['wx'] for p in params_list])
+        wy = torch.tensor([p['wy'] for p in params_list])
+        px = torch.tensor([p['px'] for p in params_list])
+        py = torch.tensor([p['py'] for p in params_list])
+        return (torch.sin(wx[:, None] * x[None, :] + px[:, None]) *
+                torch.cos(wy[:, None] * y[None, :] + py[:, None]))
+
+    @staticmethod
+    def _eval_exp_batch(params_list, x, y):
+        """Evaluate all Gaussian functions at grid points. Returns (N, K)."""
+        if not params_list:
+            return torch.zeros(0, len(x))
+        cx = torch.tensor([p['cx'] for p in params_list])
+        cy = torch.tensor([p['cy'] for p in params_list])
+        sigma = torch.tensor([p['sigma'] for p in params_list])
+        dx = x[None, :] - cx[:, None]
+        dy = y[None, :] - cy[:, None]
+        return torch.exp(-(dx ** 2 + dy ** 2) / (2 * sigma[:, None] ** 2))
+
+    # ----- vectorized analytic derivatives at origin ----------------------
+
+    @staticmethod
+    def _derivs_poly_at_origin(params_list):
+        """Analytic derivatives of all polynomials at (0, 0). Returns dict of (N,)."""
+        if not params_list:
+            return {k: torch.zeros(0) for k in ['h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy']}
+        max_order = max(p['order'] for p in params_list)
+        all_pairs = get_polynomial_pairs(max_order)
+        pair_to_idx = {pair: i for i, pair in enumerate(all_pairs)}
+        N, T = len(params_list), len(all_pairs)
+        cm = torch.zeros(N, T)
+        for i, p in enumerate(params_list):
+            for c, pair in zip(p['coeffs'], p['pairs']):
+                cm[i, pair_to_idx[pair]] = c
+
+        def _col(m, n):
+            idx = pair_to_idx.get((m, n))
+            return cm[:, idx] if idx is not None else torch.zeros(N)
+
+        return {
+            'h': torch.zeros(N),  # no constant term
+            'h_x': _col(1, 0), 'h_y': _col(0, 1),
+            'h_xx': 2.0 * _col(2, 0), 'h_xy': _col(1, 1), 'h_yy': 2.0 * _col(0, 2),
+        }
+
+    @staticmethod
+    def _derivs_trig_at_origin(params_list):
+        """Analytic derivatives of all trig functions at (0, 0). Returns dict of (N,)."""
+        if not params_list:
+            return {k: torch.zeros(0) for k in ['h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy']}
+        wx = torch.tensor([p['wx'] for p in params_list])
+        wy = torch.tensor([p['wy'] for p in params_list])
+        px = torch.tensor([p['px'] for p in params_list])
+        py = torch.tensor([p['py'] for p in params_list])
+        sp, cp = torch.sin(px), torch.cos(px)
+        sq, cq = torch.sin(py), torch.cos(py)
+        return {
+            'h': sp * cq,
+            'h_x': wx * cp * cq, 'h_y': -wy * sp * sq,
+            'h_xx': -(wx ** 2) * sp * cq, 'h_xy': -wx * wy * cp * sq,
+            'h_yy': -(wy ** 2) * sp * cq,
+        }
+
+    @staticmethod
+    def _derivs_exp_at_origin(params_list):
+        """Analytic derivatives of all Gaussian functions at (0, 0). Returns dict of (N,)."""
+        if not params_list:
+            return {k: torch.zeros(0) for k in ['h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy']}
+        cx = torch.tensor([p['cx'] for p in params_list])
+        cy = torch.tensor([p['cy'] for p in params_list])
+        sigma = torch.tensor([p['sigma'] for p in params_list])
+        s2, s4 = sigma ** 2, sigma ** 4
+        h0 = torch.exp(-(cx ** 2 + cy ** 2) / (2 * s2))
+        return {
+            'h': h0,
+            'h_x': h0 * cx / s2, 'h_y': h0 * cy / s2,
+            'h_xx': h0 * (cx ** 2 / s4 - 1 / s2),
+            'h_xy': h0 * cx * cy / s4,
+            'h_yy': h0 * (cy ** 2 / s4 - 1 / s2),
+        }
+
+    # ----- analytic sample path -------------------------------------------
+
+    def _sample_analytic(self, surface_func, x_grid, y_grid, rng):
+        """Fully vectorized: analytic derivatives at origin, no autograd per function."""
+        import time as _time
+        _t = {} if self.verbose else None
+
+        if _t is not None: _t0 = _time.perf_counter()
+        all_params = [self._sample_func_params(rng) for _ in range(self.num_test_funcs)]
+        P = len(all_params)
+        K = len(x_grid)
+        if _t is not None: _t['sample_funcs'] = _time.perf_counter() - _t0
+
+        # Group by family
+        groups = {}  # family → (indices, params)
+        for i, p in enumerate(all_params):
+            fam = p['family']
+            if fam not in groups:
+                groups[fam] = ([], [])
+            groups[fam][0].append(i)
+            groups[fam][1].append(p)
+
+        # Vectorized evaluation at grid → deltas
+        if _t is not None: _t0 = _time.perf_counter()
+        eval_fns = {'poly': self._eval_poly_batch,
+                    'trig': self._eval_trig_batch,
+                    'exp': self._eval_exp_batch}
+        deriv_fns = {'poly': self._derivs_poly_at_origin,
+                     'trig': self._derivs_trig_at_origin,
+                     'exp': self._derivs_exp_at_origin}
+
+        deltas = torch.zeros(K, P, dtype=torch.float32)
+        h_d = {k: torch.zeros(P, dtype=torch.float32)
+               for k in ['h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy']}
+
+        for fam, (indices, params) in groups.items():
+            idx = torch.tensor(indices, dtype=torch.long)
+
+            # Batch eval at grid
+            vals = eval_fns[fam](params, x_grid, y_grid)  # (N, K)
+
+            # Batch derivatives at origin (also gives h(0,0))
+            fd = deriv_fns[fam](params)
+
+            # Deltas = h(grid) - h(0,0)
+            deltas[:, idx] = (vals - fd['h'][:, None]).T  # (K, N)
+
+            # Scatter derivatives
+            for k in h_d:
+                h_d[k][idx] = fd[k]
+
+        if _t is not None: _t['deltas_and_derivs'] = _time.perf_counter() - _t0
+
+        # LB coefficients from surface (one autograd computation)
+        if _t is not None: _t0 = _time.perf_counter()
+        x0 = torch.tensor([[0.0]], requires_grad=True)
+        y0 = torch.tensor([[0.0]], requires_grad=True)
+        coeffs = compute_lb_coefficients(surface_func, x0, y0)
+        A = coeffs['A'].squeeze()
+        B = coeffs['B'].squeeze()
+        C = coeffs['C'].squeeze()
+        D = coeffs['D'].squeeze()
+        E = coeffs['E'].squeeze()
+        fx = coeffs['f_x'].squeeze()
+        fy = coeffs['f_y'].squeeze()
+
+        # Vectorised LB: Δ_LB(h) = A·h_xx + 2B·h_xy + C·h_yy + D·h_x + E·h_y
+        laplacians = (A * h_d['h_xx'] + 2 * B * h_d['h_xy'] + C * h_d['h_yy']
+                      + D * h_d['h_x'] + E * h_d['h_y'])  # (P,)
+
+        # Vectorised surface gradient at origin
+        c1 = A * h_d['h_x'] + B * h_d['h_y']  # (P,)
+        c2 = B * h_d['h_x'] + C * h_d['h_y']  # (P,)
+        gradients = torch.stack([c1, c2, c1 * fx + c2 * fy], dim=-1)  # (P, 3)
+        if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
+
+        # lb_all_points (optional — still autograd, needs callables)
+        lb_all_points = None
+        if self.compute_lb_all_points:
+            if _t is not None: _t0 = _time.perf_counter()
+            h_funcs = [self._params_to_callable(p) for p in all_params]
+            x_all = x_grid.clone().unsqueeze(-1).requires_grad_(True)
+            y_all = y_grid.clone().unsqueeze(-1).requires_grad_(True)
+            lb_all_points, _ = compute_lb_and_gradient_batch(
+                surface_func, h_funcs, x_all, y_all, verbose=self.verbose)
+            if _t is not None: _t['lb_all_pts'] = _time.perf_counter() - _t0
+
+        return deltas, laplacians, gradients, lb_all_points, _t
+
     # ----- main API -------------------------------------------------------
 
     def sample(
@@ -337,53 +695,117 @@ class TestFunctionSampler:
               - ``test_func_gradients``:  (P, 3) float32
             where P = num_test_funcs (+ 3 if include_coordinates).
         """
-        # Collect test function callables
-        h_funcs = [self._sample_func(rng) for _ in range(self.num_test_funcs)]
+        if self.derivative_mode == 'analytic' and not self.include_coordinates:
+            deltas, laplacians, gradients, lb_all_points, _t = \
+                self._sample_analytic(surface_func, x_grid, y_grid, rng)
+        else:
+            deltas, laplacians, gradients, lb_all_points, _t = \
+                self._sample_autograd(surface_func, x_grid, y_grid, rng)
 
-        if self.include_coordinates:
-            h_funcs.append(lambda x, y: x.squeeze(-1) if x.dim() > 1 else x)
-            h_funcs.append(lambda x, y: y.squeeze(-1) if y.dim() > 1 else y)
-            h_funcs.append(lambda x, y: surface_func(x, y).squeeze(-1)
-                           if surface_func(x, y).dim() > 1
-                           else surface_func(x, y))
+        P = laplacians.shape[0]
+        K = deltas.shape[0]
 
-        P = len(h_funcs)
-        K = len(x_grid)
-
-        deltas = torch.zeros(K, P, dtype=torch.float32)
-        laplacians = torch.zeros(P, dtype=torch.float32)
-        gradients = torch.zeros(P, 3, dtype=torch.float32)
-
-        # Evaluate deltas at grid points (no grad needed)
-        with torch.no_grad():
-            for p, h in enumerate(h_funcs):
-                h_grid = h(x_grid, y_grid)            # (K,)
-                h_center = h(torch.tensor(0.0), torch.tensor(0.0))
-                deltas[:, p] = h_grid - h_center
-
-        # Evaluate Δ_LB(h) and ∇_S(h) at origin via autograd (metric computed once)
-        x0 = torch.tensor([[0.0]], requires_grad=True)
-        y0 = torch.tensor([[0.0]], requires_grad=True)
-        laplacians, gradients = compute_lb_and_gradient_batch(
-            surface_func, h_funcs, x0, y0)
+        # --- Verification prints (raw, before normalization) ---
+        if self.verbose:
+            mode_str = 'analytic' if (self.derivative_mode == 'analytic'
+                                      and not self.include_coordinates) else 'autograd'
+            print(f"\n  [TestFuncSampler] K={K}, P={P}, normalize={self.normalize_target}, "
+                  f"mode={mode_str}")
+            print(f"    RAW Δ_LB at origin: min={laplacians.min():.4f}  max={laplacians.max():.4f}  "
+                  f"mean={laplacians.mean():.4f}  absmin={laplacians.abs().min():.6f}")
+            print(f"    RAW deltas: min={deltas.min():.4f}  max={deltas.max():.4f}  "
+                  f"mean_abs={deltas.abs().mean():.4f}")
+            if lb_all_points is not None:
+                print(f"    RAW Δ_LB all pts: min={lb_all_points.min():.4f}  max={lb_all_points.max():.4f}")
+            for p in list(range(min(5, P))) + ([P-1] if P > 5 else []):
+                lb_str = f"Δ_LB(origin)={laplacians[p]:+.4f}"
+                d_str = f"δh=[{deltas[:, p].min():.4f}, {deltas[:, p].max():.4f}]"
+                lb_all_str = ""
+                if lb_all_points is not None:
+                    lb_all_str = f"  Δ_LB_all=[{lb_all_points[:, p].min():.4f}, {lb_all_points[:, p].max():.4f}]"
+                prefix = "..." if p == P-1 and P > 5 else ""
+                print(f"    {prefix}h_{p}: {lb_str}  {d_str}{lb_all_str}")
 
         # Optional normalisation
         if self.normalize_target == 'unit_magnitude':
             mag = laplacians.abs().clamp(min=1e-8)
             laplacians = laplacians / mag
             deltas = deltas / mag.unsqueeze(0)
+            if lb_all_points is not None:
+                lb_all_points = lb_all_points / mag.unsqueeze(0)
         elif self.normalize_target == 'unit_variance':
             var = deltas.var(dim=0).clamp(min=1e-8)
             std = var.sqrt()
             deltas = deltas / std.unsqueeze(0)
             laplacians = laplacians / std
             gradients = gradients / std.unsqueeze(-1)
+            if lb_all_points is not None:
+                lb_all_points = lb_all_points / std.unsqueeze(0)
 
-        return {
+        if self.verbose and self.normalize_target != 'none':
+            print(f"    POST-NORM Δ_LB at origin: min={laplacians.min():.4f}  max={laplacians.max():.4f}")
+            print(f"    POST-NORM deltas: min={deltas.min():.4f}  max={deltas.max():.4f}")
+            if lb_all_points is not None:
+                print(f"    POST-NORM Δ_LB all pts: min={lb_all_points.min():.4f}  max={lb_all_points.max():.4f}")
+
+        if _t is not None:
+            total = sum(_t.values())
+            parts = [f"{k}={v*1e3:.0f}ms" for k, v in _t.items()]
+            print(f"    [timing] total={total*1e3:.0f}ms  {', '.join(parts)}")
+
+        result = {
             'test_func_deltas': deltas,         # (K, P)
             'test_func_laplacians': laplacians,  # (P,)
             'test_func_gradients': gradients,    # (P, 3)
         }
+        if lb_all_points is not None:
+            result['test_func_lb_all_points'] = lb_all_points  # (K, P)
+        return result
+
+    def _sample_autograd(self, surface_func, x_grid, y_grid, rng):
+        """Autograd-based path: loop over callables (original implementation)."""
+        import time as _time
+        _t = {} if self.verbose else None
+
+        if _t is not None: _t0 = _time.perf_counter()
+        h_funcs = [self._sample_func(rng) for _ in range(self.num_test_funcs)]
+        if self.include_coordinates:
+            h_funcs.append(lambda x, y: x.squeeze(-1) if x.dim() > 1 else x)
+            h_funcs.append(lambda x, y: y.squeeze(-1) if y.dim() > 1 else y)
+            h_funcs.append(lambda x, y: surface_func(x, y).squeeze(-1)
+                           if surface_func(x, y).dim() > 1
+                           else surface_func(x, y))
+        if _t is not None: _t['sample_funcs'] = _time.perf_counter() - _t0
+
+        P = len(h_funcs)
+        K = len(x_grid)
+        deltas = torch.zeros(K, P, dtype=torch.float32)
+
+        if _t is not None: _t0 = _time.perf_counter()
+        with torch.no_grad():
+            for p, h in enumerate(h_funcs):
+                h_grid = h(x_grid, y_grid)
+                h_center = h(torch.tensor(0.0), torch.tensor(0.0))
+                deltas[:, p] = h_grid - h_center
+        if _t is not None: _t['deltas'] = _time.perf_counter() - _t0
+
+        if _t is not None: _t0 = _time.perf_counter()
+        x0 = torch.tensor([[0.0]], requires_grad=True)
+        y0 = torch.tensor([[0.0]], requires_grad=True)
+        laplacians, gradients = compute_lb_and_gradient_batch(
+            surface_func, h_funcs, x0, y0, verbose=self.verbose)
+        if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
+
+        lb_all_points = None
+        if self.compute_lb_all_points:
+            if _t is not None: _t0 = _time.perf_counter()
+            x_all = x_grid.clone().unsqueeze(-1).requires_grad_(True)
+            y_all = y_grid.clone().unsqueeze(-1).requires_grad_(True)
+            lb_all_points, _ = compute_lb_and_gradient_batch(
+                surface_func, h_funcs, x_all, y_all, verbose=self.verbose)
+            if _t is not None: _t['lb_all_pts'] = _time.perf_counter() - _t0
+
+        return deltas, laplacians, gradients, lb_all_points, _t
 
 
 # =============================================
@@ -682,6 +1104,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         # Deltas (function value differences) are unchanged.
         if 'test_func_laplacians' in data:
             data['test_func_laplacians'] = data['test_func_laplacians'] * (d ** 2)
+        if 'test_func_lb_all_points' in data:
+            data['test_func_lb_all_points'] = data['test_func_lb_all_points'] * (d ** 2)
         if 'test_func_gradients' in data:
             data['test_func_gradients'] = data['test_func_gradients'] * d
 
@@ -1267,6 +1691,8 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                     data['test_func_deltas'] = tf_data['test_func_deltas']
                     data['test_func_laplacians'] = tf_data['test_func_laplacians'].unsqueeze(0)  # (1, P) for batching
                     data['test_func_gradients'] = tf_data['test_func_gradients'].unsqueeze(0)    # (1, P, 3) for batching
+                    if 'test_func_lb_all_points' in tf_data:
+                        data['test_func_lb_all_points'] = tf_data['test_func_lb_all_points']    # (K, P) per-node
 
             # Store origin index if we added/found one
             if origin_idx is not None:

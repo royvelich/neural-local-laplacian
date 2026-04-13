@@ -1193,12 +1193,29 @@ class GeneralizedLaplacianTestLoss(nn.Module):
     Requires test_func_deltas and test_func_laplacians in the LossContext.
 
     Args:
+        loss_mode: Error metric to use:
+            'mse': (predicted - target)²  — absolute MSE.
+            'relative': ((predicted - target) / (|target| + eps))²  — relative error.
+            'signed_log': (slog(predicted) - slog(target))²  where
+                slog(x) = sign(x)·log(|x|+1).  Compresses large values,
+                handles both signs, scale-insensitive.
         reduction: 'mean' | 'sum' | 'none'
+        eps: Small constant for numerical stability (relative mode).
     """
 
-    def __init__(self, reduction: str = 'mean'):
+    def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
+                 eps: float = 1e-8):
         super().__init__()
+        if loss_mode not in ('mse', 'relative', 'signed_log'):
+            raise ValueError(f"loss_mode must be 'mse', 'relative', or 'signed_log', got '{loss_mode}'")
+        self.loss_mode = loss_mode
         self.reduction = reduction
+        self.eps = eps
+
+    @staticmethod
+    def _signed_log(x: torch.Tensor) -> torch.Tensor:
+        """sign(x) · log(|x| + 1) — smooth, monotonic, handles negatives."""
+        return x.sign() * torch.log(x.abs() + 1.0)
 
     def forward(self, ctx: LossContext) -> torch.Tensor:
         if ctx.test_func_deltas is None:
@@ -1216,8 +1233,14 @@ class GeneralizedLaplacianTestLoss(nn.Module):
 
         target = ctx.test_func_laplacians  # (B, P)
 
-        per_func_error = (predicted - target) ** 2  # (B, P)
-        per_patch = per_func_error.mean(dim=-1)      # (B,)
+        if self.loss_mode == 'mse':
+            per_func_error = (predicted - target) ** 2
+        elif self.loss_mode == 'relative':
+            per_func_error = ((predicted - target) / (target.abs() + self.eps)) ** 2
+        elif self.loss_mode == 'signed_log':
+            per_func_error = (self._signed_log(predicted) - self._signed_log(target)) ** 2
+
+        per_patch = per_func_error.mean(dim=-1)  # (B,)
 
         if self.reduction == 'mean':
             return per_patch.mean()

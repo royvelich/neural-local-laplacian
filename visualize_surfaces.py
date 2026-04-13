@@ -183,6 +183,10 @@ class SurfaceVisualizer:
         self._surface_color = [0.3, 0.3, 0.3]
         self._origin_dot_color = [1.0, 0.0, 0.0]
         self._edge_width = 0.0  # toggled in screenshots
+        self._probe_idx = 0    # selected test/probe function index
+        self._show_probe_scalar = False  # toggle probe function coloring
+        self._probe_color_mode = 0  # 0 = delta h, 1 = Δ_LB(h)
+        self._show_ground_shadow = False
 
     def _has_hybrid_option(self):
         return self._current_surfaces is not None and len(self._current_surfaces) >= 2
@@ -325,6 +329,39 @@ class SurfaceVisualizer:
         structure.add_vector_quantity("normals", normals * self.vis_config.vector_scale,
                                      enabled=True, color=self.color_palette.get_vector_color("normals"), vectortype="ambient")
 
+    def _get_num_probes(self, surface):
+        """Return number of probe functions on this surface, or 0."""
+        if hasattr(surface, 'test_func_deltas') and surface.test_func_deltas is not None:
+            return surface.test_func_deltas.shape[-1]
+        return 0
+
+    def _add_probe_coloring(self, structure, surface, colormap='coolwarm'):
+        """Add probe function scalar coloring to a Polyscope structure."""
+        if not self._show_probe_scalar:
+            return
+        num_probes = self._get_num_probes(surface)
+        if num_probes == 0:
+            return
+        probe_idx = min(self._probe_idx, num_probes - 1)
+
+        if self._probe_color_mode == 1:
+            # Δ_LB(h) at every vertex
+            if hasattr(surface, 'test_func_lb_all_points') and surface.test_func_lb_all_points is not None:
+                lb_all = to_numpy(surface.test_func_lb_all_points)  # (K, P)
+                values = lb_all[:, probe_idx]
+                label = f"Δ_LB(h_{probe_idx})"
+            else:
+                return  # not available
+        else:
+            # Delta: h(p_j) - h(p_i)
+            deltas = to_numpy(surface.test_func_deltas)  # (K, P)
+            values = deltas[:, probe_idx]
+            label = f"δh_{probe_idx}"
+
+        structure.add_scalar_quantity(
+            name=label, values=values,
+            enabled=True, cmap=colormap)
+
     def _add_origin_indicator(self, surface, name, translation):
         if not self.is_diff_geom_at_origin_only:
             return
@@ -386,6 +423,10 @@ class SurfaceVisualizer:
                 psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (Hybrid: mesh + cloud always on)")
             c3, v3 = psim.Checkbox("Show Reference Frame", self._show_reference_frame)
             if c3: self._show_reference_frame = v3; needs_rerender = True
+            c3b, v3b = psim.Checkbox("Ground Shadow", self._show_ground_shadow)
+            if c3b:
+                self._show_ground_shadow = v3b
+                ps.set_ground_plane_mode("shadow_only" if v3b else "none")
             c4, v4 = psim.ColorEdit3("Surface Color", self._surface_color)
             if c4: self._surface_color = list(v4); needs_rerender = True
             c5, v5 = psim.SliderFloat("Point Size", self._point_radius, v_min=0.001, v_max=0.05)
@@ -428,6 +469,46 @@ class SurfaceVisualizer:
             c15, _ = psim.Checkbox("Include Origin in Grid", self._include_origin_in_grid)
             if c15: self.toggle_include_origin_in_grid()
             psim.Text("")
+
+            # ── Probe function display ──────────────────────────────
+            cur_surface_idx = 1 if self._patch_idx == _HYBRID_IDX else self._patch_idx
+            num_probes = 0
+            if self._current_surfaces and cur_surface_idx < len(self._current_surfaces):
+                num_probes = self._get_num_probes(self._current_surfaces[cur_surface_idx])
+            if num_probes > 0:
+                psim.Text("Probe Functions")
+                psim.Separator()
+                cp1, vp1 = psim.Checkbox("Show Probe Coloring", self._show_probe_scalar)
+                if cp1: self._show_probe_scalar = vp1; needs_rerender = True
+                if self._show_probe_scalar:
+                    cp2, vp2 = psim.SliderInt("Probe Index", self._probe_idx, v_min=0, v_max=num_probes - 1)
+                    if cp2: self._probe_idx = vp2; needs_rerender = True
+
+                    # Color mode selector
+                    color_modes = ["δh (function delta)", "Δ_LB(h) (analytic)"]
+                    surface = self._current_surfaces[cur_surface_idx]
+                    has_lb_all = hasattr(surface, 'test_func_lb_all_points') and surface.test_func_lb_all_points is not None
+                    if has_lb_all:
+                        cm_changed, cm_new = psim.Combo("Color Mode", self._probe_color_mode, color_modes)
+                        if cm_changed: self._probe_color_mode = cm_new; needs_rerender = True
+                    else:
+                        self._probe_color_mode = 0
+                        psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (Δ_LB coloring: enable compute_lb_all_points)")
+
+                    # Show Δ_LB value at origin for selected probe
+                    pidx = min(self._probe_idx, num_probes - 1)
+                    if hasattr(surface, 'test_func_laplacians') and surface.test_func_laplacians is not None:
+                        lb_vals = to_numpy(surface.test_func_laplacians).flatten()
+                        pidx_lb = min(pidx, len(lb_vals) - 1)
+                        psim.Text(f"  Δ_LB(h_{pidx_lb}) at origin = {lb_vals[pidx_lb]:.6f}")
+
+                    # Show value ranges
+                    deltas = to_numpy(surface.test_func_deltas)
+                    psim.Text(f"  δh range: [{deltas[:, pidx].min():.4f}, {deltas[:, pidx].max():.4f}]")
+                    if has_lb_all:
+                        lb_all = to_numpy(surface.test_func_lb_all_points)
+                        psim.Text(f"  Δ_LB range: [{lb_all[:, pidx].min():.4f}, {lb_all[:, pidx].max():.4f}]")
+                psim.Text("")
 
             # ── Surface metrics ──────────────────────────────────────
             psim.Text("Surface Metrics")
@@ -516,12 +597,14 @@ class SurfaceVisualizer:
             self._add_vector_quantities(mesh, surface, "mesh")
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(mesh, normals)
+            self._add_probe_coloring(mesh, surface, self.vis_config.mesh_scalar_colormap)
         if self._show_pointcloud:
             cloud = ps.register_point_cloud(f"{name} - Point Cloud", pos, radius=self._point_radius, enabled=True)
             cloud.set_color(tuple(c * 0.5 for c in self._surface_color))
             self._add_vector_quantities(cloud, surface, "pointcloud")
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(cloud, normals)
+            self._add_probe_coloring(cloud, surface, self.vis_config.pointcloud_scalar_colormap)
         self._add_origin_indicator(surface, name, np.zeros(3))
         self._render_origin_normals(surface, name, pred_cache_idx=idx)
 
@@ -541,6 +624,7 @@ class SurfaceVisualizer:
         self._add_vector_quantities(mesh, surf_mesh, "mesh")
         if self._show_gt_normals_all:
             self._add_normals_to_structure(mesh, normals_mesh)
+        self._add_probe_coloring(mesh, surf_mesh, self.vis_config.mesh_scalar_colormap)
 
         # Point cloud from downsampled grid (surface 1)
         cloud = ps.register_point_cloud(f"Hybrid Points ({name_pts})", pos_pts,
@@ -549,6 +633,7 @@ class SurfaceVisualizer:
         self._add_vector_quantities(cloud, surf_pts, "pointcloud")
         if self._show_gt_normals_all:
             self._add_normals_to_structure(cloud, normals_pts)
+        self._add_probe_coloring(cloud, surf_pts, self.vis_config.pointcloud_scalar_colormap)
 
         # Origin + normals from downsampled patch (what model sees)
         self._add_origin_indicator(surf_pts, "Hybrid", np.zeros(3))
@@ -653,7 +738,7 @@ def setup_polyscope():
     ps.init()
     ps.set_up_dir("z_up")
     ps.look_at(camera_location=[2.4, 2, 3.9], target=[0, 0, 0])
-    ps.set_ground_plane_mode("shadow_only")
+    ps.set_ground_plane_mode("none")
     ps.set_shadow_blur_iters(20)
     ps.set_shadow_darkness(0.15)
     ps.set_SSAA_factor(4)
