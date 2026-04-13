@@ -992,6 +992,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             seed: int = 0,
             conv_k_nearest: Optional[int] = None,
             normalize_to_unit_sphere: bool = False,
+            position_noise_std: float = 0.0,
     ):
         super().__init__()
         self._seed = seed
@@ -1000,6 +1001,7 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         self._pose_transformers = pose_transformers if pose_transformers is not None else []
         self._conv_k_nearest = conv_k_nearest
         self._normalize_to_unit_sphere = normalize_to_unit_sphere
+        self._position_noise_std = position_noise_std
 
     def reset_rng(self) -> None:
         """Reset random number generator to initial seed."""
@@ -1015,7 +1017,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         This is the main orchestration method that:
         1. Calls the derived class implementation to generate raw surface data
         2. Optionally normalizes each surface to the unit sphere
-        3. Adds features to each surface using the feature extractor
+        3. Optionally adds positional noise to vertex positions
+        4. Adds features to each surface using the feature extractor
 
         Returns:
             List of Data objects with positions, normals, differential geometry, and features
@@ -1027,6 +1030,14 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         if self._normalize_to_unit_sphere:
             for surface in surfaces:
                 self._normalize_surface_to_unit_sphere(surface)
+
+        # Optionally add positional noise (after normalization, before features)
+        # GT targets (normals, curvatures, test_func_laplacians) remain clean.
+        # Only data.pos is perturbed — the model must be robust to noisy input.
+        if self._position_noise_std > 0:
+            for surface in surfaces:
+                noise = torch.randn_like(surface.pos) * self._position_noise_std
+                surface.pos = surface.pos + noise
 
         # Add features to each surface
         for surface in surfaces:
