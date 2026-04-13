@@ -27,8 +27,9 @@ module:
 
       seed: ${globals.training_seed}
       epoch_size: 2400
+      position_noise_std: 0.02
       grid_radius_range: [1.0]
-      polynomial_offset_range: [0.05]
+      polynomial_offset_range: [0.7]
       points_scale_range: [1.0]
       coefficient_scale_range: [1.0]
       order_range: [2, 4]
@@ -47,7 +48,7 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_sphere: True
-    batch_size: 5
+    batch_size: 10
     num_workers: 5
     shuffle: True
   val_dataset_specifications:
