@@ -117,6 +117,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  area_bound_C: float = 12.566370614359172,  # 4*pi
                  mcv_mode: str = 'diagonal_gram',
                  normalize_grad_by_k: bool = False,
+                 detach_area_head: bool = False,
                  val_laplacian: Optional[Dict] = None,
                  fmap_val_cfg: Optional[Dict] = None,
                  **kwargs):
@@ -168,6 +169,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._area_bound_C = area_bound_C
         self._mcv_mode = mcv_mode
         self._normalize_grad_by_k = normalize_grad_by_k
+        self._detach_area_head = detach_area_head
 
         # Validation Laplacian config
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
@@ -474,6 +476,11 @@ class LaplacianTransformerModule(LaplacianModuleBase):
             float_mask = attention_mask.float()
             num_tokens = float_mask.sum(dim=1, keepdim=True)
             pooled = (encoded * float_mask.unsqueeze(-1)).sum(dim=1) / num_tokens
+
+        # Optionally detach: area head reads encoder features but doesn't
+        # send gradients back — encoder is trained only by gradient/stiffness losses.
+        if self._detach_area_head:
+            pooled = pooled.detach()
 
         areas_raw = self.area_head(pooled).squeeze(-1)
         areas_normalized = self._apply_area_activation(areas_raw, batch_sizes)
