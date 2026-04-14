@@ -13,6 +13,8 @@ module:
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
+  detach_area_head: true
+
   area_activation: bounded_sigmoid
   area_bound_C: 12.0   # 4π
 
@@ -58,7 +60,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
-        loss_mode: mse
+        loss_mode: relative
       weight: 1.0
 
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
@@ -86,4 +88,4 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
-      weight: 0.01
+      weight: 1.0
