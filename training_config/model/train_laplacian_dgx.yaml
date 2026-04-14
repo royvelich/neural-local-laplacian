@@ -49,11 +49,18 @@ module:
 #        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
 #      weight: 2.0
 
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+#        loss_mode: signed_log
+#      weight: 1.0
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
-        loss_mode: signed_log
+        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+        loss_mode: mse
       weight: 1.0
+
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
@@ -79,4 +86,4 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
-      weight: 0.01
+      weight: 10.0

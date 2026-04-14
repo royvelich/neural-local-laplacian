@@ -731,6 +731,7 @@ class TestFunctionSampler:
             mag = laplacians.abs().clamp(min=1e-8)
             laplacians = laplacians / mag
             deltas = deltas / mag.unsqueeze(0)
+            gradients = gradients / mag.unsqueeze(-1)
             if lb_all_points is not None:
                 lb_all_points = lb_all_points / mag.unsqueeze(0)
         elif self.normalize_target == 'unit_variance':
