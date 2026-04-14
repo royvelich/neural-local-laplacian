@@ -1304,6 +1304,82 @@ class GradientTangentPlaneLoss(nn.Module):
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
 
 
+class GeneralizedGradientSupervisionLoss(nn.Module):
+    """Supervise the discrete gradient action on multiple test functions.
+
+    For each test function h_p, compares the discrete gradient action:
+
+        (∇_S h_p)_pred = Σ_j g_ij · δh_p_j     (B, P, 3)
+
+    against the analytic ground-truth surface gradient:
+
+        (∇_S h_p)_GT                              (B, P, 3)
+
+    This is a much stronger constraint than GradientTangentPlaneLoss (which
+    only checks zero normal component).  It supervises **direction and
+    magnitude** of the gradient across P test functions — P vector equations
+    constraining the full 3×K gradient coefficient matrix.
+
+    Requires test_func_deltas and test_func_gradients in the LossContext.
+
+    Args:
+        loss_mode: Error metric:
+            'mse': ‖pred - target‖²
+            'relative': ‖pred - target‖² / (‖target‖² + eps)
+            'cosine': 1 - cos(pred, target)  (direction only)
+        reduction: 'mean' | 'sum' | 'none'
+        eps: Small constant for numerical stability.
+    """
+
+    def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
+                 eps: float = 1e-8):
+        super().__init__()
+        if loss_mode not in ('mse', 'relative', 'cosine'):
+            raise ValueError(f"loss_mode must be 'mse', 'relative', or 'cosine', got '{loss_mode}'")
+        self.loss_mode = loss_mode
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        if ctx.test_func_deltas is None:
+            raise ValueError("GeneralizedGradientSupervisionLoss requires ctx.test_func_deltas")
+        if ctx.test_func_gradients is None:
+            raise ValueError("GeneralizedGradientSupervisionLoss requires ctx.test_func_gradients")
+
+        grad_masked, _, _, mask_3d = _masked_grad_and_stiffness(ctx)
+        deltas = ctx.test_func_deltas * mask_3d  # (B, K, P) masked
+
+        # Predicted gradient: Σ_j g_ij δh_p_j  →  (B, P, 3)
+        predicted = _compute_discrete_gradient(grad_masked, deltas)
+
+        # GT gradient  →  (B, P, 3)
+        target = ctx.test_func_gradients
+
+        if self.loss_mode == 'mse':
+            # ‖pred - target‖² per function  →  (B, P)
+            per_func = ((predicted - target) ** 2).sum(dim=-1)
+        elif self.loss_mode == 'relative':
+            # ‖pred - target‖² / (‖target‖² + eps)  →  (B, P)
+            diff_sq = ((predicted - target) ** 2).sum(dim=-1)
+            target_sq = (target ** 2).sum(dim=-1) + self.eps
+            per_func = diff_sq / target_sq
+        elif self.loss_mode == 'cosine':
+            # 1 - cos(pred, target)  →  (B, P)
+            cos_sim = F.cosine_similarity(predicted, target, dim=-1)  # (B, P)
+            per_func = 1.0 - cos_sim
+
+        per_patch = per_func.mean(dim=-1)  # (B,)
+
+        if self.reduction == 'mean':
+            return per_patch.mean()
+        elif self.reduction == 'sum':
+            return per_patch.sum()
+        elif self.reduction == 'none':
+            return per_patch
+        else:
+            raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+
 class SelfSupervisedGradientTangentPlaneLoss(nn.Module):
     """Unsupervised loss: discrete gradient of test functions should be tangential.
 
