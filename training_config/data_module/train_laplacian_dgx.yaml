@@ -9,7 +9,7 @@ module:
         num_test_funcs: 300
         include_coordinates: false
         verbose: false
-        normalize_target: 'none'
+        normalize_target: 'unit_magnitude'
         families:
           poly:
             weight: 0.45

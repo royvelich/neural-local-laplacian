@@ -60,13 +60,13 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
-        loss_mode: relative
+        loss_mode: mse
       weight: 1.0
 
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+#      weight: 1.0
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
@@ -85,7 +85,7 @@ module:
 #        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
 #      weight: 1.0
 #
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
-#      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
+      weight: 1.0
