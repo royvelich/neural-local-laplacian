@@ -118,6 +118,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  mcv_mode: str = 'diagonal_gram',
                  normalize_grad_by_k: bool = False,
                  detach_area_head: bool = False,
+                 use_uniform_mass: bool = False,
                  val_laplacian: Optional[Dict] = None,
                  fmap_val_cfg: Optional[Dict] = None,
                  **kwargs):
@@ -170,6 +171,7 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self._mcv_mode = mcv_mode
         self._normalize_grad_by_k = normalize_grad_by_k
         self._detach_area_head = detach_area_head
+        self._use_uniform_mass = use_uniform_mass
 
         # Validation Laplacian config
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
@@ -220,12 +222,14 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         # Area head: aggregated features -> scalar area A_i
         # Activation applied manually via _apply_area_activation
-        self.area_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.LayerNorm(d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, 1),
-        )
+        # Omitted entirely when use_uniform_mass=True (DDP-safe: no unused params)
+        if not use_uniform_mass:
+            self.area_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 1),
+            )
 
     def _apply_area_activation(self, areas_raw: torch.Tensor,
                                 batch_sizes: torch.Tensor) -> torch.Tensor:
@@ -470,24 +474,32 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)
 
         # ── Area prediction ──────────────────────────────────────────
-        if fixed_k:
-            pooled = encoded.mean(dim=1)
+        if self._use_uniform_mass:
+            # Uniform mass: M_ii = scale² (or 1.0 if not scaling)
+            if self._scale_areas_by_patch_size:
+                areas = scale_factors ** 2
+            else:
+                areas = torch.ones(batch_size, device=grad_coeffs.device,
+                                   dtype=grad_coeffs.dtype)
         else:
-            float_mask = attention_mask.float()
-            num_tokens = float_mask.sum(dim=1, keepdim=True)
-            pooled = (encoded * float_mask.unsqueeze(-1)).sum(dim=1) / num_tokens
+            if fixed_k:
+                pooled = encoded.mean(dim=1)
+            else:
+                float_mask = attention_mask.float()
+                num_tokens = float_mask.sum(dim=1, keepdim=True)
+                pooled = (encoded * float_mask.unsqueeze(-1)).sum(dim=1) / num_tokens
 
-        # Optionally detach: area head reads encoder features but doesn't
-        # send gradients back — encoder is trained only by gradient/stiffness losses.
-        if self._detach_area_head:
-            pooled = pooled.detach()
+            # Optionally detach: area head reads encoder features but doesn't
+            # send gradients back — encoder is trained only by gradient/stiffness losses.
+            if self._detach_area_head:
+                pooled = pooled.detach()
 
-        areas_raw = self.area_head(pooled).squeeze(-1)
-        areas_normalized = self._apply_area_activation(areas_raw, batch_sizes)
-        if self._scale_areas_by_patch_size:
-            areas = areas_normalized * (scale_factors ** 2)
-        else:
-            areas = areas_normalized
+            areas_raw = self.area_head(pooled).squeeze(-1)
+            areas_normalized = self._apply_area_activation(areas_raw, batch_sizes)
+            if self._scale_areas_by_patch_size:
+                areas = areas_normalized * (scale_factors ** 2)
+            else:
+                areas = areas_normalized
 
         return {
             'stiffness_weights': stiffness_weights,
