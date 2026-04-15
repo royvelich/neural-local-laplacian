@@ -57,11 +57,11 @@ module:
         loss_mode: relative
       weight: 1.0
 
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
-        loss_mode: relative
-      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+#        loss_mode: relative
+#      weight: 1.0
 
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
