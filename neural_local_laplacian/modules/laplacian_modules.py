@@ -553,6 +553,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
 
         cosine_sim = F.cosine_similarity(predicted_mcv, target_mcv, dim=1).mean()
         areas = forward_result['areas']
+        stiffness = forward_result['stiffness_weights']  # (B, max_k)
+        mask = forward_result['attention_mask'].float()   # (B, max_k)
 
         self.log('train/loss', total_loss.item(), on_step=False, on_epoch=True,
                  prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
@@ -563,6 +565,38 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                  logger=True, batch_size=batch_size, sync_dist=True)
         self.log('train/area_std', areas.std().item(), on_step=False, on_epoch=True,
                  logger=True, batch_size=batch_size, sync_dist=True)
+
+        # ── Diagnostic metrics ──────────────────────────────────────
+        # Stiffness magnitude stats (masked)
+        s_masked = stiffness * mask  # zero out padding
+        s_valid = s_masked[mask.bool()]
+        if s_valid.numel() > 0:
+            self.log('train/stiffness_mean', s_valid.mean().item(), on_step=False,
+                     on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+            self.log('train/stiffness_std', s_valid.std().item(), on_step=False,
+                     on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+            self.log('train/stiffness_max', s_valid.max().item(), on_step=False,
+                     on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Stiffness-to-area ratio: Σ s_ij / A_i per patch (eigenvalue scale)
+        s_sum_per_patch = s_masked.sum(dim=-1)  # (B,)
+        s_over_a = s_sum_per_patch / areas.clamp(min=1e-8)  # (B,)
+        self.log('train/stiffness_area_ratio_mean', s_over_a.mean().item(), on_step=False,
+                 on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/stiffness_area_ratio_std', s_over_a.std().item(), on_step=False,
+                 on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+
+        # MCV magnitude
+        mcv_mag = torch.norm(predicted_mcv, dim=1)  # (B,)
+        self.log('train/mcv_magnitude_mean', mcv_mag.mean().item(), on_step=False,
+                 on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log('train/mcv_magnitude_std', mcv_mag.std().item(), on_step=False,
+                 on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
+
+        # Encoder weight norm
+        enc_norm = sum(p.norm().item() ** 2 for p in self.transformer_encoder.parameters()) ** 0.5
+        self.log('train/encoder_weight_norm', enc_norm, on_step=False,
+                 on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
         for name, val in loss_components_unweighted.items():
             self.log(name, val, on_step=False, on_epoch=True, logger=True,
