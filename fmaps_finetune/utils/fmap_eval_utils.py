@@ -301,6 +301,27 @@ def correspondence_metrics(
 # Core evaluation functions
 # =============================================================================
 
+
+def _eigenvalue_summary(evals: np.ndarray, prefix: str) -> Dict[str, float]:
+    """Summarise an eigenvalue array into a few loggable scalars.
+
+    Args:
+        evals: (k,) sorted eigenvalues from eigendecomposition.
+        prefix: e.g. 'eval_A' → keys like 'eval_A/lambda_01', 'eval_A/lambda_max'.
+    """
+    stats: Dict[str, float] = {}
+    n = len(evals)
+    for idx in [0, 4, 9, 19, 49, 99]:
+        if idx < n:
+            stats[f'{prefix}/lambda_{idx + 1:02d}'] = float(evals[idx])
+    stats[f'{prefix}/lambda_max'] = float(evals[-1])
+    stats[f'{prefix}/lambda_mean'] = float(evals.mean())
+    # Ratio of last to first non-trivial (spectral spread)
+    if n > 1 and abs(evals[0]) > 1e-12:
+        stats[f'{prefix}/lambda_ratio_max_01'] = float(evals[-1] / evals[0])
+    return stats
+
+
 @torch.no_grad()
 def evaluate_pair(
     model: nn.Module,
@@ -430,6 +451,15 @@ def evaluate_pair(
                 )
                 for mk, mv in ev_metrics.items():
                     metrics[f"{prefix}{evaluator.name}/{mk}"] = mv
+
+        # Eigenvalue summary from first config
+        first_tag = list(bases_by_config.keys())[0]
+        first_bases = bases_by_config[first_tag]
+        _, evalsA, _ = first_bases['A']
+        _, evalsB, _ = first_bases['B']
+        metrics.update(_eigenvalue_summary(evalsA, 'eval_A'))
+        metrics.update(_eigenvalue_summary(evalsB, 'eval_B'))
+
         _t['evaluators'] = _time.perf_counter() - t0
 
         if verbose_timing:
@@ -450,7 +480,10 @@ def evaluate_pair(
     bases = bases_by_config[first_tag]
     evA, evalsA, _ = bases['A']
     evB, evalsB, _ = bases['B']
-    return correspondence_metrics(evA, evB, mA, mB, pair.verts_b, n_a, gt_corr=gt_corr)
+    legacy_metrics = correspondence_metrics(evA, evB, mA, mB, pair.verts_b, n_a, gt_corr=gt_corr)
+    legacy_metrics.update(_eigenvalue_summary(evalsA, 'eval_A'))
+    legacy_metrics.update(_eigenvalue_summary(evalsB, 'eval_B'))
+    return legacy_metrics
 
 
 @torch.no_grad()

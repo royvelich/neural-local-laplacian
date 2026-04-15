@@ -1327,6 +1327,9 @@ class GeneralizedGradientSupervisionLoss(nn.Module):
             'mse': ‖pred - target‖²
             'relative': ‖pred - target‖² / (‖target‖² + eps)
             'cosine': 1 - cos(pred, target)  (direction only)
+            'log_mse': ‖slog(pred) - slog(target)‖²  where
+                slog(v) = v̂ · log(‖v‖ + 1).  Compresses magnitude range
+                (log scale) while preserving direction.  Not scale-invariant.
         reduction: 'mean' | 'sum' | 'none'
         eps: Small constant for numerical stability.
     """
@@ -1334,11 +1337,21 @@ class GeneralizedGradientSupervisionLoss(nn.Module):
     def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
                  eps: float = 1e-8):
         super().__init__()
-        if loss_mode not in ('mse', 'relative', 'cosine'):
-            raise ValueError(f"loss_mode must be 'mse', 'relative', or 'cosine', got '{loss_mode}'")
+        if loss_mode not in ('mse', 'relative', 'cosine', 'log_mse'):
+            raise ValueError(f"loss_mode must be 'mse', 'relative', 'cosine', "
+                             f"or 'log_mse', got '{loss_mode}'")
         self.loss_mode = loss_mode
         self.reduction = reduction
         self.eps = eps
+
+    @staticmethod
+    def _slog_vec(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Map vector to log-magnitude space: v̂ · log(‖v‖ + 1).
+
+        Preserves direction, compresses magnitude.  slog(0) = 0.
+        """
+        norm = v.norm(dim=-1, keepdim=True).clamp(min=eps)
+        return v * (torch.log(norm + 1.0) / norm)
 
     def forward(self, ctx: LossContext) -> torch.Tensor:
         if ctx.test_func_deltas is None:
@@ -1367,6 +1380,11 @@ class GeneralizedGradientSupervisionLoss(nn.Module):
             # 1 - cos(pred, target)  →  (B, P)
             cos_sim = F.cosine_similarity(predicted, target, dim=-1)  # (B, P)
             per_func = 1.0 - cos_sim
+        elif self.loss_mode == 'log_mse':
+            # ‖slog(pred) - slog(target)‖²  →  (B, P)
+            pred_log = self._slog_vec(predicted, self.eps)
+            target_log = self._slog_vec(target, self.eps)
+            per_func = ((pred_log - target_log) ** 2).sum(dim=-1)
 
         per_patch = per_func.mean(dim=-1)  # (B,)
 
