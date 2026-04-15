@@ -6,7 +6,7 @@ module:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
 
       test_func_cfg:
-        num_test_funcs: 50
+        num_test_funcs: 500
         include_coordinates: false
         verbose: false
         normalize_target: 'unit_magnitude'
