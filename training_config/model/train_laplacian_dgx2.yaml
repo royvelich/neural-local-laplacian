@@ -51,11 +51,11 @@ module:
 #        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
 #      weight: 2.0
 
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
-#        loss_mode: signed_log
-#      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+        loss_mode: relative
+      weight: 1.0
 
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
@@ -66,7 +66,7 @@ module:
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-#      weight: 2.0
+#      weight: 1.0
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
