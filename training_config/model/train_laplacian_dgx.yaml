@@ -15,7 +15,7 @@ module:
 
   detach_area_head: true
   use_uniform_mass: true
-  
+
   area_activation: bounded_sigmoid
   area_bound_C: 12.0   # 4π
 
