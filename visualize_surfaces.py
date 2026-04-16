@@ -200,6 +200,12 @@ class SurfaceVisualizer:
         self._gt_gradient_all_length = 8.5
         self._gt_gradient_all_width = self.vis_config.normal_origin_point_radius * 0.5
         self._gt_gradient_all_normalize = False
+        # Per-target visibility for the all-points gradient field.
+        # The master toggle above is on/off; these choose where the vectors
+        # attach when it is on. Both True = current default behavior (appear
+        # on both structures); turning both off hides the field entirely.
+        self._gt_gradients_all_on_mesh = True
+        self._gt_gradients_all_on_cloud = True
 
     def _has_hybrid_option(self):
         return self._current_surfaces is not None and len(self._current_surfaces) >= 2
@@ -440,7 +446,12 @@ class SurfaceVisualizer:
             return
         probe_idx = min(self._probe_idx, num_probes - 1)
 
-        grads = to_numpy(surface.test_func_gradients)  # (P, 3)
+        grads = to_numpy(surface.test_func_gradients)
+        # Storage convention from the dataset is (1, P, 3) — a leading batch dim
+        # added by .unsqueeze(0) so PyG batching stacks across surfaces. In the
+        # viz we index a single surface, so drop the leading dim if present.
+        if grads.ndim == 3 and grads.shape[0] == 1:
+            grads = grads[0]  # (P, 3)
         if probe_idx >= grads.shape[0]:
             return
         grad_vec = grads[probe_idx]  # (3,)
@@ -463,9 +474,22 @@ class SurfaceVisualizer:
             enabled=True, color=tuple(self._gt_gradient_color),
             radius=self._gt_gradient_width, vectortype="ambient")
 
-    def _add_gt_gradient_all_to_structure(self, structure, surface):
-        """Attach per-vertex GT gradient vectors for the selected probe to a structure."""
+    def _add_gt_gradient_all_to_structure(self, structure, surface, structure_type: str = "mesh"):
+        """Attach per-vertex GT gradient vectors for the selected probe to a structure.
+
+        Args:
+            structure: Polyscope structure (mesh or point cloud) to attach to.
+            surface: The surface Data object holding the GT gradient field.
+            structure_type: 'mesh' or 'pointcloud'. Checked against the per-target
+                visibility flags (_gt_gradients_all_on_mesh / _gt_gradients_all_on_cloud)
+                so the field can be shown on one, both, or neither target.
+        """
         if not self._show_gt_gradients_all:
+            return
+        # Per-target gating: skip if this structure type is disabled.
+        if structure_type == "mesh" and not self._gt_gradients_all_on_mesh:
+            return
+        if structure_type == "pointcloud" and not self._gt_gradients_all_on_cloud:
             return
         if not hasattr(surface, 'test_func_gradients_all_points') or \
                 surface.test_func_gradients_all_points is None:
@@ -643,6 +667,17 @@ class SurfaceVisualizer:
                     if cgc: self._gt_gradient_color = list(vgc); needs_rerender = True
 
                 if (self._show_gt_gradients_all and has_gt_grad_all):
+                    # Per-target visibility sub-controls (mesh / point cloud).
+                    # Without these, the vector field was attached to both structures
+                    # at once, which displayed the arrows twice when both were shown.
+                    psim.Text("  Display target:")
+                    psim.SameLine()
+                    cgtm, vgtm = psim.Checkbox("On Mesh", self._gt_gradients_all_on_mesh)
+                    if cgtm: self._gt_gradients_all_on_mesh = vgtm; needs_rerender = True
+                    psim.SameLine()
+                    cgtp, vgtp = psim.Checkbox("On Point Cloud", self._gt_gradients_all_on_cloud)
+                    if cgtp: self._gt_gradients_all_on_cloud = vgtp; needs_rerender = True
+
                     cgna, vgna = psim.Checkbox("Normalize GT Gradient (all pts)", self._gt_gradient_all_normalize)
                     if cgna: self._gt_gradient_all_normalize = vgna; needs_rerender = True
                     cgla, vgla = psim.SliderFloat("GT Gradient (all pts) Length", self._gt_gradient_all_length,
@@ -657,6 +692,10 @@ class SurfaceVisualizer:
                 if self._show_gt_gradient_origin and has_gt_grad:
                     pidx = min(self._probe_idx, num_probes - 1)
                     grads = to_numpy(surface.test_func_gradients)
+                    # Stored as (1, P, 3) from the dataset — drop the leading
+                    # batch dim for single-surface indexing here.
+                    if grads.ndim == 3 and grads.shape[0] == 1:
+                        grads = grads[0]  # (P, 3)
                     if pidx < grads.shape[0]:
                         g = grads[pidx]
                         psim.Text(f"  ∇h_{pidx}(origin) = [{float(g[0]):.4f}, {float(g[1]):.4f}, {float(g[2]):.4f}]  |g|={float(np.linalg.norm(g)):.4f}")
@@ -798,7 +837,7 @@ class SurfaceVisualizer:
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(mesh, normals)
             self._add_probe_coloring(mesh, surface, self.vis_config.mesh_scalar_colormap)
-            self._add_gt_gradient_all_to_structure(mesh, surface)
+            self._add_gt_gradient_all_to_structure(mesh, surface, structure_type="mesh")
         if self._show_pointcloud:
             cloud = ps.register_point_cloud(f"{name} - Point Cloud", pos, radius=self._point_radius, enabled=True)
             cloud.set_color(tuple(c * 0.5 for c in self._surface_color))
@@ -806,7 +845,7 @@ class SurfaceVisualizer:
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(cloud, normals)
             self._add_probe_coloring(cloud, surface, self.vis_config.pointcloud_scalar_colormap)
-            self._add_gt_gradient_all_to_structure(cloud, surface)
+            self._add_gt_gradient_all_to_structure(cloud, surface, structure_type="pointcloud")
         self._add_origin_indicator(surface, name, np.zeros(3))
         self._render_origin_normals(surface, name, pred_cache_idx=idx)
         self._render_gt_gradient_arrow(surface, name)
@@ -828,7 +867,7 @@ class SurfaceVisualizer:
         if self._show_gt_normals_all:
             self._add_normals_to_structure(mesh, normals_mesh)
         self._add_probe_coloring(mesh, surf_mesh, self.vis_config.mesh_scalar_colormap)
-        self._add_gt_gradient_all_to_structure(mesh, surf_mesh)
+        self._add_gt_gradient_all_to_structure(mesh, surf_mesh, structure_type="mesh")
 
         # Point cloud from downsampled grid (surface 1)
         cloud = ps.register_point_cloud(f"Hybrid Points ({name_pts})", pos_pts,
@@ -838,7 +877,7 @@ class SurfaceVisualizer:
         if self._show_gt_normals_all:
             self._add_normals_to_structure(cloud, normals_pts)
         self._add_probe_coloring(cloud, surf_pts, self.vis_config.pointcloud_scalar_colormap)
-        self._add_gt_gradient_all_to_structure(cloud, surf_pts)
+        self._add_gt_gradient_all_to_structure(cloud, surf_pts, structure_type="pointcloud")
 
         # Origin + normals from downsampled patch (what model sees)
         self._add_origin_indicator(surf_pts, "Hybrid", np.zeros(3))

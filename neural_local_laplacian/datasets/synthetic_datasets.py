@@ -1582,11 +1582,19 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
     def _create_raw_surface_data(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
                                  dz_dx: torch.Tensor, dz_dy: torch.Tensor, points_scale: float,
-                                 surface_params: Optional[Dict[str, Any]] = None) -> Data:
+                                 surface_params: Optional[Dict[str, Any]] = None) -> Tuple[Data, torch.Tensor]:
         """
         Create raw surface data object with positions, mesh, normals, and differential geometry.
         Does NOT add features - those are added later by the base class.
+        Does NOT apply pose transformation - that is deferred to _generate_raw_surfaces
+        so that test-function fields (and any other ℝ³ quantities attached after this
+        returns) are included in the single, centralized rotation pass.
         Modified to handle origin-only computation and center the surface at origin.
+
+        Returns:
+            data: The Data object with positions, normals, diff-geom (un-rotated).
+            origin_normal: The canonical origin normal in the un-rotated frame,
+                           used as the reference normal for the pose transformer chain.
         """
         # Compute all origin data once (derivatives, normal, H for flipping)
         origin_data = self._compute_origin_data(surface_params)
@@ -1640,12 +1648,16 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
         # Apply pose transformation to positions and differential quantities
         # ALWAYS pass the origin normal, regardless of the diff_geom_at_origin_only flag
-        data = self._repose_surface_and_quantities(data=data, normals=origin_normal)
+        # NOTE: Pose transformation is intentionally NOT applied here. It is deferred
+        # to _generate_raw_surfaces so that test-function fields (and any other ℝ³
+        # quantities attached after this returns) are included in the single,
+        # centralized rotation pass. See _repose_surface_and_quantities for the
+        # authoritative list of rotated keys (vector_3d_keys).
 
         # NOTE: Features are NOT added here - they're added by the base class
         # after calling _generate_raw_surfaces()
 
-        return data
+        return data, origin_normal
 
     def _ensure_origin_in_grid(self, x: torch.Tensor, y: torch.Tensor,
                                grid_range: Tuple[float, float]) -> Tuple[torch.Tensor, torch.Tensor, Optional[int]]:
@@ -1691,6 +1703,18 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         points_scale = self._sample_parameter(param_range=self._points_scale_range)
         grid_range = (-grid_radius, grid_radius)  # Always centered at (0, 0)
 
+        # Snapshot the rng state BEFORE the per-grid-sampler loop so that every
+        # grid sampling of this surface sees the SAME set of test-function probes.
+        # Without this, calling self._test_func_sampler.sample(rng=self._rng)
+        # inside the loop advances self._rng each iteration, and TestFunctionSampler
+        # draws a different random probe set per surface (via _sample_func_params
+        # / _sample_func). That makes "probe index k" refer to a different function
+        # on surface 0 vs surface 1 — visible in hybrid viz as inconsistent probe
+        # coloring and gradient arrows between the mesh and point cloud. Training
+        # is unaffected because it uses a single grid sampler.
+        tf_rng_state = (self._rng.bit_generator.state
+                        if self._test_func_sampler is not None else None)
+
         surfaces = []
         for grid_sampler in self._grid_samplers:
             # Generate grid for this sampling using the grid sampler
@@ -1712,24 +1736,36 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                 # Compute first derivatives BEFORE creating surface data
                 dz_dx, dz_dy = self._compute_first_derivatives(x=x, y=y, z=z)
 
-                # Create surface data object WITHOUT features (features added later by base class)
-                data = self._create_raw_surface_data(
+                # Create surface data object WITHOUT features and WITHOUT pose
+                # transform (deferred — see comment below).
+                data, origin_normal = self._create_raw_surface_data(
                     x=x, y=y, z=z, dz_dx=dz_dx, dz_dy=dz_dy,
                     points_scale=points_scale, surface_params=surface_params
                 )
 
-                # Compute test function data (if sampler is configured)
+                # Compute test function data (if sampler is configured).
+                # IMPORTANT: test functions are computed in the ORIGINAL parameter
+                # frame (using the un-rotated x, y grid and surface_func). Their
+                # ℝ³ gradients are therefore expressed in that frame and MUST be
+                # rotated together with positions/normals/principal directions
+                # below. We attach them BEFORE _repose_surface_and_quantities so
+                # the centralized vector_3d_keys loop rotates them as well.
                 if self._test_func_sampler is not None:
                     # Build a surface callable from the current surface_params
                     def surface_func(xv, yv, _sp=surface_params):
                         return self._evaluate_surface_with_parameters(xv, yv, _sp)
 
-                    # Use original (x, y) grid coordinates (detached, no grad needed for deltas)
+                    # Use a fresh rng seeded to the pre-loop snapshot so every
+                    # surface samples the SAME probe functions. The probes are
+                    # then evaluated on this surface's (x, y) grid. See the
+                    # tf_rng_state comment before the loop for context.
+                    tf_rng = np.random.default_rng()
+                    tf_rng.bit_generator.state = tf_rng_state
                     tf_data = self._test_func_sampler.sample(
                         surface_func=surface_func,
                         x_grid=x.detach(),
                         y_grid=y.detach(),
-                        rng=self._rng,
+                        rng=tf_rng,
                     )
                     data['test_func_deltas'] = tf_data['test_func_deltas']
                     data['test_func_values'] = tf_data['test_func_values']
@@ -1739,6 +1775,13 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                         data['test_func_lb_all_points'] = tf_data['test_func_lb_all_points']    # (K, P) per-node
                     if 'test_func_gradients_all_points' in tf_data:
                         data['test_func_gradients_all_points'] = tf_data['test_func_gradients_all_points']  # (K, P, 3) per-node
+
+            # Apply pose transformation ONCE to positions and ALL ℝ³ quantities
+            # (normals, principal directions, curvature gradients, AND test-function
+            # gradients). This is the single source of truth for rotation — adding
+            # a new ℝ³ field only requires updating vector_3d_keys in
+            # _repose_surface_and_quantities.
+            data = self._repose_surface_and_quantities(data=data, normals=origin_normal)
 
             # Store origin index if we added/found one
             if origin_idx is not None:
