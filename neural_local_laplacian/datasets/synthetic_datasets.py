@@ -1205,7 +1205,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
                 data['normal'] = torch.matmul(data['normal'], rotation_matrix.T)
 
             # Transform differential geometry quantities
-            vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d']
+            vector_3d_keys = ['v1_3d', 'v2_3d', 'grad_H_3d', 'grad_K_3d',
+                              'test_func_gradients', 'test_func_gradients_all_points']
             for key in vector_3d_keys:
                 if key in data:
                     data[key] = torch.matmul(data[key], rotation_matrix.T)
