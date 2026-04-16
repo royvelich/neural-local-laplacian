@@ -6,10 +6,10 @@ module:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
 
       test_func_cfg:
-        num_test_funcs: 50
+        num_test_funcs: 100
         include_coordinates: false
         verbose: false
-        normalize_target: 'unit_magnitude'
+        normalize_target: 'none'
         families:
           poly:
             weight: 0.45
@@ -35,7 +35,7 @@ module:
       order_range: [2, 2]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
-          num_points_range: [20, 40]
+          num_points_range: [100, 200]
       conv_k_nearest: null
       pose_transformers: null
       coeff_generation_method:
