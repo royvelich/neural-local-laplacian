@@ -4,12 +4,13 @@ train_dataset_specification:
   dataset:
     _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
     seed: ${globals.seed}
-    position_noise_std: 0.05
+    position_noise_std: 0.0
     test_func_cfg:
       num_test_funcs: 50
       compute_lb_all_points: true
+      compute_gradients_all_points: true
       include_coordinates: false
-      normalize_target: 'unit_magnitude'
+      normalize_target: 'none'
       families:
         poly:
           weight: 0.4

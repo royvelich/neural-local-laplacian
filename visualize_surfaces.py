@@ -185,8 +185,21 @@ class SurfaceVisualizer:
         self._edge_width = 0.0  # toggled in screenshots
         self._probe_idx = 0    # selected test/probe function index
         self._show_probe_scalar = False  # toggle probe function coloring
-        self._probe_color_mode = 0  # 0 = delta h, 1 = Δ_LB(h)
+        self._probe_color_mode = 1  # 0 = h, 1 = δh, 2 = Δ_LB(h)
+        self._probe_symmetric_cmap = False  # if True, use vminmax=(-vmax, vmax)
         self._show_ground_shadow = False
+        # GT surface gradient at origin (from test_func_gradients), tied to probe index
+        self._show_gt_gradient_origin = False
+        self._gt_gradient_color = [0.0, 1.0, 1.0]  # cyan
+        self._gt_gradient_length = 8.5
+        self._gt_gradient_width = self.vis_config.normal_origin_point_radius
+        self._gt_gradient_normalize = False
+        # GT surface gradient at all points (from test_func_gradients_all_points)
+        self._show_gt_gradients_all = False
+        self._gt_gradient_all_color = [0.0, 1.0, 1.0]  # cyan
+        self._gt_gradient_all_length = 8.5
+        self._gt_gradient_all_width = self.vis_config.normal_origin_point_radius * 0.5
+        self._gt_gradient_all_normalize = False
 
     def _has_hybrid_option(self):
         return self._current_surfaces is not None and len(self._current_surfaces) >= 2
@@ -344,23 +357,140 @@ class SurfaceVisualizer:
             return
         probe_idx = min(self._probe_idx, num_probes - 1)
 
-        if self._probe_color_mode == 1:
+        # DEBUG: dump full probe state for the selected probe
+        struct_name = getattr(structure, 'name', '?') if hasattr(structure, 'name') else '?'
+        try:
+            struct_name = structure.get_name()
+        except Exception:
+            pass
+        has_h = hasattr(surface, 'test_func_values') and surface.test_func_values is not None
+        has_lb_all = hasattr(surface, 'test_func_lb_all_points') and surface.test_func_lb_all_points is not None
+        deltas_all = to_numpy(surface.test_func_deltas)
+        d_p = deltas_all[:, probe_idx]
+        print(f"\n[probe_debug] structure='{struct_name}'  probe={probe_idx}/{num_probes}  mode={self._probe_color_mode}")
+        print(f"  K={d_p.shape[0]}  has_h={has_h}  has_lb_all={has_lb_all}")
+        print(f"  δh: min={d_p.min():.6f}  max={d_p.max():.6f}  mean={d_p.mean():.6f}  std={d_p.std():.6f}")
+        if has_h:
+            h_p = to_numpy(surface.test_func_values)[:, probe_idx]
+            print(f"   h: min={h_p.min():.6f}  max={h_p.max():.6f}  mean={h_p.mean():.6f}  std={h_p.std():.6f}")
+            # Find origin index
+            origin_idx_val = None
+            if hasattr(surface, 'origin_idx'):
+                try:
+                    origin_idx_val = int(surface.origin_idx.item())
+                except Exception:
+                    pass
+            if origin_idx_val is not None and origin_idx_val < d_p.shape[0]:
+                print(f"   h(origin)={h_p[origin_idx_val]:.6f}  δh(origin)={d_p[origin_idx_val]:.6f}  "
+                      f"diff(h-δh)@origin={h_p[origin_idx_val] - d_p[origin_idx_val]:.6f}")
+            # Per-vertex difference (should equal h(origin) for all vertices if dataset is correct)
+            diff = h_p - d_p
+            print(f"   (h - δh): min={diff.min():.6f}  max={diff.max():.6f}  "
+                  f"mean={diff.mean():.6f}  std={diff.std():.6f}  (should be constant = h(origin))")
+        if hasattr(surface, 'test_func_laplacians') and surface.test_func_laplacians is not None:
+            lb = to_numpy(surface.test_func_laplacians).flatten()
+            if probe_idx < len(lb):
+                print(f"   Δ_LB(h_{probe_idx})@origin = {lb[probe_idx]:.6f}")
+
+        if self._probe_color_mode == 0:
+            # h(p_j) — raw function value at every vertex
+            if has_h:
+                vals = to_numpy(surface.test_func_values)  # (K, P)
+                values = vals[:, probe_idx]
+                label = f"h_{probe_idx}"
+            else:
+                print("  [probe_debug] mode=h but test_func_values missing — returning")
+                return  # not available
+        elif self._probe_color_mode == 1:
+            # Delta: h(p_j) - h(p_i)
+            values = d_p
+            label = f"δh_{probe_idx}"
+        else:
             # Δ_LB(h) at every vertex
-            if hasattr(surface, 'test_func_lb_all_points') and surface.test_func_lb_all_points is not None:
+            if has_lb_all:
                 lb_all = to_numpy(surface.test_func_lb_all_points)  # (K, P)
                 values = lb_all[:, probe_idx]
                 label = f"Δ_LB(h_{probe_idx})"
             else:
+                print("  [probe_debug] mode=Δ_LB but test_func_lb_all_points missing — returning")
                 return  # not available
-        else:
-            # Delta: h(p_j) - h(p_i)
-            deltas = to_numpy(surface.test_func_deltas)  # (K, P)
-            values = deltas[:, probe_idx]
-            label = f"δh_{probe_idx}"
 
-        structure.add_scalar_quantity(
-            name=label, values=values,
-            enabled=True, cmap=colormap)
+        print(f"  → coloring: label='{label}'  values: min={values.min():.6f}  max={values.max():.6f}  "
+              f"mean={values.mean():.6f}")
+        if self._probe_symmetric_cmap:
+            vmax = float(np.abs(values).max())
+            if vmax < 1e-12:
+                vmax = 1e-12
+            structure.add_scalar_quantity(
+                name=label, values=values,
+                enabled=True, cmap=colormap, vminmax=(-vmax, vmax))
+        else:
+            structure.add_scalar_quantity(
+                name=label, values=values,
+                enabled=True, cmap=colormap)
+
+    def _render_gt_gradient_arrow(self, surface, name):
+        """Render the analytic GT surface gradient at the origin for the selected probe."""
+        if not self._show_gt_gradient_origin:
+            return
+        if not hasattr(surface, 'test_func_gradients') or surface.test_func_gradients is None:
+            return
+        num_probes = self._get_num_probes(surface)
+        if num_probes == 0:
+            return
+        probe_idx = min(self._probe_idx, num_probes - 1)
+
+        grads = to_numpy(surface.test_func_gradients)  # (P, 3)
+        if probe_idx >= grads.shape[0]:
+            return
+        grad_vec = grads[probe_idx]  # (3,)
+
+        if self._gt_gradient_normalize:
+            n = np.linalg.norm(grad_vec)
+            if n > 1e-12:
+                grad_vec = grad_vec / n
+
+        origin_3d = self._get_origin_position(surface, np.zeros(3))
+        gt_grad_scale = self.vis_config.vector_scale * self._gt_gradient_length
+
+        cloud = ps.register_point_cloud(
+            f"{name} - GT Gradient (probe {probe_idx})",
+            origin_3d, radius=self._normal_radius,
+            color=tuple(self._origin_dot_color), enabled=True)
+        cloud.add_vector_quantity(
+            f"GT Gradient h_{probe_idx}",
+            grad_vec.reshape(1, 3) * gt_grad_scale,
+            enabled=True, color=tuple(self._gt_gradient_color),
+            radius=self._gt_gradient_width, vectortype="ambient")
+
+    def _add_gt_gradient_all_to_structure(self, structure, surface):
+        """Attach per-vertex GT gradient vectors for the selected probe to a structure."""
+        if not self._show_gt_gradients_all:
+            return
+        if not hasattr(surface, 'test_func_gradients_all_points') or \
+                surface.test_func_gradients_all_points is None:
+            return
+        num_probes = self._get_num_probes(surface)
+        if num_probes == 0:
+            return
+        probe_idx = min(self._probe_idx, num_probes - 1)
+
+        grads_all = to_numpy(surface.test_func_gradients_all_points)  # (K, P, 3)
+        if probe_idx >= grads_all.shape[1]:
+            return
+        vectors = grads_all[:, probe_idx, :]  # (K, 3)
+
+        if self._gt_gradient_all_normalize:
+            norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+            vectors = np.where(norms > 1e-12, vectors / norms, vectors)
+
+        scale = self.vis_config.vector_scale * self._gt_gradient_all_length
+        structure.add_vector_quantity(
+            f"GT Gradient h_{probe_idx} (all pts)",
+            vectors * scale, enabled=True,
+            color=tuple(self._gt_gradient_all_color),
+            radius=self._gt_gradient_all_width,
+            vectortype="ambient")
 
     def _add_origin_indicator(self, surface, name, translation):
         if not self.is_diff_geom_at_origin_only:
@@ -480,20 +610,87 @@ class SurfaceVisualizer:
                 psim.Separator()
                 cp1, vp1 = psim.Checkbox("Show Probe Coloring", self._show_probe_scalar)
                 if cp1: self._show_probe_scalar = vp1; needs_rerender = True
-                if self._show_probe_scalar:
+
+                surface = self._current_surfaces[cur_surface_idx]
+                has_gt_grad = (hasattr(surface, 'test_func_gradients')
+                               and surface.test_func_gradients is not None)
+                has_gt_grad_all = (hasattr(surface, 'test_func_gradients_all_points')
+                                   and surface.test_func_gradients_all_points is not None)
+                if has_gt_grad:
+                    cg, vg = psim.Checkbox("Show GT Gradient at Origin", self._show_gt_gradient_origin)
+                    if cg: self._show_gt_gradient_origin = vg; needs_rerender = True
+                if has_gt_grad_all:
+                    cga, vga = psim.Checkbox("Show GT Gradient (all points)", self._show_gt_gradients_all)
+                    if cga: self._show_gt_gradients_all = vga; needs_rerender = True
+                elif has_gt_grad:
+                    psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (All-points gradient: enable compute_gradients_all_points)")
+
+                # Shared probe index slider (drives coloring + origin/all GT gradients)
+                if self._show_probe_scalar or self._show_gt_gradient_origin or self._show_gt_gradients_all:
                     cp2, vp2 = psim.SliderInt("Probe Index", self._probe_idx, v_min=0, v_max=num_probes - 1)
                     if cp2: self._probe_idx = vp2; needs_rerender = True
 
+                if (self._show_gt_gradient_origin and has_gt_grad):
+                    cgn, vgn = psim.Checkbox("Normalize GT Gradient (origin)", self._gt_gradient_normalize)
+                    if cgn: self._gt_gradient_normalize = vgn; needs_rerender = True
+                    cgl, vgl = psim.SliderFloat("GT Gradient (origin) Length", self._gt_gradient_length,
+                                                 v_min=0.1, v_max=20.0)
+                    if cgl: self._gt_gradient_length = vgl; needs_rerender = True
+                    cgw, vgw = psim.SliderFloat("GT Gradient (origin) Width", self._gt_gradient_width,
+                                                 v_min=0.001, v_max=0.05)
+                    if cgw: self._gt_gradient_width = vgw; needs_rerender = True
+                    cgc, vgc = psim.ColorEdit3("GT Gradient (origin) Color", self._gt_gradient_color)
+                    if cgc: self._gt_gradient_color = list(vgc); needs_rerender = True
+
+                if (self._show_gt_gradients_all and has_gt_grad_all):
+                    cgna, vgna = psim.Checkbox("Normalize GT Gradient (all pts)", self._gt_gradient_all_normalize)
+                    if cgna: self._gt_gradient_all_normalize = vgna; needs_rerender = True
+                    cgla, vgla = psim.SliderFloat("GT Gradient (all pts) Length", self._gt_gradient_all_length,
+                                                    v_min=0.1, v_max=20.0)
+                    if cgla: self._gt_gradient_all_length = vgla; needs_rerender = True
+                    cgwa, vgwa = psim.SliderFloat("GT Gradient (all pts) Width", self._gt_gradient_all_width,
+                                                    v_min=0.001, v_max=0.05)
+                    if cgwa: self._gt_gradient_all_width = vgwa; needs_rerender = True
+                    cgca, vgca = psim.ColorEdit3("GT Gradient (all pts) Color", self._gt_gradient_all_color)
+                    if cgca: self._gt_gradient_all_color = list(vgca); needs_rerender = True
+
+                if self._show_gt_gradient_origin and has_gt_grad:
+                    pidx = min(self._probe_idx, num_probes - 1)
+                    grads = to_numpy(surface.test_func_gradients)
+                    if pidx < grads.shape[0]:
+                        g = grads[pidx]
+                        psim.Text(f"  ∇h_{pidx}(origin) = [{float(g[0]):.4f}, {float(g[1]):.4f}, {float(g[2]):.4f}]  |g|={float(np.linalg.norm(g)):.4f}")
+
+                if self._show_probe_scalar:
                     # Color mode selector
-                    color_modes = ["δh (function delta)", "Δ_LB(h) (analytic)"]
-                    surface = self._current_surfaces[cur_surface_idx]
+                    color_modes = ["h (function value)", "δh (function delta)", "Δ_LB(h) (analytic)"]
+                    has_h = hasattr(surface, 'test_func_values') and surface.test_func_values is not None
                     has_lb_all = hasattr(surface, 'test_func_lb_all_points') and surface.test_func_lb_all_points is not None
-                    if has_lb_all:
-                        cm_changed, cm_new = psim.Combo("Color Mode", self._probe_color_mode, color_modes)
-                        if cm_changed: self._probe_color_mode = cm_new; needs_rerender = True
-                    else:
-                        self._probe_color_mode = 0
+
+                    # Clamp current mode to an available option
+                    if self._probe_color_mode == 0 and not has_h:
+                        self._probe_color_mode = 1
+                    if self._probe_color_mode == 2 and not has_lb_all:
+                        self._probe_color_mode = 1
+
+                    cm_changed, cm_new = psim.Combo("Color Mode", self._probe_color_mode, color_modes)
+                    if cm_changed:
+                        # Reject picks for modes whose data isn't available
+                        if cm_new == 0 and not has_h:
+                            pass
+                        elif cm_new == 2 and not has_lb_all:
+                            pass
+                        else:
+                            self._probe_color_mode = cm_new
+                            needs_rerender = True
+
+                    if not has_h:
+                        psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (h coloring: test_func_values missing)")
+                    if not has_lb_all:
                         psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (Δ_LB coloring: enable compute_lb_all_points)")
+
+                    csym, vsym = psim.Checkbox("Symmetric Colormap (centered at 0)", self._probe_symmetric_cmap)
+                    if csym: self._probe_symmetric_cmap = vsym; needs_rerender = True
 
                     # Show Δ_LB value at origin for selected probe
                     pidx = min(self._probe_idx, num_probes - 1)
@@ -503,6 +700,9 @@ class SurfaceVisualizer:
                         psim.Text(f"  Δ_LB(h_{pidx_lb}) at origin = {lb_vals[pidx_lb]:.6f}")
 
                     # Show value ranges
+                    if has_h:
+                        vals = to_numpy(surface.test_func_values)
+                        psim.Text(f"  h range: [{vals[:, pidx].min():.4f}, {vals[:, pidx].max():.4f}]")
                     deltas = to_numpy(surface.test_func_deltas)
                     psim.Text(f"  δh range: [{deltas[:, pidx].min():.4f}, {deltas[:, pidx].max():.4f}]")
                     if has_lb_all:
@@ -598,6 +798,7 @@ class SurfaceVisualizer:
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(mesh, normals)
             self._add_probe_coloring(mesh, surface, self.vis_config.mesh_scalar_colormap)
+            self._add_gt_gradient_all_to_structure(mesh, surface)
         if self._show_pointcloud:
             cloud = ps.register_point_cloud(f"{name} - Point Cloud", pos, radius=self._point_radius, enabled=True)
             cloud.set_color(tuple(c * 0.5 for c in self._surface_color))
@@ -605,8 +806,10 @@ class SurfaceVisualizer:
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(cloud, normals)
             self._add_probe_coloring(cloud, surface, self.vis_config.pointcloud_scalar_colormap)
+            self._add_gt_gradient_all_to_structure(cloud, surface)
         self._add_origin_indicator(surface, name, np.zeros(3))
         self._render_origin_normals(surface, name, pred_cache_idx=idx)
+        self._render_gt_gradient_arrow(surface, name)
 
     def _render_hybrid(self):
         surf_mesh = self._current_surfaces[0]
@@ -625,6 +828,7 @@ class SurfaceVisualizer:
         if self._show_gt_normals_all:
             self._add_normals_to_structure(mesh, normals_mesh)
         self._add_probe_coloring(mesh, surf_mesh, self.vis_config.mesh_scalar_colormap)
+        self._add_gt_gradient_all_to_structure(mesh, surf_mesh)
 
         # Point cloud from downsampled grid (surface 1)
         cloud = ps.register_point_cloud(f"Hybrid Points ({name_pts})", pos_pts,
@@ -634,10 +838,12 @@ class SurfaceVisualizer:
         if self._show_gt_normals_all:
             self._add_normals_to_structure(cloud, normals_pts)
         self._add_probe_coloring(cloud, surf_pts, self.vis_config.pointcloud_scalar_colormap)
+        self._add_gt_gradient_all_to_structure(cloud, surf_pts)
 
         # Origin + normals from downsampled patch (what model sees)
         self._add_origin_indicator(surf_pts, "Hybrid", np.zeros(3))
         self._render_origin_normals(surf_pts, "Hybrid", pred_cache_idx=1)
+        self._render_gt_gradient_arrow(surf_pts, "Hybrid")
 
     def _render_origin_normals(self, surface, name, pred_cache_idx=None):
         translation = np.zeros(3)
@@ -743,6 +949,12 @@ def setup_polyscope():
     ps.set_shadow_darkness(0.15)
     ps.set_SSAA_factor(4)
     ps.set_background_color((0.0, 0.0, 0.0))
+    # 'pretty' enables proper depth-sorted alpha blending so transparent meshes
+    # don't make opaque arrows/point-clouds appear translucent.
+    try:
+        ps.set_transparency_mode("pretty")
+    except Exception:
+        pass
 
 
 def create_custom_visualization_config(**kwargs):

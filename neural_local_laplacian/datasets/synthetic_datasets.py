@@ -330,6 +330,7 @@ class TestFunctionSampler:
             families: Optional[Dict[str, Any]] = None,
             normalize_target: str = 'none',
             compute_lb_all_points: bool = False,
+            compute_gradients_all_points: bool = False,
             verbose: bool = False,
             derivative_mode: str = 'analytic',
     ):
@@ -337,6 +338,7 @@ class TestFunctionSampler:
         self.include_coordinates = include_coordinates
         self.normalize_target = normalize_target
         self.compute_lb_all_points = compute_lb_all_points
+        self.compute_gradients_all_points = compute_gradients_all_points
         self.verbose = verbose
         if derivative_mode not in ('analytic', 'autograd'):
             raise ValueError(f"derivative_mode must be 'analytic' or 'autograd', got '{derivative_mode}'")
@@ -611,6 +613,7 @@ class TestFunctionSampler:
                      'exp': self._derivs_exp_at_origin}
 
         deltas = torch.zeros(K, P, dtype=torch.float32)
+        values = torch.zeros(K, P, dtype=torch.float32)
         h_d = {k: torch.zeros(P, dtype=torch.float32)
                for k in ['h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy']}
 
@@ -622,6 +625,9 @@ class TestFunctionSampler:
 
             # Batch derivatives at origin (also gives h(0,0))
             fd = deriv_fns[fam](params)
+
+            # Raw function values: h(grid)  →  (K, N) for this family
+            values[:, idx] = vals.T
 
             # Deltas = h(grid) - h(0,0)
             deltas[:, idx] = (vals - fd['h'][:, None]).T  # (K, N)
@@ -655,18 +661,23 @@ class TestFunctionSampler:
         gradients = torch.stack([c1, c2, c1 * fx + c2 * fy], dim=-1)  # (P, 3)
         if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
 
-        # lb_all_points (optional — still autograd, needs callables)
+        # lb_all_points / gradients_all_points (optional — still autograd, needs callables)
         lb_all_points = None
-        if self.compute_lb_all_points:
+        gradients_all_points = None
+        if self.compute_lb_all_points or self.compute_gradients_all_points:
             if _t is not None: _t0 = _time.perf_counter()
             h_funcs = [self._params_to_callable(p) for p in all_params]
             x_all = x_grid.clone().unsqueeze(-1).requires_grad_(True)
             y_all = y_grid.clone().unsqueeze(-1).requires_grad_(True)
-            lb_all_points, _ = compute_lb_and_gradient_batch(
+            lb_all, grad_all = compute_lb_and_gradient_batch(
                 surface_func, h_funcs, x_all, y_all, verbose=self.verbose)
+            if self.compute_lb_all_points:
+                lb_all_points = lb_all  # (K, P)
+            if self.compute_gradients_all_points:
+                gradients_all_points = grad_all  # (K, P, 3)
             if _t is not None: _t['lb_all_pts'] = _time.perf_counter() - _t0
 
-        return deltas, laplacians, gradients, lb_all_points, _t
+        return deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t
 
     # ----- main API -------------------------------------------------------
 
@@ -696,10 +707,10 @@ class TestFunctionSampler:
             where P = num_test_funcs (+ 3 if include_coordinates).
         """
         if self.derivative_mode == 'analytic' and not self.include_coordinates:
-            deltas, laplacians, gradients, lb_all_points, _t = \
+            deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t = \
                 self._sample_analytic(surface_func, x_grid, y_grid, rng)
         else:
-            deltas, laplacians, gradients, lb_all_points, _t = \
+            deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t = \
                 self._sample_autograd(surface_func, x_grid, y_grid, rng)
 
         P = laplacians.shape[0]
@@ -731,17 +742,24 @@ class TestFunctionSampler:
             mag = laplacians.abs().clamp(min=1e-8)
             laplacians = laplacians / mag
             deltas = deltas / mag.unsqueeze(0)
+            values = values / mag.unsqueeze(0)
             gradients = gradients / mag.unsqueeze(-1)
             if lb_all_points is not None:
                 lb_all_points = lb_all_points / mag.unsqueeze(0)
+            if gradients_all_points is not None:
+                # gradients_all_points is (K, P, 3); mag is (P,)
+                gradients_all_points = gradients_all_points / mag.view(1, -1, 1)
         elif self.normalize_target == 'unit_variance':
             var = deltas.var(dim=0).clamp(min=1e-8)
             std = var.sqrt()
             deltas = deltas / std.unsqueeze(0)
+            values = values / std.unsqueeze(0)
             laplacians = laplacians / std
             gradients = gradients / std.unsqueeze(-1)
             if lb_all_points is not None:
                 lb_all_points = lb_all_points / std.unsqueeze(0)
+            if gradients_all_points is not None:
+                gradients_all_points = gradients_all_points / std.view(1, -1, 1)
 
         if self.verbose and self.normalize_target != 'none':
             print(f"    POST-NORM Δ_LB at origin: min={laplacians.min():.4f}  max={laplacians.max():.4f}")
@@ -756,11 +774,14 @@ class TestFunctionSampler:
 
         result = {
             'test_func_deltas': deltas,         # (K, P)
+            'test_func_values': values,         # (K, P)
             'test_func_laplacians': laplacians,  # (P,)
             'test_func_gradients': gradients,    # (P, 3)
         }
         if lb_all_points is not None:
             result['test_func_lb_all_points'] = lb_all_points  # (K, P)
+        if gradients_all_points is not None:
+            result['test_func_gradients_all_points'] = gradients_all_points  # (K, P, 3)
         return result
 
     def _sample_autograd(self, surface_func, x_grid, y_grid, rng):
@@ -781,12 +802,14 @@ class TestFunctionSampler:
         P = len(h_funcs)
         K = len(x_grid)
         deltas = torch.zeros(K, P, dtype=torch.float32)
+        values = torch.zeros(K, P, dtype=torch.float32)
 
         if _t is not None: _t0 = _time.perf_counter()
         with torch.no_grad():
             for p, h in enumerate(h_funcs):
                 h_grid = h(x_grid, y_grid)
                 h_center = h(torch.tensor(0.0), torch.tensor(0.0))
+                values[:, p] = h_grid
                 deltas[:, p] = h_grid - h_center
         if _t is not None: _t['deltas'] = _time.perf_counter() - _t0
 
@@ -798,15 +821,20 @@ class TestFunctionSampler:
         if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
 
         lb_all_points = None
-        if self.compute_lb_all_points:
+        gradients_all_points = None
+        if self.compute_lb_all_points or self.compute_gradients_all_points:
             if _t is not None: _t0 = _time.perf_counter()
             x_all = x_grid.clone().unsqueeze(-1).requires_grad_(True)
             y_all = y_grid.clone().unsqueeze(-1).requires_grad_(True)
-            lb_all_points, _ = compute_lb_and_gradient_batch(
+            lb_all, grad_all = compute_lb_and_gradient_batch(
                 surface_func, h_funcs, x_all, y_all, verbose=self.verbose)
+            if self.compute_lb_all_points:
+                lb_all_points = lb_all
+            if self.compute_gradients_all_points:
+                gradients_all_points = grad_all
             if _t is not None: _t['lb_all_pts'] = _time.perf_counter() - _t0
 
-        return deltas, laplacians, gradients, lb_all_points, _t
+        return deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t
 
 
 # =============================================
@@ -1120,6 +1148,8 @@ class SyntheticSurfaceDataset(ABC, Dataset):
             data['test_func_lb_all_points'] = data['test_func_lb_all_points'] * (d ** 2)
         if 'test_func_gradients' in data:
             data['test_func_gradients'] = data['test_func_gradients'] * d
+        if 'test_func_gradients_all_points' in data:
+            data['test_func_gradients_all_points'] = data['test_func_gradients_all_points'] * d
 
     @abstractmethod
     def _generate_raw_surfaces(self) -> List[Data]:
@@ -1701,10 +1731,13 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                         rng=self._rng,
                     )
                     data['test_func_deltas'] = tf_data['test_func_deltas']
+                    data['test_func_values'] = tf_data['test_func_values']
                     data['test_func_laplacians'] = tf_data['test_func_laplacians'].unsqueeze(0)  # (1, P) for batching
                     data['test_func_gradients'] = tf_data['test_func_gradients'].unsqueeze(0)    # (1, P, 3) for batching
                     if 'test_func_lb_all_points' in tf_data:
                         data['test_func_lb_all_points'] = tf_data['test_func_lb_all_points']    # (K, P) per-node
+                    if 'test_func_gradients_all_points' in tf_data:
+                        data['test_func_gradients_all_points'] = tf_data['test_func_gradients_all_points']  # (K, P, 3) per-node
 
             # Store origin index if we added/found one
             if origin_idx is not None:
