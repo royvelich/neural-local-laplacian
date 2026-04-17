@@ -9,7 +9,7 @@ module:
         num_test_funcs: 100
         include_coordinates: false
         verbose: false
-        normalize_target: 'none'
+        normalize_target: unit_magnitude
         families:
           poly:
             weight: 0.45
@@ -27,15 +27,15 @@ module:
 
       seed: ${globals.training_seed}
       epoch_size: 2400
-      position_noise_std: [0.01, 0.04]
+      position_noise_std: [0.01, 0.05]
       grid_radius_range: [0.5, 2.0]
       polynomial_offset_range: [0.0, 1.0]
       points_scale_range: [1.0]
-      coefficient_scale_range: [1.0]
-      order_range: [2, 4]
+      coefficient_scale_range: [0.2, 3.0]
+      order_range: [2, 5]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
-          num_points_range: [6, 50]
+          num_points_range: [6, 30]
       conv_k_nearest: null
       pose_transformers: null
       coeff_generation_method:
