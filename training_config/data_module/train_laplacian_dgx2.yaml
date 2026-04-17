@@ -5,25 +5,25 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
 
-#      test_func_cfg:
-#        num_test_funcs: 100
-#        include_coordinates: false
-#        verbose: false
-#        normalize_target: 'none'
-#        families:
-#          poly:
-#            weight: 0.45
-#            order_range: [1, 4]
-#            coeff_scale: 1.0
-#            coeff_method: uniform
-#          trig:
-#            weight: 0.45
-#            frequency_range: [0.2, 6.0]
-#            phase_range: [0.0, 6.283]
-#          exp:
-#            weight: 0.1
-#            sigma_range: [0.3, 2.0]
-#            center_range: [-1.0, 1.0]
+      test_func_cfg:
+        num_test_funcs: 100
+        include_coordinates: false
+        verbose: false
+        normalize_target: 'none'
+        families:
+          poly:
+            weight: 0.45
+            order_range: [1, 4]
+            coeff_scale: 1.0
+            coeff_method: uniform
+          trig:
+            weight: 0.45
+            frequency_range: [0.2, 6.0]
+            phase_range: [0.0, 6.283]
+          exp:
+            weight: 0.1
+            sigma_range: [0.3, 2.0]
+            center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
       epoch_size: 2400
@@ -35,7 +35,7 @@ module:
       order_range: [2, 4]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
-          num_points_range: [20, 200]
+          num_points_range: [6, 50]
       conv_k_nearest: null
       pose_transformers: null
       coeff_generation_method:
