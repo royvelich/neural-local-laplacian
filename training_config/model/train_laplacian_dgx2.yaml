@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 64
+  d_model: 256
   nhead: 4
   num_encoder_layers: 2
-  dim_feedforward: 128
+  dim_feedforward: 256
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.1
   normalize_loss_weights: False
@@ -68,7 +68,7 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 2.0
-      
+
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss

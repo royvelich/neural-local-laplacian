@@ -26,6 +26,6 @@ callbacks:
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: "./checkpoints"
     filename: "last-model-{epoch:010d}"
-    every_n_epochs: 50
+    every_n_epochs: 1
     verbose: False
     save_on_train_epoch_end: True
