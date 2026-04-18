@@ -48,7 +48,7 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_sphere: True
-    batch_size: 100
+    batch_size: 5
     num_workers: 15
     shuffle: True
   val_dataset_specifications:
