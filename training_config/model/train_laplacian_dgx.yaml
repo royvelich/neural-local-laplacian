@@ -1,12 +1,12 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 64
-  nhead: 4
+  d_model: 32
+  nhead: 2
   num_encoder_layers: 2
   dim_feedforward: 64
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.1
+  dropout: 0.0
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
@@ -51,11 +51,21 @@ module:
 #        loss_mode: signed_log
 #      weight: 0.3
 
-    # Area supervision - keeps areas grounded
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 5.0
+
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 1.0
+
+#    # Area supervision - keeps areas grounded
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
+#      weight: 1.0
 
     # Geometric constraints - prevent non-physical solutions
     - _target_: neural_local_laplacian.modules.losses.LossConfig
