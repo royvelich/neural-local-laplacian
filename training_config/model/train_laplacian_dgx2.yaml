@@ -1,19 +1,19 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 256
+  d_model: 64
   nhead: 4
   num_encoder_layers: 2
-  dim_feedforward: 256
+  dim_feedforward: 128
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.1
+  dropout: 0.2
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  detach_area_head: true
+  detach_area_head: false
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
@@ -51,13 +51,13 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
         loss_mode: signed_log
-      weight: 1.0
+      weight: 10.0
 
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
         loss_mode: cosine  # ← switch back to cosine mode
-      weight: 10.0
+      weight: 1.0
 
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
