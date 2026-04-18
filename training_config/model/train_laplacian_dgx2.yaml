@@ -51,11 +51,21 @@ module:
 #        loss_mode: signed_log
 #      weight: 0.3
 
-    # Area supervision - keeps areas grounded
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 5.0
+
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 1.0
+
+#    # Area supervision - keeps areas grounded
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
+#      weight: 1.0
 
     # Geometric constraints - prevent non-physical solutions
     - _target_: neural_local_laplacian.modules.losses.LossConfig
