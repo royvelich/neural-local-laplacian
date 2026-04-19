@@ -44,45 +44,11 @@ module:
 
   feature_extractor: null
   loss_configs:
-    # Essential scale anchor - reduced weight to prevent polynomial overfitting
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
-#        loss_mode: signed_log
-#      weight: 0.3
-
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 5.0
-
+      weight: 1.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 1.0
-
-#    # Area supervision - keeps areas grounded
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
-#      weight: 1.0
-
-    # Geometric constraints - prevent non-physical solutions
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
-        w_symmetry: 1.0
-        w_idempotency: 1.0
-        w_trace: 0.1
-      weight: 10.0
-
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
-#      weight: 1.0
-
-    # Magnitude regularization - soft floor on coefficient scale
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.GradientL2RegularizationLoss
-      weight: 0.1
+      weight: 2.0
