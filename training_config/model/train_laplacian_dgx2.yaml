@@ -20,7 +20,7 @@ module:
   area_bound_C: 2.0
 
   mcv_mode: 'diagonal_gram'
-  normalize_grad_by_k: true
+  normalize_grad_by_k: false
 
   val_laplacian:
     assembly: diagonal_gram
