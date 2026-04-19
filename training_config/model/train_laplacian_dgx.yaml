@@ -47,12 +47,17 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 10.0
+      weight: 1.0
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 1.0
+      weight: 2.0
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
+        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
+        w_symmetry: 1.0
+        w_idempotency: 1.0
+        w_trace: 0.1
       weight: 1.0
