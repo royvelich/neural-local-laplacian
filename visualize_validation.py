@@ -587,6 +587,14 @@ class RealTimeEigenanalysisVisualizer:
         # the PRED inference path with the new flag value.
         self._viz_normalize_grad_by_k: Optional[bool] = None
 
+        # When True, swap predicted vertex areas for GT barycentric areas
+        # (igl.massmatrix) in the PRED pipeline. Reassembles S/M and reruns
+        # all downstream validations. Defaults to False.
+        self._viz_use_gt_areas: bool = False
+        # Cached GT barycentric mass matrix for the current mesh. Built lazily
+        # the first time Checkbox 2 is toggled on, invalidated on new batch.
+        self._cached_gt_M_scipy: Optional[scipy.sparse.csr_matrix] = None
+
     def setup_polyscope(self):
         """Initialize and configure polyscope with UI callback."""
         ps.init()
@@ -824,9 +832,30 @@ class RealTimeEigenanalysisVisualizer:
                     self._update_pred_with_new_k(
                         self.reconstruction_settings.current_pred_k
                     )
+                    # The inference re-run restored predicted areas. If the
+                    # GT-areas override is currently on, re-apply it so the
+                    # two checkboxes compose correctly.
+                    if self._viz_use_gt_areas:
+                        print("  Re-applying GT areas override (checkbox 2 is on)...")
+                        self._reassemble_pred_with_area_override()
 
             psim.TextColored((0.7, 0.7, 0.7, 1.0),
                 f"  (Active model flag: {bool(getattr(self.current_model, '_normalize_grad_by_k', False))})"
+            )
+
+            # --- Second checkbox: swap predicted areas for GT barycentric areas
+            gt_areas_changed, new_gt_areas = psim.Checkbox(
+                "Use GT areas for PRED (debug)",
+                self._viz_use_gt_areas,
+            )
+            if gt_areas_changed and new_gt_areas != self._viz_use_gt_areas:
+                self._viz_use_gt_areas = new_gt_areas
+                print(f"[*] use_gt_areas toggled: {new_gt_areas} -> reassembling PRED")
+                if self._has_current_batch_data():
+                    self._reassemble_pred_with_area_override()
+
+            psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                f"  (Areas source: {'GT barycentric' if self._viz_use_gt_areas else 'predicted'})"
             )
         else:
             psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (No model loaded)")
@@ -2017,6 +2046,13 @@ class RealTimeEigenanalysisVisualizer:
         self._mesh_boundary_info = {}
         self._weight_nbr_sample_indices = None
 
+        # Invalidate cached GT barycentric mass matrix (mesh-specific)
+        self._cached_gt_M_scipy = None
+        # Reset GT-areas override so a new mesh starts from the clean
+        # "predicted areas" state. The user can re-enable the override
+        # from the UI if desired.
+        self._viz_use_gt_areas = False
+
         # Force garbage collection
         import gc
         gc.collect()
@@ -2262,6 +2298,134 @@ class RealTimeEigenanalysisVisualizer:
             print(f"  Eigenvalue range: [{new_eigenvalues[0]:.2e}, {new_eigenvalues[-1]:.6f}]")
         else:
             print(f"  [!] Failed to compute eigendecomposition with config {new_config.tag}")
+
+    def _get_gt_barycentric_mass_matrix(self) -> Optional[scipy.sparse.csr_matrix]:
+        """Return GT barycentric mass matrix for the current mesh, building it lazily.
+
+        Uses igl.massmatrix(V, F, BARYCENTRIC) — same convention used in
+        _get_method_L_M('GT'). Cached on self._cached_gt_M_scipy until a new
+        batch arrives (_clear_stored_references clears the cache).
+        """
+        if self._cached_gt_M_scipy is not None:
+            return self._cached_gt_M_scipy
+        if not HAS_IGL:
+            print("[!] Cannot build GT mass matrix: igl not available")
+            return None
+        if self.current_gt_data is None:
+            print("[!] Cannot build GT mass matrix: no GT data loaded")
+            return None
+        try:
+            V = self.current_gt_data['vertices'].astype(np.float64)
+            F = self.current_gt_data['faces'].astype(np.int32)
+            gt_M = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC).tocsr()
+            self._cached_gt_M_scipy = gt_M
+            print(f"  Built GT barycentric mass matrix: {gt_M.shape}, "
+                  f"total area={float(gt_M.diagonal().sum()):.4f}")
+            return gt_M
+        except Exception as e:
+            print(f"[!] Failed to build GT mass matrix: {e}")
+            return None
+
+    def _reassemble_pred_with_area_override(self):
+        """
+        Reassemble PRED Laplacian honoring the current _viz_use_gt_areas flag.
+
+        When _viz_use_gt_areas is True, swap predicted vertex areas for GT
+        barycentric areas (igl.massmatrix). Reassembles S (only matters when
+        config.area_weighted=True), rebuilds M, recomputes eigendecomposition,
+        and runs the full downstream validation cascade.
+
+        Cheap operation: no kNN or model inference, just matrix assembly +
+        eigendecomposition + downstream recomputation.
+        """
+        if self.current_forward_result is None or self.current_knn is None:
+            print("[!] Cannot reassemble: no cached forward result")
+            return
+
+        use_gt = bool(self._viz_use_gt_areas)
+        label = "GT" if use_gt else "PRED"
+        print(f"  Reassembling PRED with {label} areas (config: {self.current_lap_config.tag})...")
+
+        grad_coeffs = self.current_forward_result['grad_coeffs'].float()
+        pred_areas_t = self.current_forward_result['areas'].float()  # original pred areas
+
+        # Choose areas source
+        if use_gt:
+            gt_M_scipy = self._get_gt_barycentric_mass_matrix()
+            if gt_M_scipy is None:
+                print("  [!] GT mass matrix unavailable — keeping predicted areas")
+                return
+            gt_areas_np = np.array(gt_M_scipy.diagonal()).flatten()
+            if gt_areas_np.shape[0] != pred_areas_t.shape[0]:
+                print(f"  [!] Size mismatch: GT areas ({gt_areas_np.shape[0]}) "
+                      f"vs pred areas ({pred_areas_t.shape[0]}) — keeping predicted areas")
+                return
+            areas_for_assembly = torch.from_numpy(gt_areas_np).to(
+                pred_areas_t.device, dtype=pred_areas_t.dtype
+            )
+            new_mass_matrix = gt_M_scipy
+        else:
+            areas_for_assembly = pred_areas_t
+            new_mass_matrix = mass_matrix_to_scipy(pred_areas_t)
+
+        # Reassemble S (areas only matter when config.area_weighted=True, but we
+        # always pass them — the assembler reads config.area_weighted internally)
+        L = assemble_laplacian(
+            grad_coeffs, self.current_knn, self.current_lap_config,
+            areas=areas_for_assembly,
+        )
+        new_stiffness_matrix = to_scipy_sparse(L)
+
+        print(f"  Assembled S: {new_stiffness_matrix.shape} "
+              f"({new_stiffness_matrix.nnz} non-zeros)")
+        print(f"  M total area: {float(new_mass_matrix.diagonal().sum()):.4f}")
+
+        # Recompute eigendecomposition with the new (S, M) pair
+        new_eigenvalues, new_eigenvectors = self.compute_eigendecomposition(
+            new_stiffness_matrix, k=self.config.num_eigenvectors_to_show,
+            mass_matrix=new_mass_matrix,
+        )
+
+        if new_eigenvalues is None:
+            print(f"  [!] Failed to compute eigendecomposition with {label} areas")
+            return
+
+        print(f"  Eigenvalue range: [{new_eigenvalues[0]:.2e}, {new_eigenvalues[-1]:.6f}]")
+
+        # Update cached state. We keep the *original* predicted areas tensor in
+        # current_forward_result so that if the user toggles back off, we can
+        # restore them without re-running inference. But we overwrite the
+        # active references used by downstream code (mass matrix, areas).
+        self.current_inference_result['stiffness_matrix'] = new_stiffness_matrix
+        self.current_inference_result['mass_matrix'] = new_mass_matrix
+        self.current_inference_result['areas'] = areas_for_assembly
+        self.current_inference_result['predicted_eigenvalues'] = new_eigenvalues
+        self.current_inference_result['predicted_eigenvectors'] = new_eigenvectors
+        self.current_areas = areas_for_assembly
+        # NOTE: we deliberately do NOT overwrite
+        # self.current_forward_result['areas'] — keeping the original predicted
+        # areas there lets us switch back cleanly without re-running inference.
+
+        # Recompute predicted mean curvature / normals from the new (S, M)
+        self.current_predicted_data = self.compute_predicted_quantities_from_laplacian(
+            new_stiffness_matrix,
+            self.current_gt_data['vertices'],
+            mass_matrix=new_mass_matrix,
+        )
+
+        # Visualization refresh
+        self._remove_existing_reconstructions()
+        self._update_mesh_reconstructions(self.current_gt_data, self.current_inference_result)
+        self._update_eigenvector_visualizations()
+        if self.current_mesh_structure is not None:
+            self.add_comprehensive_curvature_visualizations(
+                self.current_mesh_structure, self.current_gt_data,
+                self.current_predicted_data, self.current_inference_result,
+            )
+
+        # Full downstream validation cascade (probe, HKS/WKS, geodesics,
+        # Green's, sparsity)
+        self._recompute_validations_after_k_change("PRED")
 
     def _extract_patches_for_mesh_with_k(self, vertices: np.ndarray, k: int) -> Data:
         """
