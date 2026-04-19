@@ -20,7 +20,7 @@ module:
   area_bound_C: 2.0
 
   mcv_mode: 'diagonal_gram'
-  normalize_grad_by_k: true
+  normalize_grad_by_k: false
 
   val_laplacian:
     assembly: diagonal_gram
@@ -47,7 +47,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 100.0
+      weight: 10.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
