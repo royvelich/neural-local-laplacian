@@ -20,7 +20,7 @@ module:
   area_bound_C: 2.0
 
   mcv_mode: 'diagonal_gram'
-  normalize_grad_by_k: false
+  normalize_grad_by_k: true
 
   val_laplacian:
     assembly: diagonal_gram
@@ -76,10 +76,10 @@ module:
         w_trace: 0.1
       weight: 10.0
 
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
-      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
+#      weight: 1.0
 
     # Magnitude regularization - soft floor on coefficient scale
     - _target_: neural_local_laplacian.modules.losses.LossConfig
