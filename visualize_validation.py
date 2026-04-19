@@ -580,6 +580,13 @@ class RealTimeEigenanalysisVisualizer:
         self.current_nelo_eigenvectors = None
         self.current_nelo_eigenvalues = None
 
+        # ── Debug overrides (UI checkboxes) ─────────────────────────────
+        # Mirrors model._normalize_grad_by_k. Initialized lazily from the
+        # model on first UI render so that the checkbox shows the current
+        # model state. Toggling flips model._normalize_grad_by_k and re-runs
+        # the PRED inference path with the new flag value.
+        self._viz_normalize_grad_by_k: Optional[bool] = None
+
     def setup_polyscope(self):
         """Initialize and configure polyscope with UI callback."""
         ps.init()
@@ -784,6 +791,45 @@ class RealTimeEigenanalysisVisualizer:
         psim.TextColored((0.7, 0.7, 0.7, 1.0),
             f"Current: {self.current_lap_config.tag}"
         )
+
+        # --- PRED Debug Overrides (model-level flags toggled at viz time) ---
+        psim.Text("")
+        psim.Separator()
+        psim.Text("PRED Debug Overrides:")
+
+        if self.current_model is not None:
+            # Lazy-init checkbox state from the model's actual flag the first
+            # time we render. This keeps the checkbox in sync with the YAML
+            # config when a new model is loaded.
+            if self._viz_normalize_grad_by_k is None:
+                self._viz_normalize_grad_by_k = bool(
+                    getattr(self.current_model, '_normalize_grad_by_k', False)
+                )
+
+            ngk_changed, new_ngk = psim.Checkbox(
+                "normalize_grad_by_k (model flag)",
+                self._viz_normalize_grad_by_k,
+            )
+
+            if ngk_changed and new_ngk != self._viz_normalize_grad_by_k:
+                self._viz_normalize_grad_by_k = new_ngk
+                # Flip the flag on the model in place. The next forward pass
+                # will pick it up.
+                self.current_model._normalize_grad_by_k = new_ngk
+                print(f"[*] normalize_grad_by_k toggled: {new_ngk} -> re-running PRED inference")
+                if self._has_current_batch_data():
+                    # Re-run the full PRED path (re-extracts patches, re-runs
+                    # inference with the new flag, re-assembles, recomputes
+                    # all downstream validations).
+                    self._update_pred_with_new_k(
+                        self.reconstruction_settings.current_pred_k
+                    )
+
+            psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                f"  (Active model flag: {bool(getattr(self.current_model, '_normalize_grad_by_k', False))})"
+            )
+        else:
+            psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (No model loaded)")
 
         # --- Weyl's Law Eigenvalue Calibration ---
         psim.Text("")
