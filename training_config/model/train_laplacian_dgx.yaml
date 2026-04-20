@@ -60,14 +60,14 @@ module:
         w_symmetry: 1.0
         w_idempotency: 1.0
         w_trace: 1.0
-      weight: 0.1
+      weight: 1.0
 
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
-      weight: 0.1
+      weight: 1.0
 
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GradientL2RegularizationLoss
-      weight: 0.01
+      weight: 0.1
