@@ -823,8 +823,19 @@ class RealTimeEigenanalysisVisualizer:
                 self._viz_normalize_grad_by_k = new_ngk
                 # Flip the flag on the model in place. The next forward pass
                 # will pick it up.
+                prev_flag = getattr(self.current_model, '_normalize_grad_by_k', None)
                 self.current_model._normalize_grad_by_k = new_ngk
-                print(f"[*] normalize_grad_by_k toggled: {new_ngk} -> re-running PRED inference")
+                readback = getattr(self.current_model, '_normalize_grad_by_k', None)
+                print(f"\n{'=' * 60}")
+                print(f"[DIAG:NGK] Checkbox toggle")
+                print(f"{'=' * 60}")
+                print(f"[DIAG:NGK]   Requested: {new_ngk}")
+                print(f"[DIAG:NGK]   Model flag before set: {prev_flag}")
+                print(f"[DIAG:NGK]   Model flag after  set: {readback}")
+                print(f"[DIAG:NGK]   type(current_model):    {type(self.current_model).__name__}")
+                print(f"[DIAG:NGK]   id(current_model):      {id(self.current_model)}")
+                print(f"[DIAG:NGK]   has_current_batch_data: {self._has_current_batch_data()}")
+                print(f"{'=' * 60}\n")
                 if self._has_current_batch_data():
                     # Re-run the full PRED path (re-extracts patches, re-runs
                     # inference with the new flag, re-assembles, recomputes
@@ -838,6 +849,9 @@ class RealTimeEigenanalysisVisualizer:
                     if self._viz_use_gt_areas:
                         print("  Re-applying GT areas override (checkbox 2 is on)...")
                         self._reassemble_pred_with_area_override()
+                else:
+                    print("[DIAG:NGK] No batch data — recompute skipped. "
+                          "Flag flip will only take effect on the next batch.")
 
             psim.TextColored((0.7, 0.7, 0.7, 1.0),
                 f"  (Active model flag: {bool(getattr(self.current_model, '_normalize_grad_by_k', False))})"
@@ -3645,6 +3659,30 @@ class RealTimeEigenanalysisVisualizer:
         if cosine_similarities_nelo is not None:
             print(f"  GT vs NeLo mean: {cosine_similarities_nelo.mean():.4f}")
 
+        # [DIAG:NGK] Detailed per-eigenvector cosine values for PRED, plus a
+        # hash so you can immediately tell whether two toggled calls produce
+        # identical or different eigenvectors. A uniform S scaling (what
+        # normalize_grad_by_k does) preserves eigenvectors EXACTLY, so the
+        # hash and first-few values should be bit-identical across toggles.
+        if cosine_similarities_pred is not None:
+            print(f"[DIAG:NGK]   GT vs PRED cosine similarity per eigenvector:")
+            _show = min(10, len(cosine_similarities_pred))
+            for i in range(_show):
+                print(f"[DIAG:NGK]     cos[{i:02d}] = {cosine_similarities_pred[i]:.10f}")
+            if len(cosine_similarities_pred) > _show:
+                _tail = min(5, len(cosine_similarities_pred) - _show)
+                print(f"[DIAG:NGK]     ... (showing first {_show} of {len(cosine_similarities_pred)}; tail {_tail}:)")
+                for i in range(len(cosine_similarities_pred) - _tail, len(cosine_similarities_pred)):
+                    print(f"[DIAG:NGK]     cos[{i:02d}] = {cosine_similarities_pred[i]:.10f}")
+            # Content hash — same hash across two toggles means eigenvectors
+            # were bit-identical (expected under uniform scaling). Different
+            # hash means something in the eigendecomposition genuinely changed.
+            _arr_bytes = cosine_similarities_pred.astype(np.float64).tobytes()
+            import hashlib as _hashlib
+            _hash = _hashlib.md5(_arr_bytes).hexdigest()[:12]
+            print(f"[DIAG:NGK]   cosine_similarities_pred hash: {_hash}  "
+                  f"(compare across toggles — same hash = identical eigenvectors)")
+
     def _recompute_and_update_reconstructions(self):
         """Re-compute and update mesh reconstructions with new settings."""
         if not self._has_current_batch_data():
@@ -4206,6 +4244,14 @@ class RealTimeEigenanalysisVisualizer:
                 torch.cuda.synchronize()
             t_inference_start = time.perf_counter()
 
+            # [DIAG:NGK] Report the flag value the model will read inside forward.
+            # Reads AFTER any Lightning/DataParallel wrapping — this is what
+            # actually governs the forward pass.
+            _ngk_flag = getattr(model, '_normalize_grad_by_k', None)
+            _ngk_type = type(model).__name__
+            print(f"[DIAG:NGK]   Entering forward with _normalize_grad_by_k={_ngk_flag} "
+                  f"(model type: {_ngk_type}, id={id(model)})")
+
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=amp_dtype):
                     forward_result = model(batch_data)
@@ -4254,6 +4300,20 @@ class RealTimeEigenanalysisVisualizer:
             grad_coeffs = forward_result['grad_coeffs'].float()
             N = len(batch_sizes)
             k_val = batch_sizes[0].item()
+
+            # [DIAG:NGK] grad_coeffs signature — the raw test of whether the
+            # 1/sqrt(k) normalization was applied. If the flag is True,
+            # ||g_ij||^2 should be smaller by a factor of k than if False.
+            _g2 = (grad_coeffs ** 2).sum(dim=-1)  # (N, k) scalar stiffness per edge
+            _g2_mean = float(_g2.mean())
+            _g2_max = float(_g2.max())
+            _g2_min = float(_g2.min())
+            print(f"[DIAG:NGK]   grad_coeffs: shape={tuple(grad_coeffs.shape)}, "
+                  f"k={k_val}, sqrt(k)={k_val ** 0.5:.3f}")
+            print(f"[DIAG:NGK]   ||g_ij||^2 stats: mean={_g2_mean:.4e}, "
+                  f"min={_g2_min:.4e}, max={_g2_max:.4e}")
+            print(f"[DIAG:NGK]     (if NGK=True, these are already divided by k)")
+
             knn_t = batch_data.vertex_indices.reshape(N, k_val).to(device)
             val_lap_config = getattr(model, '_val_lap_config',
                                      LaplacianConfig(assembly='diagonal_gram'))
@@ -4276,6 +4336,21 @@ class RealTimeEigenanalysisVisualizer:
             print(f"Assembled stiffness matrix: {stiffness_matrix.shape} ({stiffness_matrix.nnz} non-zeros)")
             print(f"Assembled mass matrix: {mass_matrix.shape} (diagonal)")
 
+            # [DIAG:NGK] Signature of the assembled (S, M). Key quantities:
+            #   - trace(S) and ||S||_F : uniform scaling by c changes both by c
+            #   - mean(|S_diag|)       : diagonal magnitude, same
+            #   - mean(M_diag)         : heat method uses t = mean(areas); if M
+            #                            changes, t changes (but NGK only affects S,
+            #                            not M, so M should be stable across toggles)
+            _S_diag = np.abs(stiffness_matrix.diagonal())
+            _S_fro = scipy.sparse.linalg.norm(stiffness_matrix, 'fro')
+            _M_diag = np.array(mass_matrix.diagonal()).flatten()
+            print(f"[DIAG:NGK]   S signature: trace={float(_S_diag.sum()):.4e}, "
+                  f"||S||_F={float(_S_fro):.4e}, "
+                  f"mean|S_ii|={float(_S_diag.mean()):.4e}")
+            print(f"[DIAG:NGK]   M signature: mean={float(_M_diag.mean()):.4e}, "
+                  f"sum={float(_M_diag.sum()):.4e}  (unaffected by NGK)")
+
             # Store timing results with detailed breakdown
             self.timing_results.pred_model_inference_time = pred_inference_time
             self.timing_results.pred_matrix_assembly_time = pred_assembly_time
@@ -4292,6 +4367,33 @@ class RealTimeEigenanalysisVisualizer:
             if predicted_eigenvalues is not None:
                 print(f"Computed {len(predicted_eigenvalues)} predicted eigenvalues")
                 print(f"Predicted eigenvalue range: [{predicted_eigenvalues[0]:.2e}, {predicted_eigenvalues[-1]:.6f}]")
+
+                # [DIAG:NGK] Eigenvalue signature — the decisive test:
+                #   If NGK toggle scales S by c, then ALL eigenvalues scale by c.
+                #   Specifically lambda_max scales by c, and the ratios
+                #   lambda_i / lambda_1 stay IDENTICAL across toggles (since
+                #   eigenvector structure is preserved under uniform scaling).
+                #   Also print the Peclet-like product t * lambda_max used
+                #   implicitly by the heat method.
+                _evals_first_nonzero_idx = 1 if len(predicted_eigenvalues) > 1 else 0
+                _lam_1 = float(predicted_eigenvalues[_evals_first_nonzero_idx])
+                _lam_max = float(predicted_eigenvalues[-1])
+                _lam_mid = float(predicted_eigenvalues[len(predicted_eigenvalues) // 2])
+                _t_heat = float(_M_diag.mean())  # heat method's diffusion time
+                _peclet = _t_heat * _lam_max
+                print(f"[DIAG:NGK]   Eigenvalue signature:")
+                print(f"[DIAG:NGK]     lambda_1  (first nonzero) = {_lam_1:.4e}")
+                print(f"[DIAG:NGK]     lambda_mid                 = {_lam_mid:.4e}")
+                print(f"[DIAG:NGK]     lambda_max                 = {_lam_max:.4e}")
+                print(f"[DIAG:NGK]     ratio lambda_max/lambda_1  = {_lam_max / max(_lam_1, 1e-30):.4e}")
+                print(f"[DIAG:NGK]     t_heat = mean(M_diag)      = {_t_heat:.4e}")
+                print(f"[DIAG:NGK]     t * lambda_max (Peclet)    = {_peclet:.4e}")
+                print(f"[DIAG:NGK]   INTERPRETATION:")
+                print(f"[DIAG:NGK]     - Under a pure scale change S -> S/k: lambda_max scales by 1/k,")
+                print(f"[DIAG:NGK]       eigenVECTORS are identical, cosine similarity unchanged.")
+                print(f"[DIAG:NGK]     - If you toggle and lambda_max DOES change ~k-fold, the flag")
+                print(f"[DIAG:NGK]       took effect correctly (expected cosine sim to stay same).")
+                print(f"[DIAG:NGK]     - If lambda_max DOES NOT change, flag did not reach forward.")
 
         return {
             'stiffness_matrix': stiffness_matrix,

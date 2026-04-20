@@ -5,28 +5,9 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
 
-      test_func_cfg:
-        num_test_funcs: 50
-        include_coordinates: false
-        verbose: false
-        normalize_target: 'unit_magnitude'
-        families:
-          poly:
-            weight: 0.4
-            order_range: [1, 4]
-            coeff_scale: 1.0
-            coeff_method: uniform
-          trig:
-            weight: 0.4
-            frequency_range: [0.5, 12.0]
-            phase_range: [0.0, 6.283]
-          exp:
-            weight: 0.2
-            sigma_range: [0.3, 2.0]
-            center_range: [-1.0, 1.0]
-
       seed: ${globals.training_seed}
-      epoch_size: 300
+      epoch_size: 200
+      position_noise_std: [0.0]
       grid_radius_range: [1.0]
       polynomial_offset_range: [0.0]
       points_scale_range: [1.0]
@@ -34,7 +15,7 @@ module:
       order_range: [2, 3]
       grid_samplers:
         - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
-          num_points_range: [5, 40]
+          num_points_range: 20
       conv_k_nearest: null
       pose_transformers: null
       coeff_generation_method:
@@ -51,21 +32,21 @@ module:
     num_workers: 0
     shuffle: True
   val_dataset_specifications:
-#    # --- [0] Mesh spectral/geodesic validation (existing, PyG) ---
-#    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
-#      dataset:
-#        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-#        mesh_folder_path: '/workspace/datasets/shrec15'
-#        max_meshes: 80
-#        file_size_range_mb: [0.5, 4]
-#        require_manifold: True
-#        shuffle: True
-#        k: 8
-#        num_geodesic_sources: 5
-#        geodesic_source_method: "farthest_point_sampling"
-#      batch_size: 1
-#      num_workers: 0
-#      shuffle: False
+    # --- [0] Mesh spectral/geodesic validation (existing, PyG) ---
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+        mesh_folder_path: 'F:/input/shrec15'
+        max_meshes: 80
+        file_size_range_mb: [0.5, 4]
+        require_manifold: True
+        shuffle: True
+        k: 8
+        num_geodesic_sources: 5
+        geodesic_source_method: "farthest_point_sampling"
+      batch_size: 1
+      num_workers: 0
+      shuffle: False
 
     # --- [1] Fmap: DT4D Animals intra ---
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
