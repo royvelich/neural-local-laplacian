@@ -95,17 +95,178 @@ class LaplacianModuleBase(lightning.pytorch.LightningModule):
         }
 
 
-class LaplacianTransformerModule(LaplacianModuleBase):
-    """Surface transformer module with support for variable-sized patches."""
+# ============================================================================
+# Patch encoders — the pluggable per-element mixing stage
+# ============================================================================
+#
+# All encoders share the same contract:
+#   forward(sequences: (B, max_k, d_model), attention_mask: (B, max_k) bool)
+#     -> encoded: (B, max_k, d_model)
+#
+# They must be permutation-equivariant in the k dimension: permuting the
+# neighbors of a patch must produce the correspondingly-permuted output.
+#
+# These are the ONLY architecture-specific piece. Everything upstream
+# (patch-feature normalization, feature extractor, input projection) and
+# everything downstream (grad head, area head, 1/sqrt(k) scaling, loss
+# computation, validation) is shared across encoder choices.
+# ============================================================================
+
+
+class PatchEncoder(nn.Module):
+    """Abstract permutation-equivariant encoder over a padded patch sequence.
+
+    Concrete subclasses define the mixing architecture (transformer,
+    DeepSet, ...). The module that owns the encoder is responsible for
+    building the padded representation and the mask.
+    """
+
+    def forward(self,
+                sequences: torch.Tensor,
+                attention_mask: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class TransformerPatchEncoder(PatchEncoder):
+    """Multi-head self-attention encoder stack (the original architecture)."""
 
     def __init__(self,
+                 d_model: int,
+                 nhead: int = 8,
+                 num_layers: int = 6,
+                 dim_feedforward: int = 2048,
+                 dropout: float = 0.1,
+                 activation: str = 'gelu'):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, activation=activation, batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer, num_layers=num_layers,
+        )
+
+    def forward(self,
+                sequences: torch.Tensor,
+                attention_mask: torch.Tensor) -> torch.Tensor:
+        # PyTorch's TransformerEncoder takes key_padding_mask where True = ignore.
+        # Our attention_mask is True = valid, so invert.
+        if attention_mask.all():
+            # Fixed-k path — no mask needed, faster (matches original behaviour)
+            return self.encoder(sequences, src_key_padding_mask=None)
+        return self.encoder(sequences, src_key_padding_mask=~attention_mask)
+
+
+class DeepSetPatchEncoder(PatchEncoder):
+    """Equivariant DeepSet encoder stack.
+
+    Each layer computes:
+        h_elem    = MLP_elem(x)                           # per-element
+        context   = masked_pool(h_elem, mask)             # permutation-invariant
+        x <- x + MLP_combine(concat(h_elem, broadcast(context)))
+
+    The residual connection keeps the overall map equivariant and lets
+    information propagate through the layer without being bottlenecked
+    by the pool.
+
+    Pooling: 'mean' (default), 'sum', or 'max'. Mean is usually a good
+    default for small, roughly-constant-sized patches.
+    """
+
+    def __init__(self,
+                 d_model: int,
+                 num_layers: int = 3,
+                 dim_feedforward: int = 512,
+                 dropout: float = 0.1,
+                 pool: str = 'mean',
+                 activation: str = 'gelu'):
+        super().__init__()
+        if pool not in ('mean', 'sum', 'max'):
+            raise ValueError(f"pool must be 'mean', 'sum' or 'max', got '{pool}'")
+        self._pool = pool
+        self._num_layers = num_layers
+
+        act_cls = {'gelu': nn.GELU, 'relu': nn.ReLU}[activation]
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                # Per-element transform: d_model -> dff -> d_model
+                'elem': nn.Sequential(
+                    nn.LayerNorm(d_model),
+                    nn.Linear(d_model, dim_feedforward),
+                    act_cls(),
+                    nn.Dropout(dropout),
+                    nn.Linear(dim_feedforward, d_model),
+                ),
+                # Combine [h_elem, context_broadcast] (2*d_model) -> d_model
+                'combine': nn.Sequential(
+                    nn.LayerNorm(2 * d_model),
+                    nn.Linear(2 * d_model, dim_feedforward),
+                    act_cls(),
+                    nn.Dropout(dropout),
+                    nn.Linear(dim_feedforward, d_model),
+                ),
+            })
+            for _ in range(num_layers)
+        ])
+
+    def _pool_fn(self,
+                 h: torch.Tensor,
+                 mask_f: torch.Tensor) -> torch.Tensor:
+        """Masked pool over the k dimension. h: (B, K, D), mask_f: (B, K, 1)."""
+        if self._pool == 'mean':
+            num = (h * mask_f).sum(dim=1)
+            den = mask_f.sum(dim=1).clamp(min=1.0)
+            return num / den
+        if self._pool == 'sum':
+            return (h * mask_f).sum(dim=1)
+        # max: set invalid positions to -inf so they don't win
+        neg_inf = torch.finfo(h.dtype).min
+        h_masked = h.masked_fill(mask_f == 0, neg_inf)
+        return h_masked.max(dim=1).values
+
+    def forward(self,
+                sequences: torch.Tensor,
+                attention_mask: torch.Tensor) -> torch.Tensor:
+        # (B, K, 1) float mask for arithmetic
+        mask_f = attention_mask.unsqueeze(-1).to(sequences.dtype)
+
+        x = sequences
+        for layer in self.layers:
+            h = layer['elem'](x)                                  # (B, K, D)
+            h = h * mask_f                                         # zero invalid
+            context = self._pool_fn(h, mask_f)                     # (B, D)
+            context_bcast = context.unsqueeze(1).expand_as(h)      # (B, K, D)
+            combined = torch.cat([h, context_bcast], dim=-1)       # (B, K, 2D)
+            update = layer['combine'](combined) * mask_f           # (B, K, D)
+            x = x + update                                         # residual
+        return x
+
+
+class LaplacianLocalModule(LaplacianModuleBase):
+    """Neural local Laplacian module with a pluggable patch encoder.
+
+    All architecture-agnostic logic lives here:
+      - patch feature normalization, optional feature extractor, input
+        projection, padding / masking, 1/sqrt(k) grad normalization,
+        gradient and area heads, loss computation, eigendecomposition,
+        geodesic / fmap validation.
+
+    The only architecture-specific piece is ``patch_encoder``: any
+    ``PatchEncoder`` subclass with the contract
+        (B, max_k, d_model), (B, max_k) -> (B, max_k, d_model)
+    plugs in without touching any other code.
+
+    Concrete subclasses (``LaplacianTransformerModule``,
+    ``LaplacianDeepSetModule``) just build the right encoder and forward
+    the rest of the kwargs to this constructor.
+    """
+
+    def __init__(self,
+                 patch_encoder: PatchEncoder,
+                 d_model: int,
                  input_dim: Optional[int] = None,
                  loss_configs: Optional[List[LossConfig]] = None,
                  feature_extractor: Optional[FeatureExtractor] = None,
-                 d_model: int = 512,
-                 nhead: int = 8,
-                 num_encoder_layers: int = 6,
-                 dim_feedforward: int = 2048,
                  dropout: float = 0.1,
                  num_eigenvalues: int = 10,
                  normalize_loss_weights: bool = True,
@@ -127,7 +288,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         super().__init__(**{k: v for k, v in kwargs.items()
                            if k in ('optimizer_cfg', 'scheduler_cfg')})
 
-        self.save_hyperparameters(ignore=['loss_configs', 'feature_extractor'])
+        self.save_hyperparameters(ignore=['loss_configs', 'feature_extractor',
+                                          'patch_encoder'])
 
         # Manually save loss configuration info for logging (serializable version)
         if loss_configs is not None:
@@ -205,17 +367,11 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         else:
             self._loss_configs = loss_configs
 
-        # Input and output projections
+        # Input projection
         self.input_projection = self._build_projection(resolved_input_dim, d_model, input_projection_hidden_dims)
 
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
-            dropout=dropout, activation='gelu', batch_first=True,
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer, num_layers=num_encoder_layers,
-        )
+        # Pluggable patch encoder — the only architecture-specific piece
+        self.patch_encoder = patch_encoder
 
         # Output head: gradient coefficients g_ij in R^3
         self.grad_projection = self._build_projection(d_model, 3, output_projection_hidden_dims)
@@ -448,18 +604,15 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         # ── Input projection ─────────────────────────────────────────
         features = self.input_projection(features)
 
-        # ── Sequence padding + transformer ───────────────────────────
+        # ── Sequence padding + encoding ──────────────────────────────
         if fixed_k:
             sequences = features.view(batch_size, max_k, -1)
-            encoded = self.transformer_encoder(sequences,
-                                               src_key_padding_mask=None)
             attention_mask = torch.ones(batch_size, max_k, dtype=torch.bool,
                                         device=features.device)
         else:
             sequences, attention_mask = self._pad_sequences_vectorized(
                 features, batch_indices, batch_size, max_k)
-            encoded = self.transformer_encoder(
-                sequences, src_key_padding_mask=~attention_mask)
+        encoded = self.patch_encoder(sequences, attention_mask)
 
         # ── Output heads ─────────────────────────────────────────────
         grad_coeffs = self.grad_projection(encoded)
@@ -605,8 +758,8 @@ class LaplacianTransformerModule(LaplacianModuleBase):
         self.log('train/mcv_magnitude_std', mcv_mag.std().item(), on_step=False,
                  on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
-        # Encoder weight norm
-        enc_norm = sum(p.norm().item() ** 2 for p in self.transformer_encoder.parameters()) ** 0.5
+        # Encoder weight norm (architecture-agnostic: works for any patch_encoder)
+        enc_norm = sum(p.norm().item() ** 2 for p in self.patch_encoder.parameters()) ** 0.5
         self.log('train/encoder_weight_norm', enc_norm, on_step=False,
                  on_epoch=True, logger=True, batch_size=batch_size, sync_dist=True)
 
@@ -1016,3 +1169,74 @@ class LaplacianTransformerModule(LaplacianModuleBase):
                              prog_bar=True, sync_dist=True,
                              on_step=False, on_epoch=True, add_dataloader_idx=False)
                     break
+
+# ============================================================================
+# Backward-compatible thin shims
+# ============================================================================
+#
+# Existing Hydra configs reference ``LaplacianTransformerModule`` by its
+# fully-qualified path. The class below preserves that entry point and the
+# original constructor kwargs (``nhead``, ``num_encoder_layers``,
+# ``dim_feedforward``), translating them into a ``TransformerPatchEncoder``.
+#
+# The new ``LaplacianDeepSetModule`` exposes an analogous interface for the
+# DeepSet architecture.
+#
+# Both are ~15 lines each; all real logic lives in ``LaplacianLocalModule``.
+# ============================================================================
+
+
+class LaplacianTransformerModule(LaplacianLocalModule):
+    """Transformer-based patch encoder. Preserves the original config API."""
+
+    def __init__(self,
+                 d_model: int = 512,
+                 nhead: int = 8,
+                 num_encoder_layers: int = 6,
+                 dim_feedforward: int = 2048,
+                 dropout: float = 0.1,
+                 **kwargs):
+        encoder = TransformerPatchEncoder(
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_encoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+        )
+        super().__init__(patch_encoder=encoder, d_model=d_model,
+                         dropout=dropout, **kwargs)
+
+
+class LaplacianDeepSetModule(LaplacianLocalModule):
+    """DeepSet-based patch encoder.
+
+    Drop-in replacement for LaplacianTransformerModule. Config keys mirror
+    the transformer variant where they make sense:
+
+      - ``d_model``, ``num_encoder_layers``, ``dim_feedforward``, ``dropout``
+        play the same roles as in the transformer.
+      - ``pool`` selects the permutation-invariant aggregation (mean/sum/max).
+        Defaults to 'mean', which is usually a good choice for small patches.
+      - No ``nhead`` — there's no attention.
+
+    Parameter count is roughly ``num_encoder_layers * 4 * d_model * dim_feedforward``
+    (two MLPs per layer, each ~2*d_model*dff). At d_model=256, dff=512, L=4
+    this is ~2.1M — comparable to the transformer at similar depth/width.
+    """
+
+    def __init__(self,
+                 d_model: int = 256,
+                 num_encoder_layers: int = 3,
+                 dim_feedforward: int = 512,
+                 dropout: float = 0.1,
+                 pool: str = 'mean',
+                 **kwargs):
+        encoder = DeepSetPatchEncoder(
+            d_model=d_model,
+            num_layers=num_encoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            pool=pool,
+        )
+        super().__init__(patch_encoder=encoder, d_model=d_model,
+                         dropout=dropout, **kwargs)
