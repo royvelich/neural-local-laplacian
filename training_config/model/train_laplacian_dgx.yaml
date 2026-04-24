@@ -10,14 +10,14 @@ module:
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
-  input_projection_hidden_dims: [32, 64]
-  output_projection_hidden_dims: [64, 32]
+  input_projection_hidden_dims: null
+  output_projection_hidden_dims: null
 
   detach_area_head: true
   use_uniform_mass: false
 
-  area_activation: bounded_sigmoid
-  area_bound_C: 10.0
+  area_activation: softplus
+  area_bound_C: 1.0
 
   mcv_mode: 'diagonal_gram'
   normalize_grad_by_k: true
