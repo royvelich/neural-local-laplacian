@@ -1,6 +1,6 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
-  input_dim: 128
+  input_dim: 3
   d_model: 512
   nhead: 8
   num_encoder_layers: 1
@@ -10,8 +10,8 @@ module:
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
-  input_projection_hidden_dims: null
-  output_projection_hidden_dims: null
+  input_projection_hidden_dims: [32, 64]
+  output_projection_hidden_dims: [64, 32]
 
   detach_area_head: true
   use_uniform_mass: false
