@@ -13,7 +13,7 @@ module:
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  detach_area_head: true
+  detach_area_head: false
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
@@ -48,21 +48,7 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
       weight: 1.0
-
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 2.0
-
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
-#        w_symmetry: 1.0
-#        w_idempotency: 1.0
-#        w_trace: 1.0
-#      weight: 0.001
-#
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
-#      weight: 0.001
