@@ -194,6 +194,11 @@ def compute_lb_coefficients(surface_func, x, y):
 def compute_h_derivatives(h_func, x, y):
     """Compute h and its first/second derivatives on a fresh autograd graph.
 
+    Handles test functions that may not depend on one (or both) of x, y
+    (e.g., the coordinate test functions ``h(x,y) = x``, ``h(x,y) = y``)
+    by using ``allow_unused=True`` and substituting zero tensors for any
+    gradients PyTorch reports as missing from the graph.
+
     Args:
         h_func: Callable ``(x, y) -> scalar tensor``.
         x, y: (N, 1) tensors (will be cloned with requires_grad).
@@ -208,10 +213,59 @@ def compute_h_derivatives(h_func, x, y):
     if h.dim() == 1:
         h = h.unsqueeze(-1)
 
-    h_x = torch.autograd.grad(h.sum(), x_h, create_graph=True)[0]
-    h_y = torch.autograd.grad(h.sum(), y_h, create_graph=True)[0]
-    h_xx, h_xy = torch.autograd.grad(h_x.sum(), [x_h, y_h], retain_graph=True)
-    _, h_yy = torch.autograd.grad(h_y.sum(), [x_h, y_h], create_graph=False)
+    # If h itself is detached from the graph (e.g. h is literally a
+    # constant tensor like torch.full_like(...)), all derivatives are
+    # zero and we can short-circuit before any grad() call.
+    if not h.requires_grad:
+        zero_x = torch.zeros_like(x_h)
+        zero_y = torch.zeros_like(y_h)
+        return {
+            'h': h.detach(),
+            'h_x': zero_x, 'h_y': zero_y,
+            'h_xx': zero_x.clone(), 'h_xy': zero_y.clone(),
+            'h_yy': zero_y.clone(),
+        }
+
+    # First derivatives. ``allow_unused=True`` returns None instead of
+    # raising when h doesn't depend on the wrt-tensor. We track which
+    # gradients came from the real autograd path vs. our zero fallback,
+    # because only the real ones are valid inputs to subsequent grad()
+    # calls — a fresh torch.zeros_like() tensor is not in any graph.
+    h_x_real = torch.autograd.grad(
+        h.sum(), x_h, create_graph=True, allow_unused=True)[0]
+    h_y_real = torch.autograd.grad(
+        h.sum(), y_h, create_graph=True, allow_unused=True)[0]
+
+    h_x = h_x_real if h_x_real is not None else torch.zeros_like(x_h)
+    h_y = h_y_real if h_y_real is not None else torch.zeros_like(y_h)
+
+    # Second derivatives. Two reasons we may need to skip the autograd call:
+    #   (a) h_*_real is None — h didn't depend on the variable at all.
+    #   (b) h_*_real is a constant tensor with no grad_fn — happens when
+    #       h is linear in that variable (e.g., h(x,y)=x → h_x is constant
+    #       1, with requires_grad=False even under create_graph=True).
+    # In both cases the second derivative is mathematically zero and we
+    # avoid calling grad() on a tensor that isn't in the graph.
+    h_x_in_graph = (h_x_real is not None) and h_x_real.requires_grad
+    h_y_in_graph = (h_y_real is not None) and h_y_real.requires_grad
+
+    if not h_x_in_graph:
+        h_xx = torch.zeros_like(x_h)
+        h_xy = torch.zeros_like(y_h)
+    else:
+        h_xx_raw, h_xy_raw = torch.autograd.grad(
+            h_x_real.sum(), [x_h, y_h],
+            retain_graph=True, allow_unused=True)
+        h_xx = h_xx_raw if h_xx_raw is not None else torch.zeros_like(x_h)
+        h_xy = h_xy_raw if h_xy_raw is not None else torch.zeros_like(y_h)
+
+    if not h_y_in_graph:
+        h_yy = torch.zeros_like(y_h)
+    else:
+        _, h_yy_raw = torch.autograd.grad(
+            h_y_real.sum(), [x_h, y_h],
+            create_graph=False, allow_unused=True)
+        h_yy = h_yy_raw if h_yy_raw is not None else torch.zeros_like(y_h)
 
     return {
         'h': h.detach(), 'h_x': h_x.detach(), 'h_y': h_y.detach(),
