@@ -2,7 +2,7 @@ module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
   d_model: 512
-  nhead: 4
+  nhead: 8
   num_encoder_layers: 1
   dim_feedforward: 512
   num_eigenvalues: ${globals.num_eigenvalues}
@@ -13,7 +13,7 @@ module:
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  detach_area_head: false
+  detach_area_head: true
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
@@ -51,4 +51,4 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 4.0
+      weight: 2.0

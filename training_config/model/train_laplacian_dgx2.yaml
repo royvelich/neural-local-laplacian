@@ -2,22 +2,22 @@ module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
   d_model: 512
-  nhead: 4
+  nhead: 8
   num_encoder_layers: 1
   dim_feedforward: 512
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.1
+  dropout: 0.2
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  detach_area_head: true
+  detach_area_head: false
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
-  area_bound_C: 2.0
+  area_bound_C: 20.0
 
   mcv_mode: 'diagonal_gram'
   normalize_grad_by_k: true
@@ -47,8 +47,30 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 1.0
+      weight: 2.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 4.0
+      weight: 0.001
+
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+#      weight: 2.0
+
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
+#      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
+      weight: 30.0
