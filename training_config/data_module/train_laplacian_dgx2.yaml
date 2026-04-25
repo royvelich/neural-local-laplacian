@@ -5,25 +5,25 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
 
-#      test_func_cfg:
-#        num_test_funcs: 100
-#        include_coordinates: false
-#        verbose: false
-#        normalize_target: unit_magnitude
-#        families:
-#          poly:
-#            weight: 0.45
-#            order_range: [1, 4]
-#            coeff_scale: 1.0
-#            coeff_method: uniform
-#          trig:
-#            weight: 0.45
-#            frequency_range: [0.2, 6.0]
-#            phase_range: [0.0, 6.283]
-#          exp:
-#            weight: 0.1
-#            sigma_range: [0.3, 2.0]
-#            center_range: [-1.0, 1.0]
+      test_func_cfg:
+        num_test_funcs: 100
+        include_coordinates: false
+        verbose: false
+        normalize_target: unit_magnitude
+        families:
+          poly:
+            weight: 0.45
+            order_range: [1, 4]
+            coeff_scale: 1.0
+            coeff_method: uniform
+          trig:
+            weight: 0.45
+            frequency_range: [0.2, 6.0]
+            phase_range: [0.0, 6.283]
+          exp:
+            weight: 0.1
+            sigma_range: [0.3, 2.0]
+            center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
       epoch_size: 24000
@@ -48,7 +48,7 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_sphere: True
-    batch_size: 20
+    batch_size: 10
     num_workers: 15
     shuffle: True
   val_dataset_specifications:
@@ -57,7 +57,7 @@ module:
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
         mesh_folder_path: '/workspace/datasets/shrec15'
-        max_meshes: 80
+        max_meshes: 40
         file_size_range_mb: [0.5, 4]
         require_manifold: True
         shuffle: True
@@ -76,7 +76,7 @@ module:
           _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
           root: '/workspace/datasets/DeformingThings4DMatching-Animals'
           pairs: ["0.7:1.0"]
-        val_poses_per_pair: 2
+        val_poses_per_pair: 1
         seed: ${globals.training_seed}
       batch_size: 1
       num_workers: 0
