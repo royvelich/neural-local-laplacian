@@ -13,7 +13,7 @@ module:
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  detach_area_head: true
+  detach_area_head: false
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
@@ -43,17 +43,84 @@ module:
     geomfum_zoomout_n_iters: 10
 
   feature_extractor: null
+#  loss_configs:
+##    - _target_: neural_local_laplacian.modules.losses.LossConfig
+##      loss_module:
+##        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+##      weight: 1.0
+##    - _target_: neural_local_laplacian.modules.losses.LossConfig
+##      loss_module:
+##        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+##      weight: 2.0
+##    - _target_: neural_local_laplacian.modules.losses.LossConfig
+##      loss_module:
+##        _target_: neural_local_laplacian.modules.losses.MeanCurvatureOnlyLogMagnitudeLoss
+##      weight: 2.0
+#
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+#        loss_mode: relative
+#      weight: 1.0
+
   loss_configs:
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 2.0
+
+    # Laplacian test-function supervision — re-enabled. This is the scale
+    # anchor for ||g_ij||: it ties Σ_j ||g_ij||²·δh_j / A_i to Δ_LB(h), which
+    # without this loss is completely unconstrained and causes stiffness
+    # coefficients to drift unboundedly upward (ref: run tw416 had
+    # stiffness_max blow up to 1.06 and val λ_max to 2057 by epoch 1499).
+    # signed_log compresses large |Δ_LB| targets so high-frequency trig
+    # probes don't dominate the gradient signal.
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+#        loss_mode: signed_log
+#      weight: 0.25
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+        loss_mode: relative
       weight: 1.0
+
+    # Absolute-magnitude anchor on g_ij, belt-and-suspenders alongside the
+    # Laplacian loss. Small weight — this is a soft floor on scale drift, not
+    # a primary objective. Remove if stiffness_mean is stable without it.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GradientL2RegularizationLoss
+      weight: 0.01
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 2.0
+      weight: 1.0
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.MeanCurvatureOnlyLogMagnitudeLoss
-      weight: 2.0
+        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
+        w_symmetry: 1.0
+        w_idempotency: 1.0
+        w_trace: 1.0
+      weight: 1.0
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.SelfSupervisedGradientTangentPlaneLoss
+#      weight: 1.0
 
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
+#      weight: 1.0
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.LogAreaSupervisionLoss
+#      weight: 1.5
