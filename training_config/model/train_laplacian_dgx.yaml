@@ -51,9 +51,9 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 0.1
+      weight: 2.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureOnlyLogMagnitudeLoss
-      weight: 0.2
+      weight: 2.0
 
