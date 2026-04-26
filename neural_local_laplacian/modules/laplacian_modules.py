@@ -1349,62 +1349,171 @@ class LaplacianLocalModule(LaplacianModuleBase):
             self._fmap_val_outputs[dataloader_idx].append(metrics)
 
     def on_validation_epoch_end(self) -> None:
-        """Aggregate and log fmap pair validation metrics."""
-        if not self._fmap_val_outputs:
+        """Aggregate and log fmap pair validation metrics across DDP ranks.
+
+        DDP rank-skew safety:
+            With distributed validation samplers, ranks may have different
+            numbers of fmap pairs in ``self._fmap_val_outputs[dl_idx]`` —
+            including some ranks with zero pairs. A naive ``self.all_gather``
+            on the per-rank tensor would deadlock because tensor shapes
+            differ across ranks.
+
+            This implementation:
+              1. Iterates dl_idx values derived from val_specs (identical
+                 on every rank), not from per-rank ``_fmap_val_outputs``.
+              2. Uses all_reduce to learn the global max per-rank count
+                 and the lowest rank that holds data (for key broadcast).
+              3. Broadcasts ``float_keys`` from a data-owning rank so
+                 empty-output ranks know the column layout.
+              4. Pads every rank's local tensor to ``(max_n, K)`` before
+                 all_gather, then trims using per-rank counts.
+
+            All ranks therefore make matching collective calls in matching
+            order, satisfying NCCL's shape-agreement requirement.
+        """
+        if not self._fmap_val_enabled():
             return
 
         dm = self.trainer.datamodule
         val_specs = (dm._val_dataset_specifications
                      if hasattr(dm, '_val_dataset_specifications') else [])
 
-        for dl_idx, outputs in sorted(self._fmap_val_outputs.items()):
-            if not outputs:
+        # Globally-known list of fmap dl_indices — all ranks see the same
+        # val_specs, so this is identical across ranks and safe to iterate.
+        fmap_dl_indices = sorted(
+            idx for _, idx, _ in self._get_fmap_val_pairs_from_dm()
+        )
+
+        if not fmap_dl_indices:
+            return
+
+        world_size = self.trainer.world_size
+        is_distributed = (
+            world_size > 1
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+
+        for dl_idx in fmap_dl_indices:
+            outputs = self._fmap_val_outputs.get(dl_idx, [])
+            local_n = len(outputs)
+
+            # Determine max count across ranks (so we know how to pad).
+            if is_distributed:
+                local_n_t = torch.tensor(
+                    [local_n], device=self.device, dtype=torch.long)
+                max_n_t = local_n_t.clone()
+                torch.distributed.all_reduce(
+                    max_n_t, op=torch.distributed.ReduceOp.MAX)
+                max_n = int(max_n_t.item())
+            else:
+                max_n = local_n
+
+            if max_n == 0:
+                # No rank produced any output for this dl_idx — nothing to do.
                 continue
 
-            ds = val_specs[dl_idx].dataset if dl_idx < len(val_specs) else None
-            ds_name = getattr(ds, 'name', f'fmap_val_{dl_idx}')
+            # Determine the lowest rank that owns data (for key broadcast).
+            # Ranks with no data contribute world_size (i.e. effectively +inf
+            # for MIN reduction); ranks with data contribute their rank id.
+            if is_distributed:
+                rank_with_data = (self.global_rank
+                                  if local_n > 0 else world_size)
+                rwd_t = torch.tensor(
+                    [rank_with_data], device=self.device, dtype=torch.long)
+                torch.distributed.all_reduce(
+                    rwd_t, op=torch.distributed.ReduceOp.MIN)
+                src_rank = int(rwd_t.item())
+            else:
+                src_rank = 0
 
-            # DDP gather
-            sample = outputs[0]
-            float_keys = sorted(
-                k for k, v in sample.items()
-                if isinstance(v, (int, float)) and not k.startswith("_")
-            )
+            # Compute float_keys on the source rank, then broadcast to others.
+            # broadcast_object_list works with picklable Python objects (here
+            # a list of strings) and is safe to call on every rank.
+            if local_n > 0 and self.global_rank == src_rank:
+                float_keys = sorted(
+                    k for k, v in outputs[0].items()
+                    if isinstance(v, (int, float)) and not k.startswith("_")
+                )
+            else:
+                float_keys = None
+
+            if is_distributed:
+                obj_list = [float_keys]
+                torch.distributed.broadcast_object_list(obj_list, src=src_rank)
+                float_keys = obj_list[0]
+
             if not float_keys:
                 continue
 
-            local_t = torch.tensor(
-                [[d.get(k, float("nan")) for k in float_keys] for d in outputs],
+            K = len(float_keys)
+
+            # Build the padded local tensor of shape (max_n, K).
+            # Real entries fill the first `local_n` rows; rest is NaN.
+            local_t = torch.full(
+                (max_n, K), float("nan"),
                 device=self.device, dtype=torch.float32,
             )
+            for i, d in enumerate(outputs):
+                for j, k in enumerate(float_keys):
+                    local_t[i, j] = float(d.get(k, float("nan")))
+
+            # Also exchange real per-rank counts so we can trim padding.
+            if is_distributed:
+                local_count_t = torch.tensor(
+                    [local_n], device=self.device, dtype=torch.long)
+                count_list = [torch.zeros_like(local_count_t)
+                              for _ in range(world_size)]
+                torch.distributed.all_gather(count_list, local_count_t)
+                per_rank_counts = [int(c.item()) for c in count_list]
+            else:
+                per_rank_counts = [local_n]
+
+            # All ranks now have local_t of shape (max_n, K) — collective is
+            # shape-consistent across ranks.
             gathered = self.all_gather(local_t)
+            # Lightning returns (W, max_n, K) under DDP, or (max_n, K) when
+            # not distributed. Normalise to (W, max_n, K).
             if gathered.dim() == 2:
                 gathered = gathered.unsqueeze(0)
-            all_flat = gathered.reshape(-1, len(float_keys))
 
-            # Trim to true dataset size
-            true_size = len(val_specs[dl_idx].dataset) if dl_idx < len(val_specs) else len(outputs)
-            all_flat = all_flat[:true_size]
+            # Reassemble outputs in rank order, dropping per-rank padding.
+            all_metrics: List[Dict[str, float]] = []
+            for r, n_real in enumerate(per_rank_counts):
+                for i in range(n_real):
+                    all_metrics.append({
+                        k: gathered[r, i, j].item()
+                        for j, k in enumerate(float_keys)
+                    })
 
-            all_metrics = [
-                {k: all_flat[i, j].item() for j, k in enumerate(float_keys)}
-                for i in range(all_flat.shape[0])
-            ]
+            # Trim to the true dataset size (the fmap dataset may have been
+            # padded by the DistributedSampler so world_size divides cleanly).
+            ds = val_specs[dl_idx].dataset if dl_idx < len(val_specs) else None
+            ds_name = getattr(ds, 'name', f'fmap_val_{dl_idx}')
+            true_size = (len(val_specs[dl_idx].dataset)
+                         if dl_idx < len(val_specs) else len(all_metrics))
+            all_metrics = all_metrics[:true_size]
 
-            # Summarise and print
+            if not all_metrics:
+                continue
+
+            # Summarise and print (rank 0 only via the silent= flag).
             summary = _fmap_summarise(
                 all_metrics, self._fmap_val_evaluators,
                 f"Val epoch {self.current_epoch} [{ds_name}]",
                 silent=not self.trainer.is_global_zero,
             )
 
-            # Log to W&B / Lightning
+            # Log to W&B / Lightning. sync_dist=True here means Lightning
+            # itself does the cross-rank reduction of the scalar — every rank
+            # must call self.log with the same key, which all do because we
+            # iterate fmap_dl_indices globally and only skip when max_n == 0.
             prefix = f"val_fmap/{ds_name}"
             for mk, mv in summary.items():
                 self.log(f"{prefix}/{mk}", mv, sync_dist=True,
                          on_step=False, on_epoch=True, add_dataloader_idx=False)
 
-            # Log primary fmap metric to prog_bar
+            # Log primary fmap metric to prog_bar.
             for ev in self._fmap_val_evaluators:
                 geo_key = f"{ev.name}/geo_at_05pct"
                 if geo_key in summary:
