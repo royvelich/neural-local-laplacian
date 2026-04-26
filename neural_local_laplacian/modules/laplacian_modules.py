@@ -282,6 +282,8 @@ class LaplacianLocalModule(LaplacianModuleBase):
                  use_uniform_mass: bool = False,
                  val_laplacian: Optional[Dict] = None,
                  fmap_val_cfg: Optional[Dict] = None,
+                 enable_nan_diagnostics: bool = True,
+                 nan_diag_log_every_n_steps: int = 50,
                  **kwargs):
         # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
         # val_laplacian_mode) from old checkpoints.
@@ -334,6 +336,10 @@ class LaplacianLocalModule(LaplacianModuleBase):
         self._normalize_grad_by_k = normalize_grad_by_k
         self._detach_area_head = detach_area_head
         self._use_uniform_mass = use_uniform_mass
+
+        # [DIAG] NaN/Inf diagnostics — see training_step and on_before_optimizer_step
+        self._enable_nan_diagnostics = enable_nan_diagnostics
+        self._nan_diag_log_every = max(int(nan_diag_log_every_n_steps), 1)
 
         # Validation Laplacian config
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
@@ -412,6 +418,45 @@ class LaplacianLocalModule(LaplacianModuleBase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _diag_tensor_summary(name: str, t: torch.Tensor) -> str:
+        """[DIAG] One-line summary of a tensor for NaN/Inf debug prints."""
+        if t is None:
+            return f"{name}: <None>"
+        try:
+            shape = tuple(t.shape)
+            finite = torch.isfinite(t)
+            finite_frac = finite.float().mean().item()
+            if finite.any():
+                t_finite = t[finite]
+                stats = (f"min={t_finite.min().item():.3e} "
+                         f"max={t_finite.max().item():.3e} "
+                         f"mean={t_finite.mean().item():.3e}")
+            else:
+                stats = "ALL non-finite"
+            return (f"{name}: shape={shape} finite={finite_frac:.4f} {stats}")
+        except Exception as e:
+            return f"{name}: <error inspecting tensor: {e}>"
+
+    def _diag_dump_context(self, header: str, *,
+                           batch_idx: Optional[int] = None,
+                           extra: Optional[Dict[str, torch.Tensor]] = None) -> None:
+        """[DIAG] Print a multi-line context dump tagged with epoch/step/rank.
+
+        Used right before raising on a detected NaN/Inf so the log captures
+        enough context to diagnose which sample and which tensor went bad.
+        """
+        try:
+            rank = self.global_rank
+        except Exception:
+            rank = -1
+        print(f"[NAN-DETECT] {header} | "
+              f"epoch={self.current_epoch} step={self.global_step} "
+              f"rank={rank} batch_idx={batch_idx}", flush=True)
+        if extra:
+            for k, v in extra.items():
+                print(f"  {self._diag_tensor_summary(k, v)}", flush=True)
 
     @staticmethod
     def _build_projection(in_dim: int, out_dim: int,
@@ -671,6 +716,67 @@ class LaplacianLocalModule(LaplacianModuleBase):
         """Training step with variable-sized patch support."""
         batch_data = batch[0]
         forward_result = self.forward(batch_data)
+
+        # ── [DIAG] Forward output sanity check + cheap stats ────────────
+        if self._enable_nan_diagnostics:
+            g_check = forward_result.get('grad_coeffs')
+            A_check = forward_result.get('areas')
+            S_check = forward_result.get('stiffness_weights')
+            mask_check = forward_result.get('attention_mask')
+
+            bad_forward = False
+            if g_check is not None and not torch.isfinite(g_check).all():
+                bad_forward = True
+            if A_check is not None and not torch.isfinite(A_check).all():
+                bad_forward = True
+            if S_check is not None and not torch.isfinite(S_check).all():
+                bad_forward = True
+
+            if bad_forward:
+                self._diag_dump_context(
+                    "Non-finite tensor in forward output",
+                    batch_idx=batch_idx,
+                    extra={
+                        'grad_coeffs': g_check,
+                        'areas': A_check,
+                        'stiffness_weights': S_check,
+                        'attention_mask': (mask_check.float()
+                                            if mask_check is not None else None),
+                        'batch.pos': getattr(batch_data, 'pos', None),
+                    },
+                )
+                raise RuntimeError(
+                    "Non-finite values in forward output — see [NAN-DETECT] log above"
+                )
+
+            # Cheap continuous monitoring: log a few stats every N steps.
+            # Lightning will route these to W&B via on_step=True.
+            if self.global_step % self._nan_diag_log_every == 0:
+                # Fraction of areas saturated near upper bound — relevant
+                # when area_activation='bounded_sigmoid' and area_bound_C
+                # was set high. Saturation -> vanishing gradient, then
+                # AdamW eats accumulator state.
+                if A_check is not None and A_check.numel() > 0:
+                    sat_thresh = 0.9 * float(self._area_bound_C)
+                    self.log('diag/A_max', A_check.max().item(),
+                             on_step=True, on_epoch=False, logger=True,
+                             rank_zero_only=True)
+                    self.log('diag/A_min', A_check.min().item(),
+                             on_step=True, on_epoch=False, logger=True,
+                             rank_zero_only=True)
+                    self.log('diag/A_at_upper_bound_frac',
+                             (A_check > sat_thresh).float().mean().item(),
+                             on_step=True, on_epoch=False, logger=True,
+                             rank_zero_only=True)
+                if g_check is not None and g_check.numel() > 0:
+                    self.log('diag/g_max_abs', g_check.abs().max().item(),
+                             on_step=True, on_epoch=False, logger=True,
+                             rank_zero_only=True)
+                    g_norm = g_check.norm(dim=-1)
+                    self.log('diag/g_norm_max', g_norm.max().item(),
+                             on_step=True, on_epoch=False, logger=True,
+                             rank_zero_only=True)
+
         predicted_mcv, predicted_raw_mcv = self._compute_mean_curvature_vectors(forward_result, batch_data)
 
         batch_size = len(forward_result['batch_sizes'])
@@ -709,12 +815,57 @@ class LaplacianLocalModule(LaplacianModuleBase):
         for loss_config in self._loss_configs:
             unweighted_loss = loss_config.loss_module(loss_context)
             loss_name = loss_config.loss_module.__class__.__name__
+
+            # ── [DIAG] Per-loss NaN/Inf check ─────────────────────────
+            # Catches the SPECIFIC loss term that introduced non-finite
+            # values, before they get summed into total_loss and lose
+            # attribution. Fail fast: continuing with NaN poisons AdamW
+            # accumulators and the next ~10000 steps before observable.
+            if (self._enable_nan_diagnostics
+                    and torch.is_tensor(unweighted_loss)
+                    and not torch.isfinite(unweighted_loss).all()):
+                weight = loss_config.weight if loss_config.weight is not None else 0.0
+                self._diag_dump_context(
+                    f"Loss {loss_name} (weight={weight}) returned non-finite value "
+                    f"= {unweighted_loss.detach()}",
+                    batch_idx=batch_idx,
+                    extra={
+                        'predicted_mcv': predicted_mcv,
+                        'target_mcv': target_mcv,
+                        'predicted_raw_mcv': predicted_raw_mcv,
+                        'grad_coeffs': forward_result.get('grad_coeffs'),
+                        'areas': forward_result['areas'],
+                        'stiffness_weights': forward_result['stiffness_weights'],
+                        'gt_vertex_areas': getattr(batch_data, 'gt_vertex_areas', None),
+                        'batch.H': mean_curvatures,
+                        'batch.normal': normals,
+                    },
+                )
+                raise RuntimeError(
+                    f"Loss {loss_name} produced non-finite value — "
+                    f"see [NAN-DETECT] log above"
+                )
+
             loss_components_unweighted[f"train/{loss_name}"] = unweighted_loss
             if loss_config.weight is not None:
                 total_loss = total_loss + loss_config.weight * unweighted_loss
 
         if not isinstance(total_loss, torch.Tensor):
             raise ValueError("At least one loss must have a non-None weight for training")
+
+        # ── [DIAG] Final aggregated-loss check (defense in depth) ──────
+        # If a single component was finite but their weighted sum overflows
+        # (extremely unlikely with sane weights, but possible), this catches it.
+        if (self._enable_nan_diagnostics
+                and not torch.isfinite(total_loss).all()):
+            self._diag_dump_context(
+                f"Aggregated total_loss is non-finite (={total_loss.detach()})",
+                batch_idx=batch_idx,
+                extra={f"loss/{n}": v for n, v in loss_components_unweighted.items()},
+            )
+            raise RuntimeError(
+                "Aggregated total_loss is non-finite — see [NAN-DETECT] log above"
+            )
 
         cosine_sim = F.cosine_similarity(predicted_mcv, target_mcv, dim=1).mean()
         areas = forward_result['areas']
@@ -770,6 +921,98 @@ class LaplacianLocalModule(LaplacianModuleBase):
         result = {"loss": total_loss}
         result.update(loss_components_unweighted)
         return result
+
+    # ------------------------------------------------------------------
+    # [DIAG] Gradient diagnostics — runs after backward, before optimizer.step
+    # ------------------------------------------------------------------
+
+    # Buckets for per-component gradient norm logging. Each parameter's
+    # qualified name is matched against these substrings; first hit wins.
+    _DIAG_GRAD_BUCKETS = (
+        ('encoder',     'patch_encoder'),
+        ('input_proj',  'input_projection'),
+        ('grad_proj',   'grad_projection'),
+        ('area_head',   'area_head'),
+    )
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """[DIAG] Inspect gradients before they're applied.
+
+        Three things happen here:
+        1. Detect any non-finite gradient → fail fast with the param name(s).
+        2. Log overall gradient norm every step → cheap W&B series for
+           after-the-fact debugging.
+        3. Log per-component gradient norms occasionally → tells us which
+           branch (encoder / area_head / etc.) is exploding when norms spike.
+        """
+        if not self._enable_nan_diagnostics:
+            return
+
+        bad_params: List[Tuple[str, Tuple[int, ...], float]] = []
+        total_norm_sq = 0.0
+        component_sq: Dict[str, float] = {b[0]: 0.0 for b in self._DIAG_GRAD_BUCKETS}
+        component_sq['other'] = 0.0
+
+        for name, p in self.named_parameters():
+            if p.grad is None:
+                continue
+            g = p.grad
+            finite_mask = torch.isfinite(g)
+            if not finite_mask.all():
+                finite_frac = finite_mask.float().mean().item()
+                bad_params.append((name, tuple(g.shape), finite_frac))
+                # Don't accumulate this norm — it's NaN and would poison the sum.
+                continue
+            n_sq = float(g.norm().item() ** 2)
+            total_norm_sq += n_sq
+
+            # Bucket the parameter for per-component logging
+            bucket_key = 'other'
+            for key, substr in self._DIAG_GRAD_BUCKETS:
+                if substr in name:
+                    bucket_key = key
+                    break
+            component_sq[bucket_key] += n_sq
+
+        # Fail fast on non-finite gradients — they indicate the cascade
+        # has already started, even if total_loss happened to be finite
+        # (e.g. NaN gradient through a saturated activation).
+        if bad_params:
+            try:
+                rank = self.global_rank
+            except Exception:
+                rank = -1
+            print(f"[NAN-DETECT] Non-finite gradients at "
+                  f"epoch={self.current_epoch} step={self.global_step} rank={rank}:",
+                  flush=True)
+            for name, shape, frac in bad_params[:20]:  # cap output
+                print(f"  {name}: shape={shape} finite_frac={frac:.4f}", flush=True)
+            if len(bad_params) > 20:
+                print(f"  ... and {len(bad_params) - 20} more", flush=True)
+            raise RuntimeError(
+                f"Non-finite gradients in {len(bad_params)} parameters — "
+                f"see [NAN-DETECT] log above"
+            )
+
+        total_norm = total_norm_sq ** 0.5
+        # Always log total grad norm (one scalar per step — negligible cost)
+        self.log('diag/grad_norm', total_norm, on_step=True, on_epoch=False,
+                 logger=True, rank_zero_only=True)
+
+        # Per-component breakdown only every N steps (slightly more verbose log)
+        if self.global_step % self._nan_diag_log_every == 0:
+            for k, sq in component_sq.items():
+                self.log(f'diag/grad_norm_{k}', sq ** 0.5,
+                         on_step=True, on_epoch=False,
+                         logger=True, rank_zero_only=True)
+
+        # Soft warning on suspiciously large grad norm. Doesn't stop training
+        # — gradient_clip_val in the trainer config (recommended: 1.0) handles
+        # the actual clipping. This just makes the event visible in stdout.
+        if total_norm > 100.0:
+            print(f"[GRAD-WARN] Large grad norm {total_norm:.2f} at "
+                  f"epoch={self.current_epoch} step={self.global_step}",
+                  flush=True)
 
     # ------------------------------------------------------------------
     # Fmap validation: setup
