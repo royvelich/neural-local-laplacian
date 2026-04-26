@@ -1328,20 +1328,77 @@ class LaplacianLocalModule(LaplacianModuleBase):
             PairSample, subsample_pair, _stable_hash,
         )
 
-        for pair in batch:
+        # [FMAP-DIAG] Log batch arrival per rank — helps detect if some
+        # ranks are receiving empty or non-PairSample batches.
+        n_pair = sum(1 for p in batch if isinstance(p, PairSample))
+        n_other = len(batch) - n_pair
+        print(
+            f"[FMAP-DIAG] rank={self.global_rank} epoch={self.current_epoch} "
+            f"step_fmap batch_idx={batch_idx} dl_idx={dataloader_idx} "
+            f"batch_size={len(batch)} n_pairs={n_pair} n_skipped={n_other}",
+            flush=True,
+        )
+
+        for pair_idx, pair in enumerate(batch):
             if not isinstance(pair, PairSample):
+                # Non-PairSample item — record what type it is so we know
+                # if filtering is the source of skew.
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dataloader_idx} "
+                    f"SKIP non-PairSample at pair_idx={pair_idx}: "
+                    f"type={type(pair).__name__}",
+                    flush=True,
+                )
                 continue
+
+            pair_name = getattr(pair, 'name', f'<unnamed_{pair_idx}>')
 
             if mv > 0:
                 pair = subsample_pair(
                     pair, mv, np.random.RandomState(_stable_hash(pair.name)))
 
-            metrics = _fmap_evaluate_pair(
-                self, pair, k, num_eigenvectors, self.device,
-                laplacian_configs=self._fmap_val_eval_lap_configs,
-                evaluators=self._fmap_val_evaluators,
-                geo_cache=self._get_fmap_geo_cache(pair.name),
-                verbose_timing=(self.global_rank == 0),
+            # [FMAP-DIAG] Wrap evaluate_pair in try/except so failures become
+            # loud (rather than silently dropping the pair from outputs and
+            # creating per-rank count divergence).
+            try:
+                metrics = _fmap_evaluate_pair(
+                    self, pair, k, num_eigenvectors, self.device,
+                    laplacian_configs=self._fmap_val_eval_lap_configs,
+                    evaluators=self._fmap_val_evaluators,
+                    geo_cache=self._get_fmap_geo_cache(pair.name),
+                    verbose_timing=(self.global_rank == 0),
+                )
+            except Exception as e:
+                # Critical: do NOT swallow silently. Print loudly with full
+                # context so the rank-specific failure is visible.
+                import traceback
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dataloader_idx} "
+                    f"FAILED pair={pair_name}: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+                traceback.print_exc()
+                # Re-raise so training fails fast rather than hangs later.
+                # If you'd rather skip the pair, replace this with `continue`,
+                # but be aware that creates per-rank count skew → deadlock.
+                raise
+
+            # [FMAP-DIAG] Inspect metrics dict shape — float_keys mismatch
+            # across ranks would cause shape mismatch in all_gather even
+            # with matched per-rank counts.
+            float_keys = sorted(
+                kk for kk, vv in metrics.items()
+                if isinstance(vv, (int, float)) and not kk.startswith("_")
+            )
+            print(
+                f"[FMAP-DIAG] rank={self.global_rank} "
+                f"epoch={self.current_epoch} dl_idx={dataloader_idx} "
+                f"OK pair={pair_name} n_keys={len(float_keys)} "
+                f"keys_hash={hash(tuple(float_keys)) & 0xFFFFFFFF:08x}",
+                flush=True,
             )
 
             if dataloader_idx not in self._fmap_val_outputs:
@@ -1394,23 +1451,65 @@ class LaplacianLocalModule(LaplacianModuleBase):
             and torch.distributed.is_initialized()
         )
 
+        # [FMAP-DIAG] Snapshot of per-rank state at function entry.
+        # If different ranks print different counts here, that's the
+        # signature of the rank-skew bug (which the rest of this function
+        # now handles correctly via padding).
+        local_state = {
+            int(idx): len(self._fmap_val_outputs.get(idx, []))
+            for idx in fmap_dl_indices
+        }
+        print(
+            f"[FMAP-DIAG] rank={self.global_rank} "
+            f"epoch={self.current_epoch} "
+            f"on_validation_epoch_end ENTER "
+            f"world_size={world_size} dl_indices={fmap_dl_indices} "
+            f"local_counts_per_dl_idx={local_state}",
+            flush=True,
+        )
+
         for dl_idx in fmap_dl_indices:
             outputs = self._fmap_val_outputs.get(dl_idx, [])
             local_n = len(outputs)
 
+            print(
+                f"[FMAP-DIAG] rank={self.global_rank} "
+                f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                f"loop_iter local_n={local_n}",
+                flush=True,
+            )
+
             # Determine max count across ranks (so we know how to pad).
             if is_distributed:
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"-> all_reduce(MAX) on local_n={local_n}",
+                    flush=True,
+                )
                 local_n_t = torch.tensor(
                     [local_n], device=self.device, dtype=torch.long)
                 max_n_t = local_n_t.clone()
                 torch.distributed.all_reduce(
                     max_n_t, op=torch.distributed.ReduceOp.MAX)
                 max_n = int(max_n_t.item())
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"<- all_reduce(MAX) max_n={max_n}",
+                    flush=True,
+                )
             else:
                 max_n = local_n
 
             if max_n == 0:
                 # No rank produced any output for this dl_idx — nothing to do.
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"SKIP (max_n=0 across all ranks)",
+                    flush=True,
+                )
                 continue
 
             # Determine the lowest rank that owns data (for key broadcast).
@@ -1419,11 +1518,23 @@ class LaplacianLocalModule(LaplacianModuleBase):
             if is_distributed:
                 rank_with_data = (self.global_rank
                                   if local_n > 0 else world_size)
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"-> all_reduce(MIN) rank_with_data={rank_with_data}",
+                    flush=True,
+                )
                 rwd_t = torch.tensor(
                     [rank_with_data], device=self.device, dtype=torch.long)
                 torch.distributed.all_reduce(
                     rwd_t, op=torch.distributed.ReduceOp.MIN)
                 src_rank = int(rwd_t.item())
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"<- all_reduce(MIN) src_rank={src_rank}",
+                    flush=True,
+                )
             else:
                 src_rank = 0
 
@@ -1439,11 +1550,31 @@ class LaplacianLocalModule(LaplacianModuleBase):
                 float_keys = None
 
             if is_distributed:
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"-> broadcast_object_list(src={src_rank}) "
+                    f"local_keys={None if float_keys is None else len(float_keys)}",
+                    flush=True,
+                )
                 obj_list = [float_keys]
                 torch.distributed.broadcast_object_list(obj_list, src=src_rank)
                 float_keys = obj_list[0]
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"<- broadcast_object_list "
+                    f"received_keys={None if float_keys is None else len(float_keys)}",
+                    flush=True,
+                )
 
             if not float_keys:
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"SKIP (no float_keys agreed)",
+                    flush=True,
+                )
                 continue
 
             K = len(float_keys)
@@ -1460,18 +1591,42 @@ class LaplacianLocalModule(LaplacianModuleBase):
 
             # Also exchange real per-rank counts so we can trim padding.
             if is_distributed:
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"-> all_gather(counts)",
+                    flush=True,
+                )
                 local_count_t = torch.tensor(
                     [local_n], device=self.device, dtype=torch.long)
                 count_list = [torch.zeros_like(local_count_t)
                               for _ in range(world_size)]
                 torch.distributed.all_gather(count_list, local_count_t)
                 per_rank_counts = [int(c.item()) for c in count_list]
+                print(
+                    f"[FMAP-DIAG] rank={self.global_rank} "
+                    f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                    f"<- all_gather(counts) per_rank={per_rank_counts}",
+                    flush=True,
+                )
             else:
                 per_rank_counts = [local_n]
 
             # All ranks now have local_t of shape (max_n, K) — collective is
             # shape-consistent across ranks.
+            print(
+                f"[FMAP-DIAG] rank={self.global_rank} "
+                f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                f"-> all_gather(tensor) shape=({max_n},{K})",
+                flush=True,
+            )
             gathered = self.all_gather(local_t)
+            print(
+                f"[FMAP-DIAG] rank={self.global_rank} "
+                f"epoch={self.current_epoch} dl_idx={dl_idx} "
+                f"<- all_gather(tensor) gathered.shape={tuple(gathered.shape)}",
+                flush=True,
+            )
             # Lightning returns (W, max_n, K) under DDP, or (max_n, K) when
             # not distributed. Normalise to (W, max_n, K).
             if gathered.dim() == 2:
@@ -1521,6 +1676,16 @@ class LaplacianLocalModule(LaplacianModuleBase):
                              prog_bar=True, sync_dist=True,
                              on_step=False, on_epoch=True, add_dataloader_idx=False)
                     break
+
+        # [FMAP-DIAG] Loop over all dl_indices completed cleanly on this rank.
+        # If you see ENTER prints from all ranks but EXIT prints from only some,
+        # the deadlock is between those two points (likely a collective).
+        print(
+            f"[FMAP-DIAG] rank={self.global_rank} "
+            f"epoch={self.current_epoch} "
+            f"on_validation_epoch_end EXIT (all dl_indices processed)",
+            flush=True,
+        )
 
 # ============================================================================
 # Backward-compatible thin shims
