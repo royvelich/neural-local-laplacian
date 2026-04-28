@@ -44,10 +44,10 @@ module:
 
   feature_extractor: null
   loss_configs:
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+#      weight: 1.0
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
@@ -66,10 +66,10 @@ module:
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
 #      weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
-#      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
+      weight: 1.0
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
