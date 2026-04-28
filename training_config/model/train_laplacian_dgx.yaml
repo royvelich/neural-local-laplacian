@@ -2,7 +2,7 @@ module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
   d_model: 512
-  nhead: 4
+  nhead: 8
   num_encoder_layers: 1
   dim_feedforward: 512
   num_eigenvalues: ${globals.num_eigenvalues}
@@ -44,10 +44,10 @@ module:
 
   feature_extractor: null
   loss_configs:
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-#      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 1.0
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
@@ -66,10 +66,10 @@ module:
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
 #      weight: 1.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
-      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
+#      weight: 1.0
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
