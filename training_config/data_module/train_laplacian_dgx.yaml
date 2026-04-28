@@ -27,7 +27,7 @@ module:
 
       seed: ${globals.training_seed}
       epoch_size: 2400
-      position_noise_std: [0.2, 0.05]
+      position_noise_std: [0.02, 0.05]
       grid_radius_range: [1.0]
       polynomial_offset_range: [0.0]
       points_scale_range: [1.0]
