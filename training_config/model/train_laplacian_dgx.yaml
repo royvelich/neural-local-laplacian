@@ -14,7 +14,7 @@ module:
   output_projection_hidden_dims: null
 
   detach_area_head: true
-  use_uniform_mass: false
+  use_uniform_mass: true
 
   area_activation: bounded_sigmoid
   area_bound_C: 1.0
@@ -47,11 +47,11 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 2.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-      weight: 0.1
+      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+#      weight: 0.1
 
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
@@ -70,10 +70,10 @@ module:
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
 #      weight: 1.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-      weight: 10.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
+#      weight: 10.0
 
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
