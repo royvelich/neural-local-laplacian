@@ -7,7 +7,7 @@ module:
   num_eigenvectors: ${globals.num_eigenvectors}
   seed: ${globals.training_seed}
 
-  mode: eval
+  mode: train
   geo_cache_dir: ./geo_cache
   eval_results_dir: ./eval_results/model
 
@@ -40,7 +40,7 @@ module:
   keep_areas_head: false
   freeze_input_projection: false
   freeze_areas_head: false
-  max_vertices: 5000
+  max_vertices: 4000
   max_vertices_val: 0
   vertex_noise: 0.0
   w_prox: 0.0
