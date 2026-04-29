@@ -29,12 +29,12 @@ module:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
       weight: 1.0
 #      landmark_ratio: 0.2
-      num_landmarks: 256
+      num_landmarks: 128
       alphas:
         - 0.1
         - 1.0
         - 10.0
-      num_sample_vertices: 1024
+      num_sample_vertices: 512
       normalize: false
   random_init: false
   keep_areas_head: false
