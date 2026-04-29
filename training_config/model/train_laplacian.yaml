@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 512
-  nhead: 8
-  num_encoder_layers: 2
-  dim_feedforward: 512
+  d_model: 300
+  nhead: 100
+  num_encoder_layers: 1
+  dim_feedforward: 600
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.1
   normalize_loss_weights: False
@@ -14,7 +14,7 @@ module:
   output_projection_hidden_dims: null
 
   detach_area_head: true
-  use_uniform_mass: false
+  use_uniform_mass: true
 
   area_activation: softmax
   area_bound_C: 2.0
@@ -47,8 +47,34 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-      weight: 5.0
+      weight: 1.0
+
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+        loss_mode: relative
+      weight: 1.0
+
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
+        w_symmetry: 1.0
+        w_idempotency: 1.0
+        w_trace: 1.0
+      weight: 1.0
+
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
+      weight: 1.0
+
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
+      weight: 1.0
+
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
+        probe_mode: 'coordinates'
       weight: 1.0
