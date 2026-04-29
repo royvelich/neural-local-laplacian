@@ -49,32 +49,32 @@ module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
       weight: 1.0
 
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
-        loss_mode: relative
-      weight: 1.0
-
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
-        w_symmetry: 1.0
-        w_idempotency: 1.0
-        w_trace: 1.0
-      weight: 1.0
-
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-      weight: 1.0
-
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
-      weight: 1.0
-
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
-        probe_mode: 'coordinates'
-      weight: 1.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+#        loss_mode: relative
+#      weight: 1.0
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
+#        w_symmetry: 1.0
+#        w_idempotency: 1.0
+#        w_trace: 1.0
+#      weight: 1.0
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
+#      weight: 1.0
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
+#      weight: 1.0
+#
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyLoss
+#        probe_mode: 'coordinates'
+#      weight: 1.0
