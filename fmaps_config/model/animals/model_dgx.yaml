@@ -7,7 +7,7 @@ module:
   num_eigenvectors: ${globals.num_eigenvectors}
   seed: ${globals.training_seed}
 
-  mode: eval
+  mode: train
   geo_cache_dir: ./geo_cache
   eval_results_dir: ./eval_results/model
 
@@ -23,7 +23,7 @@ module:
 #    - assembly: diagonal_gram
 #      area_weighted: true                  # graph-Laplacian-like
 
-  baselines: []
+  baselines: [model]
 
   losses:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
@@ -31,6 +31,7 @@ module:
 #      landmark_ratio: 0.2
       num_landmarks: 256
       alphas:
+        - 0.01
         - 0.1
         - 1.0
         - 10.0
