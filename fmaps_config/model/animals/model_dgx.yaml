@@ -11,7 +11,7 @@ module:
   geo_cache_dir: ./geo_cache
   eval_results_dir: ./eval_results/model
 
-  geo_cache_workers: 4
+#  geo_cache_workers: 4
 
   train_laplacian:
     assembly: diagonal_gram
