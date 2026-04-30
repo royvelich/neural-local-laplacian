@@ -48,6 +48,35 @@ from fmaps_finetune.modules.evaluators import SpectralNNEvaluator, FunctionalMap
 
 
 # =============================================================================
+# Worker-pool BLAS thread limiter
+# =============================================================================
+#
+# The fmap baselines run scipy / numpy / scipy.sparse.linalg.eigsh inside a
+# multiprocessing.Pool. Each worker is forked from a parent that may have
+# OMP_NUM_THREADS / MKL_NUM_THREADS set to a high value (typical on a
+# multi-GPU box where each rank gets, e.g., 15 cores). Without intervention,
+# every worker also tries to use that many BLAS threads, producing
+# (workers_per_rank * world_size * blas_threads) total threads — easily 10x
+# oversubscription. The Pool initialiser below pins each worker to a single
+# BLAS thread so the parallelism comes from processes, not nested threads.
+def _limit_blas_threads_in_worker():
+    """Pool-worker initializer: cap BLAS threads to 1 in every backend."""
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=1)
+    except Exception:
+        # Fallback if threadpoolctl is unavailable for any reason.
+        # Note: setting these env vars in the worker is best-effort — MKL
+        # usually reads them at dlopen time, but on some platforms
+        # MKL_DYNAMIC=FALSE + MKL_NUM_THREADS is honoured at runtime.
+        import os
+        for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                  "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[k] = "1"
+        os.environ["MKL_DYNAMIC"] = "FALSE"
+
+
+# =============================================================================
 # Step profiler (optional, activated by profile_steps > 0)
 # =============================================================================
 
@@ -1976,7 +2005,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                     import multiprocessing as _mp
                     print(f"    [rank {self.global_rank}] Computing {n_my} pairs "
                           f"with {n_workers} workers...", flush=True)
-                    with _mp.Pool(n_workers) as pool:
+                    with _mp.Pool(n_workers, initializer=_limit_blas_threads_in_worker) as pool:
                         for i, r in enumerate(pool.imap_unordered(
                                 _precompute_geo_cache_worker, my_args)):
                             name_r, dist_cache, sqrt_area, idx_b = r
@@ -2082,7 +2111,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                     if is_rank0:
                         print(f"    Parallel precomputation: {_geo_n} pairs, "
                               f"{n_workers} workers", flush=True)
-                    with _mp.Pool(n_workers) as pool:
+                    with _mp.Pool(n_workers, initializer=_limit_blas_threads_in_worker) as pool:
                         results = {}
                         for i, r in enumerate(pool.imap_unordered(
                                 _precompute_geo_cache_worker, worker_args)):
@@ -2185,7 +2214,7 @@ class FunctionalMapModule(LaplacianModuleBase):
                         n_workers_actual = min(rb_n_workers, len(worker_args)) if worker_args else 0
 
                         if n_workers_actual > 1:
-                            with _mp_rb.Pool(n_workers_actual) as pool:
+                            with _mp_rb.Pool(n_workers_actual, initializer=_limit_blas_threads_in_worker) as pool:
                                 for done_count, (j, result) in enumerate(
                                     enumerate(pool.imap(_eval_robust_worker, worker_args)), 1
                                 ):
