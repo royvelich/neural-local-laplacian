@@ -60,5 +60,5 @@ module:
   geomfum_zoomout_k_init: 20
   geomfum_zoomout_k_final: 50
   geomfum_zoomout_n_iters: 10
-  geomfum_fmap_lmbda: 1000.0
+  geomfum_fmap_lmbda: 1.0
   geomfum_fmap_resolvent_gamma: 1.0
