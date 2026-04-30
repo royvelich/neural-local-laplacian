@@ -35,6 +35,8 @@ def main():
                         help="Artifact type filter (e.g. 'model', 'checkpoint'). Default: all types")
     parser.add_argument("--only-finished", action="store_true",
                         help="Only download from finished runs")
+    parser.add_argument("--no-code", action="store_true",
+                        help="Skip source-code artifacts (artifact type 'code')")
     parser.add_argument("--start-date", type=parse_date, default=None,
                         help="Only runs on/after this date (YYYY-MM-DD, UTC)")
     parser.add_argument("--end-date", type=parse_date, default=None,
@@ -68,6 +70,8 @@ def main():
     for run in runs:
         for artifact in run.logged_artifacts():
             if args.type and artifact.type != args.type:
+                continue
+            if args.no_code and artifact.type == "code":
                 continue
             tasks.append((run.name, artifact))
 
