@@ -4,35 +4,35 @@ module:
   _target_: neural_local_laplacian.data_modules.common.GenericPlainDataModule
   train_dataset_specification:
     _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    batch_size: 6
+    collate_fn:
+      _partial_: true
+      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
     dataset:
       _target_: fmaps_finetune.datasets.functional_map_dataset.ShapePairDataset
+      num_samples: 120
       pair_generator:
         _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
-        root: "/workspace/datasets/DeformingThings4DMatching-Animals"
         pairs:
-          - '10:'
-      num_samples: 30
+        - 0.7
+        root: /workspace/datasets/DeformingThings4DMatching-Animals
       seed: ${globals.training_seed}
-    batch_size: 5
     num_workers: 0
     shuffle: true
-    collate_fn:
-      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
-      _partial_: true
   val_dataset_specifications:
   - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    batch_size: 1
+    collate_fn:
+      _partial_: true
+      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
     dataset:
       _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
       pair_generator:
         _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
-        root: "/workspace/datasets/DeformingThings4DMatching-Animals"
         pairs:
-          - ':10'
-      val_poses_per_pair: 8
+        - 0.7:1.0
+        root: /workspace/datasets/DeformingThings4DMatching-Animals
       seed: ${globals.training_seed}
-    batch_size: 1
+      val_poses_per_pair: 15
     num_workers: 0
     shuffle: false
-    collate_fn:
-      _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
-      _partial_: true

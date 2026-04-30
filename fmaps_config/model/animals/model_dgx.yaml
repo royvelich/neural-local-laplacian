@@ -11,8 +11,6 @@ module:
   geo_cache_dir: ./geo_cache
   eval_results_dir: ./eval_results/model
 
-  geo_cache_workers: 4
-
   train_laplacian:
     assembly: diagonal_gram
     pruning: none
@@ -20,10 +18,8 @@ module:
   # Eval with both variants
   eval_laplacians:
     - assembly: diagonal_gram              # FEM-like (default)
-    - assembly: diagonal_gram
-      area_weighted: true                  # graph-Laplacian-like
 
-  baselines: []
+  baselines: [model, robust]
 
   losses:
     - _target_: fmaps_finetune.modules.functional_map_module.GeodesicDiffusionLoss
@@ -35,14 +31,13 @@ module:
         - 0.1
         - 1.0
         - 10.0
-        - 100.0
       num_sample_vertices: 1024
       normalize: false
   random_init: false
   keep_areas_head: false
   freeze_input_projection: false
   freeze_areas_head: false
-  max_vertices: 3000
+  max_vertices: 5000
   max_vertices_val: 0
   vertex_noise: 0.0
   w_prox: 0.0
