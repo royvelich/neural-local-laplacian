@@ -361,6 +361,8 @@ class LaplacianLocalModule(LaplacianModuleBase):
                     zoomout_k_init=fmap_val_cfg.get('geomfum_zoomout_k_init', 20),
                     zoomout_k_final=fmap_val_cfg.get('geomfum_zoomout_k_final', 50),
                     zoomout_n_iters=fmap_val_cfg.get('geomfum_zoomout_n_iters', 10),
+                    fmap_lmbda=fmap_val_cfg.get('fmap_lmbda', 1e3),
+                    fmap_resolvent_gamma=fmap_val_cfg.get('fmap_resolvent_gamma', 1.0),
                 ))
             # Build eval Laplacian configs
             _eval_laps = fmap_val_cfg.get('eval_laplacians',
