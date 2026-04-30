@@ -130,3 +130,43 @@ class GenericPlainDataModule(_GenericDataModuleBase):
 
     def _make_val_loader(self, spec: DatasetSpecification) -> torch.utils.data.DataLoader:
         return self._make_loader(spec)
+
+# ---------------------------------------------------------------------------
+# Mixed DataLoader subclass  (auto-selects PyG vs plain per spec)
+# ---------------------------------------------------------------------------
+
+class GenericMixedDataModule(_GenericDataModuleBase):
+    """DataModule that auto-selects PyG or plain DataLoader per specification.
+
+    If a ``DatasetSpecification`` has a ``collate_fn``, it uses a standard
+    ``torch.utils.data.DataLoader`` (for non-PyG datasets like shape pairs).
+    Otherwise, it uses PyG's ``DataLoader`` (for PyG Data/Batch datasets).
+
+    This allows mixing PyG mesh validation datasets with plain pair datasets
+    in the same training pipeline.
+    """
+
+    def _make_loader(self, spec: DatasetSpecification):
+        if spec.collate_fn is not None:
+            return torch.utils.data.DataLoader(
+                dataset=spec.dataset,
+                batch_size=spec.batch_size,
+                shuffle=spec.shuffle,
+                num_workers=spec.num_workers,
+                persistent_workers=spec.num_workers > 0,
+                collate_fn=spec.collate_fn,
+            )
+        else:
+            return PyGDataLoader(
+                dataset=spec.dataset,
+                batch_size=spec.batch_size,
+                shuffle=spec.shuffle,
+                num_workers=spec.num_workers,
+                persistent_workers=spec.num_workers > 0,
+            )
+
+    def _make_train_loader(self, spec: DatasetSpecification):
+        return self._make_loader(spec)
+
+    def _make_val_loader(self, spec: DatasetSpecification):
+        return self._make_loader(spec)
