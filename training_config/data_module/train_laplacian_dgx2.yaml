@@ -65,7 +65,7 @@ module:
         num_geodesic_sources: 5
         geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
-      num_workers: 0
+      num_workers: 10
       shuffle: False
 
     # --- [1] Fmap: DT4D Animals intra ---
