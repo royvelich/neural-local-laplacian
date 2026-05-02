@@ -1,12 +1,12 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 512
-  nhead: 8
+  d_model: 1536
+  nhead: 16
   num_encoder_layers: 1
-  dim_feedforward: 512
+  dim_feedforward: 1536
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.2
+  dropout: 0.3
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
