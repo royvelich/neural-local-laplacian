@@ -1,12 +1,12 @@
 module:
   _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
   input_dim: 3
-  d_model: 1536
-  nhead: 16
+  d_model: 768
+  nhead: 8
   num_encoder_layers: 1
-  dim_feedforward: 1536
+  dim_feedforward: 768
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.3
+  dropout: 0.2
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
@@ -14,10 +14,10 @@ module:
   output_projection_hidden_dims: null
 
   detach_area_head: true
-  use_uniform_mass: false
+  use_uniform_mass: true
 
   area_activation: bounded_sigmoid
-  area_bound_C: 2.0
+  area_bound_C: 5.0
 
   mcv_mode: 'diagonal_gram'
   normalize_grad_by_k: true
