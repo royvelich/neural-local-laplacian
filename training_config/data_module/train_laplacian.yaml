@@ -26,8 +26,8 @@ module:
 #            center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
-      epoch_size: 200
-      position_noise_std: [0.0]
+      epoch_size: 2000
+      position_noise_std: [0.0, 0.05]
       grid_radius_range: [1.0]
       polynomial_offset_range: [0.0]
       points_scale_range: [1.0]
@@ -48,8 +48,8 @@ module:
       include_origin_in_grid: False
       flip_normal_if_negative_curvature: False
       normalize_to_unit_sphere: True
-    batch_size: 5
-    num_workers: 0
+    batch_size: 2000
+    num_workers: 15
     shuffle: True
   val_dataset_specifications:
     # --- [0] Mesh spectral/geodesic validation (existing, PyG) ---
