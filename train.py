@@ -22,9 +22,8 @@ import pytorch_lightning as pl
 
 @hydra.main(version_base="1.2", config_path="training_config")
 def main(cfg: DictConfig) -> None:
-    # print(cfg)
+    pl.seed_everything(seed=cfg.globals.training_seed, workers=True)
     torch.set_float32_matmul_precision(precision='medium')
-    pl.seed_everything(seed=cfg.globals.training_seed)
     data_module = hydra.utils.instantiate(config=cfg.data_module.module)
     model = hydra.utils.instantiate(config=cfg.model.module, optimizer_cfg=cfg.optimizer, scheduler_cfg=cfg.scheduler if 'scheduler' in cfg else None)
     trainer = hydra.utils.instantiate(config=cfg.trainer)
