@@ -1344,9 +1344,6 @@ class SyntheticSurfaceDataset(ABC, Dataset):
         """
         # [DDP-DIAG] Verify each rank receives different indices. Logs the
         # first few idx values seen per (rank, worker) pair, then goes silent.
-        # This print fires from inside dataloader workers — environment vars
-        # RANK/LOCAL_RANK/WORLD_SIZE are set by Lightning's DDP launcher and
-        # inherited by forked workers.
         if not hasattr(self, '_ddp_diag_count'):
             self._ddp_diag_count = 0
         if self._ddp_diag_count < 8:
@@ -1367,6 +1364,42 @@ class SyntheticSurfaceDataset(ABC, Dataset):
 
         self._rng = np.random.default_rng(self._seed + idx)
         surfaces = self._generate_surfaces()
+
+        # [DET-DIAG] Hash of the surface output, per idx, for the first few
+        # calls. If two runs produce different hashes for the same idx, the
+        # dataset path itself is non-deterministic. If hashes match across
+        # runs but training still diverges, the bug is downstream of data.
+        if not hasattr(self, '_det_diag_count'):
+            self._det_diag_count = 0
+        if self._det_diag_count < 4:
+            import os
+            import hashlib
+            rank = os.environ.get('RANK', os.environ.get('LOCAL_RANK', '?'))
+            try:
+                worker_info = torch.utils.data.get_worker_info()
+                worker_id = worker_info.id if worker_info is not None else 'main'
+            except Exception:
+                worker_id = '?'
+            # Hash the position tensors (the most non-determinism-prone field).
+            h = hashlib.md5()
+            for s in surfaces:
+                if hasattr(s, 'pos') and s.pos is not None:
+                    # bit-exact hash of the float bytes
+                    arr = s.pos.detach().cpu().numpy()
+                    h.update(arr.tobytes())
+                    h.update(str(arr.shape).encode())
+            digest = h.hexdigest()[:16]
+            n_surfaces = len(surfaces)
+            n_pts = sum(s.pos.shape[0] if hasattr(s, 'pos') and s.pos is not None
+                        else 0 for s in surfaces)
+            print(
+                f"[DET-DIAG] rank={rank} worker={worker_id} idx={idx} "
+                f"n_surfaces={n_surfaces} total_pts={n_pts} "
+                f"pos_hash={digest}",
+                flush=True,
+            )
+            self._det_diag_count += 1
+
         return surfaces
 
 

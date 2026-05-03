@@ -719,6 +719,47 @@ class LaplacianLocalModule(LaplacianModuleBase):
         batch_data = batch[0]
         forward_result = self.forward(batch_data)
 
+        # [DET-DIAG] Hash model parameters and forward output at the first
+        # few training steps. Compare these across two runs to localize where
+        # determinism breaks:
+        #   - param_hash differs at step 0    → model init non-deterministic
+        #   - param_hash matches but pos_hash from data differs
+        #                                      → DataLoader / sampler non-det
+        #   - both match but fwd_hash differs → forward path non-deterministic
+        #     (likely dropout fed by non-det torch global RNG)
+        #   - all match at step 0 but diverge later → loss / backward / DDP
+        if not hasattr(self, '_det_diag_step_count'):
+            self._det_diag_step_count = 0
+        if self._det_diag_step_count < 3:
+            import hashlib
+            ph = hashlib.md5()
+            for p in self.parameters():
+                ph.update(p.detach().cpu().numpy().tobytes())
+            param_hash = ph.hexdigest()[:16]
+
+            fh = hashlib.md5()
+            for k in ('grad_coeffs', 'areas', 'stiffness_weights'):
+                v = forward_result.get(k)
+                if v is not None:
+                    arr = v.detach().cpu().numpy()
+                    fh.update(arr.tobytes())
+                    fh.update(str(arr.shape).encode())
+                    fh.update(k.encode())
+            fwd_hash = fh.hexdigest()[:16]
+
+            ih = hashlib.md5()
+            if hasattr(batch_data, 'pos') and batch_data.pos is not None:
+                ih.update(batch_data.pos.detach().cpu().numpy().tobytes())
+            input_hash = ih.hexdigest()[:16]
+
+            print(
+                f"[DET-DIAG-STEP] rank={self.global_rank} epoch={self.current_epoch} "
+                f"step={batch_idx} param_hash={param_hash} "
+                f"input_pos_hash={input_hash} fwd_hash={fwd_hash}",
+                flush=True,
+            )
+            self._det_diag_step_count += 1
+
         # ── [DIAG] Forward output sanity check + cheap stats ────────────
         if self._enable_nan_diagnostics:
             g_check = forward_result.get('grad_coeffs')
