@@ -5,10 +5,11 @@
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
     <envs>
-      <env name="PYTHONUNBUFFERED" value="1" />
       <env name="HYDRA_FULL_ERROR" value="1" />
       <env name="MKL_NUM_THREADS" value="4" />
       <env name="OMP_NUM_THREADS" value="4" />
+      <env name="PYTHONUNBUFFERED" value="1" />
+      <env name="PYTHONUTF8" value="1" />
     </envs>
     <option name="SDK_HOME" value="" />
     <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />

@@ -54,45 +54,37 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
-#      weight: 1.0
-
-
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-#      weight: 0.1
-
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-#      weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
-#      weight: 2.0
-
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
-#      weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
-#      weight: 1.0
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-#      weight: 10.0
-
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
-#        w_symmetry: 1.0
-#        w_idempotency: 1.0
-#        w_trace: 0.1
-#      weight: 10.0
-#
-#
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
+      weight: 0.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+        loss_mode: signed_log
+      weight: 0.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+        loss_mode: log_mse
+      weight: 2.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+        loss_mode: cosine
+      weight: 0.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
+      weight: 0.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
+      weight: 0.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.ProjectorRegularizationLoss
+        w_symmetry: 1.0
+        w_idempotency: 1.0
+        w_trace: 0.1
+      weight: 0.0
