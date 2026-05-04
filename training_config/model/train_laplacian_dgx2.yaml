@@ -17,7 +17,7 @@ module:
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
-  area_bound_C: 10.0
+  area_bound_C: 1.0
 
   mcv_mode: 'diagonal_gram'
   normalize_grad_by_k: true
@@ -66,7 +66,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
-        loss_mode: cosine
+        loss_mode: log_mse
       weight: 10.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
