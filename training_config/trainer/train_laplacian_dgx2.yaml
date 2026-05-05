@@ -5,7 +5,7 @@ accelerator: 'auto'
 strategy: 'auto'
 num_sanity_val_steps: 0
 log_every_n_steps: 1
-check_val_every_n_epoch: 25
+check_val_every_n_epoch: 20
 enable_progress_bar: True
 gradient_clip_val: 0.5
 #logger: False
@@ -27,6 +27,6 @@ callbacks:
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: "./checkpoints"
     filename: "last-model-{epoch:010d}"
-    every_n_epochs: 25
+    every_n_epochs: 20
     verbose: False
     save_on_train_epoch_end: True
