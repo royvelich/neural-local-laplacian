@@ -38,12 +38,12 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.globals.training_seed)  # seeds CPU + all CUDA devices
     torch.cuda.manual_seed_all(cfg.globals.training_seed)  # explicit, in case you fork
 
-    # Force deterministic algorithms; raises if a non-deterministic op is used
-    torch.use_deterministic_algorithms(True, warn_only=False)
-
-    # cuDNN: disable autotuner + force deterministic conv kernels
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    # # Force deterministic algorithms; raises if a non-deterministic op is used
+    # torch.use_deterministic_algorithms(True, warn_only=False)
+    #
+    # # cuDNN: disable autotuner + force deterministic conv kernels
+    # torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
 
 
 
