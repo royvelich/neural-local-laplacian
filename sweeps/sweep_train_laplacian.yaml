@@ -1,0 +1,266 @@
+# W&B sweep: pretrain neural Laplacian (train.py) on synthetic polynomial
+# surfaces with mesh + DT4D-Animals validation. Mirrors
+# training_config/*/train_laplacian_dgx.yaml. Bayes search over hparams.
+#
+# Usage:
+#   wandb sweep sweeps/sweep_train_laplacian.yaml
+#   python train.py --sweep-id <entity/project/sweep_id>
+
+program: ./train.py
+command:
+  - python
+  - ${program}
+method: bayes
+metric:
+  goal: maximize
+  name: val_fmap/animals/fmap_hks_wks/geo_at_01pct
+  summary: max
+run_cap: 80
+parameters:
+  # ===================================================================
+  # Globals
+  # ===================================================================
+  globals:
+    parameters:
+      training_seed:
+        distribution: int_uniform
+        min: 0
+        max: 9999
+      validation_seed:
+        value: 3
+      num_eigenvalues:
+        value: 50
+      ckpt_path:
+        value: null
+
+      lr:
+        distribution: log_uniform_values
+        min: 1.0e-5
+        max: 1.0e-3
+
+      gradient_clip_val:
+        values:
+          - 0.0
+          - 0.5
+          - 1.0
+
+      area_bound_C:
+        distribution: q_uniform
+        min: 0.5
+        max: 4.0
+        q: 0.5
+
+      model_width:
+        values:
+          - 512
+          - 1024
+
+      nhead:
+        values:
+          - 4
+          - 8
+          - 16
+
+      dropout:
+        distribution: q_uniform
+        min: 0.0
+        max: 0.4
+        q: 0.05
+
+      detach_area_head:
+        values:
+          - true
+          - false
+
+      loss_preset:
+        values:
+          # --- [0] DirectionCosine + AreaOnlyLogMagnitude (dgx default) ---
+          - - _target_: neural_local_laplacian.modules.losses.LossConfig
+              loss_module:
+                _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+              weight: 1.0
+            - _target_: neural_local_laplacian.modules.losses.LossConfig
+              loss_module:
+                _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+              weight: 2.0
+          # --- [1] DirectionCosine + LogMagnitude ---
+          - - _target_: neural_local_laplacian.modules.losses.LossConfig
+              loss_module:
+                _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+              weight: 1.0
+            - _target_: neural_local_laplacian.modules.losses.LossConfig
+              loss_module:
+                _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
+              weight: 1.0
+
+  # ===================================================================
+  # Data module
+  # ===================================================================
+  data_module:
+    value:
+      module:
+        _target_: neural_local_laplacian.data_modules.common.GenericMixedDataModule
+        train_dataset_specification:
+          _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+          dataset:
+            _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+            seed: ${globals.training_seed}
+            epoch_size: 24000
+            position_noise_std: [0.01, 0.05]
+            grid_radius_range: [0.5, 2.0]
+            polynomial_offset_range: [0.0, 1.0]
+            points_scale_range: [1.0]
+            coefficient_scale_range: [0.5, 3.0]
+            order_range: [2, 3]
+            grid_samplers:
+              - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+                num_points_range: [6, 30]
+            conv_k_nearest: null
+            pose_transformers: null
+            coeff_generation_method:
+              _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+              _args_: ['uniform']
+            diff_geom_components:
+              - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+                _args_: ['mean_curvature']
+            diff_geom_at_origin_only: True
+            include_origin_in_grid: False
+            flip_normal_if_negative_curvature: False
+            normalize_to_unit_sphere: True
+          batch_size: 20
+          num_workers: 10
+          shuffle: True
+        val_dataset_specifications:
+          # --- [0] Mesh spectral/geodesic validation ---
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+              mesh_folder_path: '/workspace/datasets/shrec15'
+              max_meshes: 80
+              file_size_range_mb: [0.5, 4]
+              require_manifold: True
+              shuffle: True
+              k: 8
+              num_geodesic_sources: 5
+              geodesic_source_method: "farthest_point_sampling"
+            batch_size: 1
+            num_workers: 0
+            shuffle: False
+          # --- [1] Fmap: DT4D Animals intra ---
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+                root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+                pairs: ["0.7:1.0"]
+              val_poses_per_pair: 2
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+  # ===================================================================
+  # Model
+  # ===================================================================
+  model:
+    value:
+      module:
+        _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
+        input_dim: 3
+        d_model: ${globals.model_width}
+        nhead: ${globals.nhead}
+        num_encoder_layers: 1
+        dim_feedforward: ${globals.model_width}
+        num_eigenvalues: ${globals.num_eigenvalues}
+        dropout: ${globals.dropout}
+        normalize_loss_weights: False
+        normalize_patch_features: True
+        scale_areas_by_patch_size: True
+        input_projection_hidden_dims: null
+        output_projection_hidden_dims: null
+
+        detach_area_head: ${globals.detach_area_head}
+        use_uniform_mass: false
+
+        area_activation: bounded_sigmoid
+        area_bound_C: ${globals.area_bound_C}
+
+        mcv_mode: 'diagonal_gram'
+        normalize_grad_by_k: true
+
+        val_laplacian:
+          assembly: diagonal_gram
+          pruning: none
+
+        fmap_val_cfg:
+          k: 15
+          num_eigenvectors: 100
+          max_vertices_val: 5000
+          eval_laplacians:
+            - assembly: diagonal_gram
+              pruning: none
+              area_weighted: false
+          geo_cache_dir: ./geo_cache
+          use_geomfum_eval: true
+          geomfum_descriptors: [hks, wks]
+          geomfum_zoomout: false
+          geomfum_zoomout_k_init: 20
+          geomfum_zoomout_k_final: 50
+          geomfum_zoomout_n_iters: 10
+          fmap_lmbda: 1.0
+          fmap_resolvent_gamma: 1.0
+
+        feature_extractor: null
+        loss_configs: ${globals.loss_preset}
+
+  # ===================================================================
+  # Optimizer
+  # ===================================================================
+  optimizer:
+    value:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: ${globals.lr}
+
+  # ===================================================================
+  # Scheduler
+  # ===================================================================
+  scheduler:
+    value:
+      _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+      _partial_: true
+      T_max: 60000
+      eta_min: 1.0e-6
+      last_epoch: -1
+
+  # ===================================================================
+  # Trainer
+  # ===================================================================
+  trainer:
+    value:
+      _target_: lightning.pytorch.Trainer
+      max_epochs: -1
+      devices: -1
+      accelerator: 'auto'
+      strategy: 'auto'
+      num_sanity_val_steps: 0
+      log_every_n_steps: 1
+      check_val_every_n_epoch: 50
+      enable_progress_bar: True
+      gradient_clip_val: ${globals.gradient_clip_val}
+      logger:
+        _target_: lightning.pytorch.loggers.WandbLogger
+        project: neural-cotangent-weights
+        save_dir: 'wandb'
+        log_model: 'all'
+      callbacks:
+        - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+          dirpath: "./checkpoints"
+          filename: "last-model-{epoch:010d}"
+          every_n_epochs: 50
+          verbose: False
+          save_on_train_epoch_end: True
