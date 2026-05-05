@@ -5,7 +5,8 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
 
-      test_func_cfg:
+      test_func_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
         num_test_funcs: 50
         include_coordinates: false
         verbose: false
@@ -24,6 +25,12 @@ module:
             weight: 0.1
             sigma_range: [0.3, 2.0]
             center_range: [-1.0, 1.0]
+      # Alternative: deterministic monomial basis up to degree d.
+      # test_func_sampler:
+      #   _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+      #   max_degree: 4
+      #   variables: ambient   # 'chart' (bivariate x^m y^n) or 'ambient' (x^a y^b z^c)
+      #   normalize_target: unit_magnitude
 
       seed: ${globals.training_seed}
       epoch_size: 200

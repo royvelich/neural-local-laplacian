@@ -355,8 +355,247 @@ def compute_lb_and_gradient_batch(surface_func, h_funcs, x0, y0, verbose=False):
 # Test function sampling
 # =============================================
 
-class TestFunctionSampler:
-    """Samples random test functions and computes Δ_LB + deltas + gradients.
+class BaseTestFunctionSampler(ABC):
+    """Abstract base for test-function samplers.
+
+    Subclasses produce a set of ``P`` scalar test functions
+    ``h_p(x, y)`` defined on the Monge chart of a synthetic surface.
+    The base class then computes, given the surface ``surface_func``:
+
+        test_func_deltas      (K, P)  h_p(grid) - h_p(origin)
+        test_func_values      (K, P)  h_p(grid)
+        test_func_laplacians  (P,)    Δ_g h_p at the origin
+        test_func_gradients   (P, 3)  ∇_S h_p at the origin (in ℝ³)
+
+    plus the optional per-grid-point ``test_func_lb_all_points`` and
+    ``test_func_gradients_all_points`` when the corresponding flags are
+    set.
+
+    Subclasses must implement:
+        ``_enumerate(rng) -> List[spec]``
+            Decide which P test functions to use.  Specs are opaque to
+            the base class (param dicts / exponent tuples / …).
+
+        ``_specs_to_callables(specs, surface_func) -> List[Callable]``
+            Convert specs to ``h_p(x, y)`` callables for the autograd
+            path and grid evaluation.  Ambient-coordinate samplers can
+            close ``surface_func`` into the callable (e.g. ``z = f(x, y)``).
+
+    Subclasses may optionally implement:
+        ``_specs_to_analytic_data(specs, x_grid, y_grid)``
+            Return ``(deltas, values, h_d)`` without using autograd, where
+            ``h_d`` is a dict of partial derivatives of each test function
+            at the origin (keys ``h, h_x, h_y, h_xx, h_xy, h_yy``, each
+            shape ``(P,)``).  Returning ``None`` (the default) forces the
+            autograd path.
+
+    Args:
+        normalize_target: Target normalization mode.
+            ``'none'``           — raw Δ_LB values.
+            ``'unit_magnitude'`` — divide Δ_LB and deltas by |Δ_LB| per probe.
+            ``'unit_variance'``  — divide deltas / Δ_LB so deltas have unit var.
+        derivative_mode: ``'analytic'`` (try the closed-form metric path
+            via subclass-supplied origin derivatives) or ``'autograd'``
+            (always go through ``compute_lb_and_gradient_batch``).  Falls
+            back to autograd automatically when the subclass returns
+            ``None`` from ``_specs_to_analytic_data``.
+        compute_lb_all_points: If True, also compute Δ_LB at every grid
+            point (always via autograd).
+        compute_gradients_all_points: If True, also compute ∇_S at every
+            grid point (always via autograd).
+        verbose: Print per-call diagnostics.
+    """
+
+    def __init__(
+        self,
+        normalize_target: str = 'none',
+        derivative_mode: str = 'analytic',
+        compute_lb_all_points: bool = False,
+        compute_gradients_all_points: bool = False,
+        verbose: bool = False,
+    ):
+        if derivative_mode not in ('analytic', 'autograd'):
+            raise ValueError(
+                f"derivative_mode must be 'analytic' or 'autograd', got '{derivative_mode}'")
+        if normalize_target not in ('none', 'unit_magnitude', 'unit_variance'):
+            raise ValueError(
+                f"normalize_target must be 'none' | 'unit_magnitude' | 'unit_variance', "
+                f"got '{normalize_target}'")
+        self.normalize_target = normalize_target
+        self.derivative_mode = derivative_mode
+        self.compute_lb_all_points = compute_lb_all_points
+        self.compute_gradients_all_points = compute_gradients_all_points
+        self.verbose = verbose
+
+    # ----- subclass API --------------------------------------------------
+
+    @abstractmethod
+    def _enumerate(self, rng: np.random.Generator) -> List[Any]:
+        ...
+
+    @abstractmethod
+    def _specs_to_callables(self, specs: List[Any], surface_func) -> List[Any]:
+        ...
+
+    def _specs_to_analytic_data(self, specs: List[Any],
+                                x_grid: torch.Tensor,
+                                y_grid: torch.Tensor):
+        return None
+
+    # ----- main API ------------------------------------------------------
+
+    def sample(
+        self,
+        surface_func,
+        x_grid: torch.Tensor,
+        y_grid: torch.Tensor,
+        rng: np.random.Generator,
+    ) -> Dict[str, torch.Tensor]:
+        import time as _time
+        _t = {} if self.verbose else None
+
+        if _t is not None: _t0 = _time.perf_counter()
+        specs = self._enumerate(rng)
+        P = len(specs)
+        K = len(x_grid)
+        if _t is not None: _t['enumerate'] = _time.perf_counter() - _t0
+
+        # ---- Try the analytic path first (subclass may decline) -------
+        analytic_result = None
+        if self.derivative_mode == 'analytic':
+            if _t is not None: _t0 = _time.perf_counter()
+            analytic_result = self._specs_to_analytic_data(specs, x_grid, y_grid)
+            if _t is not None: _t['analytic_specs'] = _time.perf_counter() - _t0
+
+        if analytic_result is not None:
+            deltas, values, h_d = analytic_result
+            if _t is not None: _t0 = _time.perf_counter()
+            x0 = torch.tensor([[0.0]], requires_grad=True)
+            y0 = torch.tensor([[0.0]], requires_grad=True)
+            coeffs = compute_lb_coefficients(surface_func, x0, y0)
+            # apply_lb_from_coefficients expects (N, 1)-shaped derivatives;
+            # h_d is (P,)-shaped, so unsqueeze.  coeffs are (1, 1) and
+            # broadcast into (P, 1).
+            h_derivs = {k: h_d[k].unsqueeze(-1)
+                        for k in ('h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy')}
+            laplacians, gradients = apply_lb_from_coefficients(coeffs, h_derivs)
+            laplacians = laplacians.detach()
+            gradients = gradients.detach()
+            if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
+        else:
+            if _t is not None: _t0 = _time.perf_counter()
+            h_funcs = self._specs_to_callables(specs, surface_func)
+            if _t is not None: _t['build_callables'] = _time.perf_counter() - _t0
+
+            if _t is not None: _t0 = _time.perf_counter()
+            with torch.no_grad():
+                deltas = torch.zeros(K, P, dtype=torch.float32)
+                values = torch.zeros(K, P, dtype=torch.float32)
+                for p, h in enumerate(h_funcs):
+                    h_grid = h(x_grid, y_grid)
+                    h_center = h(torch.tensor(0.0), torch.tensor(0.0))
+                    values[:, p] = h_grid
+                    deltas[:, p] = h_grid - h_center
+            if _t is not None: _t['deltas'] = _time.perf_counter() - _t0
+
+            if _t is not None: _t0 = _time.perf_counter()
+            x0 = torch.tensor([[0.0]], requires_grad=True)
+            y0 = torch.tensor([[0.0]], requires_grad=True)
+            laplacians, gradients = compute_lb_and_gradient_batch(
+                surface_func, h_funcs, x0, y0, verbose=self.verbose)
+            if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
+
+        # ---- Optional per-grid-point quantities (always autograd) -----
+        lb_all_points = None
+        gradients_all_points = None
+        if self.compute_lb_all_points or self.compute_gradients_all_points:
+            if _t is not None: _t0 = _time.perf_counter()
+            h_funcs_all = self._specs_to_callables(specs, surface_func)
+            x_all = x_grid.clone().unsqueeze(-1).requires_grad_(True)
+            y_all = y_grid.clone().unsqueeze(-1).requires_grad_(True)
+            lb_all, grad_all = compute_lb_and_gradient_batch(
+                surface_func, h_funcs_all, x_all, y_all, verbose=self.verbose)
+            if self.compute_lb_all_points:
+                lb_all_points = lb_all
+            if self.compute_gradients_all_points:
+                gradients_all_points = grad_all
+            if _t is not None: _t['lb_all_pts'] = _time.perf_counter() - _t0
+
+        # ---- Verbose preview ------------------------------------------
+        if self.verbose:
+            mode_str = 'analytic' if analytic_result is not None else 'autograd'
+            print(f"\n  [{type(self).__name__}] K={K}, P={P}, "
+                  f"normalize={self.normalize_target}, mode={mode_str}")
+            print(f"    RAW Δ_LB at origin: min={laplacians.min():.4f}  "
+                  f"max={laplacians.max():.4f}  mean={laplacians.mean():.4f}  "
+                  f"absmin={laplacians.abs().min():.6f}")
+            print(f"    RAW deltas: min={deltas.min():.4f}  max={deltas.max():.4f}  "
+                  f"mean_abs={deltas.abs().mean():.4f}")
+            if lb_all_points is not None:
+                print(f"    RAW Δ_LB all pts: min={lb_all_points.min():.4f}  "
+                      f"max={lb_all_points.max():.4f}")
+            for p in list(range(min(5, P))) + ([P - 1] if P > 5 else []):
+                lb_str = f"Δ_LB(origin)={laplacians[p]:+.4f}"
+                d_str = f"δh=[{deltas[:, p].min():.4f}, {deltas[:, p].max():.4f}]"
+                lb_all_str = ""
+                if lb_all_points is not None:
+                    lb_all_str = (f"  Δ_LB_all=[{lb_all_points[:, p].min():.4f}, "
+                                  f"{lb_all_points[:, p].max():.4f}]")
+                prefix = "..." if p == P - 1 and P > 5 else ""
+                print(f"    {prefix}h_{p}: {lb_str}  {d_str}{lb_all_str}")
+
+        # ---- Normalisation --------------------------------------------
+        if self.normalize_target == 'unit_magnitude':
+            mag = laplacians.abs().clamp(min=1e-8)
+            laplacians = laplacians / mag
+            deltas = deltas / mag.unsqueeze(0)
+            values = values / mag.unsqueeze(0)
+            gradients = gradients / mag.unsqueeze(-1)
+            if lb_all_points is not None:
+                lb_all_points = lb_all_points / mag.unsqueeze(0)
+            if gradients_all_points is not None:
+                gradients_all_points = gradients_all_points / mag.view(1, -1, 1)
+        elif self.normalize_target == 'unit_variance':
+            var = deltas.var(dim=0).clamp(min=1e-8)
+            std = var.sqrt()
+            deltas = deltas / std.unsqueeze(0)
+            values = values / std.unsqueeze(0)
+            laplacians = laplacians / std
+            gradients = gradients / std.unsqueeze(-1)
+            if lb_all_points is not None:
+                lb_all_points = lb_all_points / std.unsqueeze(0)
+            if gradients_all_points is not None:
+                gradients_all_points = gradients_all_points / std.view(1, -1, 1)
+
+        if self.verbose and self.normalize_target != 'none':
+            print(f"    POST-NORM Δ_LB at origin: min={laplacians.min():.4f}  "
+                  f"max={laplacians.max():.4f}")
+            print(f"    POST-NORM deltas: min={deltas.min():.4f}  "
+                  f"max={deltas.max():.4f}")
+            if lb_all_points is not None:
+                print(f"    POST-NORM Δ_LB all pts: min={lb_all_points.min():.4f}  "
+                      f"max={lb_all_points.max():.4f}")
+
+        if _t is not None:
+            total = sum(_t.values())
+            parts = [f"{k}={v * 1e3:.0f}ms" for k, v in _t.items()]
+            print(f"    [timing] total={total * 1e3:.0f}ms  {', '.join(parts)}")
+
+        result = {
+            'test_func_deltas': deltas,
+            'test_func_values': values,
+            'test_func_laplacians': laplacians,
+            'test_func_gradients': gradients,
+        }
+        if lb_all_points is not None:
+            result['test_func_lb_all_points'] = lb_all_points
+        if gradients_all_points is not None:
+            result['test_func_gradients_all_points'] = gradients_all_points
+        return result
+
+
+class RandomFamilyTestFunctionSampler(BaseTestFunctionSampler):
+    """Samples random test functions from configured families.
 
     Supports three families:
       - ``poly``: Random polynomials h(x,y) = Σ c_mn x^m y^n.
@@ -388,15 +627,15 @@ class TestFunctionSampler:
             verbose: bool = False,
             derivative_mode: str = 'analytic',
     ):
+        super().__init__(
+            normalize_target=normalize_target,
+            derivative_mode=derivative_mode,
+            compute_lb_all_points=compute_lb_all_points,
+            compute_gradients_all_points=compute_gradients_all_points,
+            verbose=verbose,
+        )
         self.num_test_funcs = num_test_funcs
         self.include_coordinates = include_coordinates
-        self.normalize_target = normalize_target
-        self.compute_lb_all_points = compute_lb_all_points
-        self.compute_gradients_all_points = compute_gradients_all_points
-        self.verbose = verbose
-        if derivative_mode not in ('analytic', 'autograd'):
-            raise ValueError(f"derivative_mode must be 'analytic' or 'autograd', got '{derivative_mode}'")
-        self.derivative_mode = derivative_mode
 
         if families is None:
             families = {
@@ -519,17 +758,88 @@ class TestFunctionSampler:
             raise ValueError(f"Unknown family: {family}")
 
     @staticmethod
-    def _params_to_callable(params: Dict[str, Any]):
-        """Convert a parameter dict to a callable h(x, y)."""
-        if params['family'] == 'poly':
+    def _params_to_callable(params: Dict[str, Any], surface_func=None):
+        """Convert a parameter dict to a callable h(x, y).
+
+        ``surface_func`` is only required for the 'coord' family with
+        ``kind='z'`` (i.e. h = f(x, y)).
+        """
+        fam = params['family']
+        if fam == 'poly':
             coeffs, pairs = params['coeffs'], params['pairs']
             return lambda x, y: evaluate_polynomial(x, y, coeffs, pairs)
-        elif params['family'] == 'trig':
+        if fam == 'trig':
             wx, wy, px, py = params['wx'], params['wy'], params['px'], params['py']
             return lambda x, y: torch.sin(wx * x + px) * torch.cos(wy * y + py)
-        elif params['family'] == 'exp':
+        if fam == 'exp':
             cx, cy, sigma = params['cx'], params['cy'], params['sigma']
             return lambda x, y: torch.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * sigma ** 2))
+        if fam == 'coord':
+            kind = params['kind']
+            if kind == 'x':
+                return lambda x, y: x.squeeze(-1) if x.dim() > 1 else x
+            if kind == 'y':
+                return lambda x, y: y.squeeze(-1) if y.dim() > 1 else y
+            if kind == 'z':
+                if surface_func is None:
+                    raise ValueError("surface_func is required for coord/z")
+                def _z(x, y, sf=surface_func):
+                    z = sf(x, y)
+                    return z.squeeze(-1) if z.dim() > 1 else z
+                return _z
+        raise ValueError(f"Unknown family: {fam}")
+
+    # ----- BaseTestFunctionSampler API -----------------------------------
+
+    def _enumerate(self, rng: np.random.Generator) -> List[Dict[str, Any]]:
+        specs = [self._sample_func_params(rng) for _ in range(self.num_test_funcs)]
+        if self.include_coordinates:
+            specs.append({'family': 'coord', 'kind': 'x'})
+            specs.append({'family': 'coord', 'kind': 'y'})
+            specs.append({'family': 'coord', 'kind': 'z'})
+        return specs
+
+    def _specs_to_callables(self, specs, surface_func):
+        return [self._params_to_callable(p, surface_func) for p in specs]
+
+    def _specs_to_analytic_data(self, specs, x_grid, y_grid):
+        # Coordinate functions need surface second-derivatives at the
+        # origin and are not yet wired into the analytic path; fall back
+        # to autograd whenever they are present.
+        if any(p['family'] == 'coord' for p in specs):
+            return None
+
+        P = len(specs)
+        K = len(x_grid)
+        deltas = torch.zeros(K, P, dtype=torch.float32)
+        values = torch.zeros(K, P, dtype=torch.float32)
+        h_d = {k: torch.zeros(P, dtype=torch.float32)
+               for k in ['h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy']}
+
+        # Group by family for batched evaluation
+        groups: Dict[str, Tuple[List[int], List[Dict[str, Any]]]] = {}
+        for i, s in enumerate(specs):
+            groups.setdefault(s['family'], ([], []))
+            groups[s['family']][0].append(i)
+            groups[s['family']][1].append(s)
+
+        eval_fns = {'poly': self._eval_poly_batch,
+                    'trig': self._eval_trig_batch,
+                    'exp': self._eval_exp_batch}
+        deriv_fns = {'poly': self._derivs_poly_at_origin,
+                     'trig': self._derivs_trig_at_origin,
+                     'exp': self._derivs_exp_at_origin}
+
+        for fam, (indices, params) in groups.items():
+            idx = torch.tensor(indices, dtype=torch.long)
+            vals = eval_fns[fam](params, x_grid, y_grid)  # (N_fam, K)
+            fd = deriv_fns[fam](params)
+            values[:, idx] = vals.T
+            deltas[:, idx] = (vals - fd['h'][:, None]).T
+            for k in h_d:
+                h_d[k][idx] = fd[k]
+
+        return deltas, values, h_d
 
     # ----- vectorized batch evaluation ------------------------------------
 
@@ -635,260 +945,144 @@ class TestFunctionSampler:
             'h_yy': h0 * (cy ** 2 / s4 - 1 / s2),
         }
 
-    # ----- analytic sample path -------------------------------------------
 
-    def _sample_analytic(self, surface_func, x_grid, y_grid, rng):
-        """Fully vectorized: analytic derivatives at origin, no autograd per function."""
-        import time as _time
-        _t = {} if self.verbose else None
+class MonomialBasisTestFunctionSampler(BaseTestFunctionSampler):
+    """Deterministic test-function basis: all monomials up to degree d.
 
-        if _t is not None: _t0 = _time.perf_counter()
-        all_params = [self._sample_func_params(rng) for _ in range(self.num_test_funcs)]
-        P = len(all_params)
+    Two variants controlled by ``variables``:
+
+      ``chart`` (default)
+          Bivariate monomials  h(x, y) = x^m · y^n
+          with 1 ≤ m + n ≤ max_degree, evaluated on the parameter
+          domain.  P = (d+1)(d+2)/2 - 1 probes (the constant is
+          omitted because the operator kills constants by construction).
+
+          Note: at the origin, every chart monomial of degree m + n ≥ 3
+          has zero first AND second partials, so its analytic Δ_g target
+          at the origin is identically zero.  The grid deltas are still
+          informative, so the loss still constrains the predicted
+          stiffness action to be small for those probes — useful as
+          high-frequency null-space training signal.  For genuine
+          higher-order surface-aware information use ``ambient``.
+
+      ``ambient``
+          Trivariate monomials  h(x, y, z) = x^a · y^b · z^c
+          with 1 ≤ a + b + c ≤ max_degree, evaluated on Σ as
+          ``x^a · y^b · f(x, y)^c``.  P = (d+1)(d+2)(d+3)/6 - 1.
+          Captures genuine z-dependence (extrinsic geometry).  Forces
+          the autograd path because the closed-form Monge formula
+          would need surface second-derivatives composed through
+          f(x, y)^c.
+
+    Args:
+        max_degree: Maximum total degree d.
+        variables: ``'chart'`` or ``'ambient'``.
+        normalize_target / derivative_mode / compute_lb_all_points /
+        compute_gradients_all_points / verbose: see
+        :class:`BaseTestFunctionSampler`.  ``derivative_mode='analytic'``
+        is honoured for ``variables='chart'``; the ambient variant
+        always uses autograd.
+    """
+
+    def __init__(
+        self,
+        max_degree: int,
+        variables: str = 'chart',
+        normalize_target: str = 'none',
+        derivative_mode: str = 'analytic',
+        compute_lb_all_points: bool = False,
+        compute_gradients_all_points: bool = False,
+        verbose: bool = False,
+    ):
+        super().__init__(
+            normalize_target=normalize_target,
+            derivative_mode=derivative_mode,
+            compute_lb_all_points=compute_lb_all_points,
+            compute_gradients_all_points=compute_gradients_all_points,
+            verbose=verbose,
+        )
+        if variables not in ('chart', 'ambient'):
+            raise ValueError(
+                f"variables must be 'chart' or 'ambient', got '{variables}'")
+        if int(max_degree) < 1:
+            raise ValueError(f"max_degree must be ≥ 1, got {max_degree}")
+        self.max_degree = int(max_degree)
+        self.variables = variables
+
+    # ----- BaseTestFunctionSampler API -----------------------------------
+
+    def _enumerate(self, rng: np.random.Generator) -> List[Dict[str, Any]]:
+        d = self.max_degree
+        if self.variables == 'chart':
+            return [{'family': 'mono_chart', 'm': m, 'n': n}
+                    for m in range(d + 1)
+                    for n in range(d + 1)
+                    if 1 <= m + n <= d]
+        return [{'family': 'mono_ambient', 'a': a, 'b': b, 'c': c}
+                for a in range(d + 1)
+                for b in range(d + 1)
+                for c in range(d + 1)
+                if 1 <= a + b + c <= d]
+
+    def _specs_to_callables(self, specs, surface_func):
+        funcs = []
+        for s in specs:
+            if s['family'] == 'mono_chart':
+                m, n = s['m'], s['n']
+                funcs.append(lambda x, y, m=m, n=n: (x ** m) * (y ** n))
+            elif s['family'] == 'mono_ambient':
+                a, b, c = s['a'], s['b'], s['c']
+                def _f(x, y, a=a, b=b, c=c, sf=surface_func):
+                    z = sf(x, y)
+                    if z.dim() > x.dim():
+                        z = z.squeeze(-1)
+                    return (x ** a) * (y ** b) * (z ** c)
+                funcs.append(_f)
+            else:
+                raise ValueError(f"Unknown spec family: {s['family']}")
+        return funcs
+
+    def _specs_to_analytic_data(self, specs, x_grid, y_grid):
+        # Ambient monomials require composition with the surface, so
+        # the closed-form Monge formula at origin is not used here.
+        if any(s['family'] == 'mono_ambient' for s in specs):
+            return None
+
+        P = len(specs)
         K = len(x_grid)
-        if _t is not None: _t['sample_funcs'] = _time.perf_counter() - _t0
-
-        # Group by family
-        groups = {}  # family → (indices, params)
-        for i, p in enumerate(all_params):
-            fam = p['family']
-            if fam not in groups:
-                groups[fam] = ([], [])
-            groups[fam][0].append(i)
-            groups[fam][1].append(p)
-
-        # Vectorized evaluation at grid → deltas
-        if _t is not None: _t0 = _time.perf_counter()
-        eval_fns = {'poly': self._eval_poly_batch,
-                    'trig': self._eval_trig_batch,
-                    'exp': self._eval_exp_batch}
-        deriv_fns = {'poly': self._derivs_poly_at_origin,
-                     'trig': self._derivs_trig_at_origin,
-                     'exp': self._derivs_exp_at_origin}
-
         deltas = torch.zeros(K, P, dtype=torch.float32)
         values = torch.zeros(K, P, dtype=torch.float32)
         h_d = {k: torch.zeros(P, dtype=torch.float32)
                for k in ['h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy']}
 
-        for fam, (indices, params) in groups.items():
-            idx = torch.tensor(indices, dtype=torch.long)
+        for p, s in enumerate(specs):
+            m, n = s['m'], s['n']
+            vals = (x_grid ** m) * (y_grid ** n)  # h on the grid
+            values[:, p] = vals
+            # h(0, 0) = 0 because m + n ≥ 1 → δh = vals
+            deltas[:, p] = vals
+            # Analytic derivatives at origin of h = x^m y^n.  Only
+            # five (m, n) pairs give a non-zero entry; everything else
+            # vanishes at the origin because each remaining derivative
+            # carries a positive power of x or y.
+            if (m, n) == (1, 0):
+                h_d['h_x'][p] = 1.0
+            elif (m, n) == (0, 1):
+                h_d['h_y'][p] = 1.0
+            elif (m, n) == (2, 0):
+                h_d['h_xx'][p] = 2.0
+            elif (m, n) == (1, 1):
+                h_d['h_xy'][p] = 1.0
+            elif (m, n) == (0, 2):
+                h_d['h_yy'][p] = 2.0
+            # else: all entries remain zero (default-initialised)
 
-            # Batch eval at grid
-            vals = eval_fns[fam](params, x_grid, y_grid)  # (N, K)
+        return deltas, values, h_d
 
-            # Batch derivatives at origin (also gives h(0,0))
-            fd = deriv_fns[fam](params)
 
-            # Raw function values: h(grid)  →  (K, N) for this family
-            values[:, idx] = vals.T
-
-            # Deltas = h(grid) - h(0,0)
-            deltas[:, idx] = (vals - fd['h'][:, None]).T  # (K, N)
-
-            # Scatter derivatives
-            for k in h_d:
-                h_d[k][idx] = fd[k]
-
-        if _t is not None: _t['deltas_and_derivs'] = _time.perf_counter() - _t0
-
-        # LB coefficients from surface (one autograd computation)
-        if _t is not None: _t0 = _time.perf_counter()
-        x0 = torch.tensor([[0.0]], requires_grad=True)
-        y0 = torch.tensor([[0.0]], requires_grad=True)
-        coeffs = compute_lb_coefficients(surface_func, x0, y0)
-        A = coeffs['A'].squeeze()
-        B = coeffs['B'].squeeze()
-        C = coeffs['C'].squeeze()
-        D = coeffs['D'].squeeze()
-        E = coeffs['E'].squeeze()
-        fx = coeffs['f_x'].squeeze()
-        fy = coeffs['f_y'].squeeze()
-
-        # Vectorised LB: Δ_LB(h) = A·h_xx + 2B·h_xy + C·h_yy + D·h_x + E·h_y
-        laplacians = (A * h_d['h_xx'] + 2 * B * h_d['h_xy'] + C * h_d['h_yy']
-                      + D * h_d['h_x'] + E * h_d['h_y'])  # (P,)
-
-        # Vectorised surface gradient at origin
-        c1 = A * h_d['h_x'] + B * h_d['h_y']  # (P,)
-        c2 = B * h_d['h_x'] + C * h_d['h_y']  # (P,)
-        gradients = torch.stack([c1, c2, c1 * fx + c2 * fy], dim=-1)  # (P, 3)
-        if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
-
-        # lb_all_points / gradients_all_points (optional — still autograd, needs callables)
-        lb_all_points = None
-        gradients_all_points = None
-        if self.compute_lb_all_points or self.compute_gradients_all_points:
-            if _t is not None: _t0 = _time.perf_counter()
-            h_funcs = [self._params_to_callable(p) for p in all_params]
-            x_all = x_grid.clone().unsqueeze(-1).requires_grad_(True)
-            y_all = y_grid.clone().unsqueeze(-1).requires_grad_(True)
-            lb_all, grad_all = compute_lb_and_gradient_batch(
-                surface_func, h_funcs, x_all, y_all, verbose=self.verbose)
-            if self.compute_lb_all_points:
-                lb_all_points = lb_all  # (K, P)
-            if self.compute_gradients_all_points:
-                gradients_all_points = grad_all  # (K, P, 3)
-            if _t is not None: _t['lb_all_pts'] = _time.perf_counter() - _t0
-
-        return deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t
-
-    # ----- main API -------------------------------------------------------
-
-    def sample(
-            self,
-            surface_func,
-            x_grid: torch.Tensor,
-            y_grid: torch.Tensor,
-            rng: np.random.Generator,
-    ) -> Dict[str, torch.Tensor]:
-        """Sample test functions and compute deltas, Δ_LB, and gradients.
-
-        All quantities are evaluated at the **origin** (0, 0) for the
-        Laplacian and gradient targets.  Deltas are computed for every
-        grid point relative to the origin.
-
-        Args:
-            surface_func: Callable ``(x, y) -> z`` defining the surface.
-            x_grid, y_grid: (K,) grid-point coordinates (*without* grad).
-            rng: Numpy random generator for reproducibility.
-
-        Returns:
-            Dict with:
-              - ``test_func_deltas``:     (K, P) float32
-              - ``test_func_laplacians``: (P,) float32
-              - ``test_func_gradients``:  (P, 3) float32
-            where P = num_test_funcs (+ 3 if include_coordinates).
-        """
-        if self.derivative_mode == 'analytic' and not self.include_coordinates:
-            deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t = \
-                self._sample_analytic(surface_func, x_grid, y_grid, rng)
-        else:
-            deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t = \
-                self._sample_autograd(surface_func, x_grid, y_grid, rng)
-
-        P = laplacians.shape[0]
-        K = deltas.shape[0]
-
-        # --- Verification prints (raw, before normalization) ---
-        if self.verbose:
-            mode_str = 'analytic' if (self.derivative_mode == 'analytic'
-                                      and not self.include_coordinates) else 'autograd'
-            print(f"\n  [TestFuncSampler] K={K}, P={P}, normalize={self.normalize_target}, "
-                  f"mode={mode_str}")
-            print(f"    RAW Δ_LB at origin: min={laplacians.min():.4f}  max={laplacians.max():.4f}  "
-                  f"mean={laplacians.mean():.4f}  absmin={laplacians.abs().min():.6f}")
-            print(f"    RAW deltas: min={deltas.min():.4f}  max={deltas.max():.4f}  "
-                  f"mean_abs={deltas.abs().mean():.4f}")
-            if lb_all_points is not None:
-                print(f"    RAW Δ_LB all pts: min={lb_all_points.min():.4f}  max={lb_all_points.max():.4f}")
-            for p in list(range(min(5, P))) + ([P-1] if P > 5 else []):
-                lb_str = f"Δ_LB(origin)={laplacians[p]:+.4f}"
-                d_str = f"δh=[{deltas[:, p].min():.4f}, {deltas[:, p].max():.4f}]"
-                lb_all_str = ""
-                if lb_all_points is not None:
-                    lb_all_str = f"  Δ_LB_all=[{lb_all_points[:, p].min():.4f}, {lb_all_points[:, p].max():.4f}]"
-                prefix = "..." if p == P-1 and P > 5 else ""
-                print(f"    {prefix}h_{p}: {lb_str}  {d_str}{lb_all_str}")
-
-        # Optional normalisation
-        if self.normalize_target == 'unit_magnitude':
-            mag = laplacians.abs().clamp(min=1e-8)
-            laplacians = laplacians / mag
-            deltas = deltas / mag.unsqueeze(0)
-            values = values / mag.unsqueeze(0)
-            gradients = gradients / mag.unsqueeze(-1)
-            if lb_all_points is not None:
-                lb_all_points = lb_all_points / mag.unsqueeze(0)
-            if gradients_all_points is not None:
-                # gradients_all_points is (K, P, 3); mag is (P,)
-                gradients_all_points = gradients_all_points / mag.view(1, -1, 1)
-        elif self.normalize_target == 'unit_variance':
-            var = deltas.var(dim=0).clamp(min=1e-8)
-            std = var.sqrt()
-            deltas = deltas / std.unsqueeze(0)
-            values = values / std.unsqueeze(0)
-            laplacians = laplacians / std
-            gradients = gradients / std.unsqueeze(-1)
-            if lb_all_points is not None:
-                lb_all_points = lb_all_points / std.unsqueeze(0)
-            if gradients_all_points is not None:
-                gradients_all_points = gradients_all_points / std.view(1, -1, 1)
-
-        if self.verbose and self.normalize_target != 'none':
-            print(f"    POST-NORM Δ_LB at origin: min={laplacians.min():.4f}  max={laplacians.max():.4f}")
-            print(f"    POST-NORM deltas: min={deltas.min():.4f}  max={deltas.max():.4f}")
-            if lb_all_points is not None:
-                print(f"    POST-NORM Δ_LB all pts: min={lb_all_points.min():.4f}  max={lb_all_points.max():.4f}")
-
-        if _t is not None:
-            total = sum(_t.values())
-            parts = [f"{k}={v*1e3:.0f}ms" for k, v in _t.items()]
-            print(f"    [timing] total={total*1e3:.0f}ms  {', '.join(parts)}")
-
-        result = {
-            'test_func_deltas': deltas,         # (K, P)
-            'test_func_values': values,         # (K, P)
-            'test_func_laplacians': laplacians,  # (P,)
-            'test_func_gradients': gradients,    # (P, 3)
-        }
-        if lb_all_points is not None:
-            result['test_func_lb_all_points'] = lb_all_points  # (K, P)
-        if gradients_all_points is not None:
-            result['test_func_gradients_all_points'] = gradients_all_points  # (K, P, 3)
-        return result
-
-    def _sample_autograd(self, surface_func, x_grid, y_grid, rng):
-        """Autograd-based path: loop over callables (original implementation)."""
-        import time as _time
-        _t = {} if self.verbose else None
-
-        if _t is not None: _t0 = _time.perf_counter()
-        h_funcs = [self._sample_func(rng) for _ in range(self.num_test_funcs)]
-        if self.include_coordinates:
-            h_funcs.append(lambda x, y: x.squeeze(-1) if x.dim() > 1 else x)
-            h_funcs.append(lambda x, y: y.squeeze(-1) if y.dim() > 1 else y)
-            h_funcs.append(lambda x, y: surface_func(x, y).squeeze(-1)
-                           if surface_func(x, y).dim() > 1
-                           else surface_func(x, y))
-        if _t is not None: _t['sample_funcs'] = _time.perf_counter() - _t0
-
-        P = len(h_funcs)
-        K = len(x_grid)
-        deltas = torch.zeros(K, P, dtype=torch.float32)
-        values = torch.zeros(K, P, dtype=torch.float32)
-
-        if _t is not None: _t0 = _time.perf_counter()
-        with torch.no_grad():
-            for p, h in enumerate(h_funcs):
-                h_grid = h(x_grid, y_grid)
-                h_center = h(torch.tensor(0.0), torch.tensor(0.0))
-                values[:, p] = h_grid
-                deltas[:, p] = h_grid - h_center
-        if _t is not None: _t['deltas'] = _time.perf_counter() - _t0
-
-        if _t is not None: _t0 = _time.perf_counter()
-        x0 = torch.tensor([[0.0]], requires_grad=True)
-        y0 = torch.tensor([[0.0]], requires_grad=True)
-        laplacians, gradients = compute_lb_and_gradient_batch(
-            surface_func, h_funcs, x0, y0, verbose=self.verbose)
-        if _t is not None: _t['lb_origin'] = _time.perf_counter() - _t0
-
-        lb_all_points = None
-        gradients_all_points = None
-        if self.compute_lb_all_points or self.compute_gradients_all_points:
-            if _t is not None: _t0 = _time.perf_counter()
-            x_all = x_grid.clone().unsqueeze(-1).requires_grad_(True)
-            y_all = y_grid.clone().unsqueeze(-1).requires_grad_(True)
-            lb_all, grad_all = compute_lb_and_gradient_batch(
-                surface_func, h_funcs, x_all, y_all, verbose=self.verbose)
-            if self.compute_lb_all_points:
-                lb_all_points = lb_all
-            if self.compute_gradients_all_points:
-                gradients_all_points = grad_all
-            if _t is not None: _t['lb_all_pts'] = _time.perf_counter() - _t0
-
-        return deltas, values, laplacians, gradients, lb_all_points, gradients_all_points, _t
+# Back-compat alias: the original class name still resolves to the
+# random-family sampler so out-of-tree configs and scripts keep working.
+TestFunctionSampler = RandomFamilyTestFunctionSampler
 
 
 # =============================================
@@ -1415,6 +1609,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             diff_geom_at_origin_only: bool = False,
             flip_normal_if_negative_curvature: bool = False,
             include_origin_in_grid: bool = False,
+            test_func_sampler: Optional[BaseTestFunctionSampler] = None,
             test_func_cfg: Optional[Dict[str, Any]] = None,
             **kwargs
     ):
@@ -1426,9 +1621,18 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         self._flip_normal_if_negative_curvature = flip_normal_if_negative_curvature
         self._include_origin_in_grid = include_origin_in_grid
 
-        # Test function sampler (optional)
-        if test_func_cfg is not None:
-            # Convert OmegaConf to plain dict if needed
+        # Test function sampler — prefer the directly-instantiated object
+        # (Hydra-style ``_target_`` config); fall back to the legacy
+        # ``test_func_cfg`` flat dict, which builds a
+        # RandomFamilyTestFunctionSampler.
+        if test_func_sampler is not None and test_func_cfg is not None:
+            raise ValueError(
+                "Specify either 'test_func_sampler' (preferred, instantiated "
+                "BaseTestFunctionSampler) or 'test_func_cfg' (legacy flat "
+                "dict), not both.")
+        if test_func_sampler is not None:
+            self._test_func_sampler = test_func_sampler
+        elif test_func_cfg is not None:
             try:
                 from omegaconf import DictConfig
                 if isinstance(test_func_cfg, DictConfig):
@@ -1436,7 +1640,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
                     test_func_cfg = OmegaConf.to_container(test_func_cfg, resolve=True)
             except ImportError:
                 pass
-            self._test_func_sampler = TestFunctionSampler(**test_func_cfg)
+            self._test_func_sampler = RandomFamilyTestFunctionSampler(**test_func_cfg)
         else:
             self._test_func_sampler = None
 
