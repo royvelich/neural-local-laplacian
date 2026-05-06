@@ -59,16 +59,16 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LogMagnitudeLoss
       weight: 0.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
-        loss_mode: signed_log
-      weight: 0.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
-        loss_mode: log_mse
-      weight: 0.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+#        loss_mode: signed_log
+#      weight: 0.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+#        loss_mode: log_mse
+#      weight: 0.0
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.StiffnessActionLoss
