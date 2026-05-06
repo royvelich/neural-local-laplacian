@@ -277,6 +277,7 @@ class LaplacianLocalModule(LaplacianModuleBase):
                  area_activation: str = 'softplus',
                  area_bound_C: float = 12.566370614359172,  # 4*pi
                  mcv_mode: str = 'diagonal_gram',
+                 stiffness_mode: str = 'diagonal_gram',
                  normalize_grad_by_k: bool = False,
                  detach_area_head: bool = False,
                  use_uniform_mass: bool = False,
@@ -333,6 +334,10 @@ class LaplacianLocalModule(LaplacianModuleBase):
         self._area_activation = area_activation
         self._area_bound_C = area_bound_C
         self._mcv_mode = mcv_mode
+        if stiffness_mode not in ('diagonal_gram', 'full_gram'):
+            raise ValueError(
+                f"stiffness_mode must be 'diagonal_gram' or 'full_gram', got '{stiffness_mode}'")
+        self._stiffness_mode = stiffness_mode
         self._normalize_grad_by_k = normalize_grad_by_k
         self._detach_area_head = detach_area_head
         self._use_uniform_mass = use_uniform_mass
@@ -671,7 +676,28 @@ class LaplacianLocalModule(LaplacianModuleBase):
             k_per_patch = batch_sizes.float()  # (batch_size,)
             grad_coeffs = grad_coeffs / k_per_patch[:, None, None].sqrt()
 
-        stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)
+        if self._stiffness_mode == 'full_gram':
+            # FEM-style per-edge stiffness from the predicted gradient operator:
+            #   s_ij = -⟨g_ii, g_ij⟩    with    g_ii = -Σ_k g_ik
+            # Equivalently:
+            #   s_ij = ‖g_ij‖² + Σ_{k≠j} ⟨g_ik, g_ij⟩
+            # so it equals the diagonal-gram value plus the cross-Gram terms
+            # involving neighbour j.  Reduces to ‖g_ij‖² when the g_ij are
+            # mutually orthogonal.  Can be negative when cross terms dominate.
+            #
+            # Note: this picks the sign convention so that diagonal-gram and
+            # full-gram weights agree in the orthogonal limit.  The MCV path's
+            # ``mcv_mode='full_gram'`` snippet uses ⟨g_ii, g_ij⟩ (no flip)
+            # internally and is independent of this field; flipping the sign
+            # convention there would break sign-symmetric behaviour learned
+            # by existing checkpoints, so it is intentionally left alone.
+            gc_masked = grad_coeffs.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
+            g_self = -gc_masked.sum(dim=1, keepdim=True)              # (B, 1, 3) = g_ii
+            inner = (g_self * gc_masked).sum(dim=-1)                   # (B, K) = ⟨g_ii, g_ij⟩
+            stiffness_weights = -inner                                 # (B, K) = -⟨g_ii, g_ij⟩
+        else:
+            # 'diagonal_gram' (default): s_ij = ‖g_ij‖²
+            stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)
 
         # ── Area prediction ──────────────────────────────────────────
         if self._use_uniform_mass:

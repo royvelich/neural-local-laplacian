@@ -20,6 +20,13 @@ module:
   area_bound_C: 2.0
 
   mcv_mode: 'diagonal_gram'
+  # 'diagonal_gram': s_ij = ‖g_ij‖²  (current behaviour)
+  # 'full_gram'    : s_ij = -⟨g_ii, g_ij⟩  with  g_ii = -Σ_k g_ik
+  # The FEM-style per-edge stiffness from the predicted gradient operator;
+  # equals diagonal-gram + the cross-Gram terms involving neighbour j, and
+  # reduces to ‖g_ij‖² when the g_ij are mutually orthogonal.  Can be
+  # negative when cross terms dominate.
+  stiffness_mode: 'diagonal_gram'
   normalize_grad_by_k: true
 
   val_laplacian:
