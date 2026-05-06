@@ -832,7 +832,7 @@ class SurfaceVisualizer:
             mesh = ps.register_surface_mesh(f"{name} - Mesh", pos, face,
                 smooth_shade=self.vis_config.smooth_shade, edge_width=self._edge_width,
                 color=tuple(self._surface_color), transparency=0.5)
-            mesh.set_material("candy")
+            mesh.set_material("clay")
             self._add_vector_quantities(mesh, surface, "mesh")
             if self._show_gt_normals_all:
                 self._add_normals_to_structure(mesh, normals)
@@ -862,7 +862,7 @@ class SurfaceVisualizer:
         mesh = ps.register_surface_mesh(f"Hybrid Mesh ({name_mesh})", pos_mesh, face_mesh,
             smooth_shade=self.vis_config.smooth_shade, edge_width=self._edge_width,
             color=tuple(self._surface_color), transparency=0.5)
-        mesh.set_material("candy")
+        mesh.set_material("clay")
         self._add_vector_quantities(mesh, surf_mesh, "mesh")
         if self._show_gt_normals_all:
             self._add_normals_to_structure(mesh, normals_mesh)
