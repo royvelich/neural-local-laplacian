@@ -17,6 +17,7 @@ from scipy.spatial import Delaunay
 # neural signatures
 from neural_local_laplacian.datasets.base_datasets import CoeffGenerationMethod
 from neural_local_laplacian.utils.pose_transformers import PoseTransformer
+from neural_local_laplacian.utils.utils import build_patches_from_vertices
 
 
 # =============================================
@@ -45,6 +46,69 @@ def evaluate_polynomial(x: torch.Tensor, y: torch.Tensor,
     for c, (i, j) in zip(coefficients, pairs):
         z = z + c * (x ** i) * (y ** j)
     return z
+
+
+def sample_polynomial_monge_surface(
+    rng: np.random.Generator,
+    order_range: Tuple[int, int],
+    coefficient_scale_range: Tuple[float, ...],
+    coeff_generation_method,
+    polynomial_offset_range: Tuple[float, ...] = (0.0, 0.0),
+):
+    """Sample a random polynomial Monge surface ``z = p(x + ox, y + oy)``.
+
+    Used by both the patch-level ``PolynomialSurfaceDataset`` and the
+    surface-level ``MongeSurfaceVariationalDataset`` so the polynomial
+    sampling logic lives in exactly one place.
+
+    Args:
+        rng: numpy random generator.
+        order_range: ``(min_order, max_order)`` polynomial order range.
+        coefficient_scale_range: scalar or 2-tuple range for the coefficient
+            magnitudes (used as ``coefficient_scale`` below).
+        coeff_generation_method: a :class:`CoeffGenerationMethod` value
+            (``UNIFORM`` or ``NORMAL``).
+        polynomial_offset_range: range for the random ``(ox, oy)`` offset
+            applied before evaluation, sliding the surface under the grid.
+
+    Returns:
+        surface_func: callable ``(x, y) -> z`` that closes over the sampled
+            coefficients and offset.
+        surface_params: dict ``{'coefficients', 'pairs', 'order', 'offset'}``.
+    """
+    def _sample_range(r):
+        if len(r) == 2:
+            return float(rng.uniform(low=r[0], high=r[1]))
+        return float(r[0])
+
+    order = int(rng.integers(low=order_range[0], high=order_range[1] + 1))
+    pairs = get_polynomial_pairs(order)
+    num_coeffs = len(pairs)
+    scale = _sample_range(coefficient_scale_range)
+
+    if coeff_generation_method == CoeffGenerationMethod.UNIFORM:
+        coefficients = torch.tensor(
+            2 * (rng.uniform(size=num_coeffs) - 0.5) * scale)
+    elif coeff_generation_method == CoeffGenerationMethod.NORMAL:
+        coefficients = torch.tensor(rng.normal(size=num_coeffs) * scale)
+    else:
+        raise ValueError(
+            f"Invalid coefficient generation method: {coeff_generation_method}")
+
+    offset_x = _sample_range(polynomial_offset_range)
+    offset_y = _sample_range(polynomial_offset_range)
+
+    def surface_func(x, y, _c=coefficients, _p=pairs,
+                     _ox=offset_x, _oy=offset_y):
+        return evaluate_polynomial(x + _ox, y + _oy, _c, _p)
+
+    surface_params = {
+        'coefficients': coefficients,
+        'pairs': pairs,
+        'order': order,
+        'offset': (offset_x, offset_y),
+    }
+    return surface_func, surface_params
 
 
 # =============================================
@@ -352,6 +416,182 @@ def compute_lb_and_gradient_batch(surface_func, h_funcs, x0, y0, verbose=False):
 
 
 # =============================================
+# Continuous Dirichlet form on a Monge patch
+# =============================================
+
+def gauss_legendre_2d_grid(
+    U_bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+    n: int,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gauss-Legendre nodes and weights on a 2D rectangle.
+
+    Args:
+        U_bounds: ``((u_lo, u_hi), (v_lo, v_hi))`` parameter-domain rectangle.
+        n: nodes per axis (so total Q = n²).
+        dtype: output dtype.
+
+    Returns:
+        u_grid: ``(n, n)`` u-coordinates of quadrature points.
+        v_grid: ``(n, n)`` v-coordinates of quadrature points.
+        weights: ``(n, n)`` quadrature weights (incorporate the change-of-variables
+            Jacobian for a non-unit rectangle).
+    """
+    (u_lo, u_hi), (v_lo, v_hi) = U_bounds
+
+    # Reference nodes/weights on [-1, 1]
+    nodes_1d, weights_1d = np.polynomial.legendre.leggauss(n)
+
+    # Affine map [-1, 1] → [lo, hi] with Jacobian (hi - lo)/2
+    u_nodes = 0.5 * (u_hi - u_lo) * nodes_1d + 0.5 * (u_hi + u_lo)
+    v_nodes = 0.5 * (v_hi - v_lo) * nodes_1d + 0.5 * (v_hi + v_lo)
+    u_weights = 0.5 * (u_hi - u_lo) * weights_1d
+    v_weights = 0.5 * (v_hi - v_lo) * weights_1d
+
+    u_grid_np, v_grid_np = np.meshgrid(u_nodes, v_nodes, indexing='ij')
+    weights_np = u_weights[:, None] * v_weights[None, :]
+
+    return (
+        torch.from_numpy(u_grid_np).to(dtype),
+        torch.from_numpy(v_grid_np).to(dtype),
+        torch.from_numpy(weights_np).to(dtype),
+    )
+
+
+def compute_dirichlet_bilinear_form_continuous(
+    surface_func,
+    h_funcs: List,
+    U_bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+    quadrature_n: int = 30,
+) -> torch.Tensor:
+    """Continuous Dirichlet bilinear form on a Monge patch via Gauss-Legendre.
+
+    Computes the symmetric P×P matrix
+
+        B[ℓ, p] = ∫_U  ⟨∇_g f̃_ℓ, ∇_g f̃_p⟩_g  √det g  du dv ,
+
+    where each ``f̃_ℓ(u, v) = h_funcs[ℓ](u, v)`` is a function on the parameter
+    domain (intrinsic, *not* an ambient ℝ³ function pulled back), and the
+    metric is the Monge metric induced by ``z = surface_func(u, v)``:
+
+        g = (( 1+h_u² , h_u h_v ), ( h_u h_v , 1+h_v² )),    √det g = √(1+h_u²+h_v²).
+
+    Closed-form expansion:
+
+        ⟨∇_g f̃_ℓ, ∇_g f̃_p⟩_g  =  g^{11} f̃_u^{(ℓ)} f̃_u^{(p)}
+                                + g^{12} ( f̃_u^{(ℓ)} f̃_v^{(p)} + f̃_v^{(ℓ)} f̃_u^{(p)} )
+                                + g^{22} f̃_v^{(ℓ)} f̃_v^{(p)} .
+
+    The diagonal ``B[ℓ, ℓ] = 2 · E(f_ℓ)``.
+
+    Args:
+        surface_func: callable ``(u, v) -> z`` (autograd-compatible).
+        h_funcs: list of P callables ``(u, v) -> scalar`` defined on the chart.
+        U_bounds: parameter-domain rectangle.
+        quadrature_n: Gauss-Legendre nodes per axis. n=30 gives ~1e-12 for
+            smooth integrands.
+
+    Returns:
+        ``(P, P)`` symmetric tensor (detached — analytic ground truth).
+    """
+    P = len(h_funcs)
+    if P == 0:
+        return torch.zeros(0, 0)
+
+    u_grid, v_grid, w_grid = gauss_legendre_2d_grid(U_bounds, quadrature_n)
+
+    # Flatten into Q = n² quadrature points
+    u_flat = u_grid.flatten()    # (Q,)
+    v_flat = v_grid.flatten()
+    w_flat = w_grid.flatten()
+    Q = u_flat.shape[0]
+
+    # Surface derivatives at quadrature points (autograd through surface_func).
+    # We give the surface (Q, 1)-shaped inputs to match the convention used
+    # by compute_lb_coefficients elsewhere in this module.
+    u_s = u_flat.clone().unsqueeze(-1).requires_grad_(True)
+    v_s = v_flat.clone().unsqueeze(-1).requires_grad_(True)
+    z = surface_func(u_s, v_s)
+    if z.dim() > 2:
+        z = z.squeeze(-1)
+    h_u = torch.autograd.grad(z.sum(), u_s, create_graph=False)[0].squeeze(-1)  # (Q,)
+    h_v = torch.autograd.grad(z.sum(), v_s, create_graph=False)[0].squeeze(-1)
+
+    det_g = 1.0 + h_u ** 2 + h_v ** 2
+    sqrt_det_g = det_g.sqrt()
+    g11 = (1.0 + h_v ** 2) / det_g
+    g12 = -(h_u * h_v) / det_g
+    g22 = (1.0 + h_u ** 2) / det_g
+
+    # Test-function derivatives at the same quadrature points.
+    f_tilde_u = torch.zeros(Q, P)
+    f_tilde_v = torch.zeros(Q, P)
+    for p_idx, h_func in enumerate(h_funcs):
+        u_h = u_flat.clone().unsqueeze(-1).requires_grad_(True)
+        v_h = v_flat.clone().unsqueeze(-1).requires_grad_(True)
+        f_tilde = h_func(u_h, v_h)
+        if f_tilde.dim() > 2:
+            f_tilde = f_tilde.squeeze(-1)
+
+        if not f_tilde.requires_grad:
+            # h is a constant tensor → derivatives are zero (already zero-init).
+            continue
+
+        df_du = torch.autograd.grad(
+            f_tilde.sum(), u_h, create_graph=False, allow_unused=True)[0]
+        df_dv = torch.autograd.grad(
+            f_tilde.sum(), v_h, create_graph=False, allow_unused=True)[0]
+        if df_du is not None:
+            f_tilde_u[:, p_idx] = df_du.squeeze(-1)
+        if df_dv is not None:
+            f_tilde_v[:, p_idx] = df_dv.squeeze(-1)
+
+    # Pointwise integrand B(ℓ, p) at every quadrature point, then quadrature sum.
+    # Outer products: (Q, P, P)
+    fu_outer    = f_tilde_u.unsqueeze(-1) * f_tilde_u.unsqueeze(-2)
+    fv_outer    = f_tilde_v.unsqueeze(-1) * f_tilde_v.unsqueeze(-2)
+    cross_outer = (f_tilde_u.unsqueeze(-1) * f_tilde_v.unsqueeze(-2)
+                   + f_tilde_v.unsqueeze(-1) * f_tilde_u.unsqueeze(-2))
+
+    # Broadcast g-coefficients along (P, P) — they're (Q,) functions of (u, v).
+    g11_b = g11.unsqueeze(-1).unsqueeze(-1)
+    g12_b = g12.unsqueeze(-1).unsqueeze(-1)
+    g22_b = g22.unsqueeze(-1).unsqueeze(-1)
+    sqrt_det_g_b = sqrt_det_g.unsqueeze(-1).unsqueeze(-1)
+
+    integrand = (g11_b * fu_outer + g12_b * cross_outer + g22_b * fv_outer) * sqrt_det_g_b
+    bilinear = (w_flat.unsqueeze(-1).unsqueeze(-1) * integrand).sum(dim=0)   # (P, P)
+
+    # Symmetrise (numerically) and detach — this is GT.
+    bilinear = 0.5 * (bilinear + bilinear.T)
+    return bilinear.detach()
+
+
+def compute_dirichlet_energy_continuous(
+    surface_func,
+    h_funcs: List,
+    U_bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+    quadrature_n: int = 30,
+) -> torch.Tensor:
+    """Continuous Dirichlet energy per probe: ``E(f_ℓ) = ½ ∫_U ‖∇_g f̃_ℓ‖² √det g``.
+
+    Equals ``½ · diag(compute_dirichlet_bilinear_form_continuous(...))``.
+
+    Args:
+        surface_func: callable ``(u, v) -> z``.
+        h_funcs: list of P callables.
+        U_bounds: parameter-domain rectangle.
+        quadrature_n: Gauss-Legendre nodes per axis.
+
+    Returns:
+        ``(P,)`` energies (detached).
+    """
+    bilinear = compute_dirichlet_bilinear_form_continuous(
+        surface_func, h_funcs, U_bounds, quadrature_n=quadrature_n)
+    return 0.5 * torch.diagonal(bilinear)
+
+
+# =============================================
 # Test function sampling
 # =============================================
 
@@ -403,6 +643,18 @@ class BaseTestFunctionSampler(ABC):
             point (always via autograd).
         compute_gradients_all_points: If True, also compute ∇_S at every
             grid point (always via autograd).
+        compute_continuous_energy: If True, ``sample()`` additionally returns
+            ``test_func_continuous_energy`` of shape ``(P,)``  the continuous
+            Dirichlet energy ``E(f_ℓ)`` per probe, computed by Gauss-Legendre
+            quadrature on the parameter domain. Used as the GT target for
+            ``DirichletEnergyTestLoss`` / variational training.
+        compute_continuous_bilinear: If True, ``sample()`` additionally returns
+            ``test_func_continuous_bilinear`` of shape ``(P, P)``  the
+            continuous bilinear form ``E(f_ℓ, f_p)`` per probe pair. Used as
+            the GT target for ``BilinearFormTestLoss``.
+        quadrature_n: Gauss-Legendre nodes per axis for the continuous
+            quadrature. Total quadrature points = quadrature_n². Default 30
+            gives ~1e-12 accuracy for smooth integrands.
         verbose: Print per-call diagnostics.
     """
 
@@ -412,6 +664,9 @@ class BaseTestFunctionSampler(ABC):
         derivative_mode: str = 'analytic',
         compute_lb_all_points: bool = False,
         compute_gradients_all_points: bool = False,
+        compute_continuous_energy: bool = False,
+        compute_continuous_bilinear: bool = False,
+        quadrature_n: int = 30,
         verbose: bool = False,
     ):
         if derivative_mode not in ('analytic', 'autograd'):
@@ -421,10 +676,15 @@ class BaseTestFunctionSampler(ABC):
             raise ValueError(
                 f"normalize_target must be 'none' | 'unit_magnitude' | 'unit_variance', "
                 f"got '{normalize_target}'")
+        if quadrature_n < 1:
+            raise ValueError(f"quadrature_n must be >= 1, got {quadrature_n}")
         self.normalize_target = normalize_target
         self.derivative_mode = derivative_mode
         self.compute_lb_all_points = compute_lb_all_points
         self.compute_gradients_all_points = compute_gradients_all_points
+        self.compute_continuous_energy = compute_continuous_energy
+        self.compute_continuous_bilinear = compute_continuous_bilinear
+        self.quadrature_n = int(quadrature_n)
         self.verbose = verbose
 
     # ----- subclass API --------------------------------------------------
@@ -450,7 +710,22 @@ class BaseTestFunctionSampler(ABC):
         x_grid: torch.Tensor,
         y_grid: torch.Tensor,
         rng: np.random.Generator,
+        U_bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
     ) -> Dict[str, torch.Tensor]:
+        """Compute test-function probes on a single Monge-patch surface.
+
+        Args:
+            surface_func: callable ``(u, v) -> z``.
+            x_grid, y_grid: ``(K,)`` parameter-domain coordinates of the K
+                vertices on this patch.  Probes are evaluated at these
+                positions and at the origin.
+            rng: numpy random generator.
+            U_bounds: ``((u_lo, u_hi), (v_lo, v_hi))`` parameter-domain
+                rectangle for the continuous quadrature (only used when
+                ``compute_continuous_energy`` or ``compute_continuous_bilinear``
+                is set).  If ``None``, derived from the extent of the supplied
+                grid as ``((x.min(), x.max()), (y.min(), y.max()))``.
+        """
         import time as _time
         _t = {} if self.verbose else None
 
@@ -576,6 +851,29 @@ class BaseTestFunctionSampler(ABC):
                 print(f"    POST-NORM Δ_LB all pts: min={lb_all_points.min():.4f}  "
                       f"max={lb_all_points.max():.4f}")
 
+        # ---- Optional continuous Dirichlet form (variational training) ----
+        continuous_bilinear = None
+        continuous_energy = None
+        if self.compute_continuous_bilinear or self.compute_continuous_energy:
+            if _t is not None: _t0 = _time.perf_counter()
+            if U_bounds is None:
+                # Fall back to the extent of the supplied vertex grid.
+                u_lo = float(x_grid.min().item()); u_hi = float(x_grid.max().item())
+                v_lo = float(y_grid.min().item()); v_hi = float(y_grid.max().item())
+                U_bounds_eff = ((u_lo, u_hi), (v_lo, v_hi))
+            else:
+                U_bounds_eff = U_bounds
+
+            h_funcs_for_quad = self._specs_to_callables(specs, surface_func)
+            # The bilinear form contains the energy on its diagonal; compute
+            # it once when either flag is set, derive the energy if needed.
+            continuous_bilinear = compute_dirichlet_bilinear_form_continuous(
+                surface_func, h_funcs_for_quad, U_bounds_eff,
+                quadrature_n=self.quadrature_n)
+            if self.compute_continuous_energy:
+                continuous_energy = 0.5 * torch.diagonal(continuous_bilinear)
+            if _t is not None: _t['continuous_form'] = _time.perf_counter() - _t0
+
         if _t is not None:
             total = sum(_t.values())
             parts = [f"{k}={v * 1e3:.0f}ms" for k, v in _t.items()]
@@ -591,6 +889,10 @@ class BaseTestFunctionSampler(ABC):
             result['test_func_lb_all_points'] = lb_all_points
         if gradients_all_points is not None:
             result['test_func_gradients_all_points'] = gradients_all_points
+        if continuous_bilinear is not None and self.compute_continuous_bilinear:
+            result['test_func_continuous_bilinear'] = continuous_bilinear     # (P, P)
+        if continuous_energy is not None:
+            result['test_func_continuous_energy'] = continuous_energy         # (P,)
         return result
 
 
@@ -2223,28 +2525,14 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
 
     def _generate_surface_parameters(self) -> Dict[str, Any]:
         """Generate random polynomial coefficients, order, and coordinate offsets."""
-        order = int(self._rng.integers(low=self._order_range[0], high=self._order_range[1] + 1))
-        pairs = self._get_polynomial_pairs(order)
-        num_coeffs = len(pairs)
-        coefficient_scale = self._sample_parameter(param_range=self._coefficient_scale_range)
-
-        if self._coeff_generation_method == CoeffGenerationMethod.UNIFORM:
-            coefficients = torch.tensor(2 * (self._rng.uniform(size=num_coeffs) - 0.5) * coefficient_scale)
-        elif self._coeff_generation_method == CoeffGenerationMethod.NORMAL:
-            coefficients = torch.tensor(self._rng.normal(size=num_coeffs) * coefficient_scale)
-        else:
-            raise ValueError(f"Invalid coefficient generation method: {self._coeff_generation_method}")
-
-        # Sample coordinate offsets
-        offset_x = self._sample_parameter(param_range=self._polynomial_offset_range)
-        offset_y = self._sample_parameter(param_range=self._polynomial_offset_range)
-
-        return {
-            'coefficients': coefficients,
-            'order': order,
-            'pairs': pairs,
-            'offset': (offset_x, offset_y)
-        }
+        _, params = sample_polynomial_monge_surface(
+            rng=self._rng,
+            order_range=self._order_range,
+            coefficient_scale_range=self._coefficient_scale_range,
+            coeff_generation_method=self._coeff_generation_method,
+            polynomial_offset_range=self._polynomial_offset_range,
+        )
+        return params
 
     def _evaluate_surface_with_parameters(self, x: torch.Tensor, y: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
         """Evaluate polynomial surface using pre-generated parameters with coordinate offset."""
@@ -2258,3 +2546,231 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
         y_shifted = y + offset_y
 
         return evaluate_polynomial(x_shifted, y_shifted, coefficients, pairs)
+
+
+# =============================================
+# Surface-level dataset for variational training
+# =============================================
+
+class _VariationalSurfaceData(Data):
+    """PyG Data subclass for surface-level variational batches.
+
+    The surface is laid out as one PyG graph element with ``n*k`` rows of
+    per-patch features (``x``, ``pos``, ``patch_idx``) plus surface-level
+    fields (``vertex_pos``, ``vertex_normals``, ``vertex_areas``, ``knn``,
+    ``test_func_*``).  The custom ``__cat_dim__`` / ``__inc__`` keep
+    ``patch_idx`` from being incremented when PyG batches multiple
+    surfaces.  The variational training pipeline currently runs with
+    ``batch_size=1`` (one surface per step), so cross-surface incrementing
+    of ``knn`` is not yet supported.
+    """
+
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        if key == 'patch_idx':
+            return 0
+        return super().__cat_dim__(key, value, *args, **kwargs)
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == 'patch_idx':
+            return 0
+        if key == 'knn':
+            # batch_size=1 only for now: knn indices are not offset.
+            return 0
+        return super().__inc__(key, value, *args, **kwargs)
+
+
+class MongeSurfaceVariationalDataset(Dataset):
+    """Surface-level synthetic dataset for variational / Dirichlet-energy training.
+
+    Each ``__getitem__`` returns one Monge-patch surface with ``n`` vertices,
+    their k-NN patches, per-vertex normals/areas, and probe-function data
+    including the analytic ``(P, P)`` continuous Dirichlet bilinear-form GT.
+
+    The model's ``forward()`` processes all ``n`` patches in a single batched
+    call (the patch fields ``x`` / ``pos`` / ``patch_idx`` already encode
+    them as a multi-patch batch).  The variational losses then read the
+    surface-level fields from the same ``Data`` object to compare discrete
+    and continuous Dirichlet forms.
+
+    Args:
+        order_range, coefficient_scale_range, coeff_generation_method,
+        polynomial_offset_range:  Polynomial-surface sampling parameters,
+            forwarded to :func:`sample_polynomial_monge_surface`.
+        num_vertices_range:  Per-surface vertex count.  Either an int
+            (fixed) or a 2-tuple (uniform random per surface).
+        grid_radius:  Half-side of the parameter-domain square U =
+            [-r, r]^2 used both for vertex sampling and for the continuous
+            quadrature.
+        position_noise_std:  Gaussian noise std added to 3D vertex
+            positions *after* analytic normals / areas are computed from
+            the clean surface.  Either a scalar or a 2-tuple range.
+        k:  k-NN neighbour count per patch.
+        test_func_sampler:  Configured :class:`BaseTestFunctionSampler`
+            instance.  Must have ``compute_continuous_bilinear=True`` (or
+            ``compute_continuous_energy=True``) so the GT targets are
+            attached to each item.
+        epoch_size:  Number of surfaces drawn per training epoch.
+        seed:  RNG seed.
+
+    Yields :class:`_VariationalSurfaceData` items with fields:
+        x                              (n*k, 3)  per-patch features
+        pos                            (n*k, 3)  per-patch positions (centred)
+        patch_idx                      (n*k,)    patch assignment 0..n-1
+        vertex_indices                 (n*k,)    global vertex idx per row
+        vertex_pos                     (n, 3)    vertex positions
+        vertex_normals                 (n, 3)    analytic surface normals
+        vertex_areas                   (n,)      uniform A_total/n
+        knn                            (n, k)    global neighbour indices
+        test_func_values               (n, P)    probe values at vertices
+        test_func_continuous_bilinear  (P, P)    GT bilinear form (if enabled)
+        test_func_continuous_energy    (P,)      GT energies         (if enabled)
+    """
+
+    def __init__(
+        self,
+        order_range: Tuple[int, int],
+        coefficient_scale_range,
+        coeff_generation_method: CoeffGenerationMethod,
+        num_vertices_range,
+        test_func_sampler,
+        polynomial_offset_range=(0.0, 0.0),
+        grid_radius: float = 1.0,
+        position_noise_std=0.0,
+        k: int = 15,
+        epoch_size: int = 100,
+        seed: int = 0,
+        quadrature_n_for_total_area: int = 20,
+    ):
+        super().__init__()
+        self._order_range = order_range
+        self._coefficient_scale_range = coefficient_scale_range
+        self._coeff_generation_method = coeff_generation_method
+        self._polynomial_offset_range = polynomial_offset_range
+        self._grid_radius = float(grid_radius)
+        self._k = int(k)
+        self._epoch_size = int(epoch_size)
+        self._test_func_sampler = test_func_sampler
+        self._quadrature_n_area = int(quadrature_n_for_total_area)
+
+        if isinstance(num_vertices_range, int):
+            self._num_vertices_range = (num_vertices_range, num_vertices_range)
+        else:
+            self._num_vertices_range = (
+                int(num_vertices_range[0]), int(num_vertices_range[1]))
+        if self._num_vertices_range[0] < self._k + 1:
+            raise ValueError(
+                f"num_vertices_range[0]={self._num_vertices_range[0]} must be > k={self._k}")
+
+        self._position_noise_std = self._normalize_noise_std(position_noise_std)
+        self._rng = np.random.default_rng(seed=seed)
+
+    @staticmethod
+    def _normalize_noise_std(value):
+        if isinstance(value, (int, float)):
+            return (float(value), float(value))
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1:
+                return (float(value[0]), float(value[0]))
+            if len(value) == 2:
+                return (float(value[0]), float(value[1]))
+        raise ValueError(f"position_noise_std must be scalar or 2-tuple, got {value!r}")
+
+    # PyG Dataset hooks ----------------------------------------------------
+
+    def len(self) -> int:
+        return self._epoch_size
+
+    def get(self, idx) -> _VariationalSurfaceData:
+        # 1. Sample a polynomial Monge surface.
+        surface_func, _surface_params = sample_polynomial_monge_surface(
+            rng=self._rng,
+            order_range=self._order_range,
+            coefficient_scale_range=self._coefficient_scale_range,
+            coeff_generation_method=self._coeff_generation_method,
+            polynomial_offset_range=self._polynomial_offset_range,
+        )
+
+        U_bounds = ((-self._grid_radius, self._grid_radius),
+                    (-self._grid_radius, self._grid_radius))
+
+        # 2. Sample vertex parameter coords on U.
+        n = int(self._rng.integers(low=self._num_vertices_range[0],
+                                    high=self._num_vertices_range[1] + 1))
+        u = torch.from_numpy(self._rng.uniform(
+            low=-self._grid_radius, high=self._grid_radius, size=n)).float()
+        v = torch.from_numpy(self._rng.uniform(
+            low=-self._grid_radius, high=self._grid_radius, size=n)).float()
+
+        # 3. Lift vertices to ℝ³ and compute analytic normals via autograd.
+        with torch.enable_grad():
+            u_g = u.clone().requires_grad_(True)
+            v_g = v.clone().requires_grad_(True)
+            z_g = surface_func(u_g, v_g)
+            h_u = torch.autograd.grad(z_g.sum(), u_g, create_graph=False)[0]
+            h_v = torch.autograd.grad(z_g.sum(), v_g, create_graph=False)[0]
+        z = z_g.detach()
+        h_u = h_u.detach()
+        h_v = h_v.detach()
+
+        clean_pos = torch.stack([u, v, z], dim=-1)                     # (n, 3)
+        normal_unnorm = torch.stack(
+            [-h_u, -h_v, torch.ones_like(h_u)], dim=-1)
+        vertex_normals = F.normalize(normal_unnorm, p=2, dim=-1)        # (n, 3)
+
+        # 4. Total surface area via Gauss-Legendre on √det g; uniform per-vertex.
+        u_q, v_q, w_q = gauss_legendre_2d_grid(U_bounds, self._quadrature_n_area)
+        u_q_flat = u_q.flatten()
+        v_q_flat = v_q.flatten()
+        w_q_flat = w_q.flatten()
+        with torch.enable_grad():
+            u_qg = u_q_flat.clone().unsqueeze(-1).requires_grad_(True)
+            v_qg = v_q_flat.clone().unsqueeze(-1).requires_grad_(True)
+            z_q = surface_func(u_qg, v_qg)
+            if z_q.dim() > 1:
+                z_q = z_q.squeeze(-1)
+            h_u_q = torch.autograd.grad(z_q.sum(), u_qg, create_graph=False)[0].squeeze(-1)
+            h_v_q = torch.autograd.grad(z_q.sum(), v_qg, create_graph=False)[0].squeeze(-1)
+        sqrt_det_g_q = (1.0 + h_u_q.detach() ** 2 + h_v_q.detach() ** 2).sqrt()
+        total_area = float((w_q_flat * sqrt_det_g_q).sum().item())
+        vertex_areas = torch.full((n,), total_area / n, dtype=torch.float32)
+
+        # 5. Optional position noise (applied AFTER analytic quantities are computed).
+        lo, hi = self._position_noise_std
+        noise_std = float(self._rng.uniform(low=lo, high=hi)) if hi > lo else lo
+        if noise_std > 0:
+            noise = torch.from_numpy(
+                self._rng.normal(scale=noise_std, size=(n, 3))).float()
+            noisy_pos = clean_pos + noise
+        else:
+            noisy_pos = clean_pos
+
+        # 6. Build k-NN patches.
+        patch = build_patches_from_vertices(noisy_pos, k=self._k, device=None)
+        # patch: pos (n*k, 3), x (n*k, 3), patch_idx (n*k,),
+        #        vertex_indices (n*k,), neighbor_index_matrix (n, k)
+
+        # 7. Probe values at vertices and continuous bilinear / energy GT.
+        tf = self._test_func_sampler.sample(
+            surface_func=surface_func,
+            x_grid=u, y_grid=v,
+            rng=self._rng,
+            U_bounds=U_bounds,
+        )
+
+        # 8. Bundle into a single PyG Data object.
+        data = _VariationalSurfaceData(
+            x=patch.x,
+            pos=patch.pos,
+            patch_idx=patch.patch_idx,
+            vertex_indices=patch.vertex_indices,
+            knn=patch.neighbor_index_matrix,
+            vertex_pos=noisy_pos,
+            vertex_normals=vertex_normals,
+            vertex_areas=vertex_areas,
+            test_func_values=tf['test_func_values'],
+        )
+        if 'test_func_continuous_bilinear' in tf:
+            data.test_func_continuous_bilinear = tf['test_func_continuous_bilinear']
+        if 'test_func_continuous_energy' in tf:
+            data.test_func_continuous_energy = tf['test_func_continuous_energy']
+        return data

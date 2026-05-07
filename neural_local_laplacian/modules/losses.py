@@ -31,10 +31,16 @@ class LossContext:
     areas: Optional[torch.Tensor] = None
     stiffness_weights: Optional[torch.Tensor] = None
     gt_vertex_areas: Optional[torch.Tensor] = None
-    # Test function probe data (from TestFunctionSampler)
+    # Test function probe data (from TestFunctionSampler) — patch-level
     test_func_deltas: Optional[torch.Tensor] = None      # (B, max_k, P)
     test_func_laplacians: Optional[torch.Tensor] = None   # (B, P)
     test_func_gradients: Optional[torch.Tensor] = None    # (B, P, 3)
+    # Surface-level fields (variational training pipeline)
+    knn: Optional[torch.Tensor] = None                              # (n, k)
+    vertex_normals: Optional[torch.Tensor] = None                   # (n, 3)
+    test_func_values: Optional[torch.Tensor] = None                 # (n, P)
+    test_func_continuous_bilinear: Optional[torch.Tensor] = None    # (P, P)
+    test_func_continuous_energy: Optional[torch.Tensor] = None      # (P,)
 
 
 @dataclass
@@ -1157,6 +1163,34 @@ def _masked_grad_and_stiffness(ctx: LossContext):
     return grad_masked, weights_masked, pos_masked, mask_3d
 
 
+def _signed_log(x: torch.Tensor) -> torch.Tensor:
+    """``sign(x) · log(|x| + 1)`` — smooth, monotonic, handles negatives."""
+    return x.sign() * torch.log(x.abs() + 1.0)
+
+
+def _scalar_error_per_element(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    mode: str,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Per-element error metric on matched scalar tensors.
+
+    Modes:
+      ``'mse'``         (pred - target)²
+      ``'relative'``    ((pred - target) / (|target| + eps))²
+      ``'signed_log'``  (slog(pred) - slog(target))²
+    """
+    if mode == 'mse':
+        return (predicted - target) ** 2
+    if mode == 'relative':
+        return ((predicted - target) / (target.abs() + eps)) ** 2
+    if mode == 'signed_log':
+        return (_signed_log(predicted) - _signed_log(target)) ** 2
+    raise ValueError(
+        f"loss_mode must be 'mse' / 'relative' / 'signed_log', got '{mode}'")
+
+
 def _compute_discrete_gradient(grad_masked, deltas):
     """Compute discrete surface gradient ∇h = Σ_j g_ij δh_j.
 
@@ -1214,8 +1248,8 @@ class GeneralizedLaplacianTestLoss(nn.Module):
 
     @staticmethod
     def _signed_log(x: torch.Tensor) -> torch.Tensor:
-        """sign(x) · log(|x| + 1) — smooth, monotonic, handles negatives."""
-        return x.sign() * torch.log(x.abs() + 1.0)
+        """Backwards-compatible alias for the module-level helper."""
+        return _signed_log(x)
 
     def forward(self, ctx: LossContext) -> torch.Tensor:
         if ctx.test_func_deltas is None:
@@ -1233,13 +1267,8 @@ class GeneralizedLaplacianTestLoss(nn.Module):
 
         target = ctx.test_func_laplacians  # (B, P)
 
-        if self.loss_mode == 'mse':
-            per_func_error = (predicted - target) ** 2
-        elif self.loss_mode == 'relative':
-            per_func_error = ((predicted - target) / (target.abs() + self.eps)) ** 2
-        elif self.loss_mode == 'signed_log':
-            per_func_error = (self._signed_log(predicted) - self._signed_log(target)) ** 2
-
+        per_func_error = _scalar_error_per_element(
+            predicted, target, self.loss_mode, eps=self.eps)
         per_patch = per_func_error.mean(dim=-1)  # (B,)
 
         if self.reduction == 'mean':
@@ -1449,3 +1478,158 @@ class SelfSupervisedGradientTangentPlaneLoss(nn.Module):
             return per_patch
         else:
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
+
+# =============================================
+# Variational / Dirichlet-energy losses
+# (surface-level: read per-vertex fields from LossContext)
+# =============================================
+
+class _VariationalTestLoss(nn.Module):
+    """Private base for surface-level variational losses.
+
+    Subclasses use the discrete Dirichlet-form helpers in
+    ``neural_local_laplacian.utils.dirichlet`` to compute predicted
+    quantities from ``ctx.grad_coeffs``, ``ctx.areas``, ``ctx.knn``, and
+    ``ctx.test_func_values`` (all populated by
+    ``MongeSurfaceVariationalDataset``), and compare them against the
+    analytic surface-level GT carried on the same ``LossContext``.
+
+    Args:
+        reduction: ``'mean'`` | ``'sum'`` | ``'none'``.
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError(
+                f"reduction must be 'mean' / 'sum' / 'none', got '{reduction}'")
+        self.reduction = reduction
+
+    @staticmethod
+    def _check_required(ctx: LossContext, names) -> None:
+        for name in names:
+            if getattr(ctx, name, None) is None:
+                raise ValueError(
+                    f"Variational loss is missing required LossContext field "
+                    f"'{name}'. The context must come from a "
+                    f"_VariationalSurfaceData item with the matching test-function "
+                    f"sampler flags enabled.")
+
+    @staticmethod
+    def _compute_pred_grads(ctx: LossContext) -> torch.Tensor:
+        """Compute per-vertex per-probe predicted gradients ``(n, P, 3)``."""
+        from neural_local_laplacian.utils.dirichlet import predicted_gradient_per_vertex
+        return predicted_gradient_per_vertex(
+            ctx.grad_coeffs, ctx.knn, ctx.test_func_values)
+
+    def _reduce(self, per_unit: torch.Tensor) -> torch.Tensor:
+        if self.reduction == 'mean':
+            return per_unit.mean()
+        if self.reduction == 'sum':
+            return per_unit.sum()
+        return per_unit
+
+
+class DirichletEnergyTestLoss(_VariationalTestLoss):
+    r"""Match discrete and continuous Dirichlet energies per probe.
+
+    Predicted: ``Ê(f_ℓ) = ½ Σ_i A_i ‖ĝ_i^{(ℓ)}‖²`` where
+    ``ĝ_i^{(ℓ)} = Σ_j g_ij · (f_ℓ(v_j) − f_ℓ(v_i))``.
+    Target:    ``E(f_ℓ) = ½ ∫_U ‖∇_g f̃_ℓ‖² √det g  du dv``  (Gauss-Legendre).
+
+    Reads from ``ctx``: ``grad_coeffs``, ``areas``, ``knn``,
+    ``test_func_values`` (n, P), and ``test_func_continuous_energy`` (P,).
+    """
+
+    def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
+                 eps: float = 1e-8):
+        super().__init__(reduction=reduction)
+        if loss_mode not in ('mse', 'relative', 'signed_log'):
+            raise ValueError(
+                f"loss_mode must be 'mse' / 'relative' / 'signed_log', got '{loss_mode}'")
+        self.loss_mode = loss_mode
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        from neural_local_laplacian.utils.dirichlet import discrete_dirichlet_energy
+        self._check_required(ctx, ['grad_coeffs', 'areas', 'knn',
+                                    'test_func_values',
+                                    'test_func_continuous_energy'])
+        pred_grads = self._compute_pred_grads(ctx)                 # (n, P, 3)
+        pred_energy = discrete_dirichlet_energy(pred_grads, ctx.areas)   # (P,)
+        per_probe = _scalar_error_per_element(
+            pred_energy, ctx.test_func_continuous_energy,
+            self.loss_mode, eps=self.eps)
+        return self._reduce(per_probe)
+
+
+class BilinearFormTestLoss(_VariationalTestLoss):
+    r"""Match the discrete and continuous Dirichlet bilinear forms.
+
+    Predicted: ``Ê(f_ℓ, f_p) = Σ_i A_i ⟨ĝ_i^{(ℓ)}, ĝ_i^{(p)}⟩``  ((P, P) symmetric).
+    Target:    ``E(f_ℓ, f_p) = ∫_U ⟨∇_g f̃_ℓ, ∇_g f̃_p⟩_g √det g  du dv``.
+
+    Strictly stronger than :class:`DirichletEnergyTestLoss` (its diagonal):
+    bilinear pins down per-vertex gradient inner products, leaving only
+    per-vertex frame rotations as a gauge group, while energy alone is
+    invariant under per-function per-vertex rotations.
+
+    Compares only the upper triangle (including diagonal) — both matrices
+    are symmetric, so off-diagonals are not double-counted.
+
+    Reads from ``ctx``: ``grad_coeffs``, ``areas``, ``knn``,
+    ``test_func_values`` (n, P), and ``test_func_continuous_bilinear`` (P, P).
+    """
+
+    def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
+                 eps: float = 1e-8):
+        super().__init__(reduction=reduction)
+        if loss_mode not in ('mse', 'relative', 'signed_log'):
+            raise ValueError(
+                f"loss_mode must be 'mse' / 'relative' / 'signed_log', got '{loss_mode}'")
+        self.loss_mode = loss_mode
+        self.eps = eps
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        from neural_local_laplacian.utils.dirichlet import discrete_dirichlet_bilinear
+        self._check_required(ctx, ['grad_coeffs', 'areas', 'knn',
+                                    'test_func_values',
+                                    'test_func_continuous_bilinear'])
+        pred_grads = self._compute_pred_grads(ctx)                  # (n, P, 3)
+        pred_B = discrete_dirichlet_bilinear(pred_grads, ctx.areas)  # (P, P)
+        target_B = ctx.test_func_continuous_bilinear                # (P, P)
+
+        P = pred_B.shape[0]
+        iu = torch.triu_indices(P, P, offset=0, device=pred_B.device)
+        pred_flat = pred_B[iu[0], iu[1]]
+        target_flat = target_B[iu[0], iu[1]]
+        per_pair = _scalar_error_per_element(
+            pred_flat, target_flat, self.loss_mode, eps=self.eps)
+        return self._reduce(per_pair)
+
+
+class GradientTangencyTestLoss(_VariationalTestLoss):
+    r"""Penalise non-tangential components of predicted surface gradients.
+
+    Loss:  ``L = Σ_ℓ Σ_i A_i · ⟨ĝ_i^{(ℓ)}, n̂_i⟩²``  (then reduced).
+
+    Required gauge fix when training with energy or bilinear-form
+    supervision alone: both are invariant under per-vertex rotations of
+    the predicted gradients, so without a tangency penalty the model can
+    learn geometrically wrong frames that nonetheless match the form.
+
+    Reads from ``ctx``: ``grad_coeffs``, ``areas``, ``knn``,
+    ``test_func_values``, and ``vertex_normals`` (n, 3).
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__(reduction=reduction)
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        self._check_required(ctx, ['grad_coeffs', 'areas', 'knn',
+                                    'test_func_values', 'vertex_normals'])
+        pred_grads = self._compute_pred_grads(ctx)                  # (n, P, 3)
+        normals = F.normalize(ctx.vertex_normals, p=2, dim=-1)      # (n, 3)
+        normal_component = torch.einsum('npd,nd->np', pred_grads, normals)  # (n, P)
+        weighted = ctx.areas.unsqueeze(-1) * (normal_component ** 2)         # (n, P)
+        return self._reduce(weighted)
