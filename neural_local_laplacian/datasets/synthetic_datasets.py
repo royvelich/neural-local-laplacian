@@ -352,6 +352,182 @@ def compute_lb_and_gradient_batch(surface_func, h_funcs, x0, y0, verbose=False):
 
 
 # =============================================
+# Continuous Dirichlet form on a Monge patch
+# =============================================
+
+def gauss_legendre_2d_grid(
+    U_bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+    n: int,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gauss-Legendre nodes and weights on a 2D rectangle.
+
+    Args:
+        U_bounds: ``((u_lo, u_hi), (v_lo, v_hi))`` parameter-domain rectangle.
+        n: nodes per axis (so total Q = n²).
+        dtype: output dtype.
+
+    Returns:
+        u_grid: ``(n, n)`` u-coordinates of quadrature points.
+        v_grid: ``(n, n)`` v-coordinates of quadrature points.
+        weights: ``(n, n)`` quadrature weights (incorporate the change-of-variables
+            Jacobian for a non-unit rectangle).
+    """
+    (u_lo, u_hi), (v_lo, v_hi) = U_bounds
+
+    # Reference nodes/weights on [-1, 1]
+    nodes_1d, weights_1d = np.polynomial.legendre.leggauss(n)
+
+    # Affine map [-1, 1] → [lo, hi] with Jacobian (hi - lo)/2
+    u_nodes = 0.5 * (u_hi - u_lo) * nodes_1d + 0.5 * (u_hi + u_lo)
+    v_nodes = 0.5 * (v_hi - v_lo) * nodes_1d + 0.5 * (v_hi + v_lo)
+    u_weights = 0.5 * (u_hi - u_lo) * weights_1d
+    v_weights = 0.5 * (v_hi - v_lo) * weights_1d
+
+    u_grid_np, v_grid_np = np.meshgrid(u_nodes, v_nodes, indexing='ij')
+    weights_np = u_weights[:, None] * v_weights[None, :]
+
+    return (
+        torch.from_numpy(u_grid_np).to(dtype),
+        torch.from_numpy(v_grid_np).to(dtype),
+        torch.from_numpy(weights_np).to(dtype),
+    )
+
+
+def compute_dirichlet_bilinear_form_continuous(
+    surface_func,
+    h_funcs: List,
+    U_bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+    quadrature_n: int = 30,
+) -> torch.Tensor:
+    """Continuous Dirichlet bilinear form on a Monge patch via Gauss-Legendre.
+
+    Computes the symmetric P×P matrix
+
+        B[ℓ, p] = ∫_U  ⟨∇_g f̃_ℓ, ∇_g f̃_p⟩_g  √det g  du dv ,
+
+    where each ``f̃_ℓ(u, v) = h_funcs[ℓ](u, v)`` is a function on the parameter
+    domain (intrinsic, *not* an ambient ℝ³ function pulled back), and the
+    metric is the Monge metric induced by ``z = surface_func(u, v)``:
+
+        g = (( 1+h_u² , h_u h_v ), ( h_u h_v , 1+h_v² )),    √det g = √(1+h_u²+h_v²).
+
+    Closed-form expansion:
+
+        ⟨∇_g f̃_ℓ, ∇_g f̃_p⟩_g  =  g^{11} f̃_u^{(ℓ)} f̃_u^{(p)}
+                                + g^{12} ( f̃_u^{(ℓ)} f̃_v^{(p)} + f̃_v^{(ℓ)} f̃_u^{(p)} )
+                                + g^{22} f̃_v^{(ℓ)} f̃_v^{(p)} .
+
+    The diagonal ``B[ℓ, ℓ] = 2 · E(f_ℓ)``.
+
+    Args:
+        surface_func: callable ``(u, v) -> z`` (autograd-compatible).
+        h_funcs: list of P callables ``(u, v) -> scalar`` defined on the chart.
+        U_bounds: parameter-domain rectangle.
+        quadrature_n: Gauss-Legendre nodes per axis. n=30 gives ~1e-12 for
+            smooth integrands.
+
+    Returns:
+        ``(P, P)`` symmetric tensor (detached — analytic ground truth).
+    """
+    P = len(h_funcs)
+    if P == 0:
+        return torch.zeros(0, 0)
+
+    u_grid, v_grid, w_grid = gauss_legendre_2d_grid(U_bounds, quadrature_n)
+
+    # Flatten into Q = n² quadrature points
+    u_flat = u_grid.flatten()    # (Q,)
+    v_flat = v_grid.flatten()
+    w_flat = w_grid.flatten()
+    Q = u_flat.shape[0]
+
+    # Surface derivatives at quadrature points (autograd through surface_func).
+    # We give the surface (Q, 1)-shaped inputs to match the convention used
+    # by compute_lb_coefficients elsewhere in this module.
+    u_s = u_flat.clone().unsqueeze(-1).requires_grad_(True)
+    v_s = v_flat.clone().unsqueeze(-1).requires_grad_(True)
+    z = surface_func(u_s, v_s)
+    if z.dim() > 2:
+        z = z.squeeze(-1)
+    h_u = torch.autograd.grad(z.sum(), u_s, create_graph=False)[0].squeeze(-1)  # (Q,)
+    h_v = torch.autograd.grad(z.sum(), v_s, create_graph=False)[0].squeeze(-1)
+
+    det_g = 1.0 + h_u ** 2 + h_v ** 2
+    sqrt_det_g = det_g.sqrt()
+    g11 = (1.0 + h_v ** 2) / det_g
+    g12 = -(h_u * h_v) / det_g
+    g22 = (1.0 + h_u ** 2) / det_g
+
+    # Test-function derivatives at the same quadrature points.
+    f_tilde_u = torch.zeros(Q, P)
+    f_tilde_v = torch.zeros(Q, P)
+    for p_idx, h_func in enumerate(h_funcs):
+        u_h = u_flat.clone().unsqueeze(-1).requires_grad_(True)
+        v_h = v_flat.clone().unsqueeze(-1).requires_grad_(True)
+        f_tilde = h_func(u_h, v_h)
+        if f_tilde.dim() > 2:
+            f_tilde = f_tilde.squeeze(-1)
+
+        if not f_tilde.requires_grad:
+            # h is a constant tensor → derivatives are zero (already zero-init).
+            continue
+
+        df_du = torch.autograd.grad(
+            f_tilde.sum(), u_h, create_graph=False, allow_unused=True)[0]
+        df_dv = torch.autograd.grad(
+            f_tilde.sum(), v_h, create_graph=False, allow_unused=True)[0]
+        if df_du is not None:
+            f_tilde_u[:, p_idx] = df_du.squeeze(-1)
+        if df_dv is not None:
+            f_tilde_v[:, p_idx] = df_dv.squeeze(-1)
+
+    # Pointwise integrand B(ℓ, p) at every quadrature point, then quadrature sum.
+    # Outer products: (Q, P, P)
+    fu_outer    = f_tilde_u.unsqueeze(-1) * f_tilde_u.unsqueeze(-2)
+    fv_outer    = f_tilde_v.unsqueeze(-1) * f_tilde_v.unsqueeze(-2)
+    cross_outer = (f_tilde_u.unsqueeze(-1) * f_tilde_v.unsqueeze(-2)
+                   + f_tilde_v.unsqueeze(-1) * f_tilde_u.unsqueeze(-2))
+
+    # Broadcast g-coefficients along (P, P) — they're (Q,) functions of (u, v).
+    g11_b = g11.unsqueeze(-1).unsqueeze(-1)
+    g12_b = g12.unsqueeze(-1).unsqueeze(-1)
+    g22_b = g22.unsqueeze(-1).unsqueeze(-1)
+    sqrt_det_g_b = sqrt_det_g.unsqueeze(-1).unsqueeze(-1)
+
+    integrand = (g11_b * fu_outer + g12_b * cross_outer + g22_b * fv_outer) * sqrt_det_g_b
+    bilinear = (w_flat.unsqueeze(-1).unsqueeze(-1) * integrand).sum(dim=0)   # (P, P)
+
+    # Symmetrise (numerically) and detach — this is GT.
+    bilinear = 0.5 * (bilinear + bilinear.T)
+    return bilinear.detach()
+
+
+def compute_dirichlet_energy_continuous(
+    surface_func,
+    h_funcs: List,
+    U_bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+    quadrature_n: int = 30,
+) -> torch.Tensor:
+    """Continuous Dirichlet energy per probe: ``E(f_ℓ) = ½ ∫_U ‖∇_g f̃_ℓ‖² √det g``.
+
+    Equals ``½ · diag(compute_dirichlet_bilinear_form_continuous(...))``.
+
+    Args:
+        surface_func: callable ``(u, v) -> z``.
+        h_funcs: list of P callables.
+        U_bounds: parameter-domain rectangle.
+        quadrature_n: Gauss-Legendre nodes per axis.
+
+    Returns:
+        ``(P,)`` energies (detached).
+    """
+    bilinear = compute_dirichlet_bilinear_form_continuous(
+        surface_func, h_funcs, U_bounds, quadrature_n=quadrature_n)
+    return 0.5 * torch.diagonal(bilinear)
+
+
+# =============================================
 # Test function sampling
 # =============================================
 
@@ -403,6 +579,18 @@ class BaseTestFunctionSampler(ABC):
             point (always via autograd).
         compute_gradients_all_points: If True, also compute ∇_S at every
             grid point (always via autograd).
+        compute_continuous_energy: If True, ``sample()`` additionally returns
+            ``test_func_continuous_energy`` of shape ``(P,)``  the continuous
+            Dirichlet energy ``E(f_ℓ)`` per probe, computed by Gauss-Legendre
+            quadrature on the parameter domain. Used as the GT target for
+            ``DirichletEnergyTestLoss`` / variational training.
+        compute_continuous_bilinear: If True, ``sample()`` additionally returns
+            ``test_func_continuous_bilinear`` of shape ``(P, P)``  the
+            continuous bilinear form ``E(f_ℓ, f_p)`` per probe pair. Used as
+            the GT target for ``BilinearFormTestLoss``.
+        quadrature_n: Gauss-Legendre nodes per axis for the continuous
+            quadrature. Total quadrature points = quadrature_n². Default 30
+            gives ~1e-12 accuracy for smooth integrands.
         verbose: Print per-call diagnostics.
     """
 
@@ -412,6 +600,9 @@ class BaseTestFunctionSampler(ABC):
         derivative_mode: str = 'analytic',
         compute_lb_all_points: bool = False,
         compute_gradients_all_points: bool = False,
+        compute_continuous_energy: bool = False,
+        compute_continuous_bilinear: bool = False,
+        quadrature_n: int = 30,
         verbose: bool = False,
     ):
         if derivative_mode not in ('analytic', 'autograd'):
@@ -421,10 +612,15 @@ class BaseTestFunctionSampler(ABC):
             raise ValueError(
                 f"normalize_target must be 'none' | 'unit_magnitude' | 'unit_variance', "
                 f"got '{normalize_target}'")
+        if quadrature_n < 1:
+            raise ValueError(f"quadrature_n must be >= 1, got {quadrature_n}")
         self.normalize_target = normalize_target
         self.derivative_mode = derivative_mode
         self.compute_lb_all_points = compute_lb_all_points
         self.compute_gradients_all_points = compute_gradients_all_points
+        self.compute_continuous_energy = compute_continuous_energy
+        self.compute_continuous_bilinear = compute_continuous_bilinear
+        self.quadrature_n = int(quadrature_n)
         self.verbose = verbose
 
     # ----- subclass API --------------------------------------------------
@@ -450,7 +646,22 @@ class BaseTestFunctionSampler(ABC):
         x_grid: torch.Tensor,
         y_grid: torch.Tensor,
         rng: np.random.Generator,
+        U_bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
     ) -> Dict[str, torch.Tensor]:
+        """Compute test-function probes on a single Monge-patch surface.
+
+        Args:
+            surface_func: callable ``(u, v) -> z``.
+            x_grid, y_grid: ``(K,)`` parameter-domain coordinates of the K
+                vertices on this patch.  Probes are evaluated at these
+                positions and at the origin.
+            rng: numpy random generator.
+            U_bounds: ``((u_lo, u_hi), (v_lo, v_hi))`` parameter-domain
+                rectangle for the continuous quadrature (only used when
+                ``compute_continuous_energy`` or ``compute_continuous_bilinear``
+                is set).  If ``None``, derived from the extent of the supplied
+                grid as ``((x.min(), x.max()), (y.min(), y.max()))``.
+        """
         import time as _time
         _t = {} if self.verbose else None
 
@@ -576,6 +787,29 @@ class BaseTestFunctionSampler(ABC):
                 print(f"    POST-NORM Δ_LB all pts: min={lb_all_points.min():.4f}  "
                       f"max={lb_all_points.max():.4f}")
 
+        # ---- Optional continuous Dirichlet form (variational training) ----
+        continuous_bilinear = None
+        continuous_energy = None
+        if self.compute_continuous_bilinear or self.compute_continuous_energy:
+            if _t is not None: _t0 = _time.perf_counter()
+            if U_bounds is None:
+                # Fall back to the extent of the supplied vertex grid.
+                u_lo = float(x_grid.min().item()); u_hi = float(x_grid.max().item())
+                v_lo = float(y_grid.min().item()); v_hi = float(y_grid.max().item())
+                U_bounds_eff = ((u_lo, u_hi), (v_lo, v_hi))
+            else:
+                U_bounds_eff = U_bounds
+
+            h_funcs_for_quad = self._specs_to_callables(specs, surface_func)
+            # The bilinear form contains the energy on its diagonal; compute
+            # it once when either flag is set, derive the energy if needed.
+            continuous_bilinear = compute_dirichlet_bilinear_form_continuous(
+                surface_func, h_funcs_for_quad, U_bounds_eff,
+                quadrature_n=self.quadrature_n)
+            if self.compute_continuous_energy:
+                continuous_energy = 0.5 * torch.diagonal(continuous_bilinear)
+            if _t is not None: _t['continuous_form'] = _time.perf_counter() - _t0
+
         if _t is not None:
             total = sum(_t.values())
             parts = [f"{k}={v * 1e3:.0f}ms" for k, v in _t.items()]
@@ -591,6 +825,10 @@ class BaseTestFunctionSampler(ABC):
             result['test_func_lb_all_points'] = lb_all_points
         if gradients_all_points is not None:
             result['test_func_gradients_all_points'] = gradients_all_points
+        if continuous_bilinear is not None and self.compute_continuous_bilinear:
+            result['test_func_continuous_bilinear'] = continuous_bilinear     # (P, P)
+        if continuous_energy is not None:
+            result['test_func_continuous_energy'] = continuous_energy         # (P,)
         return result
 
 
