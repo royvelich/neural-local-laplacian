@@ -30,7 +30,7 @@ module:
         compute_continuous_bilinear: true
         compute_continuous_energy: true
         quadrature_n: 30
-        derivative_mode: 'autograd'    # values at all vertices (path-independent)
+        derivative_mode: 'analytic'    # vertex values come from the same path either way; analytic is faster
         families:
           poly:
             weight: 0.5

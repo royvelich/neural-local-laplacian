@@ -1223,12 +1223,12 @@ class LaplacianLocalModule(LaplacianModuleBase):
         on synthetic patches (synthetic batches)."""
         # Detect batch type: PyG Batch (mesh OR synthetic patch) vs list of PairSample
         if isinstance(batch, Batch):
-            # Synthetic-patch validation: items carry analytic H + normal.
-            # Distinguish from mesh validation (which has .raw_vertices).
-            sample = batch[0] if len(batch) > 0 else None
-            has_curvature = sample is not None and getattr(sample, 'H', None) is not None
-            has_normal = sample is not None and getattr(sample, 'normal', None) is not None
-            has_mesh_vertices = sample is not None and getattr(sample, 'raw_vertices', None) is not None
+            # Synthetic-patch validation: per-element analytic H and normal
+            # attributes survive PyG concatenation as batch.H / batch.normal.
+            # Mesh validation: items carry .raw_vertices and a .gt_eigen pair.
+            has_curvature = getattr(batch, 'H', None) is not None
+            has_normal = getattr(batch, 'normal', None) is not None
+            has_mesh_vertices = getattr(batch, 'raw_vertices', None) is not None
             if has_curvature and has_normal and not has_mesh_vertices:
                 return self._validation_step_patch_mcv(batch, batch_idx, dataloader_idx)
             return self._validation_step_mesh(batch, batch_idx, dataloader_idx)
