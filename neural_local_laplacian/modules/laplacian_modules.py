@@ -1218,10 +1218,19 @@ class LaplacianLocalModule(LaplacianModuleBase):
 
     def validation_step(self, batch, batch_idx: int,
                         dataloader_idx: int = 0) -> Optional[Dict[str, float]]:
-        """Validate against GT eigendecomposition/geodesics (mesh batches)
-        or functional map correspondence (pair batches)."""
-        # Detect batch type: PyG Batch vs list of PairSample
+        """Validate against GT eigendecomposition/geodesics (mesh batches),
+        functional map correspondence (pair batches), or per-patch MCV
+        on synthetic patches (synthetic batches)."""
+        # Detect batch type: PyG Batch (mesh OR synthetic patch) vs list of PairSample
         if isinstance(batch, Batch):
+            # Synthetic-patch validation: items carry analytic H + normal.
+            # Distinguish from mesh validation (which has .raw_vertices).
+            sample = batch[0] if len(batch) > 0 else None
+            has_curvature = sample is not None and getattr(sample, 'H', None) is not None
+            has_normal = sample is not None and getattr(sample, 'normal', None) is not None
+            has_mesh_vertices = sample is not None and getattr(sample, 'raw_vertices', None) is not None
+            if has_curvature and has_normal and not has_mesh_vertices:
+                return self._validation_step_patch_mcv(batch, batch_idx, dataloader_idx)
             return self._validation_step_mesh(batch, batch_idx, dataloader_idx)
         elif isinstance(batch, list):
             return self._validation_step_fmap(batch, batch_idx, dataloader_idx)
@@ -1247,6 +1256,49 @@ class LaplacianLocalModule(LaplacianModuleBase):
             self.log(f'val/{name}', val, on_step=False, on_epoch=True,
                      logger=True, batch_size=len(mesh_list), sync_dist=True)
         return averaged_metrics
+
+    def _validation_step_patch_mcv(self, batch: Batch, batch_idx: int,
+                                    dataloader_idx: int) -> Dict[str, float]:
+        """Validate per-patch MCV against the analytic ``2 H n̂`` target.
+
+        Used by both the patch-level and variational pipelines: the model
+        produces ``predicted_mcv = (Σ_j s_ij p_j) / A_i`` via
+        ``_compute_mean_curvature_vectors``; we compare it to the GT
+        ``2 H n̂`` carried on the synthetic patch and log direction
+        (cosine), magnitude ratio, and log-magnitude error.
+
+        These are validation metrics only — the variational training
+        loss does not depend on them, so they give a head-to-head MCV
+        quality comparison vs. the patch-level MCV-trained baseline.
+        """
+        forward_result = self.forward(batch)
+        predicted_mcv, _predicted_raw_mcv = self._compute_mean_curvature_vectors(
+            forward_result, batch)
+
+        normals = F.normalize(batch.normal, p=2, dim=1)            # (B, 3)
+        target_mcv = 2.0 * batch.H.unsqueeze(-1) * normals         # (B, 3)
+
+        eps = 1e-8
+        pred_norm = predicted_mcv.norm(dim=-1).clamp(min=eps)      # (B,)
+        target_norm = target_mcv.norm(dim=-1).clamp(min=eps)
+        pred_unit = predicted_mcv / pred_norm.unsqueeze(-1)
+        target_unit = target_mcv / target_norm.unsqueeze(-1)
+
+        cosine = (pred_unit * target_unit).sum(dim=-1)             # (B,) in [-1, 1]
+        magnitude_ratio = pred_norm / target_norm                  # (B,)
+        log_mag_err = (pred_norm.log() - target_norm.log()) ** 2   # (B,)
+
+        metrics = {
+            'mcv_cosine_similarity': cosine.mean().item(),
+            'mcv_magnitude_ratio': magnitude_ratio.mean().item(),
+            'mcv_log_magnitude_error': log_mag_err.mean().item(),
+        }
+        for name, val in metrics.items():
+            self.log(f'val/{name}', val, on_step=False, on_epoch=True,
+                     logger=True, batch_size=int(batch.num_graphs)
+                     if hasattr(batch, 'num_graphs') else len(batch),
+                     sync_dist=True)
+        return metrics
 
     def _validate_single_mesh(self, mesh_data: BaseData) -> Dict[str, float]:
         """Validate a single mesh: eigendecomposition + geodesics."""
