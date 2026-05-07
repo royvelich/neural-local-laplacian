@@ -926,6 +926,9 @@ class RandomFamilyTestFunctionSampler(BaseTestFunctionSampler):
             normalize_target: str = 'none',
             compute_lb_all_points: bool = False,
             compute_gradients_all_points: bool = False,
+            compute_continuous_energy: bool = False,
+            compute_continuous_bilinear: bool = False,
+            quadrature_n: int = 30,
             verbose: bool = False,
             derivative_mode: str = 'analytic',
     ):
@@ -934,6 +937,9 @@ class RandomFamilyTestFunctionSampler(BaseTestFunctionSampler):
             derivative_mode=derivative_mode,
             compute_lb_all_points=compute_lb_all_points,
             compute_gradients_all_points=compute_gradients_all_points,
+            compute_continuous_energy=compute_continuous_energy,
+            compute_continuous_bilinear=compute_continuous_bilinear,
+            quadrature_n=quadrature_n,
             verbose=verbose,
         )
         self.num_test_funcs = num_test_funcs
@@ -1294,6 +1300,9 @@ class MonomialBasisTestFunctionSampler(BaseTestFunctionSampler):
         derivative_mode: str = 'analytic',
         compute_lb_all_points: bool = False,
         compute_gradients_all_points: bool = False,
+        compute_continuous_energy: bool = False,
+        compute_continuous_bilinear: bool = False,
+        quadrature_n: int = 30,
         verbose: bool = False,
     ):
         super().__init__(
@@ -1301,6 +1310,9 @@ class MonomialBasisTestFunctionSampler(BaseTestFunctionSampler):
             derivative_mode=derivative_mode,
             compute_lb_all_points=compute_lb_all_points,
             compute_gradients_all_points=compute_gradients_all_points,
+            compute_continuous_energy=compute_continuous_energy,
+            compute_continuous_bilinear=compute_continuous_bilinear,
+            quadrature_n=quadrature_n,
             verbose=verbose,
         )
         if variables not in ('chart', 'ambient'):
