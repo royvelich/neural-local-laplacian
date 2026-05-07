@@ -514,8 +514,12 @@ def compute_dirichlet_bilinear_form_continuous(
     z = surface_func(u_s, v_s)
     if z.dim() > 2:
         z = z.squeeze(-1)
-    h_u = torch.autograd.grad(z.sum(), u_s, create_graph=False)[0].squeeze(-1)  # (Q,)
-    h_v = torch.autograd.grad(z.sum(), v_s, create_graph=False)[0].squeeze(-1)
+    # Compute both partials in one grad() call so the saved-tensor graph
+    # is freed exactly once (a sequence of two grad() calls would trigger
+    # ``Trying to backward through the graph a second time``).
+    h_u, h_v = torch.autograd.grad(z.sum(), [u_s, v_s], create_graph=False)
+    h_u = h_u.squeeze(-1)   # (Q,)
+    h_v = h_v.squeeze(-1)
 
     det_g = 1.0 + h_u ** 2 + h_v ** 2
     sqrt_det_g = det_g.sqrt()
@@ -537,10 +541,9 @@ def compute_dirichlet_bilinear_form_continuous(
             # h is a constant tensor → derivatives are zero (already zero-init).
             continue
 
-        df_du = torch.autograd.grad(
-            f_tilde.sum(), u_h, create_graph=False, allow_unused=True)[0]
-        df_dv = torch.autograd.grad(
-            f_tilde.sum(), v_h, create_graph=False, allow_unused=True)[0]
+        df_du, df_dv = torch.autograd.grad(
+            f_tilde.sum(), [u_h, v_h],
+            create_graph=False, allow_unused=True)
         if df_du is not None:
             f_tilde_u[:, p_idx] = df_du.squeeze(-1)
         if df_dv is not None:
@@ -2703,12 +2706,15 @@ class MongeSurfaceVariationalDataset(Dataset):
             low=-self._grid_radius, high=self._grid_radius, size=n)).float()
 
         # 3. Lift vertices to ℝ³ and compute analytic normals via autograd.
+        # Compute both partials in a single grad() call so the graph is freed
+        # exactly once (PyTorch frees saved tensors after the first call
+        # unless retain_graph=True; computing both at once avoids that).
         with torch.enable_grad():
             u_g = u.clone().requires_grad_(True)
             v_g = v.clone().requires_grad_(True)
             z_g = surface_func(u_g, v_g)
-            h_u = torch.autograd.grad(z_g.sum(), u_g, create_graph=False)[0]
-            h_v = torch.autograd.grad(z_g.sum(), v_g, create_graph=False)[0]
+            h_u, h_v = torch.autograd.grad(
+                z_g.sum(), [u_g, v_g], create_graph=False)
         z = z_g.detach()
         h_u = h_u.detach()
         h_v = h_v.detach()
@@ -2729,8 +2735,10 @@ class MongeSurfaceVariationalDataset(Dataset):
             z_q = surface_func(u_qg, v_qg)
             if z_q.dim() > 1:
                 z_q = z_q.squeeze(-1)
-            h_u_q = torch.autograd.grad(z_q.sum(), u_qg, create_graph=False)[0].squeeze(-1)
-            h_v_q = torch.autograd.grad(z_q.sum(), v_qg, create_graph=False)[0].squeeze(-1)
+            h_u_q, h_v_q = torch.autograd.grad(
+                z_q.sum(), [u_qg, v_qg], create_graph=False)
+            h_u_q = h_u_q.squeeze(-1)
+            h_v_q = h_v_q.squeeze(-1)
         sqrt_det_g_q = (1.0 + h_u_q.detach() ** 2 + h_v_q.detach() ** 2).sqrt()
         total_area = float((w_q_flat * sqrt_det_g_q).sum().item())
         vertex_areas = torch.full((n,), total_area / n, dtype=torch.float32)
