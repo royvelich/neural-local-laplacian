@@ -2673,19 +2673,8 @@ class MongeSurfaceVariationalDataset(Dataset):
             raise ValueError(
                 f"num_vertices_range[0]={self._num_vertices_range[0]} must be > k={self._k}")
 
-        self._position_noise_std = self._normalize_noise_std(position_noise_std)
+        self._position_noise_std = SyntheticSurfaceDataset._normalize_noise_std(position_noise_std)
         self._rng = np.random.default_rng(seed=seed)
-
-    @staticmethod
-    def _normalize_noise_std(value):
-        if isinstance(value, (int, float)):
-            return (float(value), float(value))
-        if isinstance(value, (list, tuple)):
-            if len(value) == 1:
-                return (float(value[0]), float(value[0]))
-            if len(value) == 2:
-                return (float(value[0]), float(value[1]))
-        raise ValueError(f"position_noise_std must be scalar or 2-tuple, got {value!r}")
 
     # PyG Dataset hooks ----------------------------------------------------
 
