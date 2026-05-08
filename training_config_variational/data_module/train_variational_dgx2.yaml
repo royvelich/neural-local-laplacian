@@ -6,34 +6,34 @@ module:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
 
       # Monge surface family.  Pluggable: swap the _target_ to switch families.
-      surface_sampler:
-        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
-        order_range: [2, 3]
-        coefficient_scale_range: [0.5, 3.0]
-        polynomial_offset_range: [0.0, 1.0]
-        coeff_generation_method:
-          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
-          _args_: ['uniform']
+#      surface_sampler:
+#        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
+#        order_range: [2, 3]
+#        coefficient_scale_range: [0.5, 3.0]
+#        polynomial_offset_range: [0.0, 1.0]
+#        coeff_generation_method:
+#          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+#          _args_: ['uniform']
       # Alternative: GP-like surfaces via random Fourier features.
       # K / beta / magnitude_scale each accept a scalar (fixed) or a
       # 2-element range (a fresh value is drawn per surface).
-      # surface_sampler:
-      #   _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
-      #   K: [6, 12]              # uniform integer range
-      #   beta: [1.5, 3.0]         # higher β = smoother
-      #   magnitude_scale: [0.5, 1.5]
+      surface_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
+        K: [4, 12]                # was [5, 12]
+        beta: [1.5, 3.5]          # was [1.0, 3.0] — keep β ≥ 2
+        magnitude_scale: [0.2, 1.5]  # tighten upper end
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: [60, 120]
-      grid_radius: 1.0
-      position_noise_std: [0.01, 0.05]
+      num_vertices_range: [60, 500]
+      grid_radius: 1.5
+      position_noise_std: [0.0]
       k: 15
 
       # Test functions: random polynomials/trig/exp + the (P, P) continuous
       # bilinear-form GT computed by Gauss-Legendre quadrature.
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
-        num_test_funcs: 16
+        num_test_funcs: 100
         include_coordinates: false
         verbose: false
         normalize_target: none
@@ -61,7 +61,7 @@ module:
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
     batch_size: 1
-    num_workers: 0
+    num_workers: 14
     shuffle: True
 
   val_dataset_specifications:
