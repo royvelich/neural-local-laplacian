@@ -15,11 +15,13 @@ module:
           _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
           _args_: ['uniform']
       # Alternative: GP-like surfaces via random Fourier features.
+      # K / beta / magnitude_scale each accept a scalar (fixed) or a
+      # 2-element range (a fresh value is drawn per surface).
       # surface_sampler:
       #   _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
-      #   K: 10
-      #   beta: 2.0
-      #   magnitude_scale: 1.0
+      #   K: [6, 12]              # uniform integer range
+      #   beta: [1.5, 3.0]         # higher β = smoother
+      #   magnitude_scale: [0.5, 1.5]
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
       num_vertices_range: [60, 120]

@@ -192,11 +192,20 @@ class RandomFourierMongeSurfaceSampler(BaseMongeSurfaceSampler):
     The polynomial sampler's per-surface offset is unnecessary here:
     the random phases already give a uniformly-translated ensemble.
 
+    All three of ``K``, ``beta``, ``magnitude_scale`` accept either a
+    scalar (fixed across surfaces) or a 1- or 2-element sequence (a
+    range from which a fresh value is drawn per surface — uniform
+    integer for ``K``, uniform float for the other two).  This mirrors
+    the ``order_range`` / ``coefficient_scale_range`` style used by
+    the polynomial sampler.
+
     Args:
         K: Maximum frequency along each axis (modes with ``|k1| + |k2| ≤ K``
-           are kept).  Total mode count = (2K+1)² or thereabouts.
+           are kept).  Scalar or ``(K_lo, K_hi)``.
         beta: Spectral decay exponent.  ``β = 2`` is a smoothish default.
-        magnitude_scale: Overall amplitude (multiplies σ).
+            Scalar or ``(β_lo, β_hi)``.  Higher β → smoother surfaces.
+        magnitude_scale: Overall amplitude (multiplies σ).  Scalar or
+            ``(scale_lo, scale_hi)``.
         l1_truncate: If True, truncate by ``|k1| + |k2| ≤ K`` (cone);
             otherwise by ``|k1|, |k2| ≤ K`` (square).  Default True
             matches the LBO conversation recipe.
@@ -204,23 +213,59 @@ class RandomFourierMongeSurfaceSampler(BaseMongeSurfaceSampler):
 
     def __init__(
         self,
-        K: int = 10,
-        beta: float = 2.0,
-        magnitude_scale: float = 1.0,
+        K=10,
+        beta=2.0,
+        magnitude_scale=1.0,
         l1_truncate: bool = True,
     ):
-        if K < 0:
-            raise ValueError(f"K must be >= 0, got {K}")
-        if beta < 0:
-            raise ValueError(f"beta must be >= 0, got {beta}")
-        self._K = int(K)
-        self._beta = float(beta)
-        self._magnitude_scale = float(magnitude_scale)
+        self._K_range = self._normalize_range(K, name='K', cast=int)
+        self._beta_range = self._normalize_range(beta, name='beta', cast=float)
+        self._magnitude_scale_range = self._normalize_range(
+            magnitude_scale, name='magnitude_scale', cast=float)
+        if self._K_range[0] < 0:
+            raise ValueError(f"K must be >= 0, got range {self._K_range}")
+        if self._beta_range[0] < 0:
+            raise ValueError(f"beta must be >= 0, got range {self._beta_range}")
         self._l1_truncate = bool(l1_truncate)
 
-        # Pre-compute the (k1, k2) grid + spectral envelope once.  Each
-        # ``sample`` call only re-draws the random a / b coefficients.
-        K_int = self._K
+        # (k1, k2) grids only depend on K (and l1_truncate, which is fixed
+        # per instance), so cache by K — typically a small handful of
+        # distinct values across an epoch.  σ depends on (β, scale) and is
+        # cheap to recompute per sample.
+        self._grid_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @staticmethod
+    def _normalize_range(value, name: str, cast):
+        """Coerce scalar / 1-elt / 2-elt sequence to a (lo, hi) ``cast`` tuple.
+
+        Accepts plain scalars, list/tuple, and OmegaConf ListConfig (any
+        iterable that yields ``cast``-convertible elements).
+        """
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            v = cast(value)
+            return (v, v)
+        try:
+            items = [cast(x) for x in value]
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"{name} must be a scalar or 1/2-element sequence, "
+                f"got {value!r}: {e}")
+        if len(items) == 1:
+            return (items[0], items[0])
+        if len(items) == 2:
+            if items[0] > items[1]:
+                raise ValueError(
+                    f"{name}: lo {items[0]} > hi {items[1]}")
+            return (items[0], items[1])
+        raise ValueError(
+            f"{name} must be a scalar or 1/2-element sequence, got "
+            f"{len(items)} elements: {items}")
+
+    def _get_grid(self, K_int: int):
+        """Return cached (k1, k2) frequency grids for this ``K``."""
+        cached = self._grid_cache.get(K_int)
+        if cached is not None:
+            return cached
         ks = np.arange(-K_int, K_int + 1)
         K1, K2 = np.meshgrid(ks, ks, indexing='ij')
         K1 = K1.flatten()
@@ -229,38 +274,47 @@ class RandomFourierMongeSurfaceSampler(BaseMongeSurfaceSampler):
             keep = (np.abs(K1) + np.abs(K2)) <= K_int
             K1 = K1[keep]
             K2 = K2[keep]
-        # σ envelope: magnitude_scale / (1 + k1² + k2²)^(β/2)
-        sigma = self._magnitude_scale / np.power(
-            1.0 + K1 ** 2 + K2 ** 2, self._beta / 2.0)
-        self._k1 = torch.from_numpy(K1.astype(np.float32))   # (M,)
-        self._k2 = torch.from_numpy(K2.astype(np.float32))
-        self._sigma = torch.from_numpy(sigma.astype(np.float32))
+        k1 = torch.from_numpy(K1.astype(np.float32))
+        k2 = torch.from_numpy(K2.astype(np.float32))
+        self._grid_cache[K_int] = (k1, k2)
+        return k1, k2
 
     def sample(self, rng: np.random.Generator):
-        # Random Fourier coefficients with the prescribed envelope.
-        M = self._k1.shape[0]
-        a = torch.from_numpy(
-            (rng.standard_normal(size=M) * self._sigma.numpy()).astype(np.float32))
-        b = torch.from_numpy(
-            (rng.standard_normal(size=M) * self._sigma.numpy()).astype(np.float32))
+        # Per-surface draws of K / β / magnitude_scale from their ranges.
+        K_lo, K_hi = self._K_range
+        K_int = int(rng.integers(low=K_lo, high=K_hi + 1)) if K_lo != K_hi else K_lo
 
-        # Detached frequency table (no autograd needed through the constants).
-        k1 = self._k1
-        k2 = self._k2
+        beta_lo, beta_hi = self._beta_range
+        beta = (float(rng.uniform(low=beta_lo, high=beta_hi))
+                if beta_lo != beta_hi else beta_lo)
+
+        scale_lo, scale_hi = self._magnitude_scale_range
+        magnitude_scale = (float(rng.uniform(low=scale_lo, high=scale_hi))
+                           if scale_lo != scale_hi else scale_lo)
+
+        k1, k2 = self._get_grid(K_int)
+        # σ envelope at the sampled (β, scale): magnitude_scale / (1 + k1² + k2²)^(β/2)
+        sigma = magnitude_scale / (1.0 + k1 ** 2 + k2 ** 2) ** (beta / 2.0)
+
+        M = sigma.shape[0]
+        sigma_np = sigma.numpy()
+        a = torch.from_numpy(
+            (rng.standard_normal(size=M).astype(np.float32) * sigma_np))
+        b = torch.from_numpy(
+            (rng.standard_normal(size=M).astype(np.float32) * sigma_np))
 
         def surface_func(x, y, _a=a, _b=b, _k1=k1, _k2=k2):
             # x, y can be any shape; broadcast against (M,) basis.
             x_e = x.unsqueeze(-1)                     # (..., 1)
             y_e = y.unsqueeze(-1)
-            # Phase (..., M)
             phase = torch.pi * (_k1 * x_e + _k2 * y_e)
             return (_a * torch.cos(phase) + _b * torch.sin(phase)).sum(dim=-1)
 
         params = {
             'family': 'random_fourier',
-            'K': self._K,
-            'beta': self._beta,
-            'magnitude_scale': self._magnitude_scale,
+            'K': K_int,
+            'beta': beta,
+            'magnitude_scale': magnitude_scale,
             'l1_truncate': self._l1_truncate,
             # Coefficients kept for reproducibility / debugging; small.
             'a': a.detach().cpu().clone(),
