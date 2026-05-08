@@ -47,7 +47,7 @@ module:
             center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
-      epoch_size: 1000
+      epoch_size: 8000
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
     batch_size: 1
