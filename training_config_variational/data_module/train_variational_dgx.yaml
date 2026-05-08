@@ -18,14 +18,14 @@ module:
       # K / beta / magnitude_scale each accept a scalar (fixed) or a
       # 2-element range (a fresh value is drawn per surface).
       surface_sampler:
-       _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
-       K: [5, 12]              # uniform integer range
-       beta: [1.0, 3.0]         # higher β = smoother
-       magnitude_scale: [0.2, 1.5]
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
+        K: [4, 8]                # was [5, 12]
+        beta: [2.0, 3.5]          # was [1.0, 3.0] — keep β ≥ 2
+        magnitude_scale: [0.2, 1.0]  # tighten upper end
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: [100, 1000]
-      grid_radius: 2.0
+      num_vertices_range: [60, 200]
+      grid_radius: 1.0
       position_noise_std: [0.01, 0.04]
       k: 15
 
@@ -39,7 +39,7 @@ module:
         normalize_target: none
         compute_continuous_bilinear: true
         compute_continuous_energy: true
-        quadrature_n: 30
+        quadrature_n: 50
         derivative_mode: 'analytic'    # vertex values come from the same path either way; analytic is faster
         families:
           poly:
