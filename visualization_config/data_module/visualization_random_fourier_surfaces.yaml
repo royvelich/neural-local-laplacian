@@ -1,0 +1,56 @@
+_target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
+train_dataset_specification:
+  _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+  dataset:
+    # Same dataset class as the polynomial-surface viz config; only the
+    # injected surface_sampler differs.  PolynomialSurfaceDataset accepts
+    # ``surface_sampler`` directly when the polynomial-specific kwargs
+    # are omitted, so no class change is needed.
+    _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+    seed: ${globals.seed}
+    position_noise_std: 0.0
+
+    surface_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
+      K: 10                # max frequency (modes with |k1|+|k2| ≤ K)
+      beta: 2.0             # spectral decay; higher = smoother
+      magnitude_scale: 1.0  # overall amplitude
+      l1_truncate: true
+
+    test_func_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+      max_degree: 4
+      variables: ambient
+      normalize_target: unit_magnitude
+      compute_lb_all_points: true
+      compute_gradients_all_points: true
+
+    epoch_size: 1000
+    grid_radius_range: [1.0]
+    points_scale_range: [1.0]
+    grid_samplers:
+      - _target_: neural_local_laplacian.datasets.synthetic_datasets.RegularGridSampler
+        num_points: 1000
+      - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+        num_points_range: 30
+    diff_geom_at_origin_only: False
+    include_origin_in_grid: True
+    conv_k_nearest: null
+    pose_transformers:
+      - _target_: neural_local_laplacian.utils.pose_transformers.AlignNormalZTransformer
+    diff_geom_components:
+      - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+        _args_: ['mean_curvature']
+      - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+        _args_: ['gaussian_curvature']
+      - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+        _args_: ['principal_curvatures']
+      - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+        _args_: ['principal_directions_2d']
+      - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+        _args_: ['principal_directions_3d']
+    flip_normal_if_negative_curvature: False
+  batch_size: 1
+  num_workers: 0
+  shuffle: True
+val_dataset_specifications: null

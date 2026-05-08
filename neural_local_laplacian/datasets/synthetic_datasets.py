@@ -112,6 +112,164 @@ def sample_polynomial_monge_surface(
 
 
 # =============================================
+# Monge surface samplers (polynomial / random Fourier)
+# =============================================
+
+class BaseMongeSurfaceSampler(ABC):
+    """Abstract base for Monge-patch surface samplers.
+
+    A surface sampler decides which family of analytic surfaces is used
+    to drive synthetic-patch training and visualisation.  It produces
+    a closure ``surface_func(x, y) -> z`` plus a serialisable parameters
+    dict that callers can store / log.
+
+    Subclasses
+        :class:`PolynomialMongeSurfaceSampler`     — random polynomials
+        :class:`RandomFourierMongeSurfaceSampler`  — GP-like, random
+            Fourier features with a power-law spectral envelope
+            (LBO conversation §22).
+    """
+
+    @abstractmethod
+    def sample(self, rng: np.random.Generator):
+        """Draw a fresh surface.
+
+        Returns:
+            surface_func: callable ``(x, y) -> z`` (autograd-compatible).
+            surface_params: dict of plain Python / torch primitives that
+                describes the sampled surface.  Must round-trip through
+                logging (no callables in here besides the optional
+                ``_surface_func`` key handled by the dataset).
+        """
+
+
+class PolynomialMongeSurfaceSampler(BaseMongeSurfaceSampler):
+    """Random polynomial Monge surface ``z = p(x + ox, y + oy)``.
+
+    Thin wrapper around :func:`sample_polynomial_monge_surface` so the
+    same logic that has driven training for months is now reachable via
+    a Hydra-instantiable object.  All args have the same meanings.
+    """
+
+    def __init__(
+        self,
+        order_range: Tuple[int, int],
+        coefficient_scale_range: Tuple[float, ...],
+        coeff_generation_method: CoeffGenerationMethod,
+        polynomial_offset_range: Tuple[float, ...] = (0.0, 0.0),
+    ):
+        self._order_range = order_range
+        self._coefficient_scale_range = coefficient_scale_range
+        self._coeff_generation_method = coeff_generation_method
+        self._polynomial_offset_range = polynomial_offset_range
+
+    def sample(self, rng):
+        return sample_polynomial_monge_surface(
+            rng=rng,
+            order_range=self._order_range,
+            coefficient_scale_range=self._coefficient_scale_range,
+            coeff_generation_method=self._coeff_generation_method,
+            polynomial_offset_range=self._polynomial_offset_range,
+        )
+
+
+class RandomFourierMongeSurfaceSampler(BaseMongeSurfaceSampler):
+    r"""GP-like Monge surface via random Fourier features.
+
+    Samples a surface ``z = h(u, v)`` with closed-form derivatives:
+
+        h(u, v) = Σ_{|k1|+|k2| ≤ K}  σ_{k1,k2} · [a_{k1,k2} · cos(π k1 u + π k2 v)
+                                                  + b_{k1,k2} · sin(π k1 u + π k2 v)]
+
+    where ``a, b ~ N(0, 1)`` are drawn per-surface and the spectral
+    envelope is
+
+        σ_{k1,k2} = magnitude_scale / (1 + k1² + k2²)^(β / 2)
+
+    Higher ``K`` admits higher-frequency modes; higher ``β`` makes the
+    surface smoother.  ``magnitude_scale`` controls the overall amplitude.
+
+    The polynomial sampler's per-surface offset is unnecessary here:
+    the random phases already give a uniformly-translated ensemble.
+
+    Args:
+        K: Maximum frequency along each axis (modes with ``|k1| + |k2| ≤ K``
+           are kept).  Total mode count = (2K+1)² or thereabouts.
+        beta: Spectral decay exponent.  ``β = 2`` is a smoothish default.
+        magnitude_scale: Overall amplitude (multiplies σ).
+        l1_truncate: If True, truncate by ``|k1| + |k2| ≤ K`` (cone);
+            otherwise by ``|k1|, |k2| ≤ K`` (square).  Default True
+            matches the LBO conversation recipe.
+    """
+
+    def __init__(
+        self,
+        K: int = 10,
+        beta: float = 2.0,
+        magnitude_scale: float = 1.0,
+        l1_truncate: bool = True,
+    ):
+        if K < 0:
+            raise ValueError(f"K must be >= 0, got {K}")
+        if beta < 0:
+            raise ValueError(f"beta must be >= 0, got {beta}")
+        self._K = int(K)
+        self._beta = float(beta)
+        self._magnitude_scale = float(magnitude_scale)
+        self._l1_truncate = bool(l1_truncate)
+
+        # Pre-compute the (k1, k2) grid + spectral envelope once.  Each
+        # ``sample`` call only re-draws the random a / b coefficients.
+        K_int = self._K
+        ks = np.arange(-K_int, K_int + 1)
+        K1, K2 = np.meshgrid(ks, ks, indexing='ij')
+        K1 = K1.flatten()
+        K2 = K2.flatten()
+        if self._l1_truncate:
+            keep = (np.abs(K1) + np.abs(K2)) <= K_int
+            K1 = K1[keep]
+            K2 = K2[keep]
+        # σ envelope: magnitude_scale / (1 + k1² + k2²)^(β/2)
+        sigma = self._magnitude_scale / np.power(
+            1.0 + K1 ** 2 + K2 ** 2, self._beta / 2.0)
+        self._k1 = torch.from_numpy(K1.astype(np.float32))   # (M,)
+        self._k2 = torch.from_numpy(K2.astype(np.float32))
+        self._sigma = torch.from_numpy(sigma.astype(np.float32))
+
+    def sample(self, rng: np.random.Generator):
+        # Random Fourier coefficients with the prescribed envelope.
+        M = self._k1.shape[0]
+        a = torch.from_numpy(
+            (rng.standard_normal(size=M) * self._sigma.numpy()).astype(np.float32))
+        b = torch.from_numpy(
+            (rng.standard_normal(size=M) * self._sigma.numpy()).astype(np.float32))
+
+        # Detached frequency table (no autograd needed through the constants).
+        k1 = self._k1
+        k2 = self._k2
+
+        def surface_func(x, y, _a=a, _b=b, _k1=k1, _k2=k2):
+            # x, y can be any shape; broadcast against (M,) basis.
+            x_e = x.unsqueeze(-1)                     # (..., 1)
+            y_e = y.unsqueeze(-1)
+            # Phase (..., M)
+            phase = torch.pi * (_k1 * x_e + _k2 * y_e)
+            return (_a * torch.cos(phase) + _b * torch.sin(phase)).sum(dim=-1)
+
+        params = {
+            'family': 'random_fourier',
+            'K': self._K,
+            'beta': self._beta,
+            'magnitude_scale': self._magnitude_scale,
+            'l1_truncate': self._l1_truncate,
+            # Coefficients kept for reproducibility / debugging; small.
+            'a': a.detach().cpu().clone(),
+            'b': b.detach().cpu().clone(),
+        }
+        return surface_func, params
+
+
+# =============================================
 # Laplace-Beltrami via autograd
 # =============================================
 
@@ -1926,6 +2084,7 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
             diff_geom_at_origin_only: bool = False,
             flip_normal_if_negative_curvature: bool = False,
             include_origin_in_grid: bool = False,
+            surface_sampler: Optional[BaseMongeSurfaceSampler] = None,
             test_func_sampler: Optional[BaseTestFunctionSampler] = None,
             test_func_cfg: Optional[Dict[str, Any]] = None,
             **kwargs
@@ -1937,6 +2096,15 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
         self._diff_geom_at_origin_only = diff_geom_at_origin_only
         self._flip_normal_if_negative_curvature = flip_normal_if_negative_curvature
         self._include_origin_in_grid = include_origin_in_grid
+
+        # Optional injected surface sampler (Hydra-instantiated).  When
+        # set, ``_generate_surface_parameters`` and
+        # ``_evaluate_surface_with_parameters`` route through it; the
+        # closed-over surface_func is stashed in the params dict under
+        # key '_surface_func' so the existing single-pass flow needs no
+        # changes.  Subclasses (e.g. PolynomialSurfaceDataset) may keep
+        # their bespoke parameter-sampling and ignore this.
+        self._surface_sampler = surface_sampler
 
         # Test function sampler — prefer the directly-instantiated object
         # (Hydra-style ``_target_`` config); fall back to the legacy
@@ -2483,15 +2651,39 @@ class ParametricSurfaceDataset(SyntheticSurfaceDataset):
 
         return surfaces
 
-    @abstractmethod
-    def _generate_surface_parameters(self) -> Dict[str, Any]:
-        """Generate random parameters for the surface (coefficients, etc.)."""
-        pass
+    # Default sampler-driven implementation.  Subclasses may override
+    # for bespoke families (e.g. PolynomialSurfaceDataset's pre-sampler
+    # backward-compat path).
 
-    @abstractmethod
-    def _evaluate_surface_with_parameters(self, x: torch.Tensor, y: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
-        """Evaluate surface height at given parameter coordinates using pre-generated parameters."""
-        pass
+    def _generate_surface_parameters(self) -> Dict[str, Any]:
+        """Sample fresh parameters via ``self._surface_sampler``.
+
+        The closed-over ``surface_func`` is stashed in the returned dict
+        under ``'_surface_func'`` so the existing flow (which threads
+        ``surface_params`` from this method to
+        ``_evaluate_surface_with_parameters``) needs no change.
+        """
+        if self._surface_sampler is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires either a configured "
+                f"surface_sampler or an override of "
+                f"_generate_surface_parameters")
+        surface_func, params = self._surface_sampler.sample(self._rng)
+        params['_surface_func'] = surface_func
+        return params
+
+    def _evaluate_surface_with_parameters(
+            self, x: torch.Tensor, y: torch.Tensor,
+            surface_params: Dict[str, Any]) -> torch.Tensor:
+        """Evaluate via the closed-over surface_func stashed in the params."""
+        surface_func = surface_params.get('_surface_func')
+        if surface_func is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} expected '_surface_func' in "
+                f"surface_params (set by sampler-driven "
+                f"_generate_surface_parameters); got keys "
+                f"{list(surface_params.keys())}")
+        return surface_func(x, y)
 
 
 class PolynomialSurfaceDataset(ParametricSurfaceDataset):
@@ -2499,29 +2691,73 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
 
     def __init__(
             self,
-            order_range: Tuple[int, int],
-            coefficient_scale_range: Tuple[float, float],
-            coeff_generation_method: CoeffGenerationMethod,
+            order_range: Optional[Tuple[int, int]] = None,
+            coefficient_scale_range: Optional[Tuple[float, float]] = None,
+            coeff_generation_method: Optional[CoeffGenerationMethod] = None,
             polynomial_offset_range: Tuple[float, float] = (0.0, 0.0),
+            surface_sampler: Optional[BaseMongeSurfaceSampler] = None,
             **kwargs
     ):
         """
         Initialize PolynomialSurfaceDataset.
 
+        Two configuration styles are supported:
+
+        1. **Legacy (back-compat)**: pass the polynomial-specific args
+           (``order_range``, ``coefficient_scale_range``, ``coeff_generation_method``,
+           ``polynomial_offset_range``).  A :class:`PolynomialMongeSurfaceSampler`
+           is constructed internally and forwarded to the base class.  This
+           keeps every existing yaml working unchanged.
+
+        2. **Sampler injection**: pass ``surface_sampler=...``  (any
+           :class:`BaseMongeSurfaceSampler`) and omit the polynomial args.
+           Lets new yamls swap in :class:`RandomFourierMongeSurfaceSampler`
+           or any other family without subclassing.
+
+        Mixing the two styles in one call raises ``ValueError``.
+
         Args:
-            order_range: Range of polynomial orders (min, max)
-            coefficient_scale_range: Range for scaling coefficients
-            coeff_generation_method: Method for generating coefficients (UNIFORM or NORMAL)
-            polynomial_offset_range: Range for random offset applied to polynomial evaluation.
-                                     The polynomial is evaluated at (x + offset_x, y + offset_y),
-                                     effectively "sliding" the surface under the grid.
-            **kwargs: Additional arguments passed to ParametricSurfaceDataset
+            order_range: Range of polynomial orders (min, max).
+            coefficient_scale_range: Range for scaling coefficients.
+            coeff_generation_method: ``CoeffGenerationMethod.UNIFORM`` or ``NORMAL``.
+            polynomial_offset_range: Range for random ``(ox, oy)`` offset.
+            surface_sampler: Pre-instantiated surface sampler.  Mutually
+                exclusive with the polynomial args.
+            **kwargs: Forwarded to :class:`ParametricSurfaceDataset`.
         """
-        super().__init__(**kwargs)
-        self._order_range = self._validate_order_range(order_range=order_range)
-        self._coefficient_scale_range = self._validate_range(param_range=coefficient_scale_range, name="coefficient_scale_range")
-        self._polynomial_offset_range = self._validate_range(param_range=polynomial_offset_range, name="polynomial_offset_range")
-        self._coeff_generation_method = coeff_generation_method
+        polynomial_args_given = any(arg is not None for arg in (
+            order_range, coefficient_scale_range, coeff_generation_method))
+        if surface_sampler is not None and polynomial_args_given:
+            raise ValueError(
+                "PolynomialSurfaceDataset accepts either an injected "
+                "'surface_sampler' OR the legacy polynomial args "
+                "(order_range / coefficient_scale_range / "
+                "coeff_generation_method), not both.")
+
+        if surface_sampler is None:
+            # Legacy path: synthesize a PolynomialMongeSurfaceSampler.
+            if not polynomial_args_given:
+                raise ValueError(
+                    "PolynomialSurfaceDataset requires either a "
+                    "'surface_sampler' or the legacy polynomial args.")
+            order_range = self._validate_order_range(order_range=order_range)
+            coefficient_scale_range = self._validate_range(
+                param_range=coefficient_scale_range, name="coefficient_scale_range")
+            polynomial_offset_range = self._validate_range(
+                param_range=polynomial_offset_range, name="polynomial_offset_range")
+            surface_sampler = PolynomialMongeSurfaceSampler(
+                order_range=order_range,
+                coefficient_scale_range=coefficient_scale_range,
+                coeff_generation_method=coeff_generation_method,
+                polynomial_offset_range=polynomial_offset_range,
+            )
+            # Keep the historical attributes for any external introspection.
+            self._order_range = order_range
+            self._coefficient_scale_range = coefficient_scale_range
+            self._polynomial_offset_range = polynomial_offset_range
+            self._coeff_generation_method = coeff_generation_method
+
+        super().__init__(surface_sampler=surface_sampler, **kwargs)
 
     def _validate_order_range(self, order_range: Tuple[int, int]) -> Tuple[int, int]:
         """Validate polynomial order range."""
@@ -2537,30 +2773,6 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
     def _get_polynomial_pairs(order: int) -> List[Tuple[int, int]]:
         """Get list of (i, j) exponent pairs for polynomial of given order."""
         return get_polynomial_pairs(order)
-
-    def _generate_surface_parameters(self) -> Dict[str, Any]:
-        """Generate random polynomial coefficients, order, and coordinate offsets."""
-        _, params = sample_polynomial_monge_surface(
-            rng=self._rng,
-            order_range=self._order_range,
-            coefficient_scale_range=self._coefficient_scale_range,
-            coeff_generation_method=self._coeff_generation_method,
-            polynomial_offset_range=self._polynomial_offset_range,
-        )
-        return params
-
-    def _evaluate_surface_with_parameters(self, x: torch.Tensor, y: torch.Tensor, surface_params: Dict[str, Any]) -> torch.Tensor:
-        """Evaluate polynomial surface using pre-generated parameters with coordinate offset."""
-        coefficients = surface_params['coefficients']
-        pairs = surface_params['pairs']
-        offset_x, offset_y = surface_params['offset']
-
-        # Apply offset: evaluate polynomial at shifted coordinates
-        # This effectively "slides" the surface under the grid
-        x_shifted = x + offset_x
-        y_shifted = y + offset_y
-
-        return evaluate_polynomial(x_shifted, y_shifted, coefficients, pairs)
 
 
 # =============================================
@@ -2608,9 +2820,11 @@ class MongeSurfaceVariationalDataset(Dataset):
     and continuous Dirichlet forms.
 
     Args:
-        order_range, coefficient_scale_range, coeff_generation_method,
-        polynomial_offset_range:  Polynomial-surface sampling parameters,
-            forwarded to :func:`sample_polynomial_monge_surface`.
+        surface_sampler:  Pre-instantiated :class:`BaseMongeSurfaceSampler`
+            (e.g. :class:`PolynomialMongeSurfaceSampler` or
+            :class:`RandomFourierMongeSurfaceSampler`).  Drives surface
+            generation; the rest of the pipeline (quadrature, k-NN,
+            probe evaluation) is family-agnostic.
         num_vertices_range:  Per-surface vertex count.  Either an int
             (fixed) or a 2-tuple (uniform random per surface).
         grid_radius:  Half-side of the parameter-domain square U =
@@ -2643,12 +2857,9 @@ class MongeSurfaceVariationalDataset(Dataset):
 
     def __init__(
         self,
-        order_range: Tuple[int, int],
-        coefficient_scale_range,
-        coeff_generation_method: CoeffGenerationMethod,
+        surface_sampler: BaseMongeSurfaceSampler,
         num_vertices_range,
         test_func_sampler,
-        polynomial_offset_range=(0.0, 0.0),
         grid_radius: float = 1.0,
         position_noise_std=0.0,
         k: int = 15,
@@ -2657,10 +2868,7 @@ class MongeSurfaceVariationalDataset(Dataset):
         quadrature_n_for_total_area: int = 20,
     ):
         super().__init__()
-        self._order_range = order_range
-        self._coefficient_scale_range = coefficient_scale_range
-        self._coeff_generation_method = coeff_generation_method
-        self._polynomial_offset_range = polynomial_offset_range
+        self._surface_sampler = surface_sampler
         self._grid_radius = float(grid_radius)
         self._k = int(k)
         self._epoch_size = int(epoch_size)
@@ -2685,14 +2893,8 @@ class MongeSurfaceVariationalDataset(Dataset):
         return self._epoch_size
 
     def get(self, idx) -> _VariationalSurfaceData:
-        # 1. Sample a polynomial Monge surface.
-        surface_func, _surface_params = sample_polynomial_monge_surface(
-            rng=self._rng,
-            order_range=self._order_range,
-            coefficient_scale_range=self._coefficient_scale_range,
-            coeff_generation_method=self._coeff_generation_method,
-            polynomial_offset_range=self._polynomial_offset_range,
-        )
+        # 1. Sample a Monge surface from the configured family.
+        surface_func, _surface_params = self._surface_sampler.sample(self._rng)
 
         U_bounds = ((-self._grid_radius, self._grid_radius),
                     (-self._grid_radius, self._grid_radius))
