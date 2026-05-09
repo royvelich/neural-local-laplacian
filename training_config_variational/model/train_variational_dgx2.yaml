@@ -1,10 +1,10 @@
 module:
   _target_: neural_local_laplacian.modules.variational_modules.VariationalLaplacianTransformerModule
   input_dim: 3
-  d_model: 768
-  nhead: 8
-  num_encoder_layers: 1
-  dim_feedforward: 768
+  d_model: 128
+  nhead: 1
+  num_encoder_layers: 4
+  dim_feedforward: 128
   num_eigenvalues: ${globals.num_eigenvalues}
   dropout: 0.1
   normalize_loss_weights: False
@@ -58,7 +58,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
-        loss_mode: 'mse'
+        loss_mode: 'signed_log'
       weight: 1.0
 
     # Gauge fix: predicted gradients should lie in the tangent plane.
