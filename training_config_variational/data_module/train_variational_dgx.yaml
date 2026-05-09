@@ -68,7 +68,7 @@ module:
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
     batch_size: 1
-    num_workers: 0
+    num_workers: 14
     shuffle: True
 
   val_dataset_specifications:
