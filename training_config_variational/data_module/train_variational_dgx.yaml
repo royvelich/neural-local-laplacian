@@ -16,10 +16,10 @@ module:
           _args_: ['uniform']
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: [60, 120]
+      num_vertices_range: 500
       grid_radius: 1.0
       position_noise_std: [0.01, 0.05]
-      k: 15
+      k: [6, 30]
 
       # Test functions: random polynomials/trig/exp + the (P, P) continuous
       # bilinear-form GT computed by Gauss-Legendre quadrature.
@@ -52,7 +52,7 @@ module:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
 
         # The two monomial-specific knobs
-        max_degree: 5
+        max_degree: 2
         variables: 'ambient'           # 'chart' or 'ambient'
 
         # Same shared knobs as RandomFamilyTestFunctionSampler

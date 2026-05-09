@@ -1,12 +1,12 @@
 module:
   _target_: neural_local_laplacian.modules.variational_modules.VariationalLaplacianTransformerModule
   input_dim: 3
-  d_model: 128
-  nhead: 1
-  num_encoder_layers: 4
-  dim_feedforward: 128
+  d_model: 768
+  nhead: 8
+  num_encoder_layers: 1
+  dim_feedforward: 768
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.1
+  dropout: 0.2
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
@@ -17,7 +17,7 @@ module:
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
-  area_bound_C: 2.0
+  area_bound_C: 10.0
 
   # mcv_mode and stiffness_mode are unused by the variational loss path
   # but the parent class still asks for them; defaults are fine.
@@ -67,7 +67,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GradientTangencyTestLoss
-      weight: 0.1
+      weight: 0.0
 
     # Optional auxiliary signals — disabled by default.
     # Diagonal of the bilinear form (redundant when BilinearFormTestLoss is on,
