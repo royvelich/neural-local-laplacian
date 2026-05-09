@@ -19,7 +19,7 @@ module:
       num_vertices_range: 500
       grid_radius: 1.0
       position_noise_std: [0.01, 0.05]
-      k: 8
+      k: 8                           # scalar OR e.g. [10, 20] for a per-surface range
 
       # Test functions: random polynomials/trig/exp + the (P, P) continuous
       # bilinear-form GT computed by Gauss-Legendre quadrature.

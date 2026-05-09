@@ -21,6 +21,38 @@ from neural_local_laplacian.utils.utils import build_patches_from_vertices
 
 
 # =============================================
+# Generic helpers
+# =============================================
+
+def _coerce_scalar_or_range(value, name: str, cast):
+    """Coerce a scalar / 1-elt / 2-elt sequence to a ``(lo, hi)`` tuple of ``cast``.
+
+    Accepts plain Python scalars, list / tuple, and OmegaConf ``ListConfig``
+    (anything iterable that yields ``cast``-convertible elements).  Validates
+    ``lo <= hi``.  A scalar input returns ``(v, v)`` so callers can always
+    treat the result as a uniform-random range without branching.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        v = cast(value)
+        return (v, v)
+    try:
+        items = [cast(x) for x in value]
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"{name} must be a scalar or 1/2-element sequence, "
+            f"got {value!r}: {e}")
+    if len(items) == 1:
+        return (items[0], items[0])
+    if len(items) == 2:
+        if items[0] > items[1]:
+            raise ValueError(f"{name}: lo {items[0]} > hi {items[1]}")
+        return (items[0], items[1])
+    raise ValueError(
+        f"{name} must be a scalar or 1/2-element sequence, got "
+        f"{len(items)} elements: {items}")
+
+
+# =============================================
 # Polynomial evaluation (reusable)
 # =============================================
 
@@ -218,9 +250,9 @@ class RandomFourierMongeSurfaceSampler(BaseMongeSurfaceSampler):
         magnitude_scale=1.0,
         l1_truncate: bool = True,
     ):
-        self._K_range = self._normalize_range(K, name='K', cast=int)
-        self._beta_range = self._normalize_range(beta, name='beta', cast=float)
-        self._magnitude_scale_range = self._normalize_range(
+        self._K_range = _coerce_scalar_or_range(K, name='K', cast=int)
+        self._beta_range = _coerce_scalar_or_range(beta, name='beta', cast=float)
+        self._magnitude_scale_range = _coerce_scalar_or_range(
             magnitude_scale, name='magnitude_scale', cast=float)
         if self._K_range[0] < 0:
             raise ValueError(f"K must be >= 0, got range {self._K_range}")
@@ -233,33 +265,6 @@ class RandomFourierMongeSurfaceSampler(BaseMongeSurfaceSampler):
         # distinct values across an epoch.  σ depends on (β, scale) and is
         # cheap to recompute per sample.
         self._grid_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-
-    @staticmethod
-    def _normalize_range(value, name: str, cast):
-        """Coerce scalar / 1-elt / 2-elt sequence to a (lo, hi) ``cast`` tuple.
-
-        Accepts plain scalars, list/tuple, and OmegaConf ListConfig (any
-        iterable that yields ``cast``-convertible elements).
-        """
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            v = cast(value)
-            return (v, v)
-        try:
-            items = [cast(x) for x in value]
-        except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"{name} must be a scalar or 1/2-element sequence, "
-                f"got {value!r}: {e}")
-        if len(items) == 1:
-            return (items[0], items[0])
-        if len(items) == 2:
-            if items[0] > items[1]:
-                raise ValueError(
-                    f"{name}: lo {items[0]} > hi {items[1]}")
-            return (items[0], items[1])
-        raise ValueError(
-            f"{name} must be a scalar or 1/2-element sequence, got "
-            f"{len(items)} elements: {items}")
 
     def _get_grid(self, K_int: int):
         """Return cached (k1, k2) frequency grids for this ``K``."""
@@ -2887,7 +2892,10 @@ class MongeSurfaceVariationalDataset(Dataset):
         position_noise_std:  Gaussian noise std added to 3D vertex
             positions *after* analytic normals / areas are computed from
             the clean surface.  Either a scalar or a 2-tuple range.
-        k:  k-NN neighbour count per patch.
+        k:  k-NN neighbour count per patch.  Either an int (fixed across
+            surfaces) or a 2-element ``[lo, hi]`` range (uniform integer
+            random draw per surface).  ``num_vertices_range[0]`` must be
+            strictly greater than ``max(k)``.
         test_func_sampler:  Configured :class:`BaseTestFunctionSampler`
             instance.  Must have ``compute_continuous_bilinear=True`` (or
             ``compute_continuous_energy=True``) so the GT targets are
@@ -2916,7 +2924,7 @@ class MongeSurfaceVariationalDataset(Dataset):
         test_func_sampler,
         grid_radius: float = 1.0,
         position_noise_std=0.0,
-        k: int = 15,
+        k=15,
         epoch_size: int = 100,
         seed: int = 0,
         quadrature_n_for_total_area: int = 20,
@@ -2924,19 +2932,30 @@ class MongeSurfaceVariationalDataset(Dataset):
         super().__init__()
         self._surface_sampler = surface_sampler
         self._grid_radius = float(grid_radius)
-        self._k = int(k)
         self._epoch_size = int(epoch_size)
         self._test_func_sampler = test_func_sampler
         self._quadrature_n_area = int(quadrature_n_for_total_area)
+
+        # k may be a scalar or a 2-element [lo, hi] range; a fresh value
+        # is drawn per surface in get().  Each surface internally has a
+        # fixed k (since build_patches_from_vertices takes a single k);
+        # variation across surfaces exposes the model to multiple
+        # neighbour-count regimes.
+        self._k_range = _coerce_scalar_or_range(k, name='k', cast=int)
+        if self._k_range[0] < 1:
+            raise ValueError(f"k must be >= 1, got range {self._k_range}")
 
         if isinstance(num_vertices_range, int):
             self._num_vertices_range = (num_vertices_range, num_vertices_range)
         else:
             self._num_vertices_range = (
                 int(num_vertices_range[0]), int(num_vertices_range[1]))
-        if self._num_vertices_range[0] < self._k + 1:
+        # Lower bound on n must beat the *largest* k draw so every patch
+        # has enough neighbours.
+        if self._num_vertices_range[0] <= self._k_range[1]:
             raise ValueError(
-                f"num_vertices_range[0]={self._num_vertices_range[0]} must be > k={self._k}")
+                f"num_vertices_range[0]={self._num_vertices_range[0]} must be > "
+                f"max k = {self._k_range[1]}")
 
         self._position_noise_std = SyntheticSurfaceDataset._normalize_noise_std(position_noise_std)
         self._rng = np.random.default_rng(seed=seed)
@@ -3009,8 +3028,11 @@ class MongeSurfaceVariationalDataset(Dataset):
         else:
             noisy_pos = clean_pos
 
-        # 6. Build k-NN patches.
-        patch = build_patches_from_vertices(noisy_pos, k=self._k, device=None)
+        # 6. Build k-NN patches.  k is drawn fresh per surface from its
+        # configured range (forward() handles any per-surface k internally).
+        k_lo, k_hi = self._k_range
+        k_this = int(self._rng.integers(low=k_lo, high=k_hi + 1)) if k_lo != k_hi else k_lo
+        patch = build_patches_from_vertices(noisy_pos, k=k_this, device=None)
         # patch: pos (n*k, 3), x (n*k, 3), patch_idx (n*k,),
         #        vertex_indices (n*k,), neighbor_index_matrix (n, k)
 
