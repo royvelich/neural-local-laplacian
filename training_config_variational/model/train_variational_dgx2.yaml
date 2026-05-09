@@ -58,7 +58,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
-        loss_mode: 'signed_log'
+        loss_mode: 'mse'
       weight: 1.0
 
     # Gauge fix: predicted gradients should lie in the tangent plane.
@@ -67,18 +67,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GradientTangencyTestLoss
-      weight: 1.0
-
-    # Scale gauge fix: pins the joint A ↔ ‖g‖ rescaling that
-    # BilinearFormTestLoss + GradientTangencyTestLoss are invariant to.
-    # Without this, eigenvalues of the assembled (W, M) drift by a
-    # constant factor.  ctx.gt_vertex_areas is the uniform A_total/n
-    # produced by MongeSurfaceVariationalDataset, so this pins the
-    # absolute scale of A but not its per-vertex Voronoi distribution.
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
-#      weight: 0.1
+      weight: 0.1
 
     # Optional auxiliary signals — disabled by default.
     # Diagonal of the bilinear form (redundant when BilinearFormTestLoss is on,

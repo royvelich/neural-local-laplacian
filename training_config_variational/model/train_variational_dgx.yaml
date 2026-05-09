@@ -6,7 +6,7 @@ module:
   num_encoder_layers: 1
   dim_feedforward: 768
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.2
+  dropout: 0.1
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
@@ -58,7 +58,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
-        loss_mode: 'mse'
+        loss_mode: 'signed_log'
       weight: 1.0
 
     # Gauge fix: predicted gradients should lie in the tangent plane.
