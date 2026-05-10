@@ -2910,7 +2910,7 @@ class MongeSurfaceVariationalDataset(Dataset):
         vertex_indices                 (n*k,)    global vertex idx per row
         vertex_pos                     (n, 3)    vertex positions
         vertex_normals                 (n, 3)    analytic surface normals
-        vertex_areas                   (n,)      uniform A_total/n
+        vertex_areas                   (n,)      density-aware √det g(v_i) · |U|/n
         knn                            (n, k)    global neighbour indices
         test_func_values               (n, P)    probe values at vertices
         test_func_continuous_bilinear  (P, P)    GT bilinear form (if enabled)
@@ -2927,14 +2927,12 @@ class MongeSurfaceVariationalDataset(Dataset):
         k=15,
         epoch_size: int = 100,
         seed: int = 0,
-        quadrature_n_for_total_area: int = 20,
     ):
         super().__init__()
         self._surface_sampler = surface_sampler
         self._grid_radius = float(grid_radius)
         self._epoch_size = int(epoch_size)
         self._test_func_sampler = test_func_sampler
-        self._quadrature_n_area = int(quadrature_n_for_total_area)
 
         # k may be a scalar or a 2-element [lo, hi] range; a fresh value
         # is drawn per surface in get().  Each surface internally has a
@@ -2999,24 +2997,18 @@ class MongeSurfaceVariationalDataset(Dataset):
             [-h_u, -h_v, torch.ones_like(h_u)], dim=-1)
         vertex_normals = F.normalize(normal_unnorm, p=2, dim=-1)        # (n, 3)
 
-        # 4. Total surface area via Gauss-Legendre on √det g; uniform per-vertex.
-        u_q, v_q, w_q = gauss_legendre_2d_grid(U_bounds, self._quadrature_n_area)
-        u_q_flat = u_q.flatten()
-        v_q_flat = v_q.flatten()
-        w_q_flat = w_q.flatten()
-        with torch.enable_grad():
-            u_qg = u_q_flat.clone().unsqueeze(-1).requires_grad_(True)
-            v_qg = v_q_flat.clone().unsqueeze(-1).requires_grad_(True)
-            z_q = surface_func(u_qg, v_qg)
-            if z_q.dim() > 1:
-                z_q = z_q.squeeze(-1)
-            h_u_q, h_v_q = torch.autograd.grad(
-                z_q.sum(), [u_qg, v_qg], create_graph=False)
-            h_u_q = h_u_q.squeeze(-1)
-            h_v_q = h_v_q.squeeze(-1)
-        sqrt_det_g_q = (1.0 + h_u_q.detach() ** 2 + h_v_q.detach() ** 2).sqrt()
-        total_area = float((w_q_flat * sqrt_det_g_q).sum().item())
-        vertex_areas = torch.full((n,), total_area / n, dtype=torch.float32)
+        # 4. Per-vertex GT area: density-aware Monte-Carlo cell estimate.
+        # Reuses h_u, h_v already computed at the vertices in step 3.
+        # For uniformly random vertices on U each "owns" |U|/n of the
+        # parameter domain; the surface metric maps that into
+        # √det g(v_i) · |U|/n on Σ.  Σ_i A_i^{gt} approximates the analytic
+        # total surface area in expectation (Monte-Carlo Riemann sum), so
+        # the scalar gauge fix carried by AreaSupervisionLoss remains
+        # anchored while the per-vertex distribution now reflects local
+        # curvature (high √det g → larger A_i) instead of being uniform.
+        sqrt_det_g_at_v = (1.0 + h_u ** 2 + h_v ** 2).sqrt()        # (n,)
+        parameter_cell = (2.0 * self._grid_radius) ** 2 / n
+        vertex_areas = (sqrt_det_g_at_v * parameter_cell).float()    # (n,)
 
         # 5. Optional position noise (applied AFTER analytic quantities are computed).
         lo, hi = self._position_noise_std
