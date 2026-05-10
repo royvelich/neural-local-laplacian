@@ -14,7 +14,7 @@ module:
   output_projection_hidden_dims: null
 
   detach_area_head: false           # area head is trained by the variational loss
-  use_uniform_mass: true
+  use_uniform_mass: false
 
   area_activation: bounded_sigmoid
   area_bound_C: 2.0
@@ -57,9 +57,8 @@ module:
     # Primary: bilinear-form supervision (strictly stronger than energy).
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
-        loss_mode: 'log_mse'
-        area_weighted: True
+        _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
+        loss_mode: 'mse'
       weight: 1.0
 
     # Gauge fix: predicted gradients should lie in the tangent plane.
@@ -68,7 +67,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GradientTangencyTestLoss
-      weight: 0.0
+      weight: 0.1
 
     # Optional auxiliary signals — disabled by default.
     # Diagonal of the bilinear form (redundant when BilinearFormTestLoss is on,

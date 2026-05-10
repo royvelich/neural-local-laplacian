@@ -19,59 +19,41 @@ module:
       num_vertices_range: 1000
       grid_radius: 1.0
       position_noise_std: [0.01, 0.05]
-      k: [6, 15]                           # scalar OR e.g. [10, 20] for a per-surface range
+      k: 15
 
       # Test functions: random polynomials/trig/exp + the (P, P) continuous
       # bilinear-form GT computed by Gauss-Legendre quadrature.
-#      test_func_sampler:
-#        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
-#        num_test_funcs: 16
-#        include_coordinates: false
-#        verbose: false
-#        normalize_target: none
-#        compute_continuous_bilinear: true
-#        compute_continuous_energy: true
-#        quadrature_n: 40
-#        derivative_mode: 'analytic'    # vertex values come from the same path either way; analytic is faster
-#        families:
-#          poly:
-#            weight: 0.5
-#            order_range: [1, 4]
-#            coeff_scale: 1.0
-#            coeff_method: uniform
-#          trig:
-#            weight: 0.4
-#            frequency_range: [0.5, 4.0]
-#            phase_range: [0.0, 6.283]
-#          exp:
-#            weight: 0.1
-#            sigma_range: [0.3, 2.0]
-#            center_range: [-1.0, 1.0]
-
       test_func_sampler:
-        _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
-
-        # The two monomial-specific knobs
-        max_degree: 2
-        variables: 'ambient'           # 'chart' or 'ambient'
-
-        # Same shared knobs as RandomFamilyTestFunctionSampler
-        normalize_target: 'none'        # 'none' / 'unit_magnitude' / 'unit_variance'
-        derivative_mode: 'autograd'     # 'analytic' is OK only when variables='chart'
-        compute_continuous_bilinear: false
-        compute_continuous_energy: false
-#        quadrature_n: 40
-        # Set to true if you enable GradientVectorTestLoss in the model
-        # config; emits per-vertex analytic surface gradients (n, P, 3).
-        compute_gradients_all_points: true
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
+        num_test_funcs: 16
+        include_coordinates: false
         verbose: false
+        normalize_target: none
+        compute_continuous_bilinear: true
+        compute_continuous_energy: true
+        quadrature_n: 30
+        derivative_mode: 'analytic'    # vertex values come from the same path either way; analytic is faster
+        families:
+          poly:
+            weight: 0.5
+            order_range: [1, 4]
+            coeff_scale: 1.0
+            coeff_method: uniform
+          trig:
+            weight: 0.4
+            frequency_range: [0.5, 4.0]
+            phase_range: [0.0, 6.283]
+          exp:
+            weight: 0.1
+            sigma_range: [0.3, 2.0]
+            center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
       epoch_size: 8000
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
     batch_size: 1
-    num_workers: 14
+    num_workers: 0
     shuffle: True
 
   val_dataset_specifications:
