@@ -27,7 +27,7 @@ module:
 
   # Validation-only Laplacian configs (mesh / fmap paths are inherited).
   val_laplacian:
-    assembly: diagonal_gram
+    assembly: full_gram
     pruning: none
 
   # Functional-map validation. Same settings the dgx2 patch-level config
@@ -57,7 +57,7 @@ module:
     # Primary: bilinear-form supervision (strictly stronger than energy).
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
-        _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
+        _target_: neural_local_laplacian.modules.losses.DirichletEnergyTestLoss
         loss_mode: 'signed_log'
       weight: 1.0
 
