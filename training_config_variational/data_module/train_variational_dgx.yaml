@@ -58,9 +58,12 @@ module:
         # Same shared knobs as RandomFamilyTestFunctionSampler
         normalize_target: 'none'        # 'none' / 'unit_magnitude' / 'unit_variance'
         derivative_mode: 'autograd'     # 'analytic' is OK only when variables='chart'
-        compute_continuous_bilinear: true
-        compute_continuous_energy: true
-        quadrature_n: 40
+        compute_continuous_bilinear: false
+        compute_continuous_energy: false
+#        quadrature_n: 40
+        # Set to true if you enable GradientVectorTestLoss in the model
+        # config; emits per-vertex analytic surface gradients (n, P, 3).
+        compute_gradients_all_points: true
         verbose: false
 
       seed: ${globals.training_seed}
