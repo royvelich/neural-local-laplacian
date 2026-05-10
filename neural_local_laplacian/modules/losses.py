@@ -41,6 +41,7 @@ class LossContext:
     test_func_values: Optional[torch.Tensor] = None                 # (n, P)
     test_func_continuous_bilinear: Optional[torch.Tensor] = None    # (P, P)
     test_func_continuous_energy: Optional[torch.Tensor] = None      # (P,)
+    test_func_gradients_at_vertices: Optional[torch.Tensor] = None  # (n, P, 3)
 
 
 @dataclass
@@ -1633,3 +1634,89 @@ class GradientTangencyTestLoss(_VariationalTestLoss):
         normal_component = torch.einsum('npd,nd->np', pred_grads, normals)  # (n, P)
         weighted = ctx.areas.unsqueeze(-1) * (normal_component ** 2)         # (n, P)
         return self._reduce(weighted)
+
+
+class GradientVectorTestLoss(_VariationalTestLoss):
+    r"""Pointwise vector match: ``ĝ_i^{(ℓ)} ≈ ∇_g f_ℓ(v_i)``.
+
+    The strongest signal in the §21 hierarchy of the LBO conversation:
+    pins the predicted per-vertex per-probe surface gradients to their
+    analytic targets in **direction, magnitude, and tangency
+    simultaneously**.  Removes every gauge freedom that energy and
+    bilinear-form supervision leave open — including the per-vertex
+    frame rotation that bilinear can't see.
+
+    Reads from ``ctx``:
+        grad_coeffs                        (n, k, 3)
+        knn                                 (n, k)
+        test_func_values                    (n, P)
+        test_func_gradients_at_vertices     (n, P, 3)   — analytic GT, on Σ
+        areas                               (n,)        — only when ``area_weighted=True``
+
+    The dataset must be configured with
+    ``test_func_sampler.compute_gradients_all_points: true`` so the GT
+    field is populated.
+
+    Args:
+        loss_mode: vector-error metric.
+            ``'mse'``        — ``‖pred - target‖²``
+            ``'relative'``   — ``‖pred - target‖² / (‖target‖² + ε)``
+            ``'cosine'``     — ``1 - cos(pred, target)``  (direction only)
+            ``'log_mse'``    — ``‖slog(pred) - slog(target)‖²``  with
+                ``slog(v) = v̂ · log(‖v‖+1)``;  log-compresses magnitude
+                while preserving direction.
+        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over (vertex × probe).
+        eps: numerical floor for relative / cosine / log_mse.
+        area_weighted: if True, weight each (i, ℓ) entry by ``A_i`` before
+            reducing; matches the variational pipeline's integration-style
+            convention but is cosmetic for the gradient match.
+    """
+
+    def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
+                 eps: float = 1e-8, area_weighted: bool = False):
+        super().__init__(reduction=reduction)
+        if loss_mode not in ('mse', 'relative', 'cosine', 'log_mse'):
+            raise ValueError(
+                f"loss_mode must be 'mse' / 'relative' / 'cosine' / 'log_mse', "
+                f"got '{loss_mode}'")
+        self.loss_mode = loss_mode
+        self.eps = eps
+        self.area_weighted = area_weighted
+
+    @staticmethod
+    def _slog_vec(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Map ``v`` to log-magnitude space: ``v̂ · log(‖v‖ + 1)``.
+
+        Preserves direction, compresses magnitude.  ``slog(0) = 0``.
+        """
+        norm = v.norm(dim=-1, keepdim=True).clamp(min=eps)
+        return v * (torch.log(norm + 1.0) / norm)
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        required = ['grad_coeffs', 'knn', 'test_func_values',
+                    'test_func_gradients_at_vertices']
+        if self.area_weighted:
+            required.append('areas')
+        self._check_required(ctx, required)
+
+        pred_grads = self._compute_pred_grads(ctx)            # (n, P, 3)
+        target = ctx.test_func_gradients_at_vertices          # (n, P, 3)
+
+        if self.loss_mode == 'mse':
+            per = ((pred_grads - target) ** 2).sum(dim=-1)    # (n, P)
+        elif self.loss_mode == 'relative':
+            diff_sq = ((pred_grads - target) ** 2).sum(dim=-1)
+            target_sq = (target ** 2).sum(dim=-1) + self.eps
+            per = diff_sq / target_sq
+        elif self.loss_mode == 'cosine':
+            cos_sim = F.cosine_similarity(pred_grads, target, dim=-1)
+            per = 1.0 - cos_sim
+        else:  # 'log_mse'
+            pred_log = self._slog_vec(pred_grads, self.eps)
+            target_log = self._slog_vec(target, self.eps)
+            per = ((pred_log - target_log) ** 2).sum(dim=-1)
+
+        if self.area_weighted:
+            per = ctx.areas.unsqueeze(-1) * per
+
+        return self._reduce(per)

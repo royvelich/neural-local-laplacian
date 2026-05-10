@@ -82,3 +82,13 @@ module:
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
 #      weight: 1.0
+    # Pointwise vector match: ĝ_i^{(ℓ)} ≈ ∇_g f_ℓ(v_i).  Strongest signal
+    # in the §21 hierarchy — pins direction, magnitude, and tangency at
+    # every vertex.  Implies the tangency penalty (set its weight to 0.0
+    # if you enable this).  Requires the test_func_sampler to set
+    # ``compute_gradients_all_points: true``.
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
+#        loss_mode: 'log_mse'   # or 'mse' / 'relative' / 'cosine'
+#      weight: 1.0

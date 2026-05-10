@@ -86,6 +86,8 @@ class _VariationalTrainingMixin:
                 surface, 'test_func_continuous_bilinear', None)
             tf_continuous_energy = getattr(
                 surface, 'test_func_continuous_energy', None)
+            tf_gradients_at_vertices = getattr(
+                surface, 'test_func_gradients_at_vertices', None)
 
             # The variational losses operate on whole-surface tensors; no
             # MCV target is needed.  We still set predicted_mcv/target_mcv
@@ -106,6 +108,7 @@ class _VariationalTrainingMixin:
                 test_func_values=test_func_values,
                 test_func_continuous_bilinear=tf_continuous_bilinear,
                 test_func_continuous_energy=tf_continuous_energy,
+                test_func_gradients_at_vertices=tf_gradients_at_vertices,
                 gt_vertex_areas=getattr(surface, 'vertex_areas', None),
             )
 

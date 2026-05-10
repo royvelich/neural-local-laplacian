@@ -61,6 +61,9 @@ module:
         compute_continuous_bilinear: true
         compute_continuous_energy: true
         quadrature_n: 40
+        # Set to true if you enable GradientVectorTestLoss in the model
+        # config; emits per-vertex analytic surface gradients (n, P, 3).
+        compute_gradients_all_points: false
         verbose: false
 
       seed: ${globals.training_seed}
