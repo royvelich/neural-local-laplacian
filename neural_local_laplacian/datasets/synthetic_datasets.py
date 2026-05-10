@@ -3038,4 +3038,9 @@ class MongeSurfaceVariationalDataset(Dataset):
             data.test_func_continuous_bilinear = tf['test_func_continuous_bilinear']
         if 'test_func_continuous_energy' in tf:
             data.test_func_continuous_energy = tf['test_func_continuous_energy']
+        if 'test_func_gradients_all_points' in tf:
+            # In the variational layout, the sampler's "all points" axis
+            # is the n vertices; expose under the more semantic name that
+            # GradientVectorTestLoss reads.
+            data.test_func_gradients_at_vertices = tf['test_func_gradients_all_points']
         return data
