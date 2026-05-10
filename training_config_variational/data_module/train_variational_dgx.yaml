@@ -16,7 +16,7 @@ module:
           _args_: ['uniform']
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: [60, 120]
+      num_vertices_range: 2000
       grid_radius: 1.0
       position_noise_std: [0.01, 0.05]
       k: 15
@@ -25,7 +25,7 @@ module:
       # bilinear-form GT computed by Gauss-Legendre quadrature.
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
-        num_test_funcs: 16
+        num_test_funcs: 30
         include_coordinates: false
         verbose: false
         normalize_target: none

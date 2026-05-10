@@ -67,7 +67,7 @@ module:
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GradientTangencyTestLoss
-      weight: 0.1
+      weight: 0.5
 
     # Optional auxiliary signals — disabled by default.
     # Diagonal of the bilinear form (redundant when BilinearFormTestLoss is on,
