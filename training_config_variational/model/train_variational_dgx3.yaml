@@ -39,7 +39,7 @@ module:
     num_eigenvectors: 100
     max_vertices_val: 5000
     eval_laplacians:
-      - assembly: diagonal_gram
+      - assembly: full_gram
         pruning: none
         area_weighted: false
     geo_cache_dir: ./geo_cache
