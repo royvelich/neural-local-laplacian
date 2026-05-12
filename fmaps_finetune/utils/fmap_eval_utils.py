@@ -386,6 +386,10 @@ def evaluate_pair(
         M_np_shared[label] = M_np
 
         grad_coeffs = fwd['grad_coeffs']
+        # Stiffness head's output, when configured.  The configured
+        # assembly inside each lap_cfg decides whether it's actually
+        # consumed (only ``'from_stiffness'`` reads it).
+        stiffness_weights = fwd.get('stiffness_weights')
 
         for cfg in laplacian_configs:
             tag = cfg.tag
@@ -408,7 +412,8 @@ def evaluate_pair(
 
             t0 = _time.perf_counter()
             L_assembled = assemble_laplacian(
-                grad_coeffs, knn_t, eval_cfg, areas=M_diag, knn_prune=knn_prune)
+                grad_coeffs, knn_t, eval_cfg, areas=M_diag, knn_prune=knn_prune,
+                stiffness_weights=stiffness_weights)
 
             # Convert to scipy sparse if dense (pruned configs)
             if use_sparse:

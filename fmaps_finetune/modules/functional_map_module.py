@@ -2049,11 +2049,15 @@ class FunctionalMapModule(LaplacianModuleBase):
                     knn_sp_b = compute_knn(pair.verts_b, lap_cfg.k_prune)
                     knn_sp_a_t = torch.from_numpy(knn_sp_a).long().to(device)
                     knn_sp_b_t = torch.from_numpy(knn_sp_b).long().to(device)
-                S_A = assemble_laplacian(fwd_a['grad_coeffs'], knn_a_t, lap_cfg,
-                                        areas=fwd_a['areas'], knn_prune=knn_sp_a_t)
+                S_A = assemble_laplacian(
+                    fwd_a['grad_coeffs'], knn_a_t, lap_cfg,
+                    areas=fwd_a['areas'], knn_prune=knn_sp_a_t,
+                    stiffness_weights=fwd_a.get('stiffness_weights'))
                 M_A = fwd_a['areas']
-                S_B = assemble_laplacian(fwd_b['grad_coeffs'], knn_b_t, lap_cfg,
-                                        areas=fwd_b['areas'], knn_prune=knn_sp_b_t)
+                S_B = assemble_laplacian(
+                    fwd_b['grad_coeffs'], knn_b_t, lap_cfg,
+                    areas=fwd_b['areas'], knn_prune=knn_sp_b_t,
+                    stiffness_weights=fwd_b.get('stiffness_weights'))
                 M_B = fwd_b['areas']
 
             with prof.phase("losses"):

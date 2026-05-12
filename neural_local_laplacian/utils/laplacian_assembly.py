@@ -40,8 +40,19 @@ class LaplacianConfig:
     """Configuration for Laplacian assembly and pruning.
 
     Args:
-        assembly: 'diagonal_gram' (scalar ||g||^2, kNN-sparse) or
-                  'full_gram' (full Gram G^T G, 2-hop fill-in).
+        assembly: One of
+            ``'diagonal_gram'``  — scalar ``‖g_ij‖²`` derived from grad_coeffs,
+                                   kNN-sparse.
+            ``'full_gram'``      — full local Gram ``Gᵀ G`` derived from
+                                   grad_coeffs, 2-hop fill-in.
+            ``'from_stiffness'`` — reads the precomputed per-edge
+                                   ``stiffness_weights`` field directly
+                                   (used when ``stiffness_mode`` is one of
+                                   the learned modes, where ``s_ij`` is no
+                                   longer derivable from ``grad_coeffs``).
+                                   Structurally diagonal-gram-shaped
+                                   (one scalar per edge, kNN-sparse, no
+                                   2-hop fill-in).
         pruning: 'none' (keep as-is), 'knn' (prune to kNN graph),
                  or 'topk' (keep k largest per row).
         k_prune: For 'topk': number of off-diagonal entries to keep per row.
@@ -54,7 +65,7 @@ class LaplacianConfig:
                       intact (for training with sparse solvers like torch-sla).
                       Pruning not supported.
     """
-    assembly: Literal['diagonal_gram', 'full_gram'] = 'diagonal_gram'
+    assembly: Literal['diagonal_gram', 'full_gram', 'from_stiffness'] = 'diagonal_gram'
     pruning: Literal['none', 'knn', 'topk'] = 'none'
     k_prune: Optional[int] = None
     sparse: bool = False
@@ -62,8 +73,9 @@ class LaplacianConfig:
     area_weighted: bool = False  # If True, multiply areas into S (graph-Laplacian-like)
 
     def __post_init__(self):
-        if self.assembly not in ('diagonal_gram', 'full_gram'):
-            raise ValueError(f"assembly must be 'diagonal_gram' or 'full_gram', got: {self.assembly}")
+        _valid_assemblies = ('diagonal_gram', 'full_gram', 'from_stiffness')
+        if self.assembly not in _valid_assemblies:
+            raise ValueError(f"assembly must be one of {_valid_assemblies}, got: {self.assembly}")
         if self.pruning not in ('none', 'knn', 'topk'):
             raise ValueError(f"pruning must be 'none', 'knn', or 'topk', got: {self.pruning}")
         if self.pruning == 'topk' and self.k_prune is None:
@@ -74,6 +86,12 @@ class LaplacianConfig:
             raise ValueError(f"Pruning is not supported in sparse mode (got pruning='{self.pruning}')")
         if self.torch_sparse and self.pruning != 'none':
             raise ValueError(f"Pruning is not supported in torch_sparse mode (got pruning='{self.pruning}')")
+
+    @property
+    def reads_stiffness_weights(self) -> bool:
+        """Whether assembly consumes the precomputed stiffness_weights field
+        (vs. deriving stiffness from grad_coeffs)."""
+        return self.assembly == 'from_stiffness'
 
     @property
     def tag(self) -> str:
@@ -102,17 +120,26 @@ def assemble_laplacian(
     config: LaplacianConfig,
     areas: Optional[torch.Tensor] = None,
     knn_prune: Optional[torch.Tensor] = None,
+    stiffness_weights: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, scipy.sparse.csr_matrix]:
     """Assemble a Laplacian matrix according to config.
 
     Args:
-        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.
+        grad_coeffs: (N, k, 3) gradient coefficients per neighbor.  Used by
+            the ``'diagonal_gram'`` and ``'full_gram'`` assemblies, which
+            derive per-edge stiffness from these directly.  Ignored when
+            ``config.assembly == 'from_stiffness'``.
         knn: (N, k) kNN indices used for assembly.
         config: LaplacianConfig specifying assembly + pruning + sparse.
         areas: (N,) per-vertex areas. Always pass this (needed for M).
                Only multiplied into S when config.area_weighted is True.
         knn_prune: (N, k') optional kNN indices for pruning='knn'.
                    If None and pruning='knn', uses the assembly knn.
+        stiffness_weights: (N, k) per-edge stiffness ``s_ij``.  Required
+            when ``config.assembly == 'from_stiffness'``; ignored otherwise.
+            Pass the model's ``forward_result['stiffness_weights']`` to
+            obtain a Laplacian whose stiffness path is consistent with
+            ``stiffness_mode`` set on the module.
 
     Returns:
         Dense torch.Tensor, scipy.sparse.csr_matrix, or torch sparse
@@ -120,6 +147,28 @@ def assemble_laplacian(
     """
     # Only pass areas into S assembly when area_weighted is set
     s_areas = areas if config.area_weighted else None
+
+    if config.assembly == 'from_stiffness':
+        if stiffness_weights is None:
+            raise ValueError(
+                "assembly='from_stiffness' requires the stiffness_weights "
+                "argument — pass forward_result['stiffness_weights'] from "
+                "the model so the assembled Laplacian reads the learned "
+                "stiffness head consistently with stiffness_mode.")
+        if config.torch_sparse:
+            return _assemble_from_stiffness_torch_sparse(
+                stiffness_weights, knn, s_areas)
+        if config.sparse:
+            return _assemble_from_stiffness_sparse(
+                stiffness_weights, knn, s_areas)
+        L = assemble_from_stiffness_weights(stiffness_weights, knn, s_areas)
+        # Pruning is supported on the dense path the same way as for the
+        # other assemblies.
+        if config.pruning == 'knn':
+            L = prune_to_knn(L, knn_prune if knn_prune is not None else knn)
+        elif config.pruning == 'topk':
+            L = prune_to_topk(L, config.k_prune)
+        return L
 
     if config.torch_sparse:
         if config.assembly == 'full_gram':
@@ -242,6 +291,125 @@ def assemble_diagonal_gram_laplacian(
     L.diagonal().copy_(-L.sum(dim=1))
 
     return L
+
+
+# =============================================================================
+# Stiffness-driven assembly (reads precomputed s_ij directly)
+# =============================================================================
+#
+# These mirror the diagonal-gram path structurally — one scalar per edge,
+# kNN sparsity, no 2-hop fill — but they take ``stiffness_weights`` (the
+# model's per-edge ``s_ij``) as input instead of deriving it from
+# ``grad_coeffs``.  This is the right assembly when ``stiffness_mode`` is
+# ``'learned'`` or ``'learned_positive'``: the gradient head and the
+# stiffness head are independent, so the assembled Laplacian must
+# consume the head that is actually being supervised as the stiffness.
+
+def assemble_from_stiffness_weights(
+    stiffness_weights: torch.Tensor,
+    knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Assemble dense graph Laplacian directly from per-edge stiffness.
+
+    ``L_{i,j} = −s_ij`` for ``j ∈ knn(i)``, symmetrised by averaging both
+    directions, with the diagonal set to ``−Σ_j L_{i,j}`` so row sums vanish.
+
+    Args:
+        stiffness_weights: (N, k) per-edge stiffness ``s_ij``.
+        knn: (N, k) kNN indices (long tensor).
+        areas: (N,) per-vertex areas.  When provided, w_ij = a_i · s_ij
+            (graph-Laplacian-like, areas enter S in addition to M).
+            When None, s_ij is used as-is.
+
+    Returns:
+        L: (N, N) dense symmetric Laplacian (structurally kNN-sparse).
+    """
+    N, k = stiffness_weights.shape
+    device = stiffness_weights.device
+
+    edge_weights = stiffness_weights
+    if areas is not None:
+        edge_weights = areas[:, None] * edge_weights
+
+    L = torch.zeros(N, N, device=device, dtype=stiffness_weights.dtype)
+    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn)
+    L[row_idx, knn] -= edge_weights
+    L[knn, row_idx] -= edge_weights
+    L = 0.5 * L  # average both directions
+
+    L.fill_diagonal_(0.0)
+    L.diagonal().copy_(-L.sum(dim=1))
+
+    return L
+
+
+def _build_from_stiffness_offdiag_sparse(
+    stiffness_weights: torch.Tensor,
+    knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build symmetric off-diagonal Laplacian as a coalesced torch sparse tensor.
+
+    Shared by both the scipy and torch sparse paths.  Mirrors
+    :func:`_build_diagonal_gram_offdiag_sparse` but reads
+    ``stiffness_weights`` directly.
+    """
+    N, k = stiffness_weights.shape
+    device = stiffness_weights.device
+
+    edge_weights = stiffness_weights
+    if areas is not None:
+        edge_weights = areas[:, None] * edge_weights
+
+    row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn).reshape(-1)
+    col_idx = knn.reshape(-1)
+    vals = -edge_weights.reshape(-1)
+
+    all_rows = torch.cat([row_idx, col_idx])
+    all_cols = torch.cat([col_idx, row_idx])
+    all_vals = torch.cat([vals, vals]) * 0.5
+
+    indices = torch.stack([all_rows, all_cols])
+    L_sparse = torch.sparse_coo_tensor(indices, all_vals, size=(N, N)).coalesce()
+    L_sparse = (L_sparse + L_sparse.t()).coalesce()
+    L_sparse._values().mul_(0.5)
+    return L_sparse
+
+
+def _assemble_from_stiffness_torch_sparse(
+    stiffness_weights: torch.Tensor,
+    knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Torch sparse COO Laplacian from per-edge stiffness (autograd-compatible)."""
+    N = stiffness_weights.shape[0]
+    device = stiffness_weights.device
+
+    L_offdiag = _build_from_stiffness_offdiag_sparse(stiffness_weights, knn, areas)
+
+    row_sums = torch.sparse.sum(L_offdiag, dim=1).to_dense()
+    diag_indices = torch.arange(N, device=device).unsqueeze(0).expand(2, -1)
+    L_diag = torch.sparse_coo_tensor(diag_indices, -row_sums, size=(N, N))
+
+    return (L_offdiag + L_diag).coalesce()
+
+
+def _assemble_from_stiffness_sparse(
+    stiffness_weights: torch.Tensor,
+    knn: torch.Tensor,
+    areas: Optional[torch.Tensor] = None,
+) -> scipy.sparse.csr_matrix:
+    """scipy.sparse Laplacian from per-edge stiffness (eval-only; no autograd)."""
+    N = stiffness_weights.shape[0]
+    L_offdiag = _build_from_stiffness_offdiag_sparse(stiffness_weights, knn, areas)
+
+    L_csr = _torch_sparse_to_scipy(L_offdiag, N)
+    L_csr.setdiag(0.0)
+    row_sums = np.asarray(L_csr.sum(axis=1)).ravel()
+    L_csr.setdiag(-row_sums)
+    L_csr.eliminate_zeros()
+    return L_csr
 
 
 # =============================================================================
