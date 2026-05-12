@@ -334,9 +334,10 @@ class LaplacianLocalModule(LaplacianModuleBase):
         self._area_activation = area_activation
         self._area_bound_C = area_bound_C
         self._mcv_mode = mcv_mode
-        if stiffness_mode not in ('diagonal_gram', 'full_gram'):
+        _stiffness_modes = ('diagonal_gram', 'full_gram', 'learned', 'learned_positive')
+        if stiffness_mode not in _stiffness_modes:
             raise ValueError(
-                f"stiffness_mode must be 'diagonal_gram' or 'full_gram', got '{stiffness_mode}'")
+                f"stiffness_mode must be one of {_stiffness_modes}, got '{stiffness_mode}'")
         self._stiffness_mode = stiffness_mode
         self._normalize_grad_by_k = normalize_grad_by_k
         self._detach_area_head = detach_area_head
@@ -388,6 +389,14 @@ class LaplacianLocalModule(LaplacianModuleBase):
 
         # Output head: gradient coefficients g_ij in R^3
         self.grad_projection = self._build_projection(d_model, 3, output_projection_hidden_dims)
+
+        # Output head: per-edge scalar stiffness s_ij.
+        # Only created when stiffness_mode requires it (DDP-safe: no
+        # unused params when stiffness is derived from grad_coeffs via
+        # the 'diagonal_gram' / 'full_gram' modes).
+        if stiffness_mode in ('learned', 'learned_positive'):
+            self.stiffness_projection = self._build_projection(
+                d_model, 1, output_projection_hidden_dims)
 
         # Area head: aggregated features -> scalar area A_i
         # Activation applied manually via _apply_area_activation
@@ -695,6 +704,21 @@ class LaplacianLocalModule(LaplacianModuleBase):
             g_self = -gc_masked.sum(dim=1, keepdim=True)              # (B, 1, 3) = g_ii
             inner = (g_self * gc_masked).sum(dim=-1)                   # (B, K) = ⟨g_ii, g_ij⟩
             stiffness_weights = -inner                                 # (B, K) = -⟨g_ii, g_ij⟩
+        elif self._stiffness_mode in ('learned', 'learned_positive'):
+            # Independent stiffness head: s_ij is a direct network
+            # output, decoupled from ‖g_ij‖².  This breaks the
+            # structural identity ``L = G^T M G`` (the assembled
+            # Laplacian from g and the stiffness-action Laplacian from
+            # s are no longer guaranteed to be the same operator) — pair
+            # with a soft consistency loss
+            # (DirichletEnergyConsistencyLoss) if you want them to track
+            # each other.
+            stiffness_weights = self.stiffness_projection(encoded).squeeze(-1)  # (B, K)
+            if self._stiffness_mode == 'learned_positive':
+                # PSD-by-construction: smooth, monotone, ≥ 0.
+                stiffness_weights = F.softplus(stiffness_weights)
+            # 'learned' (signed) lets the operator be indefinite — the
+            # FEM convention on obtuse cells.
         else:
             # 'diagonal_gram' (default): s_ij = ‖g_ij‖²
             stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)
