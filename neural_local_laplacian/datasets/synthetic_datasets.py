@@ -3057,4 +3057,7 @@ class MongeSurfaceVariationalDataset(Dataset):
             # is the n vertices; expose under the more semantic name that
             # GradientVectorTestLoss reads.
             data.test_func_gradients_at_vertices = tf['test_func_gradients_all_points']
+        if 'test_func_lb_all_points' in tf:
+            # Same idea, for LaplacianActionTestLoss.
+            data.test_func_laplacians_at_vertices = tf['test_func_lb_all_points']
         return data

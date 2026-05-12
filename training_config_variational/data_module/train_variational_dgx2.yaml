@@ -31,6 +31,13 @@ module:
         normalize_target: none
         compute_continuous_bilinear: true
         compute_continuous_energy: true
+        # Per-vertex analytic Δ_g h targets — set true if you enable
+        # LaplacianActionTestLoss in the model config.  Required so the
+        # GT field test_func_laplacians_at_vertices is populated.
+        compute_lb_all_points: false
+        # Per-vertex analytic ∇_S h targets — set true if you enable
+        # GradientVectorTestLoss in the model config.
+        compute_gradients_all_points: false
         quadrature_n: 30
         derivative_mode: 'analytic'    # vertex values come from the same path either way; analytic is faster
         families:

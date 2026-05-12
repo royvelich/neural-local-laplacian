@@ -42,6 +42,7 @@ class LossContext:
     test_func_continuous_bilinear: Optional[torch.Tensor] = None    # (P, P)
     test_func_continuous_energy: Optional[torch.Tensor] = None      # (P,)
     test_func_gradients_at_vertices: Optional[torch.Tensor] = None  # (n, P, 3)
+    test_func_laplacians_at_vertices: Optional[torch.Tensor] = None  # (n, P)
 
 
 @dataclass
@@ -1715,6 +1716,83 @@ class GradientVectorTestLoss(_VariationalTestLoss):
             pred_log = self._slog_vec(pred_grads, self.eps)
             target_log = self._slog_vec(target, self.eps)
             per = ((pred_log - target_log) ** 2).sum(dim=-1)
+
+        if self.area_weighted:
+            per = ctx.areas.unsqueeze(-1) * per
+
+        return self._reduce(per)
+
+
+class LaplacianActionTestLoss(_VariationalTestLoss):
+    r"""Per-vertex match of the discrete Laplacian action on test functions.
+
+    The variational analog of :class:`GeneralizedLaplacianTestLoss`
+    (which is per-patch, at the origin only).  For each vertex i and
+    probe ℓ, compare the discrete Laplacian action against the analytic
+    target evaluated at v_i:
+
+        predicted_i^{(ℓ)}  =  (Σ_j  s_ij · (h_ℓ(v_j) − h_ℓ(v_i)))  /  A_i
+        target_i^{(ℓ)}     =  Δ_g h_ℓ (v_i)
+
+    Routes gradient through the **stiffness head** ``s_ij`` and the
+    **area head** ``A_i``, so this is the primary signal you'd use to
+    train ``stiffness_mode='learned'`` / ``'learned_positive'`` in the
+    variational pipeline.  None of the other variational losses
+    currently consume ``stiffness_weights`` — without one of these the
+    learned stiffness head receives no gradient at all.
+
+    Reads from ``ctx``:
+        stiffness_weights                  (n, k)
+        areas                              (n,)
+        knn                                (n, k)
+        test_func_values                   (n, P)
+        test_func_laplacians_at_vertices   (n, P)        — analytic GT
+
+    The dataset must be configured with
+    ``test_func_sampler.compute_lb_all_points: true`` so the analytic
+    per-vertex Laplacian targets are populated.
+
+    Args:
+        loss_mode: scalar error metric — ``'mse'`` / ``'relative'`` / ``'signed_log'``.
+        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over (vertex × probe).
+        eps: numerical floor for relative mode.
+        area_weighted: if True, weight each (i, ℓ) entry by ``A_i`` before
+            reducing.  Off by default — the per-vertex match is already
+            normalised by ``A_i`` inside the predicted Laplacian.
+    """
+
+    def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
+                 eps: float = 1e-8, area_weighted: bool = False):
+        super().__init__(reduction=reduction)
+        if loss_mode not in ('mse', 'relative', 'signed_log'):
+            raise ValueError(
+                f"loss_mode must be 'mse' / 'relative' / 'signed_log', got '{loss_mode}'")
+        self.loss_mode = loss_mode
+        self.eps = eps
+        self.area_weighted = area_weighted
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        self._check_required(ctx, [
+            'stiffness_weights', 'areas', 'knn',
+            'test_func_values', 'test_func_laplacians_at_vertices'])
+
+        # Per-vertex per-probe deltas via knn gather.
+        # values shape (n, P); knn shape (n, k);
+        # values[knn] → (n, k, P).
+        neighbour_values = ctx.test_func_values[ctx.knn]            # (n, k, P)
+        center_values    = ctx.test_func_values.unsqueeze(1)        # (n, 1, P)
+        deltas           = neighbour_values - center_values          # (n, k, P)
+
+        # Discrete Laplacian-Beltrami action:
+        #   Δ̂h_i^{(ℓ)}  =  (Σ_j  s_ij · δh_ji^{(ℓ)})  /  A_i
+        s = ctx.stiffness_weights                                   # (n, k)
+        numerator = (s.unsqueeze(-1) * deltas).sum(dim=1)           # (n, P)
+        predicted = numerator / ctx.areas.unsqueeze(-1)             # (n, P)
+
+        target = ctx.test_func_laplacians_at_vertices               # (n, P)
+
+        per = _scalar_error_per_element(
+            predicted, target, self.loss_mode, eps=self.eps)        # (n, P)
 
         if self.area_weighted:
             per = ctx.areas.unsqueeze(-1) * per
