@@ -201,7 +201,14 @@ def step_pred_inference(
     knn = vi.reshape(N, k_val)
 
     t0 = time.perf_counter()
-    L = assemble_laplacian(grad_coeffs, knn, laplacian_config, areas=areas)
+    # Thread the learned stiffness head through assembly; the configured
+    # ``laplacian_config.assembly`` decides whether it's actually consumed
+    # (only ``'from_stiffness'`` reads it).
+    stiffness_weights = fwd_result.get('stiffness_weights')
+    if stiffness_weights is not None:
+        stiffness_weights = stiffness_weights.float()
+    L = assemble_laplacian(grad_coeffs, knn, laplacian_config, areas=areas,
+                           stiffness_weights=stiffness_weights)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t_assembly = time.perf_counter() - t0
@@ -269,7 +276,14 @@ def step_pred_reassemble(
     knn = vi.reshape(N, k_val)
 
     t0 = time.perf_counter()
-    L = assemble_laplacian(grad_coeffs, knn, laplacian_config, areas=areas)
+    # Thread the learned stiffness head through assembly; the configured
+    # ``laplacian_config.assembly`` decides whether it's actually consumed
+    # (only ``'from_stiffness'`` reads it).
+    stiffness_weights = fwd_result.get('stiffness_weights')
+    if stiffness_weights is not None:
+        stiffness_weights = stiffness_weights.float()
+    L = assemble_laplacian(grad_coeffs, knn, laplacian_config, areas=areas,
+                           stiffness_weights=stiffness_weights)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t_assembly = time.perf_counter() - t0

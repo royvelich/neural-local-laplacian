@@ -2230,8 +2230,14 @@ class RealTimeEigenanalysisVisualizer:
         areas = forward_result['areas'].float()
         grad_coeffs = forward_result['grad_coeffs'].float()
 
-        # Assemble with current config (config.area_weighted controls whether areas go into S)
-        L = assemble_laplacian(grad_coeffs, knn_t, self.current_lap_config, areas=areas)
+        # Assemble with current config (config.area_weighted controls whether areas go into S).
+        # Pass stiffness_weights through so 'from_stiffness' assembly works
+        # when the model uses a learned stiffness head.
+        stiffness_weights = forward_result.get('stiffness_weights')
+        if stiffness_weights is not None:
+            stiffness_weights = stiffness_weights.float()
+        L = assemble_laplacian(grad_coeffs, knn_t, self.current_lap_config,
+                               areas=areas, stiffness_weights=stiffness_weights)
         new_stiffness_matrix = to_scipy_sparse(L)
         new_mass_matrix = mass_matrix_to_scipy(areas)
 
@@ -2289,9 +2295,15 @@ class RealTimeEigenanalysisVisualizer:
         print(f"  Reassembling with config: {new_config.tag}...")
         grad_coeffs = self.current_forward_result['grad_coeffs'].float()
         areas = self.current_forward_result['areas'].float()
+        stiffness_weights = self.current_forward_result.get('stiffness_weights')
+        if stiffness_weights is not None:
+            stiffness_weights = stiffness_weights.float()
 
-        # config.area_weighted controls whether areas go into S
-        L = assemble_laplacian(grad_coeffs, self.current_knn, new_config, areas=areas)
+        # config.area_weighted controls whether areas go into S; 'from_stiffness'
+        # assembly reads stiffness_weights directly when the model uses a
+        # learned stiffness head.
+        L = assemble_laplacian(grad_coeffs, self.current_knn, new_config,
+                               areas=areas, stiffness_weights=stiffness_weights)
         new_stiffness_matrix = to_scipy_sparse(L)
         new_mass_matrix = mass_matrix_to_scipy(areas)
 

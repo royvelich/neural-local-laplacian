@@ -347,9 +347,16 @@ class LaplacianLocalModule(LaplacianModuleBase):
         self._enable_nan_diagnostics = enable_nan_diagnostics
         self._nan_diag_log_every = max(int(nan_diag_log_every_n_steps), 1)
 
-        # Validation Laplacian config
+        # Validation Laplacian config.  When the stiffness head is learned
+        # (``stiffness_mode='learned' / 'learned_positive'``), the gradient
+        # head and the stiffness head are independent — so a Gram-based
+        # assembly that reads only ``grad_coeffs`` would silently ignore
+        # the learned stiffness.  Coerce the assembly to ``'from_stiffness'``
+        # in that regime so the assembled Laplacian uses the head that the
+        # training losses are actually supervising.
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
-        self._val_lap_config = LaplacianConfig(**_val_lap)
+        self._val_lap_config = self._coerce_lap_cfg_for_stiffness_mode(
+            LaplacianConfig(**_val_lap), origin='val_laplacian')
 
         # Fmap validation config (optional — enables pair-based correspondence eval)
         self._fmap_val_cfg = fmap_val_cfg
@@ -370,10 +377,13 @@ class LaplacianLocalModule(LaplacianModuleBase):
                     fmap_lmbda=fmap_val_cfg.get('fmap_lmbda', 1e3),
                     fmap_resolvent_gamma=fmap_val_cfg.get('fmap_resolvent_gamma', 1.0),
                 ))
-            # Build eval Laplacian configs
+            # Build eval Laplacian configs (same coercion as val_lap above).
             _eval_laps = fmap_val_cfg.get('eval_laplacians',
                                           [{'assembly': 'diagonal_gram', 'pruning': 'none'}])
-            self._fmap_val_eval_lap_configs = [LaplacianConfig(**d) for d in _eval_laps]
+            self._fmap_val_eval_lap_configs = [
+                self._coerce_lap_cfg_for_stiffness_mode(
+                    LaplacianConfig(**d), origin=f'fmap_val_cfg.eval_laplacians[{i}]')
+                for i, d in enumerate(_eval_laps)]
 
         # Store loss configs (optionally normalized)
         if normalize_loss_weights:
@@ -408,6 +418,42 @@ class LaplacianLocalModule(LaplacianModuleBase):
                 nn.GELU(),
                 nn.Linear(d_model // 2, 1),
             )
+
+    def _coerce_lap_cfg_for_stiffness_mode(
+            self, cfg: LaplacianConfig, *, origin: str) -> LaplacianConfig:
+        """Make a :class:`LaplacianConfig` consistent with ``self._stiffness_mode``.
+
+        For learned stiffness modes the gradient head and the stiffness
+        head are independent network outputs — a Gram-based assembly
+        (``'diagonal_gram'`` / ``'full_gram'``) would build the Laplacian
+        from ``grad_coeffs`` and silently ignore the learned stiffness.
+        Override to ``'from_stiffness'`` so validation reads the head that
+        the training losses actually supervise as the stiffness.
+
+        For derived stiffness modes the existing assembly choices are
+        consistent with the stiffness derivation and are passed through
+        unchanged.
+        """
+        if self._stiffness_mode in ('learned', 'learned_positive'):
+            if cfg.assembly != 'from_stiffness':
+                import logging
+                logging.getLogger(__name__).info(
+                    f"[stiffness_mode={self._stiffness_mode}] coercing "
+                    f"{origin}.assembly from '{cfg.assembly}' to 'from_stiffness' "
+                    f"so the assembled Laplacian reads the learned stiffness head.")
+                cfg = LaplacianConfig(
+                    assembly='from_stiffness',
+                    pruning=cfg.pruning,
+                    k_prune=cfg.k_prune,
+                    sparse=cfg.sparse,
+                    torch_sparse=cfg.torch_sparse,
+                    area_weighted=cfg.area_weighted,
+                )
+        else:
+            # Derived modes: caller's assembly choice (incl. 'from_stiffness'
+            # for power users) is honoured as-is.
+            pass
+        return cfg
 
     def _apply_area_activation(self, areas_raw: torch.Tensor,
                                 batch_sizes: torch.Tensor) -> torch.Tensor:
@@ -1342,8 +1388,13 @@ class LaplacianLocalModule(LaplacianModuleBase):
 
         # Eigendecomposition: uses config.area_weighted to decide
         with torch.no_grad():
-            L = assemble_laplacian(forward_result['grad_coeffs'], knn,
-                                   self._val_lap_config, areas=areas)
+            # Pass both heads through; the configured ``val_laplacian.assembly``
+            # (coerced in __init__ for learned stiffness modes) decides which
+            # one is used.
+            L = assemble_laplacian(
+                forward_result['grad_coeffs'], knn,
+                self._val_lap_config, areas=areas,
+                stiffness_weights=forward_result.get('stiffness_weights'))
 
         stiffness_matrix = to_scipy_sparse(L)
         mass_matrix = mass_matrix_to_scipy(areas)
