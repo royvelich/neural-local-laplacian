@@ -20,12 +20,15 @@ module:
   area_bound_C: 2.0
 
   mcv_mode: 'diagonal_gram'
-  # 'diagonal_gram': s_ij = ‖g_ij‖²  (current behaviour)
-  # 'full_gram'    : s_ij = -⟨g_ii, g_ij⟩  with  g_ii = -Σ_k g_ik
-  # The FEM-style per-edge stiffness from the predicted gradient operator;
-  # equals diagonal-gram + the cross-Gram terms involving neighbour j, and
-  # reduces to ‖g_ij‖² when the g_ij are mutually orthogonal.  Can be
-  # negative when cross terms dominate.
+  # 'diagonal_gram'    : s_ij = ‖g_ij‖²              (derived from grad head)
+  # 'full_gram'        : s_ij = -⟨g_ii, g_ij⟩       (derived; FEM-correct,
+  #                       can be negative when cross-Gram terms dominate)
+  # 'learned'          : s_ij from an independent scalar head, signed
+  # 'learned_positive' : same, with softplus → s_ij ≥ 0 (PSD-by-construction)
+  # The two 'learned' modes decouple stiffness from gradient magnitude;
+  # the model gains a dedicated head for cotangent-style weights.  Pair
+  # with a soft consistency loss if you want the assembled Laplacians
+  # from the two heads to track each other.
   stiffness_mode: 'diagonal_gram'
   normalize_grad_by_k: true
 
