@@ -58,8 +58,8 @@ module:
         _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
         loss_mode: 'cosine'
         area_weighted: False
-      weight: 1.0
+      weight: 0.1
     - loss_module:
         _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
-        loss_mode: 'signed_log'
+        loss_mode: 'mse'
       weight: 1.0       # tune relative to vector loss

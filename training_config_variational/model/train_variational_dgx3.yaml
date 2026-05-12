@@ -61,5 +61,5 @@ module:
       weight: 1.0
     - loss_module:
         _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
-        loss_mode: 'signed_log'
+        loss_mode: 'mse'
       weight: 1.0       # tune relative to vector loss
