@@ -2395,10 +2395,16 @@ class RealTimeEigenanalysisVisualizer:
             new_mass_matrix = mass_matrix_to_scipy(pred_areas_t)
 
         # Reassemble S (areas only matter when config.area_weighted=True, but we
-        # always pass them — the assembler reads config.area_weighted internally)
+        # always pass them — the assembler reads config.area_weighted internally).
+        # Thread stiffness_weights through so 'from_stiffness' assembly works
+        # when the model uses a learned stiffness head.
+        stiffness_weights = self.current_forward_result.get('stiffness_weights')
+        if stiffness_weights is not None:
+            stiffness_weights = stiffness_weights.float()
         L = assemble_laplacian(
             grad_coeffs, self.current_knn, self.current_lap_config,
             areas=areas_for_assembly,
+            stiffness_weights=stiffness_weights,
         )
         new_stiffness_matrix = to_scipy_sparse(L)
 
@@ -4338,7 +4344,13 @@ class RealTimeEigenanalysisVisualizer:
                 sparse=(val_lap_config.pruning == 'none'),
             )
             self.current_lap_config = val_lap_config
-            L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config, areas=areas)
+            # Pass stiffness_weights through so 'from_stiffness' assembly
+            # works when the model uses a learned stiffness head (the
+            # configured ``val_lap_config.assembly`` controls whether it's
+            # actually consumed).
+            L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config,
+                                   areas=areas,
+                                   stiffness_weights=stiffness_weights)
             stiffness_matrix = to_scipy_sparse(L)
             mass_matrix = mass_matrix_to_scipy(areas)
 
