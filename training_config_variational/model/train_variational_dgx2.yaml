@@ -82,3 +82,12 @@ module:
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
 #      weight: 1.0
+    # Per-vertex match of the discrete Laplacian action on test functions.
+    # Routes gradient through the stiffness head — the primary signal you
+    # need when stiffness_mode='learned' or 'learned_positive'.  Requires
+    # data_module test_func_sampler.compute_lb_all_points: true.
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
+#        loss_mode: 'signed_log'   # or 'mse' / 'relative'
+#      weight: 1.0
