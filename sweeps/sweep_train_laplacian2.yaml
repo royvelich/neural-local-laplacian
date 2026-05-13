@@ -175,7 +175,7 @@ parameters:
         area_bound_C: ${globals.area_bound_C}
 
         mcv_mode: 'diagonal_gram'
-        normalize_grad_by_k: true
+        normalize_grad_by_sqrt_k: true
 
         val_laplacian:
           assembly: diagonal_gram

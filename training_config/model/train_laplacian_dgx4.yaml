@@ -22,7 +22,7 @@ module:
 #    assembly: diagonal_gram
 #    pruning: none
 
-  normalize_grad_by_k: true
+  normalize_grad_by_sqrt_k: true
 
   val_laplacian:
     assembly: diagonal_gram

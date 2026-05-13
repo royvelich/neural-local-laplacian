@@ -581,11 +581,15 @@ class RealTimeEigenanalysisVisualizer:
         self.current_nelo_eigenvalues = None
 
         # ── Debug overrides (UI checkboxes) ─────────────────────────────
-        # Mirrors model._normalize_grad_by_k. Initialized lazily from the
-        # model on first UI render so that the checkbox shows the current
-        # model state. Toggling flips model._normalize_grad_by_k and re-runs
-        # the PRED inference path with the new flag value.
+        # Mirror the three independent normalization flags on the model:
+        #   _normalize_grad_by_sqrt_k  — g_ij /= sqrt(k)
+        #   _normalize_grad_by_k       — g_ij /= k
+        #   _normalize_stiffness_by_k  — s_ij /= k
+        # Initialized lazily from the model on first UI render. Toggling
+        # flips the corresponding attribute and re-runs PRED inference.
+        self._viz_normalize_grad_by_sqrt_k: Optional[bool] = None
         self._viz_normalize_grad_by_k: Optional[bool] = None
+        self._viz_normalize_stiffness_by_k: Optional[bool] = None
 
         # When True, swap predicted vertex areas for GT barycentric areas
         # (igl.massmatrix) in the PRED pipeline. Reassembles S/M and reruns
@@ -735,12 +739,20 @@ class RealTimeEigenanalysisVisualizer:
 
         psim.Text("")
 
-        assembly_options = ['diagonal_gram', 'full_gram']
-        current_assembly_idx = assembly_options.index(self.current_lap_config.assembly) \
-            if self.current_lap_config.assembly in assembly_options else 0
+        assembly_options = ['diagonal_gram', 'full_gram', 'from_stiffness']
+        # If the current assembly isn't in the menu (shouldn't happen after
+        # adding 'from_stiffness', but defensive against future additions),
+        # fall back to index 0 — but DO NOT silently rewrite current_lap_config
+        # to that fallback on render; only commit a change if the user actually
+        # interacts with the combo.
+        try:
+            current_assembly_idx = assembly_options.index(self.current_lap_config.assembly)
+        except ValueError:
+            current_assembly_idx = 0
         assembly_changed, new_assembly_idx = psim.Combo(
             "Assembly", current_assembly_idx, assembly_options
         )
+        new_assembly = assembly_options[new_assembly_idx]
 
         # Area-weighted checkbox (part of LaplacianConfig)
         aw_changed, new_aw = psim.Checkbox(
@@ -748,27 +760,38 @@ class RealTimeEigenanalysisVisualizer:
             self.current_lap_config.area_weighted
         )
 
+        # Pruning: only meaningful on the sparse from-gradient paths. The
+        # sparse 'from_stiffness' builders ignore pruning, so disable the
+        # combo (and force pruning='none') when from_stiffness is selected.
         pruning_options = ['none', 'knn', 'topk']
-        current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
-            if self.current_lap_config.pruning in pruning_options else 0
-        pruning_changed, new_pruning_idx = psim.Combo(
-            "Pruning", current_pruning_idx, pruning_options
-        )
-
+        pruning_changed = False
         k_prune_changed = False
-        new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
-        if pruning_options[new_pruning_idx] in ('knn', 'topk'):
-            k_prune_changed, new_k_prune = psim.InputInt(
-                "k_prune",
-                new_k_prune,
-                flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+        if new_assembly == 'from_stiffness':
+            new_pruning_idx = 0  # 'none'
+            new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
+            psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                "Pruning: none  (ignored on sparse from_stiffness path)")
+            if self.current_lap_config.pruning != 'none':
+                pruning_changed = True  # force flip back to 'none'
+        else:
+            current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
+                if self.current_lap_config.pruning in pruning_options else 0
+            pruning_changed, new_pruning_idx = psim.Combo(
+                "Pruning", current_pruning_idx, pruning_options
             )
-            new_k_prune = max(3, min(100, new_k_prune))
+            new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
+            if pruning_options[new_pruning_idx] in ('knn', 'topk'):
+                k_prune_changed, new_k_prune = psim.InputInt(
+                    "k_prune",
+                    new_k_prune,
+                    flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+                )
+                new_k_prune = max(3, min(100, new_k_prune))
 
         if assembly_changed or pruning_changed or k_prune_changed or aw_changed:
             new_pruning = pruning_options[new_pruning_idx]
             new_config = LaplacianConfig(
-                assembly=assembly_options[new_assembly_idx],
+                assembly=new_assembly,
                 pruning=new_pruning,
                 k_prune=new_k_prune if new_pruning in ('knn', 'topk') else None,
                 area_weighted=new_aw,
@@ -806,55 +829,72 @@ class RealTimeEigenanalysisVisualizer:
         psim.Text("PRED Debug Overrides:")
 
         if self.current_model is not None:
-            # Lazy-init checkbox state from the model's actual flag the first
-            # time we render. This keeps the checkbox in sync with the YAML
+            # Lazy-init checkbox state from the model's actual flags the first
+            # time we render. Keeps the checkboxes in sync with the YAML
             # config when a new model is loaded.
+            if self._viz_normalize_grad_by_sqrt_k is None:
+                self._viz_normalize_grad_by_sqrt_k = bool(
+                    getattr(self.current_model, '_normalize_grad_by_sqrt_k', False)
+                )
             if self._viz_normalize_grad_by_k is None:
                 self._viz_normalize_grad_by_k = bool(
                     getattr(self.current_model, '_normalize_grad_by_k', False)
                 )
+            if self._viz_normalize_stiffness_by_k is None:
+                self._viz_normalize_stiffness_by_k = bool(
+                    getattr(self.current_model, '_normalize_stiffness_by_k', False)
+                )
 
-            ngk_changed, new_ngk = psim.Checkbox(
-                "normalize_grad_by_k (model flag)",
-                self._viz_normalize_grad_by_k,
-            )
-
-            if ngk_changed and new_ngk != self._viz_normalize_grad_by_k:
-                self._viz_normalize_grad_by_k = new_ngk
-                # Flip the flag on the model in place. The next forward pass
-                # will pick it up.
-                prev_flag = getattr(self.current_model, '_normalize_grad_by_k', None)
-                self.current_model._normalize_grad_by_k = new_ngk
-                readback = getattr(self.current_model, '_normalize_grad_by_k', None)
+            def _toggle_norm_flag(flag_attr: str, ui_attr: str, label: str):
+                """Render a checkbox bound to a model normalization flag and
+                rerun the PRED pipeline if the value flipped."""
+                current = getattr(self, ui_attr)
+                changed, new_val = psim.Checkbox(label, current)
+                if not (changed and new_val != current):
+                    return
+                setattr(self, ui_attr, new_val)
+                prev_flag = getattr(self.current_model, flag_attr, None)
+                setattr(self.current_model, flag_attr, new_val)
+                readback = getattr(self.current_model, flag_attr, None)
                 print(f"\n{'=' * 60}")
-                print(f"[DIAG:NGK] Checkbox toggle")
+                print(f"[DIAG:NORM] Checkbox toggle ({flag_attr})")
                 print(f"{'=' * 60}")
-                print(f"[DIAG:NGK]   Requested: {new_ngk}")
-                print(f"[DIAG:NGK]   Model flag before set: {prev_flag}")
-                print(f"[DIAG:NGK]   Model flag after  set: {readback}")
-                print(f"[DIAG:NGK]   type(current_model):    {type(self.current_model).__name__}")
-                print(f"[DIAG:NGK]   id(current_model):      {id(self.current_model)}")
-                print(f"[DIAG:NGK]   has_current_batch_data: {self._has_current_batch_data()}")
+                print(f"[DIAG:NORM]   Requested: {new_val}")
+                print(f"[DIAG:NORM]   Model flag before set: {prev_flag}")
+                print(f"[DIAG:NORM]   Model flag after  set: {readback}")
+                print(f"[DIAG:NORM]   has_current_batch_data: {self._has_current_batch_data()}")
                 print(f"{'=' * 60}\n")
                 if self._has_current_batch_data():
-                    # Re-run the full PRED path (re-extracts patches, re-runs
-                    # inference with the new flag, re-assembles, recomputes
-                    # all downstream validations).
                     self._update_pred_with_new_k(
                         self.reconstruction_settings.current_pred_k
                     )
-                    # The inference re-run restored predicted areas. If the
-                    # GT-areas override is currently on, re-apply it so the
-                    # two checkboxes compose correctly.
                     if self._viz_use_gt_areas:
-                        print("  Re-applying GT areas override (checkbox 2 is on)...")
+                        print("  Re-applying GT areas override...")
                         self._reassemble_pred_with_area_override()
                 else:
-                    print("[DIAG:NGK] No batch data — recompute skipped. "
+                    print("[DIAG:NORM] No batch data — recompute skipped. "
                           "Flag flip will only take effect on the next batch.")
 
+            _toggle_norm_flag(
+                '_normalize_grad_by_sqrt_k',
+                '_viz_normalize_grad_by_sqrt_k',
+                "normalize_grad_by_sqrt_k (g_ij /= sqrt(k))",
+            )
+            _toggle_norm_flag(
+                '_normalize_grad_by_k',
+                '_viz_normalize_grad_by_k',
+                "normalize_grad_by_k (g_ij /= k)",
+            )
+            _toggle_norm_flag(
+                '_normalize_stiffness_by_k',
+                '_viz_normalize_stiffness_by_k',
+                "normalize_stiffness_by_k (s_ij /= k)",
+            )
+
             psim.TextColored((0.7, 0.7, 0.7, 1.0),
-                f"  (Active model flag: {bool(getattr(self.current_model, '_normalize_grad_by_k', False))})"
+                f"  (Active: grad/sqrt(k)={bool(getattr(self.current_model, '_normalize_grad_by_sqrt_k', False))}, "
+                f"grad/k={bool(getattr(self.current_model, '_normalize_grad_by_k', False))}, "
+                f"stiffness/k={bool(getattr(self.current_model, '_normalize_stiffness_by_k', False))})"
             )
 
             # --- Second checkbox: swap predicted areas for GT barycentric areas
@@ -2374,6 +2414,9 @@ class RealTimeEigenanalysisVisualizer:
 
         grad_coeffs = self.current_forward_result['grad_coeffs'].float()
         pred_areas_t = self.current_forward_result['areas'].float()  # original pred areas
+        stiffness_weights = self.current_forward_result.get('stiffness_weights')
+        if stiffness_weights is not None:
+            stiffness_weights = stiffness_weights.float()
 
         # Choose areas source
         if use_gt:
@@ -2396,15 +2439,11 @@ class RealTimeEigenanalysisVisualizer:
 
         # Reassemble S (areas only matter when config.area_weighted=True, but we
         # always pass them — the assembler reads config.area_weighted internally).
-        # Thread stiffness_weights through so 'from_stiffness' assembly works
-        # when the model uses a learned stiffness head.
-        stiffness_weights = self.current_forward_result.get('stiffness_weights')
-        if stiffness_weights is not None:
-            stiffness_weights = stiffness_weights.float()
+        # Pass stiffness_weights (extracted above) so 'from_stiffness' assembly
+        # works on learned[_positive] models.
         L = assemble_laplacian(
             grad_coeffs, self.current_knn, self.current_lap_config,
-            areas=areas_for_assembly,
-            stiffness_weights=stiffness_weights,
+            areas=areas_for_assembly, stiffness_weights=stiffness_weights,
         )
         new_stiffness_matrix = to_scipy_sparse(L)
 
@@ -4262,13 +4301,17 @@ class RealTimeEigenanalysisVisualizer:
                 torch.cuda.synchronize()
             t_inference_start = time.perf_counter()
 
-            # [DIAG:NGK] Report the flag value the model will read inside forward.
-            # Reads AFTER any Lightning/DataParallel wrapping — this is what
-            # actually governs the forward pass.
-            _ngk_flag = getattr(model, '_normalize_grad_by_k', None)
-            _ngk_type = type(model).__name__
-            print(f"[DIAG:NGK]   Entering forward with _normalize_grad_by_k={_ngk_flag} "
-                  f"(model type: {_ngk_type}, id={id(model)})")
+            # [DIAG:NORM] Report the normalization flag values the model will
+            # read inside forward.  Reads AFTER any Lightning/DataParallel
+            # wrapping — this is what actually governs the forward pass.
+            _norm_sqrt_k = getattr(model, '_normalize_grad_by_sqrt_k', None)
+            _norm_k = getattr(model, '_normalize_grad_by_k', None)
+            _norm_s_k = getattr(model, '_normalize_stiffness_by_k', None)
+            _model_type = type(model).__name__
+            print(f"[DIAG:NORM]   Entering forward with "
+                  f"grad/sqrt(k)={_norm_sqrt_k}, grad/k={_norm_k}, "
+                  f"stiffness/k={_norm_s_k} "
+                  f"(model type: {_model_type}, id={id(model)})")
 
             if use_amp:
                 with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -4319,18 +4362,18 @@ class RealTimeEigenanalysisVisualizer:
             N = len(batch_sizes)
             k_val = batch_sizes[0].item()
 
-            # [DIAG:NGK] grad_coeffs signature — the raw test of whether the
-            # 1/sqrt(k) normalization was applied. If the flag is True,
-            # ||g_ij||^2 should be smaller by a factor of k than if False.
+            # [DIAG:NORM] grad_coeffs signature — raw test of which (if any)
+            # normalization branch was applied. ||g_ij||^2 should drop by a
+            # factor of k when normalize_grad_by_sqrt_k is True, and by k^2
+            # when normalize_grad_by_k is True.
             _g2 = (grad_coeffs ** 2).sum(dim=-1)  # (N, k) scalar stiffness per edge
             _g2_mean = float(_g2.mean())
             _g2_max = float(_g2.max())
             _g2_min = float(_g2.min())
-            print(f"[DIAG:NGK]   grad_coeffs: shape={tuple(grad_coeffs.shape)}, "
+            print(f"[DIAG:NORM]   grad_coeffs: shape={tuple(grad_coeffs.shape)}, "
                   f"k={k_val}, sqrt(k)={k_val ** 0.5:.3f}")
-            print(f"[DIAG:NGK]   ||g_ij||^2 stats: mean={_g2_mean:.4e}, "
+            print(f"[DIAG:NORM]   ||g_ij||^2 stats: mean={_g2_mean:.4e}, "
                   f"min={_g2_min:.4e}, max={_g2_max:.4e}")
-            print(f"[DIAG:NGK]     (if NGK=True, these are already divided by k)")
 
             knn_t = batch_data.vertex_indices.reshape(N, k_val).to(device)
             val_lap_config = getattr(model, '_val_lap_config',
@@ -4347,7 +4390,8 @@ class RealTimeEigenanalysisVisualizer:
             # Pass stiffness_weights through so 'from_stiffness' assembly
             # works when the model uses a learned stiffness head (the
             # configured ``val_lap_config.assembly`` controls whether it's
-            # actually consumed).
+            # actually consumed).  stiffness_weights was extracted from
+            # forward_result earlier in this function.
             L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config,
                                    areas=areas,
                                    stiffness_weights=stiffness_weights)
