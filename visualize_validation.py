@@ -739,12 +739,20 @@ class RealTimeEigenanalysisVisualizer:
 
         psim.Text("")
 
-        assembly_options = ['diagonal_gram', 'full_gram']
-        current_assembly_idx = assembly_options.index(self.current_lap_config.assembly) \
-            if self.current_lap_config.assembly in assembly_options else 0
+        assembly_options = ['diagonal_gram', 'full_gram', 'from_stiffness']
+        # If the current assembly isn't in the menu (shouldn't happen after
+        # adding 'from_stiffness', but defensive against future additions),
+        # fall back to index 0 — but DO NOT silently rewrite current_lap_config
+        # to that fallback on render; only commit a change if the user actually
+        # interacts with the combo.
+        try:
+            current_assembly_idx = assembly_options.index(self.current_lap_config.assembly)
+        except ValueError:
+            current_assembly_idx = 0
         assembly_changed, new_assembly_idx = psim.Combo(
             "Assembly", current_assembly_idx, assembly_options
         )
+        new_assembly = assembly_options[new_assembly_idx]
 
         # Area-weighted checkbox (part of LaplacianConfig)
         aw_changed, new_aw = psim.Checkbox(
@@ -752,27 +760,38 @@ class RealTimeEigenanalysisVisualizer:
             self.current_lap_config.area_weighted
         )
 
+        # Pruning: only meaningful on the sparse from-gradient paths. The
+        # sparse 'from_stiffness' builders ignore pruning, so disable the
+        # combo (and force pruning='none') when from_stiffness is selected.
         pruning_options = ['none', 'knn', 'topk']
-        current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
-            if self.current_lap_config.pruning in pruning_options else 0
-        pruning_changed, new_pruning_idx = psim.Combo(
-            "Pruning", current_pruning_idx, pruning_options
-        )
-
+        pruning_changed = False
         k_prune_changed = False
-        new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
-        if pruning_options[new_pruning_idx] in ('knn', 'topk'):
-            k_prune_changed, new_k_prune = psim.InputInt(
-                "k_prune",
-                new_k_prune,
-                flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+        if new_assembly == 'from_stiffness':
+            new_pruning_idx = 0  # 'none'
+            new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
+            psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                "Pruning: none  (ignored on sparse from_stiffness path)")
+            if self.current_lap_config.pruning != 'none':
+                pruning_changed = True  # force flip back to 'none'
+        else:
+            current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
+                if self.current_lap_config.pruning in pruning_options else 0
+            pruning_changed, new_pruning_idx = psim.Combo(
+                "Pruning", current_pruning_idx, pruning_options
             )
-            new_k_prune = max(3, min(100, new_k_prune))
+            new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
+            if pruning_options[new_pruning_idx] in ('knn', 'topk'):
+                k_prune_changed, new_k_prune = psim.InputInt(
+                    "k_prune",
+                    new_k_prune,
+                    flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
+                )
+                new_k_prune = max(3, min(100, new_k_prune))
 
         if assembly_changed or pruning_changed or k_prune_changed or aw_changed:
             new_pruning = pruning_options[new_pruning_idx]
             new_config = LaplacianConfig(
-                assembly=assembly_options[new_assembly_idx],
+                assembly=new_assembly,
                 pruning=new_pruning,
                 k_prune=new_k_prune if new_pruning in ('knn', 'topk') else None,
                 area_weighted=new_aw,
@@ -2395,6 +2414,9 @@ class RealTimeEigenanalysisVisualizer:
 
         grad_coeffs = self.current_forward_result['grad_coeffs'].float()
         pred_areas_t = self.current_forward_result['areas'].float()  # original pred areas
+        stiffness_weights = self.current_forward_result.get('stiffness_weights')
+        if stiffness_weights is not None:
+            stiffness_weights = stiffness_weights.float()
 
         # Choose areas source
         if use_gt:
@@ -2417,15 +2439,11 @@ class RealTimeEigenanalysisVisualizer:
 
         # Reassemble S (areas only matter when config.area_weighted=True, but we
         # always pass them — the assembler reads config.area_weighted internally).
-        # Thread stiffness_weights through so 'from_stiffness' assembly works
-        # when the model uses a learned stiffness head.
-        stiffness_weights = self.current_forward_result.get('stiffness_weights')
-        if stiffness_weights is not None:
-            stiffness_weights = stiffness_weights.float()
+        # Pass stiffness_weights (extracted above) so 'from_stiffness' assembly
+        # works on learned[_positive] models.
         L = assemble_laplacian(
             grad_coeffs, self.current_knn, self.current_lap_config,
-            areas=areas_for_assembly,
-            stiffness_weights=stiffness_weights,
+            areas=areas_for_assembly, stiffness_weights=stiffness_weights,
         )
         new_stiffness_matrix = to_scipy_sparse(L)
 
@@ -4372,7 +4390,8 @@ class RealTimeEigenanalysisVisualizer:
             # Pass stiffness_weights through so 'from_stiffness' assembly
             # works when the model uses a learned stiffness head (the
             # configured ``val_lap_config.assembly`` controls whether it's
-            # actually consumed).
+            # actually consumed).  stiffness_weights was extracted from
+            # forward_result earlier in this function.
             L = assemble_laplacian(grad_coeffs, knn_t, val_lap_config,
                                    areas=areas,
                                    stiffness_weights=stiffness_weights)
