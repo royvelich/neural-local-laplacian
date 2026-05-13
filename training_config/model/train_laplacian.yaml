@@ -22,7 +22,7 @@ module:
   mcv_mode: 'full_gram'
   stiffness_mode: 'full_gram'
 
-  normalize_grad_by_k: true
+  normalize_grad_by_sqrt_k: true
 
   val_laplacian:
     assembly: full_gram

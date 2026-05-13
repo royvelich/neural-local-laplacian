@@ -271,7 +271,7 @@ parameters:
 
         losses: ${globals.loss_preset}
 
-        normalize_grad_by_k: true
+        normalize_grad_by_sqrt_k: true
 
         random_init: false
         keep_areas_head: false

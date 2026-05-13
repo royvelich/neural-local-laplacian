@@ -30,7 +30,7 @@ module:
   # with a soft consistency loss if you want the assembled Laplacians
   # from the two heads to track each other.
   stiffness_mode: 'diagonal_gram'
-  normalize_grad_by_k: true
+  normalize_grad_by_sqrt_k: true
 
   val_laplacian:
     assembly: diagonal_gram

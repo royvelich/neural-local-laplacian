@@ -278,7 +278,9 @@ class LaplacianLocalModule(LaplacianModuleBase):
                  area_bound_C: float = 12.566370614359172,  # 4*pi
                  mcv_mode: str = 'diagonal_gram',
                  stiffness_mode: str = 'diagonal_gram',
+                 normalize_grad_by_sqrt_k: bool = False,
                  normalize_grad_by_k: bool = False,
+                 normalize_stiffness_by_k: bool = False,
                  detach_area_head: bool = False,
                  use_uniform_mass: bool = False,
                  val_laplacian: Optional[Dict] = None,
@@ -339,7 +341,9 @@ class LaplacianLocalModule(LaplacianModuleBase):
             raise ValueError(
                 f"stiffness_mode must be one of {_stiffness_modes}, got '{stiffness_mode}'")
         self._stiffness_mode = stiffness_mode
+        self._normalize_grad_by_sqrt_k = normalize_grad_by_sqrt_k
         self._normalize_grad_by_k = normalize_grad_by_k
+        self._normalize_stiffness_by_k = normalize_stiffness_by_k
         self._detach_area_head = detach_area_head
         self._use_uniform_mass = use_uniform_mass
 
@@ -724,12 +728,18 @@ class LaplacianLocalModule(LaplacianModuleBase):
         # ── Output heads ─────────────────────────────────────────────
         grad_coeffs = self.grad_projection(encoded)
 
-        # Normalize grad_coeffs by 1/sqrt(k) so that the Laplacian's
-        # eigenvalues stay stable as k changes.  ||g_ij/sqrt(k)||^2 = ||g_ij||^2/k
-        # turns the neighbor sum into a mean.
-        if self._normalize_grad_by_k:
-            k_per_patch = batch_sizes.float()  # (batch_size,)
+        # Per-patch k for normalization knobs below.
+        k_per_patch = batch_sizes.float()  # (batch_size,)
+
+        # Three independent normalization flags; they compose multiplicatively.
+        # - normalize_grad_by_sqrt_k: g_ij /= sqrt(k)   → ||g_ij||^2 ~ 1/k
+        # - normalize_grad_by_k:      g_ij /= k         → ||g_ij||^2 ~ 1/k^2
+        # - normalize_stiffness_by_k: s_ij /= k         (applied to whichever
+        #     stiffness path the mode selects below: gram-derived or learned).
+        if self._normalize_grad_by_sqrt_k:
             grad_coeffs = grad_coeffs / k_per_patch[:, None, None].sqrt()
+        if self._normalize_grad_by_k:
+            grad_coeffs = grad_coeffs / k_per_patch[:, None, None]
 
         if self._stiffness_mode == 'full_gram':
             # FEM-style per-edge stiffness from the predicted gradient operator:
@@ -768,6 +778,13 @@ class LaplacianLocalModule(LaplacianModuleBase):
         else:
             # 'diagonal_gram' (default): s_ij = ‖g_ij‖²
             stiffness_weights = (grad_coeffs ** 2).sum(dim=-1)
+
+        # Optional explicit 1/k scaling of the stiffness weights.  Applies
+        # uniformly across all stiffness_modes — for gram-derived modes it
+        # composes with whatever grad normalization was active above, for
+        # the learned modes it scales the head output directly.
+        if self._normalize_stiffness_by_k:
+            stiffness_weights = stiffness_weights / k_per_patch[:, None]
 
         # ── Area prediction ──────────────────────────────────────────
         if self._use_uniform_mass:

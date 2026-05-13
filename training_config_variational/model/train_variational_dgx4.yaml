@@ -23,7 +23,7 @@ module:
   # but the parent class still asks for them; defaults are fine.
   mcv_mode: 'diagonal_gram'
   stiffness_mode: 'diagonal_gram'
-  normalize_grad_by_k: true
+  normalize_grad_by_sqrt_k: true
 
   # Validation-only Laplacian configs (mesh / fmap paths are inherited).
   val_laplacian:
