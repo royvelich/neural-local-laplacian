@@ -36,7 +36,7 @@ module:
         include_coordinates: false
         verbose: false
         normalize_target: none
-        compute_continuous_bilinear: false
+        compute_continuous_bilinear: true
         compute_continuous_energy: false
         compute_lb_all_points: true
         compute_gradients_all_points: true

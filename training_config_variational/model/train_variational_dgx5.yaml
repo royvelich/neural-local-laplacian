@@ -81,6 +81,12 @@ module:
         loss_mode: 'signed_log'     # scale-robust; handles signed Δ values
       weight: 1.0
 
+
+    - loss_module:
+        _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
+        loss_mode: 'mse'
+      weight: 1.0       # tune relative to vector loss
+
     # ── Optional: area gauge anchor ──────────────────────────────────
     # GradientVectorTestLoss anchors g; LaplacianActionTestLoss anchors
     # the product s · A via the /A_i denominator.  AreaSupervisionLoss
