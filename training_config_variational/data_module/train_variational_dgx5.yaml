@@ -32,11 +32,11 @@ module:
       # loss consumes it — saves the Gauss-Legendre cost per surface.
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
-        num_test_funcs: 16
+        num_test_funcs: 200
         include_coordinates: false
         verbose: false
         normalize_target: none
-        compute_continuous_bilinear: true
+        compute_continuous_bilinear: false
         compute_continuous_energy: false
         compute_lb_all_points: true
         compute_gradients_all_points: true
