@@ -64,7 +64,7 @@ module:
         normalize_target: none
 
         # Same continuous-form / per-vertex GT toggles as the random sampler:
-        compute_continuous_bilinear: false   # needed by BilinearFormTestLoss
+        compute_continuous_bilinear: true   # needed by BilinearFormTestLoss
         compute_continuous_energy: false     # needed by DirichletEnergyTestLoss
         compute_lb_all_points: true        # set true if you use LaplacianActionTestLoss
         compute_gradients_all_points: true # set true if you use GradientVectorTestLoss
