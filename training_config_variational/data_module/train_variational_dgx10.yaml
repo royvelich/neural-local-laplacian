@@ -62,18 +62,48 @@ module:
 #            sigma_range: [0.3, 2.0]
 #            center_range: [-1.0, 1.0]
 
-      test_func_sampler:
-        _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
-        max_degree: 3
-        variables: ambient
-        derivative_mode: analytic
-        normalize_target: none
+#      test_func_sampler:
+#        _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+#        max_degree: 3
+#        variables: ambient
+#        derivative_mode: analytic
+#        normalize_target: none
+#
+#        compute_continuous_bilinear: false   # BilinearFormTestLoss disabled in dgx8
+#        compute_continuous_energy: false
+#        compute_lb_all_points: true          # LaplacianActionTestLoss anchor
+#        compute_gradients_all_points: true   # GradientVectorTestLoss anchor
+#        verbose: false
 
-        compute_continuous_bilinear: false   # BilinearFormTestLoss disabled in dgx8
-        compute_continuous_energy: false
-        compute_lb_all_points: true          # LaplacianActionTestLoss anchor
-        compute_gradients_all_points: true   # GradientVectorTestLoss anchor
+
+
+      test_func_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
+        num_test_funcs: 20
+        include_coordinates: false
         verbose: false
+        normalize_target: none
+        compute_continuous_bilinear: false
+        compute_continuous_energy: false
+        compute_lb_all_points: true
+        compute_gradients_all_points: true
+        derivative_mode: 'analytic'
+        families:
+          poly:
+            weight: 0.3
+            order_range: [1, 4]
+            coeff_scale: 1.0
+            coeff_method: uniform
+          trig:
+            weight: 0.6
+            frequency_range: [0.5, 7.0]
+            phase_range: [0.0, 6.283]
+          exp:
+            weight: 0.1
+            sigma_range: [0.3, 2.0]
+            center_range: [-1.0, 1.0]
+
+
 
       seed: ${globals.training_seed}
       epoch_size: 64
