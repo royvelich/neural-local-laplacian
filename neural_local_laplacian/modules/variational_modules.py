@@ -92,6 +92,10 @@ class _VariationalTrainingMixin:
                 surface, 'test_func_laplacians_at_vertices', None)
             geodesic_sources = getattr(surface, 'geodesic_sources', None)
             geodesic_distances = getattr(surface, 'geodesic_distances', None)
+            heat_kernel_times = getattr(surface, 'heat_kernel_times', None)
+            heat_kernel_gt = getattr(surface, 'heat_kernel_gt', None)
+            heat_kernel_diagonal_only = getattr(
+                surface, 'heat_kernel_diagonal_only', None)
 
             # The variational losses operate on whole-surface tensors; no
             # MCV target is needed.  We still set predicted_mcv/target_mcv
@@ -116,6 +120,9 @@ class _VariationalTrainingMixin:
                 test_func_laplacians_at_vertices=tf_lap_at_vertices,
                 geodesic_sources=geodesic_sources,
                 geodesic_distances=geodesic_distances,
+                heat_kernel_times=heat_kernel_times,
+                heat_kernel_gt=heat_kernel_gt,
+                heat_kernel_diagonal_only=heat_kernel_diagonal_only,
                 gt_vertex_areas=getattr(surface, 'vertex_areas', None),
             )
 

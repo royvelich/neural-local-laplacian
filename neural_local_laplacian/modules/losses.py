@@ -46,6 +46,10 @@ class LossContext:
     # Heat-method geodesic supervision (variational pipeline)
     geodesic_sources: Optional[torch.Tensor] = None                 # (S,) vertex idx
     geodesic_distances: Optional[torch.Tensor] = None               # (S, n)
+    # Heat-kernel supervision (variational pipeline)
+    heat_kernel_times: Optional[torch.Tensor] = None                # (T,)
+    heat_kernel_gt: Optional[torch.Tensor] = None                   # (T, n) or (T, n, n)
+    heat_kernel_diagonal_only: Optional[torch.Tensor] = None        # 0-d bool
 
 
 @dataclass
@@ -1982,3 +1986,126 @@ class HeatMethodGeodesicLoss(_VariationalTestLoss):
 
         per = torch.stack(per_source_errors, dim=0)                   # (S, n)
         return self._reduce(per)
+
+
+class HeatKernelLoss(_VariationalTestLoss):
+    r"""Match the discrete heat kernel against the analytic GT.
+
+    The discrete heat kernel matrix at diffusion time ``t`` is
+
+        K_t  =  exp(-t · M⁻¹ L)              ∈ ℝ^{n×n}
+
+    Entrywise this approximates ``K_t(x_i, x_j)`` of the continuous heat
+    semigroup ``exp(-tΔ_g)``.  Spectrally,
+
+        K_t(x_i, x_j)  =  Σ_k  exp(-λ_k t) · φ_k(x_i) · φ_k(x_j)
+
+    where ``(λ_k, φ_k)`` are M-orthonormal generalized eigenpairs of
+    ``Lφ = λMφ`` (PSD convention).  The GT side computes this spectral
+    form on a dense reference triangulation of the same Monge patch (see
+    :func:`compute_heat_kernel_gt_on_monge_patch`).
+
+    Routes gradient through:
+      • the stiffness head (via ``L = assemble_from_stiffness_weights``)
+      • the area head     (via ``M = diag(areas)``)
+
+    Does NOT touch the gradient head — pair with a small
+    :class:`GradientVectorTestLoss` if you want that head trained too.
+
+    Args:
+        diagonal_only: if True, supervise only the diagonal ``K_t(x_i, x_i)``
+            (= HKS at each vertex), which is what fmap descriptors read.
+            If False, supervise the full ``(n, n)`` kernel — strictly more
+            information, ``n²`` memory per t.  Must match the
+            ``heat_kernel_diagonal_only`` flag the dataset was built with.
+        loss_mode: ``'mse'`` / ``'relative'`` / ``'signed_log'``.
+        normalize_per_t: divide each t-channel's error by ``‖K_t_gt‖_F``
+            (or ``‖K_t_gt‖_2`` in diagonal mode) before reducing.  Makes
+            the loss scale-invariant per spectral band — useful because
+            small-t kernels can have much larger entries than large-t.
+        L_assembly: ``'from_stiffness'`` (default — pair with
+            ``stiffness_mode='learned[_positive]'``) or ``'diagonal_gram'``.
+        eps: numerical floor.
+        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over the t-axis.
+    """
+
+    def __init__(self,
+                 diagonal_only: bool = True,
+                 loss_mode: str = 'mse',
+                 normalize_per_t: bool = True,
+                 L_assembly: str = 'from_stiffness',
+                 eps: float = 1e-12,
+                 reduction: str = 'mean'):
+        super().__init__(reduction=reduction)
+        if loss_mode not in ('mse', 'relative', 'signed_log'):
+            raise ValueError(
+                f"loss_mode must be 'mse' / 'relative' / 'signed_log', got '{loss_mode}'")
+        if L_assembly not in ('from_stiffness', 'diagonal_gram'):
+            raise ValueError(
+                f"L_assembly must be 'from_stiffness' / 'diagonal_gram', got '{L_assembly}'")
+        self.diagonal_only = diagonal_only
+        self.loss_mode = loss_mode
+        self.normalize_per_t = normalize_per_t
+        self.L_assembly = L_assembly
+        self.eps = eps
+
+    def _assemble_L(self, ctx: LossContext) -> torch.Tensor:
+        from neural_local_laplacian.utils.laplacian_assembly import (
+            assemble_from_stiffness_weights,
+            assemble_diagonal_gram_laplacian,
+        )
+        if self.L_assembly == 'from_stiffness':
+            return assemble_from_stiffness_weights(
+                ctx.stiffness_weights, ctx.knn, areas=None)
+        return assemble_diagonal_gram_laplacian(
+            ctx.grad_coeffs, ctx.knn, areas=None)
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        self._check_required(ctx, ['stiffness_weights', 'areas', 'knn',
+                                   'heat_kernel_times', 'heat_kernel_gt'])
+
+        # Sanity-check the dataset convention matches the loss config.
+        gt_diag_flag = ctx.heat_kernel_diagonal_only
+        if gt_diag_flag is not None:
+            gt_is_diag = bool(gt_diag_flag.item()
+                              if torch.is_tensor(gt_diag_flag) else gt_diag_flag)
+            if gt_is_diag != self.diagonal_only:
+                raise ValueError(
+                    f"HeatKernelLoss(diagonal_only={self.diagonal_only}) does "
+                    f"not match the dataset (heat_kernel_diagonal_only="
+                    f"{gt_is_diag}).  Either flip the loss config or rebuild "
+                    f"the GT with the matching flag.")
+
+        L = self._assemble_L(ctx)                                  # (n, n)
+        n = L.shape[0]
+        device = L.device
+        dtype = L.dtype
+
+        # M is diagonal — avoid materialising the full (n, n) inverse.
+        # M⁻¹ L is computed by scaling each row of L by 1 / A_i.
+        inv_areas = (1.0 / (ctx.areas + self.eps)).unsqueeze(-1)   # (n, 1)
+        M_inv_L = inv_areas * L                                    # (n, n)
+
+        times = ctx.heat_kernel_times.to(device=device, dtype=dtype)  # (T,)
+        gt = ctx.heat_kernel_gt.to(device=device, dtype=dtype)        # (T, n) or (T, n, n)
+        T = times.shape[0]
+
+        per_t = []
+        for t_idx in range(T):
+            t = times[t_idx]
+            K_pred = torch.matrix_exp(-t * M_inv_L)                # (n, n)
+            if self.diagonal_only:
+                K_pred = torch.diagonal(K_pred)                    # (n,)
+            target = gt[t_idx]                                     # (n,) or (n, n)
+            err = _scalar_error_per_element(
+                K_pred, target, self.loss_mode, eps=self.eps)      # same shape
+            if self.normalize_per_t:
+                denom = (target ** 2).sum().clamp_min(self.eps).sqrt()
+                err = err / denom
+            per_t.append(err.mean() if self.reduction == 'mean'
+                         else err.sum() if self.reduction == 'sum'
+                         else err)
+        if self.reduction == 'none':
+            return torch.stack(per_t, dim=0)                       # (T, ...)
+        return torch.stack(per_t).mean() if self.reduction == 'mean' \
+            else torch.stack(per_t).sum()
