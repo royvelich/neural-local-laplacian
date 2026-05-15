@@ -94,7 +94,7 @@ module:
         _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
         loss_mode: 'log_mse'
         area_weighted: false
-      weight: 0.1
+      weight: 0.0
 
     # ── Anchor: stiffness head scale ─────────────────────────────────
     # The heat-method loss is gauge-degenerate under uniform rescaling
@@ -106,7 +106,7 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
         loss_mode: 'signed_log'
-      weight: 0.1
+      weight: 0.0
 
     # ── BilinearFormTestLoss intentionally omitted ───────────────────
     # Redundant with the gradient anchor (both supervise ∇_g f), and
