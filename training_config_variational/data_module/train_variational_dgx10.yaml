@@ -1,0 +1,173 @@
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericMixedDataModule
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
+
+      # Random Fourier-feature Monge surface family (GP-like).  Drop-in
+      # replacement for PolynomialMongeSurfaceSampler — same BaseMongeSurfaceSampler
+      # interface, so the rest of this file (test_func_sampler, geodesic GT,
+      # vertex sampling) is identical to dgx8.  Each of K / beta /
+      # magnitude_scale accepts a scalar or a 2-element [lo, hi] range
+      # (uniform random draw per surface).
+      surface_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
+        K: [6, 12]
+        beta: [1.5, 3.0]
+        magnitude_scale: [0.05, 0.3]
+        l1_truncate: true
+
+      # Vertex sampling on U = [-grid_radius, grid_radius]^2.
+      num_vertices_range: [30, 60]
+      grid_radius: 1.0
+      position_noise_std: [0.01, 0.04]
+      k: [6, 15]
+
+      # Test functions — heat-method-centric run.  The primary signal is
+      # HeatMethodGeodesicLoss (data: geodesic_sources + geodesic_distances).
+      # The analytic test-function losses are kept on as low-weight gauge
+      # anchors:
+      #   • compute_gradients_all_points: true  → GradientVectorTestLoss
+      #     (anchors the direction + magnitude of g_ij, since the heat
+      #     method only reads ∇u and normalises immediately).
+      #   • compute_lb_all_points: true         → LaplacianActionTestLoss
+      #     (anchors the scale of s_ij, since the heat method is
+      #     gauge-degenerate under L → α L).
+      # The continuous (P, P) bilinear quadrature is OFF — BilinearFormTestLoss
+      # is dropped in dgx8 (redundant with the gradient anchor).
+#      test_func_sampler:
+#        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
+#        num_test_funcs: 16
+#        include_coordinates: false
+#        verbose: false
+#        normalize_target: none
+#        compute_continuous_bilinear: false
+#        compute_continuous_energy: false
+#        compute_lb_all_points: true
+#        compute_gradients_all_points: true
+#        derivative_mode: 'analytic'
+#        families:
+#          poly:
+#            weight: 0.5
+#            order_range: [1, 4]
+#            coeff_scale: 1.0
+#            coeff_method: uniform
+#          trig:
+#            weight: 0.4
+#            frequency_range: [0.5, 4.0]
+#            phase_range: [0.0, 6.283]
+#          exp:
+#            weight: 0.1
+#            sigma_range: [0.3, 2.0]
+#            center_range: [-1.0, 1.0]
+
+      test_func_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+        max_degree: 3
+        variables: ambient
+        derivative_mode: analytic
+        normalize_target: none
+
+        compute_continuous_bilinear: false   # BilinearFormTestLoss disabled in dgx8
+        compute_continuous_energy: false
+        compute_lb_all_points: true          # LaplacianActionTestLoss anchor
+        compute_gradients_all_points: true   # GradientVectorTestLoss anchor
+        verbose: false
+
+      seed: ${globals.training_seed}
+      epoch_size: 8
+
+      # ----- GT geodesic distances (HeatMethodGeodesicLoss, primary signal) -----
+      # Each surface item carries:
+      #   geodesic_sources:    (S,)        FPS-chosen training-vertex indices
+      #   geodesic_distances:  (S, n)      exact GT distances on a dense
+      #                                    reference triangulation
+      # via the exact MMP algorithm (pygeodesic / igl.exact_geodesic).
+      # More sources = denser supervision per surface; each adds two sparse
+      # linear solves in the loss.  S=4 on 30–60-vertex patches is cheap.
+      #
+      # RFF surfaces can be wigglier than polynomial ones at high K /
+      # low beta.  100 (vs 80 for dgx8/polynomial) trades ~1.5× MMP cost
+      # for ~1.5× sharper GT — still well under the per-step model cost.
+      # Bump to 120–160 if you push K higher or beta lower.
+      compute_geodesics: true
+      num_geodesic_sources: 4
+      geodesic_source_method: farthest_point_sampling
+      geodesic_reference_resolution: 100
+    # batch_size MUST be 1 for v1 (variational batching across surfaces is
+    # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
+    batch_size: 1
+    num_workers: 0
+    shuffle: True
+
+  val_dataset_specifications:
+    # --- [0] Patch-level MCV validation (synthetic patches with analytic H, n̂) ---
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+        seed: ${globals.validation_seed}
+        epoch_size: 200
+        position_noise_std: [0.0, 0.05]
+        grid_radius_range: [0.5, 2.0]
+        polynomial_offset_range: [0.0, 1.0]
+        points_scale_range: [1.0]
+        coefficient_scale_range: [0.5, 3.0]
+        order_range: [2, 3]
+        grid_samplers:
+          - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+            num_points_range: [6, 30]
+        conv_k_nearest: null
+        pose_transformers: null
+        coeff_generation_method:
+          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+          _args_: ['uniform']
+        diff_geom_components:
+          - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+            _args_: ['mean_curvature']
+        diff_geom_at_origin_only: True
+        include_origin_in_grid: False
+        flip_normal_if_negative_curvature: False
+        normalize_to_unit_sphere: True
+      batch_size: 8
+      num_workers: 0
+      shuffle: False
+
+    # --- [1] Mesh spectral / geodesic validation ---
+    # _validation_step_mesh builds the Laplacian via assemble_laplacian.
+    # With stiffness_mode='learned_positive' on the model, val_laplacian
+    # is auto-coerced to assembly='from_stiffness', so the assembled L
+    # reads the learned stiffness head.
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+        mesh_folder_path: '/workspace/datasets/shrec15'
+        max_meshes: 80
+        file_size_range_mb: [0.5, 4]
+        require_manifold: True
+        shuffle: True
+        k: 8
+        num_geodesic_sources: 5
+        geodesic_source_method: "farthest_point_sampling"
+      batch_size: 1
+      num_workers: 0
+      shuffle: False
+
+    # --- [2] Fmap: DT4D Animals intra ---
+    # Same fmap-correspondence validation as dgx2.  fmap_val_cfg's
+    # eval_laplacians block is also auto-coerced to 'from_stiffness'.
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+          root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+          pairs: ["0.7:1.0"]
+        val_poses_per_pair: 2
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
