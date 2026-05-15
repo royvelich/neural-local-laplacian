@@ -207,6 +207,22 @@ class SurfaceVisualizer:
         self._gt_gradients_all_on_mesh = True
         self._gt_gradients_all_on_cloud = True
 
+        # GT geodesic distances (attached by MongeSurfaceVariationalDataset
+        # when compute_geodesics: true).  Surface carries:
+        #   surface.geodesic_sources:   (S,)    training-vertex idx per source
+        #   surface.geodesic_distances: (S, n)  exact GT distance per vertex
+        self._show_gt_geodesics = False
+        self._geodesic_source_idx = 0
+        self._geodesic_cmap = 'viridis'
+        self._geodesic_symmetric_cmap = False
+        self._show_geodesic_source_marker = True
+        self._geodesic_source_color = [1.0, 0.2, 0.2]   # red marker at source
+        self._geodesic_source_radius_scale = 2.0         # multiplier on point_radius
+        # Where to attach the geodesic scalar field. Same convention as the
+        # all-points gradient: master toggle + per-target visibility.
+        self._geodesics_on_mesh = True
+        self._geodesics_on_cloud = True
+
     def _has_hybrid_option(self):
         return self._current_surfaces is not None and len(self._current_surfaces) >= 2
 
@@ -516,6 +532,80 @@ class SurfaceVisualizer:
             radius=self._gt_gradient_all_width,
             vectortype="ambient")
 
+    def _has_gt_geodesics(self, surface) -> bool:
+        return (hasattr(surface, 'geodesic_distances')
+                and surface.geodesic_distances is not None
+                and hasattr(surface, 'geodesic_sources')
+                and surface.geodesic_sources is not None)
+
+    def _num_geodesic_sources(self, surface) -> int:
+        if not self._has_gt_geodesics(surface):
+            return 0
+        return int(surface.geodesic_sources.shape[0])
+
+    def _add_gt_geodesic_to_structure(self, structure, surface, structure_type: str = "mesh"):
+        """Color a Polyscope structure by per-vertex GT geodesic distance.
+
+        Reads ``surface.geodesic_distances`` (S, n) and
+        ``surface.geodesic_sources`` (S,), attached by
+        MongeSurfaceVariationalDataset when ``compute_geodesics: true``.
+        Adds a scalar quantity named ``GT geodesic d(v_s, ·)`` whose
+        values are the GT distance from the currently selected source
+        vertex; selectable via ``Source idx`` slider in the UI.
+
+        Args:
+            structure: Polyscope mesh / point cloud.
+            surface:   surface item carrying the geodesic GT fields.
+            structure_type: 'mesh' or 'pointcloud'; checked against per-
+                target visibility flags so the field can be shown on
+                one, both, or neither target.
+        """
+        if not self._show_gt_geodesics or not self._has_gt_geodesics(surface):
+            return
+        if structure_type == "mesh" and not self._geodesics_on_mesh:
+            return
+        if structure_type == "pointcloud" and not self._geodesics_on_cloud:
+            return
+
+        S = self._num_geodesic_sources(surface)
+        src_idx = min(self._geodesic_source_idx, S - 1)
+        distances = to_numpy(surface.geodesic_distances[src_idx])  # (n,)
+        # Defensive: scalar field length must match the structure's vertex count.
+        if distances.shape[0] != to_numpy(surface.pos).shape[0]:
+            return
+        src_vertex = int(to_numpy(surface.geodesic_sources[src_idx]))
+        name = f"GT geodesic d(v_{src_vertex}, ·)"
+
+        vmin = float(distances.min())
+        vmax = float(distances.max())
+        if self._geodesic_symmetric_cmap:
+            bound = max(abs(vmin), abs(vmax))
+            vrange = (-bound, bound)
+        else:
+            vrange = (vmin, vmax)
+        structure.add_scalar_quantity(name=name, values=distances,
+                                      enabled=True, cmap=self._geodesic_cmap,
+                                      vminmax=vrange)
+
+    def _render_gt_geodesic_source_marker(self, surface, name: str):
+        """Place a small marker sphere at the currently selected geodesic source."""
+        if not (self._show_gt_geodesics and self._show_geodesic_source_marker):
+            return
+        if not self._has_gt_geodesics(surface):
+            return
+        S = self._num_geodesic_sources(surface)
+        src_idx = min(self._geodesic_source_idx, S - 1)
+        src_vertex = int(to_numpy(surface.geodesic_sources[src_idx]))
+        pos = to_numpy(surface.pos)
+        if src_vertex >= pos.shape[0]:
+            return
+        marker = ps.register_point_cloud(
+            f"{name} - Geodesic source v_{src_vertex}",
+            pos[src_vertex:src_vertex + 1],
+            radius=self._point_radius * self._geodesic_source_radius_scale,
+            enabled=True)
+        marker.set_color(tuple(self._geodesic_source_color))
+
     def _add_origin_indicator(self, surface, name, translation):
         if not self.is_diff_geom_at_origin_only:
             return
@@ -749,6 +839,75 @@ class SurfaceVisualizer:
                         psim.Text(f"  Δ_LB range: [{lb_all[:, pidx].min():.4f}, {lb_all[:, pidx].max():.4f}]")
                 psim.Text("")
 
+            # ── GT geodesic distances ────────────────────────────────
+            # Surface-level field attached by MongeSurfaceVariationalDataset
+            # when compute_geodesics: true.  Only rendered when present.
+            current_surface = (self._current_surfaces[self._patch_idx]
+                               if (self._current_surfaces
+                                   and self._patch_idx != _HYBRID_IDX
+                                   and self._patch_idx < len(self._current_surfaces))
+                               else None)
+            if (current_surface is None and self._current_surfaces
+                    and self._patch_idx == _HYBRID_IDX
+                    and len(self._current_surfaces) >= 2):
+                current_surface = self._current_surfaces[1]  # points surface in hybrid
+
+            if current_surface is not None and self._has_gt_geodesics(current_surface):
+                psim.Text("GT Geodesics")
+                psim.Separator()
+                cgg, vgg = psim.Checkbox("Show GT Geodesics", self._show_gt_geodesics)
+                if cgg: self._show_gt_geodesics = vgg; needs_rerender = True
+
+                S = self._num_geodesic_sources(current_surface)
+                if self._show_gt_geodesics and S > 0:
+                    if self._geodesic_source_idx >= S:
+                        self._geodesic_source_idx = 0
+                    if S > 1:
+                        csi, vsi = psim.SliderInt("Source idx",
+                                                  self._geodesic_source_idx,
+                                                  v_min=0, v_max=S - 1)
+                        if csi:
+                            self._geodesic_source_idx = vsi
+                            needs_rerender = True
+                    src_vertex = int(to_numpy(
+                        current_surface.geodesic_sources[self._geodesic_source_idx]))
+                    psim.Text(f"  Source vertex: v_{src_vertex}  "
+                              f"({self._geodesic_source_idx + 1}/{S})")
+                    dists = to_numpy(
+                        current_surface.geodesic_distances[self._geodesic_source_idx])
+                    psim.Text(f"  d range: [{dists.min():.4f}, {dists.max():.4f}]")
+
+                    # Per-target visibility (same idiom as the gradient field).
+                    psim.Text("  Display target:")
+                    psim.SameLine()
+                    cgom, vgom = psim.Checkbox("On Mesh##geo", self._geodesics_on_mesh)
+                    if cgom: self._geodesics_on_mesh = vgom; needs_rerender = True
+                    psim.SameLine()
+                    cgop, vgop = psim.Checkbox("On Point Cloud##geo",
+                                               self._geodesics_on_cloud)
+                    if cgop: self._geodesics_on_cloud = vgop; needs_rerender = True
+
+                    cgsm, vgsm = psim.Checkbox("Show Source Marker",
+                                               self._show_geodesic_source_marker)
+                    if cgsm:
+                        self._show_geodesic_source_marker = vgsm
+                        needs_rerender = True
+                    cgmc, vgmc = psim.ColorEdit3("Source Marker Color",
+                                                 self._geodesic_source_color)
+                    if cgmc: self._geodesic_source_color = list(vgmc); needs_rerender = True
+                    cgms, vgms = psim.SliderFloat("Source Marker Size",
+                                                  self._geodesic_source_radius_scale,
+                                                  v_min=0.5, v_max=8.0)
+                    if cgms:
+                        self._geodesic_source_radius_scale = vgms
+                        needs_rerender = True
+                    csym_g, vsym_g = psim.Checkbox("Symmetric Cmap##geo",
+                                                   self._geodesic_symmetric_cmap)
+                    if csym_g:
+                        self._geodesic_symmetric_cmap = vsym_g
+                        needs_rerender = True
+                psim.Text("")
+
             # ── Surface metrics ──────────────────────────────────────
             psim.Text("Surface Metrics")
             psim.Separator()
@@ -838,6 +997,7 @@ class SurfaceVisualizer:
                 self._add_normals_to_structure(mesh, normals)
             self._add_probe_coloring(mesh, surface, self.vis_config.mesh_scalar_colormap)
             self._add_gt_gradient_all_to_structure(mesh, surface, structure_type="mesh")
+            self._add_gt_geodesic_to_structure(mesh, surface, structure_type="mesh")
         if self._show_pointcloud:
             cloud = ps.register_point_cloud(f"{name} - Point Cloud", pos, radius=self._point_radius, enabled=True)
             cloud.set_color(tuple(c * 0.5 for c in self._surface_color))
@@ -846,9 +1006,11 @@ class SurfaceVisualizer:
                 self._add_normals_to_structure(cloud, normals)
             self._add_probe_coloring(cloud, surface, self.vis_config.pointcloud_scalar_colormap)
             self._add_gt_gradient_all_to_structure(cloud, surface, structure_type="pointcloud")
+            self._add_gt_geodesic_to_structure(cloud, surface, structure_type="pointcloud")
         self._add_origin_indicator(surface, name, np.zeros(3))
         self._render_origin_normals(surface, name, pred_cache_idx=idx)
         self._render_gt_gradient_arrow(surface, name)
+        self._render_gt_geodesic_source_marker(surface, name)
 
     def _render_hybrid(self):
         surf_mesh = self._current_surfaces[0]
@@ -868,6 +1030,7 @@ class SurfaceVisualizer:
             self._add_normals_to_structure(mesh, normals_mesh)
         self._add_probe_coloring(mesh, surf_mesh, self.vis_config.mesh_scalar_colormap)
         self._add_gt_gradient_all_to_structure(mesh, surf_mesh, structure_type="mesh")
+        self._add_gt_geodesic_to_structure(mesh, surf_mesh, structure_type="mesh")
 
         # Point cloud from downsampled grid (surface 1)
         cloud = ps.register_point_cloud(f"Hybrid Points ({name_pts})", pos_pts,
@@ -878,11 +1041,14 @@ class SurfaceVisualizer:
             self._add_normals_to_structure(cloud, normals_pts)
         self._add_probe_coloring(cloud, surf_pts, self.vis_config.pointcloud_scalar_colormap)
         self._add_gt_gradient_all_to_structure(cloud, surf_pts, structure_type="pointcloud")
+        self._add_gt_geodesic_to_structure(cloud, surf_pts, structure_type="pointcloud")
 
         # Origin + normals from downsampled patch (what model sees)
         self._add_origin_indicator(surf_pts, "Hybrid", np.zeros(3))
         self._render_origin_normals(surf_pts, "Hybrid", pred_cache_idx=1)
         self._render_gt_gradient_arrow(surf_pts, "Hybrid")
+        # Geodesic source marker uses the points surface (what the model trained on)
+        self._render_gt_geodesic_source_marker(surf_pts, "Hybrid")
 
     def _render_origin_normals(self, surface, name, pred_cache_idx=None):
         translation = np.zeros(3)
