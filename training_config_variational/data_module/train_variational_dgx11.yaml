@@ -38,7 +38,7 @@ module:
         verbose: false
 
       seed: ${globals.training_seed}
-      epoch_size: 8000
+      epoch_size: 800
 
       # GT geodesics are NOT needed when only HeatKernelLoss is active.
       compute_geodesics: false
