@@ -413,10 +413,53 @@ class SurfaceVisualizer:
         structure.add_vector_quantity("normals", normals * self.vis_config.vector_scale,
                                      enabled=True, color=self.color_palette.get_vector_color("normals"), vectortype="ambient")
 
+    # ── Probe-field name resolution ──────────────────────────────────
+    # MongeSurfaceVariationalDataset attaches probe data under different
+    # names than the patch-level synthetic datasets:
+    #   patch level                       variational
+    #   ─────────────────────────────────  ───────────────────────────────
+    #   test_func_deltas                   (not present — no center concept)
+    #   test_func_values                   test_func_values            (same)
+    #   test_func_gradients_all_points     test_func_gradients_at_vertices
+    #   test_func_lb_all_points            test_func_laplacians_at_vertices
+    # These helpers return the first present field from a fallback chain
+    # so the rest of the viz code can stay branch-free.
+    @staticmethod
+    def _probe_attr(surface, *names):
+        """Return the first present, non-None attribute among ``names``."""
+        for n in names:
+            v = getattr(surface, n, None)
+            if v is not None:
+                return v
+        return None
+
+    def _get_test_func_deltas(self, surface):
+        return self._probe_attr(surface, 'test_func_deltas')
+
+    def _get_test_func_values(self, surface):
+        return self._probe_attr(surface, 'test_func_values')
+
+    def _get_test_func_gradients_all(self, surface):
+        return self._probe_attr(
+            surface, 'test_func_gradients_all_points',
+            'test_func_gradients_at_vertices')
+
+    def _get_test_func_lb_all(self, surface):
+        return self._probe_attr(
+            surface, 'test_func_lb_all_points',
+            'test_func_laplacians_at_vertices')
+
     def _get_num_probes(self, surface):
-        """Return number of probe functions on this surface, or 0."""
-        if hasattr(surface, 'test_func_deltas') and surface.test_func_deltas is not None:
-            return surface.test_func_deltas.shape[-1]
+        """Return number of probe functions on this surface, or 0.
+
+        Reads `test_func_deltas` (patch-level) or falls back to
+        `test_func_values` (variational, which has no center-relative
+        deltas).  Either has shape (..., P) so the trailing axis is P.
+        """
+        for getter in (self._get_test_func_deltas, self._get_test_func_values):
+            v = getter(surface)
+            if v is not None:
+                return v.shape[-1]
         return 0
 
     def _add_probe_coloring(self, structure, surface, colormap='coolwarm'):
@@ -434,15 +477,23 @@ class SurfaceVisualizer:
             struct_name = structure.get_name()
         except Exception:
             pass
-        has_h = hasattr(surface, 'test_func_values') and surface.test_func_values is not None
-        has_lb_all = hasattr(surface, 'test_func_lb_all_points') and surface.test_func_lb_all_points is not None
-        deltas_all = to_numpy(surface.test_func_deltas)
-        d_p = deltas_all[:, probe_idx]
+        vals_t = self._get_test_func_values(surface)
+        lb_all_t = self._get_test_func_lb_all(surface)
+        deltas_t = self._get_test_func_deltas(surface)
+        has_h = vals_t is not None
+        has_lb_all = lb_all_t is not None
+        has_deltas = deltas_t is not None
+
+        d_p = None
+        if has_deltas:
+            deltas_all = to_numpy(deltas_t)
+            d_p = deltas_all[:, probe_idx]
         print(f"\n[probe_debug] structure='{struct_name}'  probe={probe_idx}/{num_probes}  mode={self._probe_color_mode}")
-        print(f"  K={d_p.shape[0]}  has_h={has_h}  has_lb_all={has_lb_all}")
-        print(f"  δh: min={d_p.min():.6f}  max={d_p.max():.6f}  mean={d_p.mean():.6f}  std={d_p.std():.6f}")
+        print(f"  has_h={has_h}  has_lb_all={has_lb_all}  has_deltas={has_deltas}")
+        if has_deltas:
+            print(f"  δh: min={d_p.min():.6f}  max={d_p.max():.6f}  mean={d_p.mean():.6f}  std={d_p.std():.6f}")
         if has_h:
-            h_p = to_numpy(surface.test_func_values)[:, probe_idx]
+            h_p = to_numpy(vals_t)[:, probe_idx]
             print(f"   h: min={h_p.min():.6f}  max={h_p.max():.6f}  mean={h_p.mean():.6f}  std={h_p.std():.6f}")
             # Find origin index
             origin_idx_val = None
@@ -451,13 +502,14 @@ class SurfaceVisualizer:
                     origin_idx_val = int(surface.origin_idx.item())
                 except Exception:
                     pass
-            if origin_idx_val is not None and origin_idx_val < d_p.shape[0]:
+            if has_deltas and origin_idx_val is not None and origin_idx_val < d_p.shape[0]:
                 print(f"   h(origin)={h_p[origin_idx_val]:.6f}  δh(origin)={d_p[origin_idx_val]:.6f}  "
                       f"diff(h-δh)@origin={h_p[origin_idx_val] - d_p[origin_idx_val]:.6f}")
-            # Per-vertex difference (should equal h(origin) for all vertices if dataset is correct)
-            diff = h_p - d_p
-            print(f"   (h - δh): min={diff.min():.6f}  max={diff.max():.6f}  "
-                  f"mean={diff.mean():.6f}  std={diff.std():.6f}  (should be constant = h(origin))")
+            if has_deltas:
+                # Per-vertex difference (should equal h(origin) for all vertices if dataset is correct)
+                diff = h_p - d_p
+                print(f"   (h - δh): min={diff.min():.6f}  max={diff.max():.6f}  "
+                      f"mean={diff.mean():.6f}  std={diff.std():.6f}  (should be constant = h(origin))")
         if hasattr(surface, 'test_func_laplacians') and surface.test_func_laplacians is not None:
             lb = to_numpy(surface.test_func_laplacians).flatten()
             if probe_idx < len(lb):
@@ -466,24 +518,28 @@ class SurfaceVisualizer:
         if self._probe_color_mode == 0:
             # h(p_j) — raw function value at every vertex
             if has_h:
-                vals = to_numpy(surface.test_func_values)  # (K, P)
+                vals = to_numpy(vals_t)  # (K, P)
                 values = vals[:, probe_idx]
                 label = f"h_{probe_idx}"
             else:
                 print("  [probe_debug] mode=h but test_func_values missing — returning")
                 return  # not available
         elif self._probe_color_mode == 1:
-            # Delta: h(p_j) - h(p_i)
+            # Delta: h(p_j) - h(p_i) — patch-level only
+            if not has_deltas:
+                print("  [probe_debug] mode=δh but test_func_deltas missing "
+                      "(variational dataset has no center-relative deltas) — returning")
+                return
             values = d_p
             label = f"δh_{probe_idx}"
         else:
             # Δ_LB(h) at every vertex
             if has_lb_all:
-                lb_all = to_numpy(surface.test_func_lb_all_points)  # (K, P)
+                lb_all = to_numpy(lb_all_t)  # (K, P)
                 values = lb_all[:, probe_idx]
                 label = f"Δ_LB(h_{probe_idx})"
             else:
-                print("  [probe_debug] mode=Δ_LB but test_func_lb_all_points missing — returning")
+                print("  [probe_debug] mode=Δ_LB but per-vertex Laplacian field missing — returning")
                 return  # not available
 
         print(f"  → coloring: label='{label}'  values: min={values.min():.6f}  max={values.max():.6f}  "
@@ -556,15 +612,15 @@ class SurfaceVisualizer:
             return
         if structure_type == "pointcloud" and not self._gt_gradients_all_on_cloud:
             return
-        if not hasattr(surface, 'test_func_gradients_all_points') or \
-                surface.test_func_gradients_all_points is None:
+        grads_t = self._get_test_func_gradients_all(surface)
+        if grads_t is None:
             return
         num_probes = self._get_num_probes(surface)
         if num_probes == 0:
             return
         probe_idx = min(self._probe_idx, num_probes - 1)
 
-        grads_all = to_numpy(surface.test_func_gradients_all_points)  # (K, P, 3)
+        grads_all = to_numpy(grads_t)  # (K, P, 3)
         if probe_idx >= grads_all.shape[1]:
             return
         vectors = grads_all[:, probe_idx, :]  # (K, 3)
@@ -909,10 +965,13 @@ class SurfaceVisualizer:
                 if cp1: self._show_probe_scalar = vp1; needs_rerender = True
 
                 surface = self._current_surfaces[cur_surface_idx]
+                # `test_func_gradients` is the origin-only gradient — only
+                # patch-level datasets compute it.  `*_all_points` /
+                # `*_at_vertices` are the per-vertex variants (the variational
+                # dataset only has the latter).
                 has_gt_grad = (hasattr(surface, 'test_func_gradients')
                                and surface.test_func_gradients is not None)
-                has_gt_grad_all = (hasattr(surface, 'test_func_gradients_all_points')
-                                   and surface.test_func_gradients_all_points is not None)
+                has_gt_grad_all = self._get_test_func_gradients_all(surface) is not None
                 if has_gt_grad:
                     cg, vg = psim.Checkbox("Show GT Gradient at Origin", self._show_gt_gradient_origin)
                     if cg: self._show_gt_gradient_origin = vg; needs_rerender = True
@@ -976,19 +1035,27 @@ class SurfaceVisualizer:
                 if self._show_probe_scalar:
                     # Color mode selector
                     color_modes = ["h (function value)", "δh (function delta)", "Δ_LB(h) (analytic)"]
-                    has_h = hasattr(surface, 'test_func_values') and surface.test_func_values is not None
-                    has_lb_all = hasattr(surface, 'test_func_lb_all_points') and surface.test_func_lb_all_points is not None
+                    vals_t = self._get_test_func_values(surface)
+                    lb_all_t = self._get_test_func_lb_all(surface)
+                    deltas_t = self._get_test_func_deltas(surface)
+                    has_h = vals_t is not None
+                    has_lb_all = lb_all_t is not None
+                    has_deltas = deltas_t is not None
 
                     # Clamp current mode to an available option
                     if self._probe_color_mode == 0 and not has_h:
-                        self._probe_color_mode = 1
+                        self._probe_color_mode = 1 if has_deltas else 2
+                    if self._probe_color_mode == 1 and not has_deltas:
+                        self._probe_color_mode = 0 if has_h else 2
                     if self._probe_color_mode == 2 and not has_lb_all:
-                        self._probe_color_mode = 1
+                        self._probe_color_mode = 0 if has_h else 1
 
                     cm_changed, cm_new = psim.Combo("Color Mode", self._probe_color_mode, color_modes)
                     if cm_changed:
                         # Reject picks for modes whose data isn't available
                         if cm_new == 0 and not has_h:
+                            pass
+                        elif cm_new == 1 and not has_deltas:
                             pass
                         elif cm_new == 2 and not has_lb_all:
                             pass
@@ -998,6 +1065,9 @@ class SurfaceVisualizer:
 
                     if not has_h:
                         psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (h coloring: test_func_values missing)")
+                    if not has_deltas:
+                        psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                            "  (δh coloring: variational dataset has no center-relative deltas)")
                     if not has_lb_all:
                         psim.TextColored((0.7, 0.7, 0.7, 1.0), "  (Δ_LB coloring: enable compute_lb_all_points)")
 
@@ -1013,12 +1083,13 @@ class SurfaceVisualizer:
 
                     # Show value ranges
                     if has_h:
-                        vals = to_numpy(surface.test_func_values)
+                        vals = to_numpy(vals_t)
                         psim.Text(f"  h range: [{vals[:, pidx].min():.4f}, {vals[:, pidx].max():.4f}]")
-                    deltas = to_numpy(surface.test_func_deltas)
-                    psim.Text(f"  δh range: [{deltas[:, pidx].min():.4f}, {deltas[:, pidx].max():.4f}]")
+                    if has_deltas:
+                        deltas = to_numpy(deltas_t)
+                        psim.Text(f"  δh range: [{deltas[:, pidx].min():.4f}, {deltas[:, pidx].max():.4f}]")
                     if has_lb_all:
-                        lb_all = to_numpy(surface.test_func_lb_all_points)
+                        lb_all = to_numpy(lb_all_t)
                         psim.Text(f"  Δ_LB range: [{lb_all[:, pidx].min():.4f}, {lb_all[:, pidx].max():.4f}]")
                 psim.Text("")
 
