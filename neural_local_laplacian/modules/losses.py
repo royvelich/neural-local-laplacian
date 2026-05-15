@@ -43,6 +43,9 @@ class LossContext:
     test_func_continuous_energy: Optional[torch.Tensor] = None      # (P,)
     test_func_gradients_at_vertices: Optional[torch.Tensor] = None  # (n, P, 3)
     test_func_laplacians_at_vertices: Optional[torch.Tensor] = None  # (n, P)
+    # Heat-method geodesic supervision (variational pipeline)
+    geodesic_sources: Optional[torch.Tensor] = None                 # (S,) vertex idx
+    geodesic_distances: Optional[torch.Tensor] = None               # (S, n)
 
 
 @dataclass
@@ -1797,4 +1800,185 @@ class LaplacianActionTestLoss(_VariationalTestLoss):
         if self.area_weighted:
             per = ctx.areas.unsqueeze(-1) * per
 
+        return self._reduce(per)
+
+
+class HeatMethodGeodesicLoss(_VariationalTestLoss):
+    r"""Match heat-method geodesic distances against analytic GT.
+
+    Implements the discrete Crane-Weischedel-Wardetzky heat method on the
+    operators emitted by the model and compares the recovered distance
+    field to the GT geodesic distances attached by
+    :class:`MongeSurfaceVariationalDataset` (computed via exact MMP on a
+    fine reference triangulation of the same Monge patch).
+
+    Pipeline per source ``s``:
+
+      1.  Heat-diffuse: ``(M + t·L) u = e_s``.
+      2.  Vertex-wise gradient: ``∇u_i = Σ_j g_ij · (u_j − u_i)``  ∈ ℝ³.
+      3.  Normalize: ``X_i = −∇u_i / ‖∇u_i‖``.
+      4.  Recover distance: ``(L + ε·M) φ = Gᵀ M₃ X_flat``.
+      5.  Gauge fix ``φ ← φ − φ(s)``.
+
+    Routes gradient through **all three heads**:
+        - ``areas``           — into M (mass) and into L (when ``L = α·s_ij``).
+        - ``stiffness_weights`` — into L.
+        - ``grad_coeffs``     — into G (gradient + divergence).
+
+    Because steps 1 and 4 both solve linear systems involving L, and step
+    2 reads G while step 4 reads Gᵀ, this loss implicitly couples the two
+    heads: it is only consistent when ``L ≈ Gᵀ M_3 G`` (the discrete
+    Stokes identity).  Useful side-effect when training with
+    ``stiffness_mode='learned[_positive]'``, where the two heads can
+    otherwise drift apart silently.
+
+    Args:
+        t: heat diffusion time (positive scalar).  Crane et al. recommend
+            ``t ≈ mean_edge_length²``.  Default uses a normalised area
+            scaling that adapts to the patch size: ``t = t_scale · A_total / n``.
+        t_scale: multiplier when ``t`` is set to ``None`` (auto mode).
+        epsilon_reg: small regularizer added as ``ε·M`` to the Poisson
+            stiffness to handle the constant nullspace.  Default 1e-6.
+        loss_mode: scalar error metric — ``'mse'`` / ``'relative'`` / ``'signed_log'``.
+        normalize_by_diameter: divide the per-vertex error by the source's
+            GT maximum (the patch diameter from that source) before
+            reducing.  Makes the loss scale-invariant across patches and
+            sources — useful when patch sizes vary.
+        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over (source × vertex).
+        eps: numerical floor for relative mode.
+        L_assembly: which assembly to use for L.  ``'from_stiffness'``
+            (default) routes through the stiffness head — pair with
+            ``stiffness_mode='learned[_positive]'``.  ``'diagonal_gram'``
+            uses ‖g_ij‖² — useful when stiffness is gram-derived.
+    """
+
+    def __init__(self,
+                 t: Optional[float] = None,
+                 t_scale: float = 1.0,
+                 epsilon_reg: float = 1e-6,
+                 loss_mode: str = 'mse',
+                 normalize_by_diameter: bool = True,
+                 reduction: str = 'mean',
+                 eps: float = 1e-8,
+                 L_assembly: str = 'from_stiffness'):
+        super().__init__(reduction=reduction)
+        if loss_mode not in ('mse', 'relative', 'signed_log'):
+            raise ValueError(
+                f"loss_mode must be 'mse' / 'relative' / 'signed_log', got '{loss_mode}'")
+        if L_assembly not in ('from_stiffness', 'diagonal_gram'):
+            raise ValueError(
+                f"L_assembly must be 'from_stiffness' / 'diagonal_gram', got '{L_assembly}'")
+        self.t = t
+        self.t_scale = float(t_scale)
+        self.epsilon_reg = float(epsilon_reg)
+        self.loss_mode = loss_mode
+        self.normalize_by_diameter = normalize_by_diameter
+        self.eps = eps
+        self.L_assembly = L_assembly
+
+    def _assemble_L(self, ctx: LossContext) -> torch.Tensor:
+        from neural_local_laplacian.utils.laplacian_assembly import (
+            assemble_from_stiffness_weights,
+            assemble_diagonal_gram_laplacian,
+        )
+        if self.L_assembly == 'from_stiffness':
+            return assemble_from_stiffness_weights(
+                ctx.stiffness_weights, ctx.knn, areas=None)
+        return assemble_diagonal_gram_laplacian(
+            ctx.grad_coeffs, ctx.knn, areas=None)
+
+    @staticmethod
+    def _per_vertex_gradient(
+        grad_coeffs: torch.Tensor,
+        knn: torch.Tensor,
+        u: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute ``(∇u)_i = Σ_j g_ij · (u_j − u_i)`` → (n, 3)."""
+        # u: (n,); knn: (n, k); grad_coeffs: (n, k, 3)
+        u_neigh = u[knn]                              # (n, k)
+        u_center = u.unsqueeze(1)                     # (n, 1)
+        delta = (u_neigh - u_center).unsqueeze(-1)    # (n, k, 1)
+        return (grad_coeffs * delta).sum(dim=1)       # (n, 3)
+
+    @staticmethod
+    def _per_vertex_divergence(
+        grad_coeffs: torch.Tensor,
+        knn: torch.Tensor,
+        X: torch.Tensor,
+        areas: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the FEM-form RHS ``b = Gᵀ M_3 X_flat`` → (n,).
+
+        Using the gradient operator ``(G u)_i = Σ_j g_ij (u_j − u_i)``,
+        its transpose acts on vector fields ``X : ℝ^{3n}`` as
+        ``(Gᵀ Y)_c = Σ_i  G[3i+d, c] · Y_{i,d}`` (summed over d).  Because
+        ``G[3i+d, c] = g_ij[d]`` when c is the j-th neighbour of i, and
+        ``G[3i+d, i] = −Σ_j g_ij[d]``, we get
+            (Gᵀ Y)_c =  Σ_{i: c ∈ knn(i)}  g_{ic}[d] · Y_{i,d}
+                       − Σ_d (Σ_j g_cj[d]) · Y_{c,d}
+        and the FEM RHS is ``b_c = A_c · (Gᵀ Y)_c`` after folding the mass
+        matrix ``M_3 = diag(repeat(A, 3))``.  We use scatter-add for the
+        first term.
+        """
+        n, k, _ = grad_coeffs.shape
+        # Center contribution: −(Σ_j g_cj) · A_c X_c
+        g_sum = grad_coeffs.sum(dim=1)                                # (n, 3)
+        center_term = -(g_sum * X).sum(dim=-1) * areas                # (n,)
+        # Neighbour contribution: for each (i, j_local) the c = knn[i, j_local]
+        # accumulates g_ij · A_i · X_i.
+        per_edge = (grad_coeffs * (areas.unsqueeze(-1) * X).unsqueeze(1)
+                    ).sum(dim=-1)                                      # (n, k)
+        neighbour_term = grad_coeffs.new_zeros(n).index_add(
+            0, knn.reshape(-1), per_edge.reshape(-1))                   # (n,)
+        return neighbour_term + center_term
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        self._check_required(ctx, [
+            'grad_coeffs', 'stiffness_weights', 'areas', 'knn',
+            'geodesic_sources', 'geodesic_distances'])
+
+        L = self._assemble_L(ctx)                                     # (n, n)
+        M_diag = ctx.areas                                            # (n,)
+        n = M_diag.shape[0]
+        device = L.device
+        dtype = L.dtype
+        eye = torch.eye(n, device=device, dtype=dtype)
+        M_full = M_diag.unsqueeze(-1) * eye                           # (n, n)
+
+        if self.t is None:
+            t = self.t_scale * float(M_diag.sum().item()) / n
+        else:
+            t = float(self.t)
+
+        A_heat = M_full + t * L                                       # (n, n)
+        A_poisson = L + self.epsilon_reg * M_full                     # (n, n)
+
+        sources = ctx.geodesic_sources                                # (S,)
+        gt = ctx.geodesic_distances                                   # (S, n)
+        S = sources.shape[0]
+
+        # Heat-method per source.
+        per_source_errors = []
+        for s_idx in range(S):
+            s = int(sources[s_idx].item())
+            b_heat = L.new_zeros(n)
+            b_heat[s] = 1.0
+            u = torch.linalg.solve(A_heat, b_heat)                    # (n,)
+            grad_u = self._per_vertex_gradient(ctx.grad_coeffs, ctx.knn, u)  # (n, 3)
+            X = -grad_u / (grad_u.norm(dim=-1, keepdim=True) + self.eps)     # (n, 3)
+            rhs = self._per_vertex_divergence(
+                ctx.grad_coeffs, ctx.knn, X, M_diag)                  # (n,)
+            phi = torch.linalg.solve(A_poisson, rhs)                  # (n,)
+            phi = phi - phi[s]                                        # gauge: φ(s) = 0
+            per_vertex = _scalar_error_per_element(
+                phi, gt[s_idx].to(device=device, dtype=dtype),
+                self.loss_mode, eps=self.eps)                         # (n,)
+            if self.normalize_by_diameter:
+                # Source-specific diameter from the GT (≥ eps); makes
+                # the loss invariant to patch scale.
+                diam_sq = (gt[s_idx].to(device=device, dtype=dtype) ** 2).max() + self.eps
+                per_vertex = per_vertex / diam_sq
+            per_source_errors.append(per_vertex)
+
+        per = torch.stack(per_source_errors, dim=0)                   # (S, n)
         return self._reduce(per)

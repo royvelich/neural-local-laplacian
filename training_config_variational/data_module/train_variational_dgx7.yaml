@@ -73,6 +73,18 @@ module:
 
       seed: ${globals.training_seed}
       epoch_size: 8000
+
+      # ----- GT geodesic distances (HeatMethodGeodesicLoss) -----
+      # When enabled, each surface item carries:
+      #   geodesic_sources:    (S,)        FPS-chosen training-vertex indices
+      #   geodesic_distances:  (S, n)      exact GT distances on a dense
+      #                                    reference triangulation
+      # of the same Monge patch (M×M parameter grid, exact MMP via
+      # pygeodesic / igl.exact_geodesic).  Set to False to skip the cost.
+      compute_geodesics: true
+      num_geodesic_sources: 2
+      geodesic_source_method: farthest_point_sampling
+      geodesic_reference_resolution: 80
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
     batch_size: 1
