@@ -61,7 +61,7 @@ module:
 
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
-        max_degree: 5
+        max_degree: 3
         variables: ambient
         derivative_mode: analytic
         normalize_target: none
@@ -73,7 +73,7 @@ module:
         verbose: false
 
       seed: ${globals.training_seed}
-      epoch_size: 8000
+      epoch_size: 8
 
       # ----- GT geodesic distances (HeatMethodGeodesicLoss, primary signal) -----
       # Each surface item carries:
