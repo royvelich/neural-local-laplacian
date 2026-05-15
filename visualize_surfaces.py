@@ -312,12 +312,42 @@ class SurfaceVisualizer:
             return np.array([[0.0, 0.0, 0.0]]) + translation
 
     def _extract_surface_data(self, surface):
-        pos = to_numpy(surface.pos)
-        face = to_numpy(surface.face).T
+        # Prefer the explicit per-vertex positions when present
+        # (_VariationalSurfaceData stores them in vertex_pos; surface.pos
+        # there is the stacked (n*k, 3) per-patch points, not vertex
+        # positions, and would mis-align with vertex-level fields like
+        # vertex_normals / geodesic_distances).  Patch-level datasets
+        # don't have vertex_pos, so we fall back to surface.pos.
+        if hasattr(surface, 'vertex_pos') and surface.vertex_pos is not None:
+            pos = to_numpy(surface.vertex_pos)
+        else:
+            pos = to_numpy(surface.pos)
+        # `face` is present on the patch-level synthetic datasets but not on
+        # _VariationalSurfaceData (the variational dataset emits a vertex
+        # cloud, not a triangulation).  Fall back to a 2D Delaunay over the
+        # xy projection — exact triangulation of the parameter domain for
+        # Monge patches up to position_noise_std.  None if Delaunay fails
+        # (e.g. < 3 vertices or all-collinear); the renderer then skips the
+        # mesh structure for this surface.
+        face = None
+        surf_face = getattr(surface, 'face', None)
+        if surf_face is not None:
+            face = to_numpy(surf_face).T
+        elif pos.shape[0] >= 3:
+            try:
+                from scipy.spatial import Delaunay
+                face = Delaunay(pos[:, :2]).simplices.astype(np.int32)
+            except Exception as e:
+                print(f"  [!] Falling back to point-cloud only "
+                      f"(Delaunay failed: {e})")
+                face = None
         if hasattr(surface, 'normal'):
             normals = to_numpy(surface.normal)
             if self.is_diff_geom_at_origin_only and normals.shape[0] == 1:
                 normals = np.broadcast_to(normals, (pos.shape[0], 3)).copy()
+        elif hasattr(surface, 'vertex_normals') and surface.vertex_normals is not None:
+            # Variational dataset stores normals under vertex_normals.
+            normals = to_numpy(surface.vertex_normals)
         else:
             normals = np.array([[0.0, 0.0, 1.0]] * pos.shape[0])
         return pos, face, normals
@@ -571,7 +601,12 @@ class SurfaceVisualizer:
         src_idx = min(self._geodesic_source_idx, S - 1)
         distances = to_numpy(surface.geodesic_distances[src_idx])  # (n,)
         # Defensive: scalar field length must match the structure's vertex count.
-        if distances.shape[0] != to_numpy(surface.pos).shape[0]:
+        # vertex_pos is the right reference on variational data (surface.pos is
+        # the stacked per-patch tensor there).
+        vertex_pos_src = (surface.vertex_pos
+                          if hasattr(surface, 'vertex_pos') and surface.vertex_pos is not None
+                          else surface.pos)
+        if distances.shape[0] != to_numpy(vertex_pos_src).shape[0]:
             return
         src_vertex = int(to_numpy(surface.geodesic_sources[src_idx]))
         name = f"GT geodesic d(v_{src_vertex}, ·)"
@@ -596,7 +631,12 @@ class SurfaceVisualizer:
         S = self._num_geodesic_sources(surface)
         src_idx = min(self._geodesic_source_idx, S - 1)
         src_vertex = int(to_numpy(surface.geodesic_sources[src_idx]))
-        pos = to_numpy(surface.pos)
+        # Use vertex_pos on variational data — surface.pos is the stacked
+        # per-patch tensor there and would mis-index.
+        vertex_pos_src = (surface.vertex_pos
+                          if hasattr(surface, 'vertex_pos') and surface.vertex_pos is not None
+                          else surface.pos)
+        pos = to_numpy(vertex_pos_src)
         if src_vertex >= pos.shape[0]:
             return
         marker = ps.register_point_cloud(
@@ -987,7 +1027,13 @@ class SurfaceVisualizer:
         surface = self._current_surfaces[idx]
         name = self._current_surface_names[idx]
         pos, face, normals = self._extract_surface_data(surface)
-        if self._show_mesh:
+        # Auto-fallback: if the surface has no triangulation (and Delaunay
+        # couldn't produce one), force the point-cloud view so the surface
+        # is still visible.
+        if face is None and self._show_mesh and not self._show_pointcloud:
+            print("  [!] No triangulation available — showing point cloud instead")
+            self._show_pointcloud = True
+        if self._show_mesh and face is not None:
             mesh = ps.register_surface_mesh(f"{name} - Mesh", pos, face,
                 smooth_shade=self.vis_config.smooth_shade, edge_width=self._edge_width,
                 color=tuple(self._surface_color), transparency=0.5)
