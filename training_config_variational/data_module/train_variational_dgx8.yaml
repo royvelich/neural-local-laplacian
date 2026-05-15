@@ -86,7 +86,7 @@ module:
       compute_geodesics: true
       num_geodesic_sources: 4
       geodesic_source_method: farthest_point_sampling
-      geodesic_reference_resolution: 80
+      geodesic_reference_resolution: 200
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
     batch_size: 1

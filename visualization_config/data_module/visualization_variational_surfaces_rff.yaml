@@ -19,9 +19,9 @@ train_dataset_specification:
       l1_truncate: true
 
     # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-    num_vertices_range: [30, 60]
-    grid_radius: 1.0
-    position_noise_std: [0.01, 0.04]
+    num_vertices_range: 500
+    grid_radius: 1.5
+    position_noise_std: 0.0
     k: [6, 15]
 
     # Test functions — keep ALL per-vertex GT on so the viz can also
@@ -50,7 +50,7 @@ train_dataset_specification:
     compute_geodesics: true
     num_geodesic_sources: 4
     geodesic_source_method: farthest_point_sampling
-    geodesic_reference_resolution: 80
+    geodesic_reference_resolution: 90
   batch_size: 1
   num_workers: 0
   shuffle: True

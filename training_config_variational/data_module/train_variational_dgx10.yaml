@@ -19,9 +19,9 @@ module:
         l1_truncate: true
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: [30, 60]
-      grid_radius: 1.0
-      position_noise_std: [0.01, 0.04]
+      num_vertices_range: 500
+      grid_radius: 1.5
+      position_noise_std: 0.0
       k: [6, 15]
 
       # Test functions — heat-method-centric run.  The primary signal is
@@ -76,7 +76,7 @@ module:
         verbose: false
 
       seed: ${globals.training_seed}
-      epoch_size: 8
+      epoch_size: 64
 
       # ----- GT geodesic distances (HeatMethodGeodesicLoss, primary signal) -----
       # Each surface item carries:
