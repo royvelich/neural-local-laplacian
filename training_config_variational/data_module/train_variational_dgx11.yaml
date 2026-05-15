@@ -1,0 +1,147 @@
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericMixedDataModule
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
+
+      # Polynomial Monge surface family.
+      surface_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
+        order_range: [2, 3]
+        coefficient_scale_range: [0.5, 3.0]
+        polynomial_offset_range: [0.0, 1.0]
+        coeff_generation_method:
+          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+          _args_: ['uniform']
+
+      # Vertex sampling on U = [-grid_radius, grid_radius]^2.
+      num_vertices_range: [30, 60]
+      grid_radius: 1.0
+      position_noise_std: [0.01, 0.04]
+      k: [6, 15]
+
+      # Test functions — heat-kernel-only run.  HeatKernelLoss is the
+      # sole loss; no analytic test-function losses are active, so all
+      # per-vertex / continuous-form analytic-GT flags are off.  Sampler
+      # is still configured because dataset.get() always calls .sample().
+      test_func_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+        max_degree: 2
+        variables: chart
+        derivative_mode: analytic
+        normalize_target: none
+        compute_continuous_bilinear: false
+        compute_continuous_energy: false
+        compute_lb_all_points: false
+        compute_gradients_all_points: false
+        verbose: false
+
+      seed: ${globals.training_seed}
+      epoch_size: 8000
+
+      # GT geodesics are NOT needed when only HeatKernelLoss is active.
+      compute_geodesics: false
+
+      # ----- GT heat kernel at a ladder of times (HeatKernelLoss) -----
+      # Each surface item carries:
+      #   heat_kernel_times:           (T,)        diffusion times
+      #   heat_kernel_gt:              (T, n)      K_t(v_i, v_i) per vertex
+      #                                            (diagonal_only=true)
+      #                              or (T, n, n)  full K_t entries
+      #                                            (diagonal_only=false)
+      # Built by computing cotangent + barycentric mass on a fine
+      # reference triangulation of U (same machinery as the geodesic
+      # GT), eigendecomposing L_ref φ = λ M_ref φ for the top
+      # ``num_eigenpairs`` modes, bilinearly interpolating each
+      # eigenvector to the training-vertex UV coords, and synthesising
+      # K_t(v_i, v_j) = Σ_k exp(-λ_k t) · φ_k(v_i) · φ_k(v_j).
+      #
+      # Time ladder: log-spaced across two decades.  Small t probes the
+      # local geometry (high frequencies); large t the global structure
+      # (low frequencies / Weyl regime).
+      #
+      # num_eigenpairs: 50 covers the spectrum we actually weight at
+      # these t's (modes with λ·t > ~30 contribute < 1e-13).  Bump for
+      # smaller t or larger n.
+      compute_heat_kernel: true
+      heat_kernel_times: [0.005, 0.025, 0.1]
+      heat_kernel_num_eigenpairs: 50
+      heat_kernel_diagonal_only: true     # supervise HKS only
+      heat_kernel_reference_resolution: null  # null ⇒ reuse geodesic_reference_resolution
+    # batch_size MUST be 1 for v1 (variational batching across surfaces is
+    # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
+    batch_size: 1
+    num_workers: 0
+    shuffle: True
+
+  val_dataset_specifications:
+    # --- [0] Patch-level MCV validation (synthetic patches with analytic H, n̂) ---
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+        seed: ${globals.validation_seed}
+        epoch_size: 200
+        position_noise_std: [0.0, 0.05]
+        grid_radius_range: [0.5, 2.0]
+        polynomial_offset_range: [0.0, 1.0]
+        points_scale_range: [1.0]
+        coefficient_scale_range: [0.5, 3.0]
+        order_range: [2, 3]
+        grid_samplers:
+          - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+            num_points_range: [6, 30]
+        conv_k_nearest: null
+        pose_transformers: null
+        coeff_generation_method:
+          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+          _args_: ['uniform']
+        diff_geom_components:
+          - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+            _args_: ['mean_curvature']
+        diff_geom_at_origin_only: True
+        include_origin_in_grid: False
+        flip_normal_if_negative_curvature: False
+        normalize_to_unit_sphere: True
+      batch_size: 8
+      num_workers: 0
+      shuffle: False
+
+    # --- [1] Mesh spectral / geodesic validation ---
+    # _validation_step_mesh builds the Laplacian via assemble_laplacian.
+    # With stiffness_mode='learned_positive' on the model, val_laplacian
+    # is auto-coerced to assembly='from_stiffness', so the assembled L
+    # reads the learned stiffness head.
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+        mesh_folder_path: '/workspace/datasets/shrec15'
+        max_meshes: 80
+        file_size_range_mb: [0.5, 4]
+        require_manifold: True
+        shuffle: True
+        k: 8
+        num_geodesic_sources: 5
+        geodesic_source_method: "farthest_point_sampling"
+      batch_size: 1
+      num_workers: 0
+      shuffle: False
+
+    # --- [2] Fmap: DT4D Animals intra ---
+    # Same fmap-correspondence validation as dgx2.  fmap_val_cfg's
+    # eval_laplacians block is also auto-coerced to 'from_stiffness'.
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+          root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+          pairs: ["0.7:1.0"]
+        val_poses_per_pair: 2
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true

@@ -2996,7 +2996,121 @@ class _VariationalSurfaceData(Data):
             # batch_size=1 only for now: knn / geodesic source indices are
             # not offset when batched.
             return 0
+        if key in ('heat_kernel_times', 'heat_kernel_gt',
+                   'heat_kernel_diagonal_only'):
+            # Surface-level scalars / per-vertex tensors — no offset.
+            return 0
         return super().__inc__(key, value, *args, **kwargs)
+
+
+def compute_heat_kernel_gt_on_monge_patch(
+    surface_func,
+    grid_radius: float,
+    vertex_uv: np.ndarray,
+    times,
+    fine_resolution: int = 80,
+    num_eigenpairs: int = 50,
+    diagonal_only: bool = True,
+):
+    """Compute analytic-quality GT heat kernel ``K_t(v_i, v_j)`` on a Monge patch.
+
+    Builds the same dense reference triangulation used by
+    :func:`compute_geodesic_gt_on_monge_patch` (an ``M × M`` parameter
+    grid lifted via ``surface_func`` to Σ), assembles the cotangent
+    Laplacian and barycentric mass matrix on it via ``igl``, takes the
+    top ``num_eigenpairs`` generalized eigenpairs ``L φ = λ M φ``
+    (M-orthonormal), bilinearly interpolates each eigenvector back to
+    the training-vertex U-coordinates, and synthesises the heat-kernel
+    matrix per time ``t`` from the spectral form
+
+        K_t(v_i, v_j) = Σ_k exp(-λ_k t) · φ_k(v_i) · φ_k(v_j)
+
+    Args:
+        surface_func: callable ``(u, v) → z`` (torch-compatible).
+        grid_radius: half-side of the parameter domain U.
+        vertex_uv: (n, 2) U-coordinates of the training vertices.
+        times: iterable of positive scalars (heat-diffusion times).
+        fine_resolution: M, the per-axis number of fine-grid vertices.
+        num_eigenpairs: number of generalized eigenpairs to keep.  ~50
+            covers t values well above mean-edge-length²; bump for
+            smaller t / sharper local kernels.
+        diagonal_only: if True, return only the diagonal K_t(v_i, v_i)
+            of shape ``(T, n)`` — this is the HKS the fmap pipeline
+            actually reads.  If False, return the full ``(T, n, n)``
+            kernel.
+
+    Returns:
+        ``(T, n)`` ndarray when ``diagonal_only`` else ``(T, n, n)``,
+        or ``None`` if igl is unavailable / the cotangent assembly fails.
+    """
+    try:
+        import igl
+    except ImportError:
+        print("  [!] HeatKernelLoss GT requires `igl` — skipping")
+        return None
+
+    M_grid = int(fine_resolution)
+    lin = np.linspace(-grid_radius, grid_radius, M_grid)
+    gu, gv = np.meshgrid(lin, lin, indexing='ij')
+    fine_u = gu.ravel().astype(np.float64)
+    fine_v = gv.ravel().astype(np.float64)
+
+    with torch.no_grad():
+        z = surface_func(
+            torch.from_numpy(fine_u).float(),
+            torch.from_numpy(fine_v).float()
+        ).detach().cpu().numpy().astype(np.float64)
+    fine_xyz = np.stack([fine_u, fine_v, z], axis=1)
+    fine_faces = _build_grid_triangulation(M_grid)
+
+    try:
+        L_ref = -igl.cotmatrix(fine_xyz, fine_faces).tocsc()  # PSD
+        M_ref = igl.massmatrix(
+            fine_xyz, fine_faces, igl.MASSMATRIX_TYPE_BARYCENTRIC).tocsc()
+    except Exception as e:
+        print(f"  [!] Cotangent assembly failed on heat-kernel GT mesh: {e}")
+        return None
+
+    # Top-k generalized eigenpairs L φ = λ M φ with sigma=0 (smallest λ).
+    # M-orthonormal: Φᵀ M Φ = I.
+    k_req = max(2, min(int(num_eigenpairs), L_ref.shape[0] - 2))
+    try:
+        import scipy.sparse.linalg as sla
+        eigvals, eigvecs = sla.eigsh(L_ref, k=k_req, M=M_ref, sigma=0.0,
+                                     which='LM')
+    except Exception as e:
+        print(f"  [!] Heat-kernel eigendecomp failed: {e}")
+        return None
+    # eigsh near sigma=0 can return tiny negatives — clip.
+    eigvals = np.clip(eigvals, a_min=0.0, a_max=None).astype(np.float64)
+
+    # Bilinearly interpolate each eigenvector to the training-vertex UV coords.
+    n_train = vertex_uv.shape[0]
+    phi_train = np.empty((k_req, n_train), dtype=np.float64)
+    for k in range(k_req):
+        phi_train[k] = _bilinear_interpolate_grid(
+            eigvecs[:, k].astype(np.float64), M_grid, grid_radius, vertex_uv)
+
+    # Synthesise K_t per time.
+    times_arr = np.asarray(list(times), dtype=np.float64)  # (T,)
+    if times_arr.ndim == 0:
+        times_arr = times_arr.reshape(1)
+    T = times_arr.shape[0]
+    if diagonal_only:
+        # K_t(v, v) = Σ_k exp(-λ_k t) · φ_k(v)²
+        phi_sq = phi_train ** 2                              # (k, n)
+        out = np.zeros((T, n_train), dtype=np.float32)
+        for t_idx, t in enumerate(times_arr):
+            weights = np.exp(-eigvals * float(t))            # (k,)
+            out[t_idx] = (weights[:, None] * phi_sq).sum(axis=0).astype(np.float32)
+    else:
+        # K_t(v_i, v_j) = Σ_k exp(-λ_k t) · φ_k(v_i) · φ_k(v_j)
+        out = np.zeros((T, n_train, n_train), dtype=np.float32)
+        for t_idx, t in enumerate(times_arr):
+            weights = np.exp(-eigvals * float(t))            # (k,)
+            weighted = phi_train * weights[:, None]          # (k, n)
+            out[t_idx] = (weighted.T @ phi_train).astype(np.float32)
+    return out
 
 
 class MongeSurfaceVariationalDataset(Dataset):
@@ -3065,6 +3179,11 @@ class MongeSurfaceVariationalDataset(Dataset):
         num_geodesic_sources: int = 2,
         geodesic_source_method: str = 'farthest_point_sampling',
         geodesic_reference_resolution: int = 80,
+        compute_heat_kernel: bool = False,
+        heat_kernel_times=(0.01, 0.05, 0.2),
+        heat_kernel_num_eigenpairs: int = 50,
+        heat_kernel_diagonal_only: bool = True,
+        heat_kernel_reference_resolution: Optional[int] = None,
     ):
         super().__init__()
         self._surface_sampler = surface_sampler
@@ -3087,6 +3206,29 @@ class MongeSurfaceVariationalDataset(Dataset):
             raise ValueError(
                 "geodesic_reference_resolution must be >= 8, got "
                 f"{self._geodesic_reference_resolution}")
+
+        self._compute_heat_kernel = bool(compute_heat_kernel)
+        # Normalise to a tuple of floats so it's safe to pass through Hydra
+        # ListConfig / scalars / numpy arrays.
+        if isinstance(heat_kernel_times, (int, float)):
+            self._heat_kernel_times = (float(heat_kernel_times),)
+        else:
+            self._heat_kernel_times = tuple(float(t) for t in heat_kernel_times)
+        if any(t <= 0.0 for t in self._heat_kernel_times):
+            raise ValueError(
+                f"heat_kernel_times must all be > 0, got {self._heat_kernel_times}")
+        self._heat_kernel_num_eigenpairs = int(heat_kernel_num_eigenpairs)
+        if self._heat_kernel_num_eigenpairs < 2:
+            raise ValueError(
+                "heat_kernel_num_eigenpairs must be >= 2, got "
+                f"{self._heat_kernel_num_eigenpairs}")
+        self._heat_kernel_diagonal_only = bool(heat_kernel_diagonal_only)
+        # Default to the same reference triangulation used for geodesics; let
+        # callers override (heat-kernel-only runs may want a coarser mesh).
+        self._heat_kernel_reference_resolution = (
+            self._geodesic_reference_resolution
+            if heat_kernel_reference_resolution is None
+            else int(heat_kernel_reference_resolution))
 
         # k may be a scalar or a 2-element [lo, hi] range; a fresh value
         # is drawn per surface in get().  Each surface internally has a
@@ -3244,4 +3386,28 @@ class MongeSurfaceVariationalDataset(Dataset):
             if gt is not None:
                 data.geodesic_sources = torch.from_numpy(source_indices).long()
                 data.geodesic_distances = torch.from_numpy(gt).float()
+
+        # 10. Optional GT heat kernel at a ladder of times.  Uses the same
+        # dense reference triangulation strategy but the cotangent-eigen
+        # path rather than the MMP path; falls back silently when igl /
+        # scipy.sparse.linalg cannot produce a result for this surface.
+        if self._compute_heat_kernel:
+            # Build vertex_uv (the geodesic block may have built it already
+            # but it's tiny — recomputing is cheaper than branching).
+            vertex_uv = torch.stack([u, v], dim=-1).numpy()
+            hk = compute_heat_kernel_gt_on_monge_patch(
+                surface_func=surface_func,
+                grid_radius=self._grid_radius,
+                vertex_uv=vertex_uv,
+                times=self._heat_kernel_times,
+                fine_resolution=self._heat_kernel_reference_resolution,
+                num_eigenpairs=self._heat_kernel_num_eigenpairs,
+                diagonal_only=self._heat_kernel_diagonal_only,
+            )
+            if hk is not None:
+                data.heat_kernel_times = torch.tensor(
+                    self._heat_kernel_times, dtype=torch.float32)
+                data.heat_kernel_gt = torch.from_numpy(hk).float()
+                data.heat_kernel_diagonal_only = torch.tensor(
+                    bool(self._heat_kernel_diagonal_only))
         return data
