@@ -223,6 +223,25 @@ class SurfaceVisualizer:
         self._geodesics_on_mesh = True
         self._geodesics_on_cloud = True
 
+        # PRED geodesics: run the loaded model on the surface and recover
+        # the distance field via the heat method on its (areas, stiffness,
+        # grad) heads.  Same source as GT for direct comparison.
+        # Only available when self.trained_model is not None.
+        self._show_pred_geodesics = False
+        self._pred_geodesics_on_mesh = True
+        self._pred_geodesics_on_cloud = True
+        self._pred_geodesics_cmap = 'viridis'
+        self._pred_geodesics_L_assembly = 'from_stiffness'
+        self._pred_geodesics_t = None              # None ⇒ auto (A_total/n)
+        self._pred_geodesics_t_scale = 1.0
+        self._pred_geodesics_epsilon_reg = 1.0e-6
+        # Cache: (surface_idx, source_idx, L_assembly, t, t_scale, eps_reg)
+        # → np.ndarray of distances.  Cleared on every visualize_surface_set().
+        self._pred_geodesics_cache: dict = {}
+        # Forward-result cache (per surface_idx) — avoid re-running the model
+        # when only the source / t changes.  Cleared on every batch.
+        self._pred_forward_cache: dict = {}
+
     def _has_hybrid_option(self):
         return self._current_surfaces is not None and len(self._current_surfaces) >= 2
 
@@ -646,6 +665,130 @@ class SurfaceVisualizer:
             enabled=True)
         marker.set_color(tuple(self._geodesic_source_color))
 
+    # ── Predicted geodesics (via loaded model + heat method) ─────────────
+
+    def _pred_geodesics_cfg_key(self) -> tuple:
+        """Cache key fragment for the current heat-method config."""
+        return (self._pred_geodesics_L_assembly,
+                self._pred_geodesics_t,
+                self._pred_geodesics_t_scale,
+                self._pred_geodesics_epsilon_reg)
+
+    def _compute_forward_for_surface(self, surface_idx: int, surface):
+        """Run model.forward on the variational surface, cached.  Returns
+        a dict with detached ``grad_coeffs``, ``areas``, ``stiffness_weights``
+        (all on self.device, float dtype) and ``knn`` from the surface."""
+        if surface_idx in self._pred_forward_cache:
+            return self._pred_forward_cache[surface_idx]
+        if self.trained_model is None:
+            return None
+        try:
+            forward_batch = Batch.from_data_list([surface]).to(self.device)
+            self.trained_model.eval()
+            with torch.no_grad():
+                fwd = self.trained_model(forward_batch)
+            knn = surface.knn.to(self.device)
+            out = {
+                'grad_coeffs': fwd['grad_coeffs'].float(),
+                'areas': fwd['areas'].float(),
+                'stiffness_weights': fwd['stiffness_weights'].float(),
+                'knn': knn,
+            }
+            self._pred_forward_cache[surface_idx] = out
+            return out
+        except Exception as e:
+            print(f"  [!] Model forward failed on surface {surface_idx}: {e}")
+            return None
+
+    def _compute_pred_geodesic_distances(self, surface_idx: int, surface,
+                                         source_vertex: int):
+        """Heat-method distance field from ``source_vertex``.  Caches by
+        (surface_idx, source_vertex, config_key) so flipping the source slider
+        doesn't re-run the model."""
+        key = (surface_idx, int(source_vertex)) + self._pred_geodesics_cfg_key()
+        if key in self._pred_geodesics_cache:
+            return self._pred_geodesics_cache[key]
+        fwd = self._compute_forward_for_surface(surface_idx, surface)
+        if fwd is None:
+            return None
+        try:
+            from neural_local_laplacian.utils.laplacian_assembly import (
+                assemble_from_stiffness_weights,
+                assemble_diagonal_gram_laplacian,
+            )
+            from neural_local_laplacian.modules.losses import HeatMethodGeodesicLoss
+
+            grad_coeffs = fwd['grad_coeffs']                          # (n, k, 3)
+            areas = fwd['areas']                                      # (n,)
+            stiffness = fwd['stiffness_weights']                      # (n, k)
+            knn = fwd['knn']                                          # (n, k)
+            n = areas.shape[0]
+            if source_vertex < 0 or source_vertex >= n:
+                return None
+
+            if self._pred_geodesics_L_assembly == 'from_stiffness':
+                L = assemble_from_stiffness_weights(stiffness, knn, areas=None)
+            else:
+                L = assemble_diagonal_gram_laplacian(grad_coeffs, knn, areas=None)
+
+            device = L.device
+            dtype = L.dtype
+            eye = torch.eye(n, device=device, dtype=dtype)
+            M_full = areas.unsqueeze(-1) * eye
+
+            if self._pred_geodesics_t is None:
+                t = self._pred_geodesics_t_scale * float(areas.sum().item()) / n
+            else:
+                t = float(self._pred_geodesics_t)
+
+            A_heat = M_full + t * L
+            A_poisson = L + self._pred_geodesics_epsilon_reg * M_full
+
+            b_heat = L.new_zeros(n)
+            b_heat[source_vertex] = 1.0
+            u = torch.linalg.solve(A_heat, b_heat)
+            grad_u = HeatMethodGeodesicLoss._per_vertex_gradient(grad_coeffs, knn, u)
+            X = -grad_u / (grad_u.norm(dim=-1, keepdim=True) + 1e-8)
+            rhs = HeatMethodGeodesicLoss._per_vertex_divergence(grad_coeffs, knn, X, areas)
+            phi = torch.linalg.solve(A_poisson, rhs)
+            phi = phi - phi[source_vertex]
+            dist = phi.detach().cpu().numpy().astype(np.float32)
+            self._pred_geodesics_cache[key] = dist
+            return dist
+        except Exception as e:
+            print(f"  [!] Heat-method PRED solve failed: {e}")
+            return None
+
+    def _add_pred_geodesic_to_structure(self, structure, surface_idx: int,
+                                        surface, structure_type: str = "mesh"):
+        """Color a structure by the PREDICTED heat-method distance field."""
+        if not (self._show_pred_geodesics and self._has_gt_geodesics(surface)):
+            return
+        if self.trained_model is None:
+            return
+        if structure_type == "mesh" and not self._pred_geodesics_on_mesh:
+            return
+        if structure_type == "pointcloud" and not self._pred_geodesics_on_cloud:
+            return
+        S = self._num_geodesic_sources(surface)
+        if S == 0:
+            return
+        src_idx = min(self._geodesic_source_idx, S - 1)
+        src_vertex = int(to_numpy(surface.geodesic_sources[src_idx]))
+        distances = self._compute_pred_geodesic_distances(
+            surface_idx, surface, src_vertex)
+        if distances is None:
+            return
+        vertex_pos_src = (surface.vertex_pos
+                          if hasattr(surface, 'vertex_pos') and surface.vertex_pos is not None
+                          else surface.pos)
+        if distances.shape[0] != to_numpy(vertex_pos_src).shape[0]:
+            return
+        name = f"PRED geodesic d(v_{src_vertex}, ·)"
+        structure.add_scalar_quantity(
+            name=name, values=distances, enabled=True,
+            cmap=self._pred_geodesics_cmap)
+
     def _add_origin_indicator(self, surface, name, translation):
         if not self.is_diff_geom_at_origin_only:
             return
@@ -946,6 +1089,76 @@ class SurfaceVisualizer:
                     if csym_g:
                         self._geodesic_symmetric_cmap = vsym_g
                         needs_rerender = True
+
+                # ── PRED geodesics (heat method on the loaded model) ──
+                if self.trained_model is not None and S > 0:
+                    psim.Text("")
+                    psim.Text("PRED Geodesics (via loaded model)")
+                    cpg, vpg = psim.Checkbox("Show PRED Geodesics",
+                                             self._show_pred_geodesics)
+                    if cpg: self._show_pred_geodesics = vpg; needs_rerender = True
+
+                    if self._show_pred_geodesics:
+                        # L assembly switch — mirrors visualize_validation UI.
+                        assembly_opts = ['from_stiffness', 'diagonal_gram']
+                        try:
+                            cur_assembly_idx = assembly_opts.index(
+                                self._pred_geodesics_L_assembly)
+                        except ValueError:
+                            cur_assembly_idx = 0
+                        ca, va = psim.Combo("L assembly##pred",
+                                            cur_assembly_idx, assembly_opts)
+                        if ca and assembly_opts[va] != self._pred_geodesics_L_assembly:
+                            self._pred_geodesics_L_assembly = assembly_opts[va]
+                            self._pred_geodesics_cache = {}
+                            needs_rerender = True
+
+                        ct, vt = psim.SliderFloat(
+                            "t scale (× A_total / n)",
+                            self._pred_geodesics_t_scale,
+                            v_min=0.01, v_max=10.0)
+                        if ct and abs(vt - self._pred_geodesics_t_scale) > 1e-12:
+                            self._pred_geodesics_t_scale = vt
+                            self._pred_geodesics_cache = {}
+                            needs_rerender = True
+
+                        psim.Text("  Display target:")
+                        psim.SameLine()
+                        cpm, vpm = psim.Checkbox("On Mesh##pred",
+                                                 self._pred_geodesics_on_mesh)
+                        if cpm: self._pred_geodesics_on_mesh = vpm; needs_rerender = True
+                        psim.SameLine()
+                        cpc, vpc = psim.Checkbox("On Point Cloud##pred",
+                                                 self._pred_geodesics_on_cloud)
+                        if cpc: self._pred_geodesics_on_cloud = vpc; needs_rerender = True
+
+                        # Error metrics (computed on the fly, light).
+                        try:
+                            src_vertex = int(to_numpy(
+                                current_surface.geodesic_sources[
+                                    min(self._geodesic_source_idx, S - 1)]))
+                            pred_d = self._compute_pred_geodesic_distances(
+                                self._patch_idx if self._patch_idx != _HYBRID_IDX else 1,
+                                current_surface, src_vertex)
+                            gt_d = to_numpy(current_surface.geodesic_distances[
+                                min(self._geodesic_source_idx, S - 1)])
+                            if pred_d is not None and pred_d.shape == gt_d.shape:
+                                diff = pred_d - gt_d
+                                gt_norm = float(np.linalg.norm(gt_d)) + 1e-12
+                                rel_l2 = float(np.linalg.norm(diff)) / gt_norm
+                                max_abs = float(np.abs(diff).max())
+                                psim.Text(f"  rel L2 err: {rel_l2:.4f}")
+                                psim.Text(f"  max abs err: {max_abs:.4f}  "
+                                          f"(GT range [{gt_d.min():.4f}, {gt_d.max():.4f}])")
+                                psim.Text(f"  PRED range: [{pred_d.min():.4f}, "
+                                          f"{pred_d.max():.4f}]")
+                        except Exception as e:
+                            psim.TextColored((1.0, 0.5, 0.5, 1.0),
+                                             f"  (PRED metric error: {e})")
+                elif self.trained_model is None:
+                    psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                        "  (Load a checkpoint to enable PRED geodesics)")
+
                 psim.Text("")
 
             # ── Surface metrics ──────────────────────────────────────
@@ -984,6 +1197,8 @@ class SurfaceVisualizer:
         self._patch_idx = 0
         self.surface_metrics = []
         self._prediction_cache = {}
+        self._pred_geodesics_cache = {}
+        self._pred_forward_cache = {}
         for i, (name, surface) in enumerate(zip(surface_names, surfaces)):
             metric = {
                 'name': name,
@@ -1044,6 +1259,7 @@ class SurfaceVisualizer:
             self._add_probe_coloring(mesh, surface, self.vis_config.mesh_scalar_colormap)
             self._add_gt_gradient_all_to_structure(mesh, surface, structure_type="mesh")
             self._add_gt_geodesic_to_structure(mesh, surface, structure_type="mesh")
+            self._add_pred_geodesic_to_structure(mesh, idx, surface, structure_type="mesh")
         if self._show_pointcloud:
             cloud = ps.register_point_cloud(f"{name} - Point Cloud", pos, radius=self._point_radius, enabled=True)
             cloud.set_color(tuple(c * 0.5 for c in self._surface_color))
@@ -1053,6 +1269,7 @@ class SurfaceVisualizer:
             self._add_probe_coloring(cloud, surface, self.vis_config.pointcloud_scalar_colormap)
             self._add_gt_gradient_all_to_structure(cloud, surface, structure_type="pointcloud")
             self._add_gt_geodesic_to_structure(cloud, surface, structure_type="pointcloud")
+            self._add_pred_geodesic_to_structure(cloud, idx, surface, structure_type="pointcloud")
         self._add_origin_indicator(surface, name, np.zeros(3))
         self._render_origin_normals(surface, name, pred_cache_idx=idx)
         self._render_gt_gradient_arrow(surface, name)
@@ -1077,6 +1294,9 @@ class SurfaceVisualizer:
         self._add_probe_coloring(mesh, surf_mesh, self.vis_config.mesh_scalar_colormap)
         self._add_gt_gradient_all_to_structure(mesh, surf_mesh, structure_type="mesh")
         self._add_gt_geodesic_to_structure(mesh, surf_mesh, structure_type="mesh")
+        # Hybrid: model trained on the point-cloud surface, so the prediction
+        # is computed and attached using surf_pts; we paint it on the mesh
+        # only if the two share a vertex set.  Skip mesh attachment by default.
 
         # Point cloud from downsampled grid (surface 1)
         cloud = ps.register_point_cloud(f"Hybrid Points ({name_pts})", pos_pts,
@@ -1088,6 +1308,7 @@ class SurfaceVisualizer:
         self._add_probe_coloring(cloud, surf_pts, self.vis_config.pointcloud_scalar_colormap)
         self._add_gt_gradient_all_to_structure(cloud, surf_pts, structure_type="pointcloud")
         self._add_gt_geodesic_to_structure(cloud, surf_pts, structure_type="pointcloud")
+        self._add_pred_geodesic_to_structure(cloud, 1, surf_pts, structure_type="pointcloud")
 
         # Origin + normals from downsampled patch (what model sees)
         self._add_origin_indicator(surf_pts, "Hybrid", np.zeros(3))
