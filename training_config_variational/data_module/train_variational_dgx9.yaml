@@ -1,0 +1,136 @@
+module:
+  _target_: neural_local_laplacian.data_modules.common.GenericMixedDataModule
+  train_dataset_specification:
+    _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+    dataset:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
+
+      # Polynomial Monge surface family.
+      surface_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
+        order_range: [2, 3]
+        coefficient_scale_range: [0.5, 3.0]
+        polynomial_offset_range: [0.0, 1.0]
+        coeff_generation_method:
+          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+          _args_: ['uniform']
+
+      # Vertex sampling on U = [-grid_radius, grid_radius]^2.
+      num_vertices_range: [30, 60]
+      grid_radius: 1.0
+      position_noise_std: [0.01, 0.04]
+      k: [6, 15]
+
+      # Test functions — geodesic-only run.  HeatMethodGeodesicLoss is
+      # the sole loss in dgx9; no analytic test-function losses are
+      # active, so all per-vertex / continuous-form analytic-GT flags
+      # are off.  The dataset still calls test_func_sampler.sample()
+      # unconditionally, so a sampler is configured — but with every
+      # compute_* flag off it returns only test_func_values (probe
+      # values at vertices), which no loss reads.
+      test_func_sampler:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+        max_degree: 2                # small basis — values still computed but unused
+        variables: chart
+        derivative_mode: analytic
+        normalize_target: none
+
+        compute_continuous_bilinear: false
+        compute_continuous_energy: false
+        compute_lb_all_points: false
+        compute_gradients_all_points: false
+        verbose: false
+
+      seed: ${globals.training_seed}
+      epoch_size: 8000
+
+      # ----- GT geodesic distances (HeatMethodGeodesicLoss, sole signal) -----
+      # Each surface item carries:
+      #   geodesic_sources:    (S,)        FPS-chosen training-vertex indices
+      #   geodesic_distances:  (S, n)      exact GT distances on a dense
+      #                                    reference triangulation
+      # via the exact MMP algorithm (pygeodesic / igl.exact_geodesic).
+      # Bumped to 6 sources in dgx9 since this is the only training
+      # signal — denser per-surface coverage matters more here.  Each
+      # source adds two sparse linear solves in the loss; still cheap
+      # on 30–60-vertex patches.
+      compute_geodesics: true
+      num_geodesic_sources: 6
+      geodesic_source_method: farthest_point_sampling
+      geodesic_reference_resolution: 80
+    # batch_size MUST be 1 for v1 (variational batching across surfaces is
+    # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
+    batch_size: 1
+    num_workers: 0
+    shuffle: True
+
+  val_dataset_specifications:
+    # --- [0] Patch-level MCV validation (synthetic patches with analytic H, n̂) ---
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+        seed: ${globals.validation_seed}
+        epoch_size: 200
+        position_noise_std: [0.0, 0.05]
+        grid_radius_range: [0.5, 2.0]
+        polynomial_offset_range: [0.0, 1.0]
+        points_scale_range: [1.0]
+        coefficient_scale_range: [0.5, 3.0]
+        order_range: [2, 3]
+        grid_samplers:
+          - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+            num_points_range: [6, 30]
+        conv_k_nearest: null
+        pose_transformers: null
+        coeff_generation_method:
+          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+          _args_: ['uniform']
+        diff_geom_components:
+          - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+            _args_: ['mean_curvature']
+        diff_geom_at_origin_only: True
+        include_origin_in_grid: False
+        flip_normal_if_negative_curvature: False
+        normalize_to_unit_sphere: True
+      batch_size: 8
+      num_workers: 0
+      shuffle: False
+
+    # --- [1] Mesh spectral / geodesic validation ---
+    # _validation_step_mesh builds the Laplacian via assemble_laplacian.
+    # With stiffness_mode='learned_positive' on the model, val_laplacian
+    # is auto-coerced to assembly='from_stiffness', so the assembled L
+    # reads the learned stiffness head.
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+        mesh_folder_path: '/workspace/datasets/shrec15'
+        max_meshes: 80
+        file_size_range_mb: [0.5, 4]
+        require_manifold: True
+        shuffle: True
+        k: 8
+        num_geodesic_sources: 5
+        geodesic_source_method: "farthest_point_sampling"
+      batch_size: 1
+      num_workers: 0
+      shuffle: False
+
+    # --- [2] Fmap: DT4D Animals intra ---
+    # Same fmap-correspondence validation as dgx2.  fmap_val_cfg's
+    # eval_laplacians block is also auto-coerced to 'from_stiffness'.
+    - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+      dataset:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+        pair_generator:
+          _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+          root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+          pairs: ["0.7:1.0"]
+        val_poses_per_pair: 2
+        seed: ${globals.training_seed}
+      batch_size: 1
+      num_workers: 0
+      shuffle: false
+      collate_fn:
+        _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+        _partial_: true
