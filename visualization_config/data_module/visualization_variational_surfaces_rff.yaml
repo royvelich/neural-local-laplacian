@@ -1,0 +1,57 @@
+_target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
+train_dataset_specification:
+  _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+  dataset:
+    _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
+
+    # Random Fourier-feature Monge surfaces — same family the variational
+    # training pipeline uses for the GP-like surfaces.  The samplers are
+    # interchangeable behind BaseMongeSurfaceSampler, so nothing else in
+    # this config needs to change relative to the polynomial variant.
+    #
+    # Each of K / beta / magnitude_scale accepts a scalar (fixed) or a
+    # 2-element [lo, hi] range (uniform random draw per surface).
+    surface_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
+      K: [6, 12]
+      beta: [1.5, 3.0]
+      magnitude_scale: [0.05, 0.3]
+      l1_truncate: true
+
+    # Vertex sampling on U = [-grid_radius, grid_radius]^2.
+    num_vertices_range: [30, 60]
+    grid_radius: 1.0
+    position_noise_std: [0.01, 0.04]
+    k: [6, 15]
+
+    # Test functions — keep ALL per-vertex GT on so the viz can also
+    # show the gradient field.  Set any flag to false to skip its cost
+    # if you don't need it.
+    test_func_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+      max_degree: 4
+      variables: ambient
+      derivative_mode: analytic
+      normalize_target: none
+      compute_continuous_bilinear: false
+      compute_continuous_energy: false
+      compute_lb_all_points: true
+      compute_gradients_all_points: true
+      verbose: false
+
+    seed: ${globals.seed}
+    epoch_size: 1000
+
+    # ----- GT geodesic distances -----
+    # RFF surfaces can be wigglier than polynomial ones at high K /
+    # low beta — bump geodesic_reference_resolution if the GT field
+    # looks coarsely discretised on a particular surface.  120 doubles
+    # face count (~28k triangles, still fast).
+    compute_geodesics: true
+    num_geodesic_sources: 4
+    geodesic_source_method: farthest_point_sampling
+    geodesic_reference_resolution: 80
+  batch_size: 1
+  num_workers: 0
+  shuffle: True
+val_dataset_specifications: null
