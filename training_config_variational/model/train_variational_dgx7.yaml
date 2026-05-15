@@ -13,7 +13,9 @@ module:
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  detach_area_head: false           # area head is trained by LaplacianActionTestLoss
+  # The heat-method loss couples all three heads (areas → M and L,
+  # stiffness → L, grad_coeffs → G), so areas should remain trainable.
+  detach_area_head: false           # area head trained by LaplacianActionTestLoss + heat method
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
@@ -86,6 +88,26 @@ module:
         _target_: neural_local_laplacian.modules.losses.BilinearFormTestLoss
         loss_mode: 'mse'
       weight: 1.0       # tune relative to vector loss
+
+    # ── End-to-end: heat-method geodesic supervision ─────────────────
+    # Match the heat-method-recovered distance field against the exact
+    # GT (MMP on a dense reference triangulation, attached by the
+    # dataset when compute_geodesics: true).  Couples all three heads:
+    #   (M + tL) u = e_s          ← areas, stiffness head
+    #   ∇u  via   grad_coeffs      ← gradient head
+    #   L φ = Gᵀ M_3 X_flat        ← stiffness + gradient head
+    # L is assembled from the stiffness head ('from_stiffness') — the
+    # same path val_laplacian uses under stiffness_mode='learned_positive'.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.HeatMethodGeodesicLoss
+        t: null                     # auto: t_scale · A_total / n
+        t_scale: 1.0
+        epsilon_reg: 1.0e-6
+        loss_mode: 'mse'
+        normalize_by_diameter: true # makes the loss patch-scale-invariant
+        L_assembly: 'from_stiffness'
+      weight: 1.0
 
     # ── Optional: area gauge anchor ──────────────────────────────────
     # GradientVectorTestLoss anchors g; LaplacianActionTestLoss anchors

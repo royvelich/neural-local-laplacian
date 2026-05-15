@@ -2838,6 +2838,139 @@ class PolynomialSurfaceDataset(ParametricSurfaceDataset):
 # Surface-level dataset for variational training
 # =============================================
 
+
+def _build_grid_triangulation(M: int):
+    """Return (faces, ij_index) for the standard split-quad triangulation of
+    an M×M grid of vertices laid out row-major as ``v[i*M + j]``.
+
+    Each quad ``[(i, j), (i+1, j), (i, j+1), (i+1, j+1)]`` is split along the
+    diagonal ``(i, j) - (i+1, j+1)``:
+        T1 = (i, j),     (i+1, j),     (i+1, j+1)
+        T2 = (i, j),     (i+1, j+1),   (i,   j+1)
+    Returns:
+        faces:   (2*(M-1)*(M-1), 3) int32 — triangle vertex indices.
+    """
+    i, j = np.meshgrid(np.arange(M - 1), np.arange(M - 1), indexing='ij')
+    a = (i * M + j).ravel()
+    b = ((i + 1) * M + j).ravel()
+    c = ((i + 1) * M + (j + 1)).ravel()
+    d = (i * M + (j + 1)).ravel()
+    t1 = np.stack([a, b, c], axis=1)
+    t2 = np.stack([a, c, d], axis=1)
+    return np.concatenate([t1, t2], axis=0).astype(np.int32)
+
+
+def _bilinear_interpolate_grid(
+    field: np.ndarray,
+    M: int,
+    grid_radius: float,
+    query_uv: np.ndarray,
+) -> np.ndarray:
+    """Bilinearly interpolate a scalar field defined on an M×M grid spanning
+    U = [-grid_radius, grid_radius]^2 (row-major ``i*M + j``) at arbitrary
+    query points ``query_uv = (n, 2)`` in U-coordinates.
+
+    Bilinear on the unit cell suffices here — the diagonal split is used by
+    the triangulation, but the interpolated GT distance field is C^0 across
+    each cell either way, and the small difference between the two triangle
+    halves vanishes as M grows.  For M ≥ 80 the error is dominated by the
+    triangulation discretization itself, not by which scheme we pick.
+    """
+    n = query_uv.shape[0]
+    u = (query_uv[:, 0] + grid_radius) / (2.0 * grid_radius) * (M - 1)
+    v = (query_uv[:, 1] + grid_radius) / (2.0 * grid_radius) * (M - 1)
+    i = np.clip(np.floor(u).astype(np.int64), 0, M - 2)
+    j = np.clip(np.floor(v).astype(np.int64), 0, M - 2)
+    fu = (u - i)
+    fv = (v - j)
+    f00 = field[i * M + j]
+    f10 = field[(i + 1) * M + j]
+    f01 = field[i * M + (j + 1)]
+    f11 = field[(i + 1) * M + (j + 1)]
+    return (f00 * (1 - fu) * (1 - fv)
+            + f10 * fu * (1 - fv)
+            + f01 * (1 - fu) * fv
+            + f11 * fu * fv)
+
+
+def _nearest_grid_index(uv: np.ndarray, M: int, grid_radius: float) -> int:
+    """Return the row-major index of the M×M grid vertex closest to ``uv``."""
+    u, v = float(uv[0]), float(uv[1])
+    i = int(round((u + grid_radius) / (2.0 * grid_radius) * (M - 1)))
+    j = int(round((v + grid_radius) / (2.0 * grid_radius) * (M - 1)))
+    i = max(0, min(M - 1, i))
+    j = max(0, min(M - 1, j))
+    return i * M + j
+
+
+def compute_geodesic_gt_on_monge_patch(
+    surface_func,
+    grid_radius: float,
+    vertex_uv: np.ndarray,
+    source_indices: np.ndarray,
+    fine_resolution: int = 80,
+):
+    """Compute analytic-quality GT geodesic distances on a Monge patch.
+
+    Builds a dense reference triangulation of ``U = [-grid_radius, grid_radius]^2``
+    (an ``M × M`` grid of vertices, standard split-quad faces), lifts it to
+    Σ via ``surface_func``, and runs the exact MMP algorithm via
+    :func:`compute_exact_geodesics` (which dispatches to pygeodesic or
+    igl.exact_geodesic).  Distances from each source are bilinearly
+    interpolated back to the requested training-vertex U-coordinates.
+
+    Sources are snapped to the nearest fine-grid vertex; the resulting
+    source-location error is ``≤ grid_radius / (M - 1)`` in parameter
+    coordinates (~0.013 for the default M=80 on a unit patch), well below
+    typical model error.
+
+    Args:
+        surface_func: callable ``(u, v) → z`` (numpy-compatible).
+        grid_radius: half-side of U.
+        vertex_uv: (n, 2) U-coordinates of the training vertices.
+        source_indices: (S,) indices into ``vertex_uv``.  Each is snapped
+            to the nearest fine-grid vertex before the MMP solve.
+        fine_resolution: M, the per-axis number of fine-grid vertices.
+
+    Returns:
+        ``(S, n)`` numpy array of GT geodesic distances, or ``None`` if
+        any of the per-source MMP calls fail (e.g. on degenerate
+        triangulations).  Callers should fall back to skipping the GT for
+        that batch.
+    """
+    from neural_local_laplacian.utils.geodesic_utils import compute_exact_geodesics
+
+    M = int(fine_resolution)
+    lin = np.linspace(-grid_radius, grid_radius, M)
+    gu, gv = np.meshgrid(lin, lin, indexing='ij')
+    fine_u = gu.ravel().astype(np.float64)
+    fine_v = gv.ravel().astype(np.float64)
+
+    # Lift via the same surface function used at training-vertex sampling.
+    # surface_func is a torch closure — call it with torch tensors then
+    # detach back to numpy.  No autograd needed for the GT.
+    with torch.no_grad():
+        z = surface_func(
+            torch.from_numpy(fine_u).float(),
+            torch.from_numpy(fine_v).float()
+        ).detach().cpu().numpy().astype(np.float64)
+    fine_xyz = np.stack([fine_u, fine_v, z], axis=1)
+    fine_faces = _build_grid_triangulation(M)
+
+    out = np.zeros((len(source_indices), vertex_uv.shape[0]), dtype=np.float32)
+    for s_out, s_train in enumerate(source_indices):
+        s_fine = _nearest_grid_index(vertex_uv[int(s_train)], M, grid_radius)
+        dist_fine = compute_exact_geodesics(fine_xyz, fine_faces, s_fine, verbose=False)
+        if dist_fine is None:
+            return None
+        # Bilinear interp from fine grid back to training-vertex U-coords.
+        # Re-pin the source's own distance to 0 (interpolation through the
+        # snapped grid vertex would otherwise give a tiny non-zero value).
+        out[s_out] = _bilinear_interpolate_grid(
+            dist_fine, M, grid_radius, vertex_uv).astype(np.float32)
+        out[s_out, int(s_train)] = 0.0
+    return out
+
 class _VariationalSurfaceData(Data):
     """PyG Data subclass for surface-level variational batches.
 
@@ -2859,8 +2992,9 @@ class _VariationalSurfaceData(Data):
     def __inc__(self, key, value, *args, **kwargs):
         if key == 'patch_idx':
             return 0
-        if key == 'knn':
-            # batch_size=1 only for now: knn indices are not offset.
+        if key in ('knn', 'geodesic_sources'):
+            # batch_size=1 only for now: knn / geodesic source indices are
+            # not offset when batched.
             return 0
         return super().__inc__(key, value, *args, **kwargs)
 
@@ -2927,12 +3061,32 @@ class MongeSurfaceVariationalDataset(Dataset):
         k=15,
         epoch_size: int = 100,
         seed: int = 0,
+        compute_geodesics: bool = False,
+        num_geodesic_sources: int = 2,
+        geodesic_source_method: str = 'farthest_point_sampling',
+        geodesic_reference_resolution: int = 80,
     ):
         super().__init__()
         self._surface_sampler = surface_sampler
         self._grid_radius = float(grid_radius)
         self._epoch_size = int(epoch_size)
         self._test_func_sampler = test_func_sampler
+        self._compute_geodesics = bool(compute_geodesics)
+        self._num_geodesic_sources = int(num_geodesic_sources)
+        if self._num_geodesic_sources < 1:
+            raise ValueError(
+                f"num_geodesic_sources must be >= 1, got {self._num_geodesic_sources}")
+        if geodesic_source_method not in (
+                'farthest_point_sampling', 'random', 'mixed'):
+            raise ValueError(
+                "geodesic_source_method must be 'farthest_point_sampling' / "
+                f"'random' / 'mixed', got '{geodesic_source_method}'")
+        self._geodesic_source_method = geodesic_source_method
+        self._geodesic_reference_resolution = int(geodesic_reference_resolution)
+        if self._geodesic_reference_resolution < 8:
+            raise ValueError(
+                "geodesic_reference_resolution must be >= 8, got "
+                f"{self._geodesic_reference_resolution}")
 
         # k may be a scalar or a 2-element [lo, hi] range; a fresh value
         # is drawn per surface in get().  Each surface internally has a
@@ -3060,4 +3214,34 @@ class MongeSurfaceVariationalDataset(Dataset):
         if 'test_func_lb_all_points' in tf:
             # Same idea, for LaplacianActionTestLoss.
             data.test_func_laplacians_at_vertices = tf['test_func_lb_all_points']
+
+        # 9. Optional GT geodesic distances on the smooth Monge patch.
+        # Reference triangulation + exact MMP (pygeodesic / igl).  When
+        # the MMP solve fails on a degenerate fine mesh the helper returns
+        # None; we skip the GT for this surface rather than failing the
+        # whole epoch, mirroring how the mesh-validation pipeline handles
+        # unsafe meshes.
+        if self._compute_geodesics:
+            from neural_local_laplacian.utils.geodesic_utils import (
+                select_multiple_geodesic_sources,
+            )
+            n_verts = noisy_pos.shape[0]
+            S = min(self._num_geodesic_sources, n_verts)
+            source_indices = select_multiple_geodesic_sources(
+                noisy_pos.numpy(),
+                num_sources=S,
+                method=self._geodesic_source_method,
+                seed=int(self._rng.integers(0, 2 ** 31 - 1)),
+            ).astype(np.int64)
+            vertex_uv = torch.stack([u, v], dim=-1).numpy()
+            gt = compute_geodesic_gt_on_monge_patch(
+                surface_func=surface_func,
+                grid_radius=self._grid_radius,
+                vertex_uv=vertex_uv,
+                source_indices=source_indices,
+                fine_resolution=self._geodesic_reference_resolution,
+            )
+            if gt is not None:
+                data.geodesic_sources = torch.from_numpy(source_indices).long()
+                data.geodesic_distances = torch.from_numpy(gt).float()
         return data
