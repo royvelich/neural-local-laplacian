@@ -1,0 +1,53 @@
+_target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
+train_dataset_specification:
+  _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+  dataset:
+    _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
+
+    # Polynomial Monge surface family.  Match dgx7/dgx8/dgx9 so the
+    # visualised surfaces have the same distribution as the training run.
+    surface_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
+      order_range: [2, 3]
+      coefficient_scale_range: [0.5, 3.0]
+      polynomial_offset_range: [0.0, 1.0]
+      coeff_generation_method:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+        _args_: ['uniform']
+
+    # Vertex sampling on U = [-grid_radius, grid_radius]^2.
+    num_vertices_range: [30, 60]
+    grid_radius: 1.0
+    position_noise_std: [0.01, 0.04]
+    k: [6, 15]
+
+    # Test functions — keep ALL per-vertex GT on so the viz can also
+    # show the gradient field (the "GT Gradient (all pts)" UI block).
+    # Set any flag to false to skip its cost if you don't need it.
+    test_func_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
+      max_degree: 4
+      variables: ambient
+      derivative_mode: analytic
+      normalize_target: none
+      compute_continuous_bilinear: false
+      compute_continuous_energy: false
+      compute_lb_all_points: true
+      compute_gradients_all_points: true
+      verbose: false
+
+    seed: ${globals.seed}
+    epoch_size: 1000
+
+    # ----- GT geodesic distances -----
+    # Drives the "GT Geodesics" UI section in visualize_surfaces.py.
+    # Set compute_geodesics: false if you only want to inspect surfaces
+    # and don't need the distance field.
+    compute_geodesics: true
+    num_geodesic_sources: 4
+    geodesic_source_method: farthest_point_sampling
+    geodesic_reference_resolution: 80
+  batch_size: 1
+  num_workers: 0
+  shuffle: True
+val_dataset_specifications: null

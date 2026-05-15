@@ -1203,6 +1203,16 @@ def main(cfg: DictConfig) -> None:
 
     for batch_idx, surfaces in enumerate(data_loader):
         print(f"\nProcessing batch {batch_idx + 1}")
+        # Normalize whatever the loader yields into a flat list of Data items.
+        # The patch-level datasets emit List[Data] (one per grid sampler) and
+        # the PyG Collater passes that through.  The variational dataset emits
+        # a single _VariationalSurfaceData per item, which the Collater wraps
+        # in a Batch (batch_size=1) — unpack it back into a one-element list
+        # so the rest of the pipeline doesn't need to special-case it.
+        if isinstance(surfaces, Batch):
+            surfaces = surfaces.to_data_list()
+        elif isinstance(surfaces, Data):
+            surfaces = [surfaces]
         surface_names = visualizer._get_surface_names(surfaces)
         visualizer.visualize_surface_set(surfaces, surface_names)
         print(f"\n[OK] Batch {batch_idx + 1} complete! Close window to continue.")
