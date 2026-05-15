@@ -2,13 +2,7 @@ _target_: lightning.pytorch.Trainer
 max_epochs: -1
 devices: -1
 accelerator: 'auto'
-# HeatKernelLoss only reads (stiffness, areas) — the gradient head's
-# parameters never appear in the backward graph, so DDP's default
-# strict-parameter-use check fails.  ddp_find_unused_parameters_true
-# tells the reducer to allow that (small perf overhead, no correctness
-# impact).  If you add a GradientVectorTestLoss anchor later, you can
-# flip this back to 'auto'.
-strategy: 'ddp_find_unused_parameters_true'
+strategy: 'auto'
 num_sanity_val_steps: 0
 log_every_n_steps: 1
 check_val_every_n_epoch: 5

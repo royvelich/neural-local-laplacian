@@ -7,68 +7,55 @@ module:
 
       # Polynomial Monge surface family.
       surface_sampler:
-        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
-        order_range: [2, 3]
-        coefficient_scale_range: [0.5, 3.0]
-        polynomial_offset_range: [0.0, 1.0]
-        coeff_generation_method:
-          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
-          _args_: ['uniform']
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
+        K: [6, 12]
+        beta: [1.5, 3.0]
+        magnitude_scale: [0.05, 0.3]
+        l1_truncate: true
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: [30, 60]
-      grid_radius: 1.0
-      position_noise_std: [0.01, 0.04]
-      k: [6, 15]
+      num_vertices_range: 600
+      grid_radius: 1.5
+      position_noise_std: 0.0
+      k: 15
 
-      # Test functions — heat-kernel-only run.  HeatKernelLoss is the
-      # sole loss; no analytic test-function losses are active, so all
-      # per-vertex / continuous-form analytic-GT flags are off.  Sampler
-      # is still configured because dataset.get() always calls .sample().
+      # Test functions.  This config is built for the pair
+      #   GradientVectorTestLoss + LaplacianActionTestLoss
+      # under stiffness_mode='learned_positive':
+      #   • compute_gradients_all_points: true  → per-vertex analytic ∇_S h
+      #     (read by GradientVectorTestLoss to train the gradient head).
+      #   • compute_lb_all_points: true         → per-vertex analytic Δ_g h
+      #     (read by LaplacianActionTestLoss to train the stiffness head).
+      # The (P, P) continuous bilinear quadrature is OFF since neither
+      # loss consumes it — saves the Gauss-Legendre cost per surface.
       test_func_sampler:
-        _target_: neural_local_laplacian.datasets.synthetic_datasets.MonomialBasisTestFunctionSampler
-        max_degree: 2
-        variables: chart
-        derivative_mode: analytic
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
+        num_test_funcs: 20
+        include_coordinates: false
+        verbose: false
         normalize_target: none
         compute_continuous_bilinear: false
         compute_continuous_energy: false
-        compute_lb_all_points: false
-        compute_gradients_all_points: false
-        verbose: false
+        compute_lb_all_points: true
+        compute_gradients_all_points: true
+        derivative_mode: 'analytic'
+        families:
+          poly:
+            weight: 0.5
+            order_range: [1, 4]
+            coeff_scale: 1.0
+            coeff_method: uniform
+          trig:
+            weight: 0.4
+            frequency_range: [0.5, 4.0]
+            phase_range: [0.0, 6.283]
+          exp:
+            weight: 0.1
+            sigma_range: [0.3, 2.0]
+            center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
-      epoch_size: 800
-
-      # GT geodesics are NOT needed when only HeatKernelLoss is active.
-      compute_geodesics: false
-
-      # ----- GT heat kernel at a ladder of times (HeatKernelLoss) -----
-      # Each surface item carries:
-      #   heat_kernel_times:           (T,)        diffusion times
-      #   heat_kernel_gt:              (T, n)      K_t(v_i, v_i) per vertex
-      #                                            (diagonal_only=true)
-      #                              or (T, n, n)  full K_t entries
-      #                                            (diagonal_only=false)
-      # Built by computing cotangent + barycentric mass on a fine
-      # reference triangulation of U (same machinery as the geodesic
-      # GT), eigendecomposing L_ref φ = λ M_ref φ for the top
-      # ``num_eigenpairs`` modes, bilinearly interpolating each
-      # eigenvector to the training-vertex UV coords, and synthesising
-      # K_t(v_i, v_j) = Σ_k exp(-λ_k t) · φ_k(v_i) · φ_k(v_j).
-      #
-      # Time ladder: log-spaced across two decades.  Small t probes the
-      # local geometry (high frequencies); large t the global structure
-      # (low frequencies / Weyl regime).
-      #
-      # num_eigenpairs: 50 covers the spectrum we actually weight at
-      # these t's (modes with λ·t > ~30 contribute < 1e-13).  Bump for
-      # smaller t or larger n.
-      compute_heat_kernel: true
-      heat_kernel_times: [0.005, 0.025, 0.1]
-      heat_kernel_num_eigenpairs: 50
-      heat_kernel_diagonal_only: true     # supervise HKS only
-      heat_kernel_reference_resolution: null  # null ⇒ reuse geodesic_reference_resolution
+      epoch_size: 8000
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
     batch_size: 1
