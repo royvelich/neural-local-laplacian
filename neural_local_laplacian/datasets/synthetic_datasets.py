@@ -3252,6 +3252,7 @@ class MongeSurfaceVariationalDataset(Dataset):
                 f"max k = {self._k_range[1]}")
 
         self._position_noise_std = SyntheticSurfaceDataset._normalize_noise_std(position_noise_std)
+        self._seed = int(seed)
         self._rng = np.random.default_rng(seed=seed)
 
     # PyG Dataset hooks ----------------------------------------------------

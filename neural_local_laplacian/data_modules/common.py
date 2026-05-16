@@ -3,12 +3,64 @@ from typing import Optional, List, Callable
 
 # Third-party library imports
 import lightning
+import numpy as np
 import torch.utils.data
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch_geometric.data import Dataset as PyGDataset
 
 # neural signatures
 from neural_local_laplacian.utils import utils
+
+
+# ---------------------------------------------------------------------------
+# Worker init: dataset-RNG reseed for reproducibility
+# ---------------------------------------------------------------------------
+
+try:
+    from lightning.fabric.utilities.seed import (
+        pl_worker_init_function as _pl_worker_init_fn,
+    )
+except ImportError:  # older Lightning
+    try:
+        from pytorch_lightning.utilities.seed import (
+            pl_worker_init_function as _pl_worker_init_fn,
+        )
+    except ImportError:
+        _pl_worker_init_fn = None
+
+
+def dataset_worker_init_fn(worker_id: int) -> None:
+    """DataLoader ``worker_init_fn`` that fixes per-worker dataset RNG.
+
+    Datasets like :class:`MongeSurfaceVariationalDataset` keep a private
+    ``self._rng = np.random.default_rng(seed)`` set at construction time.
+    When the loader uses ``num_workers > 0`` each worker forks its own copy
+    of that RNG, and which worker handles which ``get(idx)`` call is
+    determined by OS scheduling — so the *content* of batch ``i`` is not
+    reproducible across runs and curves diverge between identical configs.
+
+    Lightning's ``seed_everything(workers=True)`` only reseeds the global
+    ``numpy``/``torch``/``random`` RNGs in each worker; the dataset's own
+    ``_rng`` instance is untouched.  This function:
+
+      1. Delegates to Lightning's worker init (if available) so the global
+         RNGs are still seeded per-worker per-epoch.
+      2. Reseeds the dataset's own ``_rng`` to
+         ``default_rng(dataset._seed + worker_id)``, making the per-worker
+         sample sequence reproducible across runs (and across persistent-
+         worker epochs).
+
+    Datasets without ``_seed`` / ``_rng`` are silently skipped.
+    """
+    if _pl_worker_init_fn is not None:
+        _pl_worker_init_fn(worker_id)
+
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    ds = info.dataset
+    if hasattr(ds, '_seed') and hasattr(ds, '_rng'):
+        ds._rng = np.random.default_rng(int(ds._seed) + int(worker_id))
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +145,7 @@ class GenericPygDataModule(_GenericDataModuleBase):
             shuffle=spec.shuffle,
             num_workers=spec.num_workers,
             persistent_workers=spec.num_workers > 0,
+            worker_init_fn=dataset_worker_init_fn if spec.num_workers > 0 else None,
         )
 
     def _make_train_loader(self, spec: DatasetSpecification) -> PyGDataLoader:
@@ -123,6 +176,7 @@ class GenericPlainDataModule(_GenericDataModuleBase):
             num_workers=spec.num_workers,
             persistent_workers=spec.num_workers > 0,
             collate_fn=spec.collate_fn,
+            worker_init_fn=dataset_worker_init_fn if spec.num_workers > 0 else None,
         )
 
     def _make_train_loader(self, spec: DatasetSpecification) -> torch.utils.data.DataLoader:
@@ -148,6 +202,7 @@ class GenericMixedDataModule(_GenericDataModuleBase):
     """
 
     def _make_loader(self, spec: DatasetSpecification):
+        wif = dataset_worker_init_fn if spec.num_workers > 0 else None
         if spec.collate_fn is not None:
             return torch.utils.data.DataLoader(
                 dataset=spec.dataset,
@@ -156,6 +211,7 @@ class GenericMixedDataModule(_GenericDataModuleBase):
                 num_workers=spec.num_workers,
                 persistent_workers=spec.num_workers > 0,
                 collate_fn=spec.collate_fn,
+                worker_init_fn=wif,
             )
         else:
             return PyGDataLoader(
@@ -164,6 +220,7 @@ class GenericMixedDataModule(_GenericDataModuleBase):
                 shuffle=spec.shuffle,
                 num_workers=spec.num_workers,
                 persistent_workers=spec.num_workers > 0,
+                worker_init_fn=wif,
             )
 
     def _make_train_loader(self, spec: DatasetSpecification):
