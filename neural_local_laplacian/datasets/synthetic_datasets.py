@@ -2977,28 +2977,75 @@ class _VariationalSurfaceData(Data):
     The surface is laid out as one PyG graph element with ``n*k`` rows of
     per-patch features (``x``, ``pos``, ``patch_idx``) plus surface-level
     fields (``vertex_pos``, ``vertex_normals``, ``vertex_areas``, ``knn``,
-    ``test_func_*``).  The custom ``__cat_dim__`` / ``__inc__`` keep
-    ``patch_idx`` from being incremented when PyG batches multiple
-    surfaces.  The variational training pipeline currently runs with
-    ``batch_size=1`` (one surface per step), so cross-surface incrementing
-    of ``knn`` is not yet supported.
+    ``test_func_*``).
+
+    ``__cat_dim__`` / ``__inc__`` are overridden so a ``Batch.from_data_list``
+    over multiple surfaces round-trips correctly through
+    ``batch.to_data_list()`` (which the variational training step uses to
+    iterate surfaces one at a time):
+
+      * **Index fields** (``patch_idx``, ``knn``, ``vertex_indices``,
+        ``geodesic_sources``) carry per-surface local indices and must NOT
+        be offset across the batch — ``__inc__`` returns 0 so each surface
+        keeps its own indexing space.
+      * **Per-surface probe-/time-level tensors** with shapes independent
+        of the vertex count ``n`` (``test_func_continuous_bilinear``,
+        ``test_func_continuous_energy``, ``heat_kernel_times``,
+        ``heat_kernel_diagonal_only``) are stacked on a new batch dim
+        (``__cat_dim__`` returns ``None``) so they become ``(B, ...)``.
+      * **Per-vertex tensors** (``vertex_pos``, ``vertex_normals``,
+        ``vertex_areas``, ``test_func_values``, ``test_func_*_at_vertices``)
+        use PyG's default ``cat_dim=0`` and are sliced back per surface
+        via the cumulative-``n`` offsets PyG already tracks.
+
+    Batching prerequisites:
+
+      * ``k`` (patch size) must be fixed across all surfaces in a batch —
+        ``knn``, ``x``, ``pos`` are concatenated along dim 0 and require
+        matching trailing shape.
+      * ``compute_heat_kernel: true`` / ``compute_geodesics: true`` attach
+        ``heat_kernel_gt`` / ``geodesic_distances`` whose shapes contain
+        ``n`` (and ``S``).  These are stacked on a new batch dim, so they
+        require uniform ``n`` (and ``S``) across the batch — i.e. the data
+        module must set ``num_vertices_range`` to a single value.  Mixed-
+        ``n`` batches with these GT fields raise a ``torch.stack`` error.
     """
+
+    # Probe-/surface-level tensors that are independent of vertex count.
+    # ``__cat_dim__ = None`` triggers ``torch.stack`` on a new dim 0 so
+    # ``Batch`` shapes become ``(B, ...)`` and ``to_data_list`` indexes
+    # ``[i]`` to recover each surface's tensor.  ``heat_kernel_gt`` and
+    # ``geodesic_distances`` are also stacked; that only works if every
+    # surface in the batch has matching ``n`` (and ``S``) — see class
+    # docstring for the prerequisite.
+    _SURFACE_STACK_KEYS = frozenset({
+        'test_func_continuous_bilinear',
+        'test_func_continuous_energy',
+        'heat_kernel_times',
+        'heat_kernel_gt',
+        'heat_kernel_diagonal_only',
+        'geodesic_distances',
+    })
+
+    # Per-surface local-index tensors — never offset when batching.
+    _SURFACE_LOCAL_INDEX_KEYS = frozenset({
+        'patch_idx',
+        'knn',
+        'vertex_indices',
+        'geodesic_sources',
+    })
 
     def __cat_dim__(self, key, value, *args, **kwargs):
         if key == 'patch_idx':
             return 0
+        if key in self._SURFACE_STACK_KEYS:
+            return None
         return super().__cat_dim__(key, value, *args, **kwargs)
 
     def __inc__(self, key, value, *args, **kwargs):
-        if key == 'patch_idx':
+        if key in self._SURFACE_LOCAL_INDEX_KEYS:
             return 0
-        if key in ('knn', 'geodesic_sources'):
-            # batch_size=1 only for now: knn / geodesic source indices are
-            # not offset when batched.
-            return 0
-        if key in ('heat_kernel_times', 'heat_kernel_gt',
-                   'heat_kernel_diagonal_only'):
-            # Surface-level scalars / per-vertex tensors — no offset.
+        if key in self._SURFACE_STACK_KEYS:
             return 0
         return super().__inc__(key, value, *args, **kwargs)
 
