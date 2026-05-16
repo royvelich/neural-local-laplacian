@@ -73,6 +73,11 @@ parameters:
           - true
           - false
 
+      normalize_stiffness_by_k:
+        values:
+          - true
+          - false
+
       num_test_funcs:
         values:
           - 8
@@ -284,6 +289,7 @@ parameters:
         mcv_mode: 'diagonal_gram'
         stiffness_mode: 'learned_positive'
         normalize_grad_by_k: ${globals.normalize_grad_by_k}
+        normalize_stiffness_by_k: ${globals.normalize_stiffness_by_k}
 
         val_laplacian:
           assembly: diagonal_gram      # auto-coerced to from_stiffness
