@@ -60,7 +60,7 @@ module:
       epoch_size: 8000
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
-    batch_size: 1
+    batch_size: 500
     num_workers: 0
     shuffle: True
 

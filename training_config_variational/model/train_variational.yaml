@@ -30,6 +30,7 @@ module:
   mcv_mode: 'diagonal_gram'
   stiffness_mode: 'learned_positive'
   normalize_grad_by_k: true
+  normalize_stiffness_by_k: true
 
   # Validation-only Laplacian config.  The user-facing 'diagonal_gram'
   # value below is overridden in __init__ to 'from_stiffness' because
