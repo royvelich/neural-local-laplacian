@@ -15,7 +15,6 @@ method: bayes
 metric:
   goal: maximize
   name: val_fmap/animals/fmap_hks_wks/geo_at_05pct
-  summary: max
 #run_cap: 80
 parameters:
   # ===================================================================
@@ -24,7 +23,10 @@ parameters:
   globals:
     parameters:
       training_seed:
-        value: 42
+        values:
+          - 3407
+          - 42
+          - 5423
 
       validation_seed:
         value: 3
@@ -36,7 +38,7 @@ parameters:
         value: null
 
       lr:
-        value: 5.0e-5
+        value: 1.0e-5
 
       gradient_clip_val:
         values:
@@ -52,7 +54,6 @@ parameters:
 
       model_width:
         values:
-          - 512
           - 768
           - 1024
 
@@ -60,24 +61,21 @@ parameters:
         values:
           - 4
           - 8
-          - 16
 
       dropout:
         distribution: q_uniform
         min: 0.0
-        max: 0.4
+        max: 0.3
         q: 0.05
 
       normalize_grad_by_k:
         values:
           - true
-          - false
 
       normalize_stiffness_by_k:
         values:
           - true
-          - false
-
+          -
       num_test_funcs:
         values:
           - 8
@@ -87,12 +85,12 @@ parameters:
       grad_loss_weight:
         distribution: log_uniform_values
         min: 0.1
-        max: 10.0
+        max: 2.0
 
       stiffness_loss_weight:
         distribution: log_uniform_values
         min: 0.1
-        max: 10.0
+        max: 2.0
 
       loss_preset:
         values:
@@ -342,7 +340,7 @@ parameters:
   trainer:
     value:
       _target_: lightning.pytorch.Trainer
-      max_epochs: -1
+      max_epochs: 50
       devices: -1
       accelerator: 'auto'
       strategy: 'auto'
