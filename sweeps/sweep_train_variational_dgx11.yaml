@@ -188,8 +188,9 @@ parameters:
                   center_range: [-1.0, 1.0]
             seed: ${globals.training_seed}
             epoch_size: 8000
-          # batch_size MUST be 1: variational batching across surfaces is
-          # not yet implemented in _VariationalSurfaceData.__inc__ for knn.
+          # Cross-surface batching is supported now; bump batch_size to
+          # amortise dataloader overhead (acts as gradient accumulation —
+          # the training step still iterates surfaces one at a time).
           batch_size: 1
           num_workers: 0
           shuffle: True

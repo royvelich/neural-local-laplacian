@@ -58,8 +58,12 @@ module:
 
       seed: ${globals.training_seed}
       epoch_size: 8000
-    # batch_size MUST be 1 for v1 (variational batching across surfaces is
-    # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
+    # Cross-surface batching is supported (see _VariationalSurfaceData);
+    # ``k`` must be fixed across surfaces (it is, above), and enabling
+    # ``compute_heat_kernel`` / ``compute_geodesics`` requires uniform
+    # ``num_vertices_range`` in that case.  batch_size > 1 acts as
+    # gradient accumulation — the variational training step still
+    # iterates surfaces one at a time.
     batch_size: 100
     num_workers: 0
     shuffle: True
