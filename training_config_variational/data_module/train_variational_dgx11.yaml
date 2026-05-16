@@ -7,16 +7,18 @@ module:
 
       # Polynomial Monge surface family.
       surface_sampler:
-        _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFourierMongeSurfaceSampler
-        K: [6, 12]
-        beta: [1.5, 3.0]
-        magnitude_scale: [0.05, 0.3]
-        l1_truncate: true
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
+        order_range: [2, 3]
+        coefficient_scale_range: [0.5, 3.0]
+        polynomial_offset_range: [0.0, 1.0]
+        coeff_generation_method:
+          _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+          _args_: ['uniform']
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: 600
-      grid_radius: 1.5
-      position_noise_std: 0.0
+      num_vertices_range: [60, 120]
+      grid_radius: 1.0
+      position_noise_std: [0.01, 0.05]
       k: 15
 
       # Test functions.  This config is built for the pair
@@ -30,7 +32,7 @@ module:
       # loss consumes it — saves the Gauss-Legendre cost per surface.
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
-        num_test_funcs: 20
+        num_test_funcs: 16
         include_coordinates: false
         verbose: false
         normalize_target: none
