@@ -32,7 +32,7 @@ module:
       # loss consumes it — saves the Gauss-Legendre cost per surface.
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
-        num_test_funcs: 16
+        num_test_funcs: 32
         include_coordinates: false
         verbose: false
         normalize_target: none
@@ -57,10 +57,10 @@ module:
             center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
-      epoch_size: 8000
+      epoch_size: 1000
     # batch_size MUST be 1 for v1 (variational batching across surfaces is
     # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
-    batch_size: 100
+    batch_size: 50
     num_workers: 0
     shuffle: True
 
@@ -104,8 +104,8 @@ module:
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
-        mesh_folder_path: '/workspace/datasets/shrec15'
-        max_meshes: 80
+        mesh_folder_path: 'F:/input/shrec15'
+        max_meshes: 10
         file_size_range_mb: [0.5, 4]
         require_manifold: True
         shuffle: True
@@ -124,9 +124,9 @@ module:
         _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
         pair_generator:
           _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
-          root: '/workspace/datasets/DeformingThings4DMatching-Animals'
-          pairs: ["0.7:1.0"]
-        val_poses_per_pair: 2
+          root: 'F:/3DV22_DeformingThings4DMatching_dataset-main/DeformingThings4DMatching-Animals'
+          pairs: ["0.8:1.0"]
+        val_poses_per_pair: 1
         seed: ${globals.training_seed}
       batch_size: 1
       num_workers: 0
