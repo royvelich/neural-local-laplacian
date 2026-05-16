@@ -37,6 +37,7 @@ class LossContext:
     test_func_gradients: Optional[torch.Tensor] = None    # (B, P, 3)
     # Surface-level fields (variational training pipeline)
     knn: Optional[torch.Tensor] = None                              # (n, k)
+    vertex_pos: Optional[torch.Tensor] = None                       # (n, 3)
     vertex_normals: Optional[torch.Tensor] = None                   # (n, 3)
     test_func_values: Optional[torch.Tensor] = None                 # (n, P)
     test_func_continuous_bilinear: Optional[torch.Tensor] = None    # (P, P)
@@ -1805,6 +1806,70 @@ class LaplacianActionTestLoss(_VariationalTestLoss):
             per = ctx.areas.unsqueeze(-1) * per
 
         return self._reduce(per)
+
+
+class MeanCurvatureDirectionCosineTestLoss(_VariationalTestLoss):
+    r"""Cosine-similarity direction loss on the discrete mean curvature vector.
+
+    Variational analog of :class:`DirectionCosineLoss`.  Computes the
+    per-vertex MCV from the **learned stiffness head** acting on vertex
+    positions and compares its direction to the analytic surface normal:
+
+        MCV_i  =  (Σ_j s_ij · (p_{knn[i,j]} - p_i)) / A_i
+        L_i    =  1 − |⟨MCV_i / ‖MCV_i‖,  n̂_i⟩|       (signed=False, default)
+        L_i    =  1 −  ⟨MCV_i / ‖MCV_i‖,  n̂_i⟩         (signed=True)
+
+    The sign-agnostic form is the default since :class:`MongeSurfaceVariationalDataset`
+    only carries the (unsigned) surface normal, not the signed mean
+    curvature.  Use ``signed=True`` only when you know the dataset's
+    normal convention matches the MCV sign convention you expect.
+
+    Reads from ``ctx``:
+        stiffness_weights  (n, k)
+        areas              (n,)
+        knn                (n, k)
+        vertex_pos         (n, 3)
+        vertex_normals     (n, 3)
+
+    Args:
+        signed: if True, use ``1 - cos`` (assumes consistent sign convention);
+            otherwise use ``1 - |cos|`` (direction-only, sign-agnostic).
+        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over vertices.
+        eps: numerical floor for normalisation.
+        area_weighted: if True, weight each vertex by ``A_i`` before reducing.
+    """
+
+    def __init__(self, signed: bool = False, reduction: str = 'mean',
+                 eps: float = 1e-8, area_weighted: bool = False):
+        super().__init__(reduction=reduction)
+        self.signed = bool(signed)
+        self.eps = float(eps)
+        self.area_weighted = bool(area_weighted)
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        self._check_required(ctx, [
+            'stiffness_weights', 'areas', 'knn',
+            'vertex_pos', 'vertex_normals'])
+
+        p = ctx.vertex_pos                                  # (n, 3)
+        neighbour_pos = p[ctx.knn]                          # (n, k, 3)
+        deltas = neighbour_pos - p.unsqueeze(1)             # (n, k, 3)
+
+        s = ctx.stiffness_weights                           # (n, k)
+        numerator = (s.unsqueeze(-1) * deltas).sum(dim=1)   # (n, 3)
+        mcv = numerator / ctx.areas.unsqueeze(-1)           # (n, 3)
+
+        mcv_unit = F.normalize(mcv, p=2, dim=-1, eps=self.eps)
+        normal_unit = F.normalize(ctx.vertex_normals, p=2, dim=-1, eps=self.eps)
+        cos = (mcv_unit * normal_unit).sum(dim=-1)          # (n,)
+        if not self.signed:
+            cos = cos.abs()
+        per_vertex = 1.0 - cos                              # (n,)
+
+        if self.area_weighted:
+            per_vertex = ctx.areas * per_vertex
+
+        return self._reduce(per_vertex)
 
 
 class HeatMethodGeodesicLoss(_VariationalTestLoss):

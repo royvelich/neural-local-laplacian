@@ -80,6 +80,7 @@ class _VariationalTrainingMixin:
 
             # Surface-level GT fields (attached by MongeSurfaceVariationalDataset).
             knn = getattr(surface, 'knn', None)
+            vertex_pos = getattr(surface, 'vertex_pos', None)
             vertex_normals = getattr(surface, 'vertex_normals', None)
             test_func_values = getattr(surface, 'test_func_values', None)
             tf_continuous_bilinear = getattr(
@@ -112,6 +113,7 @@ class _VariationalTrainingMixin:
                 areas=areas,
                 stiffness_weights=stiffness,
                 knn=knn,
+                vertex_pos=vertex_pos,
                 vertex_normals=vertex_normals,
                 test_func_values=test_func_values,
                 test_func_continuous_bilinear=tf_continuous_bilinear,
