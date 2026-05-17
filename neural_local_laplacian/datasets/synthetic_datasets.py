@@ -1523,7 +1523,14 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
                            ``center_mode`` values; in ``'surface'`` mode
                            the resulting 3D positions are obtained by
                            lifting ``(cx, cy)`` through ``surface_func``.
-        amplitude_scale:   stddev of ``c_{p,m} ~ N(0, scale²)``.
+        amplitude_scale:   stddev of ``c_{p,m} ~ N(0, scale²)``.  Scalar
+                           for a fixed stddev across probes, or a
+                           ``[lo, hi]`` range for a fresh uniform draw
+                           per probe (drawn from
+                           ``U(amp_lo, amp_hi)``).  Useful to mix
+                           low- and high-magnitude probes in the same
+                           batch so the model sees a wide range of
+                           target gradient / LB magnitudes.
         center_mode:       Where the Gaussian distance is measured.
                            ``'parameter'`` (default) — 2D Gaussian on
                            ``(u, v)``; centers live on the chart.  Pure
@@ -1552,7 +1559,7 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
             num_centers_range=(4, 12),
             sigma_range=(0.3, 1.0),
             center_range=(-1.0, 1.0),
-            amplitude_scale: float = 1.0,
+            amplitude_scale=1.0,
             center_mode: str = 'parameter',
             normalize_target: str = 'none',
             compute_lb_all_points: bool = False,
@@ -1597,11 +1604,12 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
                 f"center_range must be [c_lo, c_hi>=c_lo], got {center_range}")
         self.center_range = (c_lo, c_hi)
 
-        amp = float(amplitude_scale)
-        if amp <= 0:
+        amp_lo, amp_hi = _coerce_scalar_or_range(
+            amplitude_scale, name='amplitude_scale', cast=float)
+        if amp_lo <= 0:
             raise ValueError(
-                f"amplitude_scale must be > 0, got {amplitude_scale}")
-        self.amplitude_scale = amp
+                f"amplitude_scale must be > 0 (lower bound), got {amplitude_scale}")
+        self.amplitude_scale_range = (amp_lo, amp_hi)
 
         if center_mode not in ('parameter', 'surface'):
             raise ValueError(
@@ -1619,8 +1627,10 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
         c_lo, c_hi = self.center_range
         cx = torch.tensor(rng.uniform(c_lo, c_hi, size=M), dtype=torch.float32)
         cy = torch.tensor(rng.uniform(c_lo, c_hi, size=M), dtype=torch.float32)
+        amp_lo, amp_hi = self.amplitude_scale_range
+        amp = float(rng.uniform(amp_lo, amp_hi)) if amp_lo != amp_hi else amp_lo
         c = torch.tensor(
-            rng.normal(0.0, self.amplitude_scale, size=M),
+            rng.normal(0.0, amp, size=M),
             dtype=torch.float32)
         return {'family': 'grf', 'cx': cx, 'cy': cy, 'c': c, 'sigma': sigma}
 
