@@ -1474,6 +1474,218 @@ class RandomFamilyTestFunctionSampler(BaseTestFunctionSampler):
         }
 
 
+class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
+    r"""Random test functions as sums of Gaussian RBFs (closed-form GRF).
+
+    Each test function is the closed-form analog of "Gaussian-smooth a
+    random vertex field" — a finite-rank Gaussian Random Field on the
+    parameter domain:
+
+        h_p(x, y) = Σ_{m=1}^{M_p}  c_{p,m} · exp(
+                     -((x - cx_{p,m})² + (y - cy_{p,m})²) / (2 σ_p²))
+
+    where for each probe ``p``:
+        * ``M_p`` RBF centers, drawn uniformly from ``num_centers_range``.
+        * Amplitudes ``c_{p,m} ~ N(0, amplitude_scale²)``.
+        * Centers ``(cx_{p,m}, cy_{p,m})`` drawn uniformly on
+          ``center_range × center_range``.
+        * Width ``σ_p`` drawn uniformly from ``sigma_range``.
+
+    Because every term is ``C^∞`` in ``(x, y)``, the function is
+    differentiable everywhere — autograd LB and gradient targets work
+    without a reference triangulation, and the Gauss-Legendre quadrature
+    used by ``compute_continuous_*`` is well-defined (smooth, integrable
+    on a bounded chart).
+
+    In the limit ``M → ∞`` this converges to a Gaussian Process draw
+    with a squared-exponential covariance kernel of width ``σ``.  For
+    practical ``M ∈ [4, 20]`` it's a rich, low-rank GP-like field —
+    smoothness controlled by ``σ`` (small = high-frequency, large =
+    low-frequency), spatial complexity controlled by ``M`` (more
+    centers ≈ more "features" in the field).
+
+    The single-center special case ``num_centers_range=[1, 1]``
+    reproduces the ``exp`` family of
+    :class:`RandomFamilyTestFunctionSampler`; ``M > 1`` is the genuine
+    extension.
+
+    Args:
+        num_test_funcs:    P, number of probes per surface.
+        num_centers_range: ``[M_lo, M_hi]`` — RBF centers per probe.
+        sigma_range:       ``[σ_lo, σ_hi]`` — RBF width per probe.
+        center_range:      ``[c_lo, c_hi]`` — bbox for RBF center
+                           sampling on the parameter domain.  Default
+                           ``[-1.0, 1.0]`` matches the default
+                           Monge-patch grid radius.
+        amplitude_scale:   stddev of ``c_{p,m} ~ N(0, scale²)``.
+        + standard :class:`BaseTestFunctionSampler` kwargs.
+    """
+
+    def __init__(
+            self,
+            num_test_funcs: int = 16,
+            num_centers_range=(4, 12),
+            sigma_range=(0.3, 1.0),
+            center_range=(-1.0, 1.0),
+            amplitude_scale: float = 1.0,
+            normalize_target: str = 'none',
+            compute_lb_all_points: bool = False,
+            compute_gradients_all_points: bool = False,
+            compute_continuous_energy: bool = False,
+            compute_continuous_bilinear: bool = False,
+            quadrature_n: int = 30,
+            verbose: bool = False,
+            derivative_mode: str = 'analytic',
+    ):
+        super().__init__(
+            normalize_target=normalize_target,
+            derivative_mode=derivative_mode,
+            compute_lb_all_points=compute_lb_all_points,
+            compute_gradients_all_points=compute_gradients_all_points,
+            compute_continuous_energy=compute_continuous_energy,
+            compute_continuous_bilinear=compute_continuous_bilinear,
+            quadrature_n=quadrature_n,
+            verbose=verbose,
+        )
+        if int(num_test_funcs) < 1:
+            raise ValueError(
+                f"num_test_funcs must be >= 1, got {num_test_funcs}")
+        self.num_test_funcs = int(num_test_funcs)
+
+        m_lo, m_hi = int(num_centers_range[0]), int(num_centers_range[1])
+        if m_lo < 1 or m_hi < m_lo:
+            raise ValueError(
+                f"num_centers_range must be [M_lo>=1, M_hi>=M_lo], "
+                f"got {num_centers_range}")
+        self.num_centers_range = (m_lo, m_hi)
+
+        s_lo, s_hi = float(sigma_range[0]), float(sigma_range[1])
+        if s_lo <= 0 or s_hi < s_lo:
+            raise ValueError(
+                f"sigma_range must be [σ_lo>0, σ_hi>=σ_lo], got {sigma_range}")
+        self.sigma_range = (s_lo, s_hi)
+
+        c_lo, c_hi = float(center_range[0]), float(center_range[1])
+        if c_hi < c_lo:
+            raise ValueError(
+                f"center_range must be [c_lo, c_hi>=c_lo], got {center_range}")
+        self.center_range = (c_lo, c_hi)
+
+        amp = float(amplitude_scale)
+        if amp <= 0:
+            raise ValueError(
+                f"amplitude_scale must be > 0, got {amplitude_scale}")
+        self.amplitude_scale = amp
+
+    # ----- spec sampling --------------------------------------------------
+
+    def _sample_params(self, rng: np.random.Generator) -> Dict[str, Any]:
+        m_lo, m_hi = self.num_centers_range
+        M = int(rng.integers(m_lo, m_hi + 1))
+        s_lo, s_hi = self.sigma_range
+        sigma = float(rng.uniform(s_lo, s_hi))
+        c_lo, c_hi = self.center_range
+        cx = torch.tensor(rng.uniform(c_lo, c_hi, size=M), dtype=torch.float32)
+        cy = torch.tensor(rng.uniform(c_lo, c_hi, size=M), dtype=torch.float32)
+        c = torch.tensor(
+            rng.normal(0.0, self.amplitude_scale, size=M),
+            dtype=torch.float32)
+        return {'family': 'grf', 'cx': cx, 'cy': cy, 'c': c, 'sigma': sigma}
+
+    # ----- BaseTestFunctionSampler API -----------------------------------
+
+    def _enumerate(self, rng: np.random.Generator) -> List[Dict[str, Any]]:
+        return [self._sample_params(rng) for _ in range(self.num_test_funcs)]
+
+    @staticmethod
+    def _params_to_callable(params: Dict[str, Any]):
+        cx, cy, c, sigma = params['cx'], params['cy'], params['c'], params['sigma']
+        two_s2 = 2.0 * (sigma ** 2)
+
+        def h(x, y):
+            # Add a trailing axis to broadcast against the (M,) centers.
+            # Works for x of any shape: (K,) -> (K, M); (K, 1) -> (K, 1, M);
+            # 0-d scalar -> (1, M).  Sum on dim=-1 collapses back to input shape.
+            x_e = x.unsqueeze(-1)
+            y_e = y.unsqueeze(-1)
+            dx = x_e - cx
+            dy = y_e - cy
+            g = torch.exp(-(dx ** 2 + dy ** 2) / two_s2)        # (..., M)
+            return (g * c).sum(dim=-1)                           # (...,)
+
+        return h
+
+    def _specs_to_callables(self, specs, surface_func):
+        return [self._params_to_callable(p) for p in specs]
+
+    def _specs_to_analytic_data(self, specs, x_grid, y_grid):
+        P = len(specs)
+        K = len(x_grid)
+        if P == 0:
+            empty = {k: torch.zeros(0, dtype=torch.float32)
+                     for k in ('h', 'h_x', 'h_y', 'h_xx', 'h_xy', 'h_yy')}
+            return torch.zeros(K, 0), torch.zeros(K, 0), empty
+
+        # Pad per-probe arrays into (P, M_max).  Padding amplitudes with 0
+        # makes the "missing" centers contribute nothing to any sum, so
+        # downstream einsum-style reductions are correct regardless of M_p.
+        M_max = max(int(s['cx'].shape[0]) for s in specs)
+        cx = torch.zeros(P, M_max, dtype=torch.float32)
+        cy = torch.zeros(P, M_max, dtype=torch.float32)
+        cw = torch.zeros(P, M_max, dtype=torch.float32)
+        sigma = torch.zeros(P, dtype=torch.float32)
+        for p, s in enumerate(specs):
+            M_p = int(s['cx'].shape[0])
+            cx[p, :M_p] = s['cx']
+            cy[p, :M_p] = s['cy']
+            cw[p, :M_p] = s['c']
+            sigma[p] = s['sigma']
+
+        s2 = sigma ** 2                            # (P,)
+        s4 = s2 ** 2                               # (P,)
+        two_s2 = 2.0 * s2                          # (P,)
+
+        # ----- values at the K grid points ----------------------------
+        # Broadcast: x (K,) -> (1, K, 1); cx (P, M_max) -> (P, 1, M_max).
+        x_b = x_grid.view(1, K, 1)
+        y_b = y_grid.view(1, K, 1)
+        cx_b = cx.view(P, 1, M_max)
+        cy_b = cy.view(P, 1, M_max)
+        cw_b = cw.view(P, 1, M_max)
+        two_s2_b = two_s2.view(P, 1, 1)
+        dx = x_b - cx_b
+        dy = y_b - cy_b
+        g_grid = torch.exp(-(dx ** 2 + dy ** 2) / two_s2_b)     # (P, K, M_max)
+        # (P, K) → transpose to the (K, P) convention used downstream.
+        values = (g_grid * cw_b).sum(dim=-1).transpose(0, 1).contiguous()
+
+        # ----- derivatives at the origin ------------------------------
+        # For a single RBF centered at (cx_m, cy_m):
+        #   g_m(0,0)        = exp(-(cx_m² + cy_m²) / (2σ²))
+        #   ∂_x g_m(0,0)    = g_m · ( cx_m / σ²)
+        #   ∂_y g_m(0,0)    = g_m · ( cy_m / σ²)
+        #   ∂²_xx g_m(0,0)  = g_m · ( cx_m² / σ⁴ - 1/σ²)
+        #   ∂²_xy g_m(0,0)  = g_m · ( cx_m · cy_m / σ⁴)
+        #   ∂²_yy g_m(0,0)  = g_m · ( cy_m² / σ⁴ - 1/σ²)
+        # Sum over m with amplitudes c_{p,m}.
+        s2u = s2.unsqueeze(-1)                                   # (P, 1)
+        s4u = s4.unsqueeze(-1)                                   # (P, 1)
+        two_s2u = two_s2.unsqueeze(-1)                           # (P, 1)
+        g0 = torch.exp(-(cx ** 2 + cy ** 2) / two_s2u)           # (P, M_max)
+        weighted_g0 = g0 * cw                                    # (P, M_max)
+        h    = weighted_g0.sum(dim=-1)                                                      # (P,)
+        h_x  = (weighted_g0 * (cx / s2u)).sum(dim=-1)
+        h_y  = (weighted_g0 * (cy / s2u)).sum(dim=-1)
+        h_xx = (weighted_g0 * ((cx ** 2) / s4u - 1.0 / s2u)).sum(dim=-1)
+        h_xy = (weighted_g0 * ((cx * cy) / s4u)).sum(dim=-1)
+        h_yy = (weighted_g0 * ((cy ** 2) / s4u - 1.0 / s2u)).sum(dim=-1)
+        h_d = {'h': h, 'h_x': h_x, 'h_y': h_y,
+               'h_xx': h_xx, 'h_xy': h_xy, 'h_yy': h_yy}
+
+        deltas = values - h.unsqueeze(0)                          # (K, P)
+        return deltas, values, h_d
+
+
 class MonomialBasisTestFunctionSampler(BaseTestFunctionSampler):
     """Deterministic test-function basis: all monomials up to degree d.
 
