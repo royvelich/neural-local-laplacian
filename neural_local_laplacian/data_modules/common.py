@@ -64,6 +64,98 @@ def dataset_worker_init_fn(worker_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# k-grouped batch sampler (variable-k variational batching)
+# ---------------------------------------------------------------------------
+
+class KGroupedBatchSampler(torch.utils.data.Sampler):
+    """Yields lists of dataset indices grouped by matching ``k``.
+
+    Cross-surface batching in :class:`_VariationalSurfaceData` requires
+    uniform patch size ``k`` across every surface in a batch — the
+    ``knn``, ``x``, ``pos`` tensors concatenate on dim 0 and need
+    matching trailing dim.  When a dataset draws ``k`` from a range, a
+    naive ``shuffle=True`` loader will mix surfaces with different ``k``
+    in the same batch and crash at collation.
+
+    This sampler reads each index's ``k`` via ``dataset.k_for_idx(idx)``,
+    buckets indices by ``k`` once at construction (assumes the assignment
+    is stable for the dataset's lifetime — true for
+    :class:`MongeSurfaceVariationalDataset` which pre-samples ``k_per_idx``
+    at ``__init__``), and each epoch yields contiguous batches of
+    ``batch_size`` drawn from a single bucket.  Every emitted batch is
+    therefore ``k``-homogeneous and PyG collation succeeds.
+
+    Args:
+        dataset:    Must expose ``__len__`` and ``k_for_idx(idx) -> int``.
+        batch_size: Items per batch.
+        shuffle:    Shuffle within each ``k`` bucket each epoch and
+                    shuffle the order of emitted batches.
+        drop_last:  Drop any bucket tail smaller than ``batch_size``.
+                    When False (default), the tail is emitted as a
+                    smaller (still ``k``-homogeneous) batch.
+        seed:       Base seed for the epoch generator; each call to
+                    ``__iter__`` advances the epoch counter for
+                    reproducible shuffles across runs.
+    """
+
+    def __init__(self, dataset, batch_size: int, shuffle: bool = True,
+                 drop_last: bool = False, seed: int = 0) -> None:
+        if not hasattr(dataset, 'k_for_idx'):
+            raise TypeError(
+                f"KGroupedBatchSampler requires the dataset to expose "
+                f"k_for_idx(idx) -> int. {type(dataset).__name__} does not.")
+        if int(batch_size) < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._dataset = dataset
+        self._batch_size = int(batch_size)
+        self._shuffle = bool(shuffle)
+        self._drop_last = bool(drop_last)
+        self._seed = int(seed)
+        self._epoch = 0
+
+        buckets: dict = {}
+        for i in range(len(dataset)):
+            k = int(dataset.k_for_idx(i))
+            buckets.setdefault(k, []).append(i)
+        self._buckets = {k: np.asarray(v, dtype=np.int64)
+                         for k, v in buckets.items()}
+
+    def __iter__(self):
+        rng = np.random.default_rng(self._seed + self._epoch)
+        self._epoch += 1
+
+        all_batches: List[List[int]] = []
+        for indices in self._buckets.values():
+            arr = indices.copy()
+            if self._shuffle:
+                rng.shuffle(arr)
+            n = arr.shape[0]
+            n_full = n // self._batch_size
+            for b in range(n_full):
+                all_batches.append(
+                    arr[b * self._batch_size:(b + 1) * self._batch_size].tolist())
+            tail = arr[n_full * self._batch_size:]
+            if tail.shape[0] > 0 and not self._drop_last:
+                all_batches.append(tail.tolist())
+
+        if self._shuffle:
+            order = rng.permutation(len(all_batches))
+            all_batches = [all_batches[i] for i in order]
+        for batch in all_batches:
+            yield batch
+
+    def __len__(self) -> int:
+        total = 0
+        for indices in self._buckets.values():
+            n = indices.shape[0]
+            if self._drop_last:
+                total += n // self._batch_size
+            else:
+                total += (n + self._batch_size - 1) // self._batch_size
+        return total
+
+
+# ---------------------------------------------------------------------------
 # Dataset specification
 # ---------------------------------------------------------------------------
 
@@ -77,6 +169,13 @@ class DatasetSpecification:
         shuffle:     Whether to shuffle each epoch.
         collate_fn:  Optional collate function (plain DataLoader only;
                      ignored by GenericPygDataModule which uses PyG's DataLoader).
+        group_by_k:  If True, wire a :class:`KGroupedBatchSampler` so
+                     every batch is k-homogeneous.  Requires the dataset
+                     to expose ``k_for_idx(idx) -> int`` (e.g.
+                     :class:`MongeSurfaceVariationalDataset`).  Use this
+                     when the dataset draws ``k`` from a range and you
+                     want ``batch_size > 1`` — without it, mixed-k
+                     batches crash at PyG collation.
     """
 
     def __init__(
@@ -86,12 +185,14 @@ class DatasetSpecification:
         num_workers: int,
         shuffle: bool,
         collate_fn: Optional[Callable] = None,
+        group_by_k: bool = False,
     ):
         self.dataset     = dataset
         self.batch_size  = batch_size
         self.num_workers = num_workers
         self.shuffle     = shuffle
         self.collate_fn  = collate_fn
+        self.group_by_k  = bool(group_by_k)
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +240,29 @@ class GenericPygDataModule(_GenericDataModuleBase):
     """
 
     def _make_loader(self, spec: DatasetSpecification) -> PyGDataLoader:
+        wif = dataset_worker_init_fn if spec.num_workers > 0 else None
+        if spec.group_by_k:
+            sampler = KGroupedBatchSampler(
+                dataset=spec.dataset,
+                batch_size=spec.batch_size,
+                shuffle=spec.shuffle,
+                drop_last=False,
+                seed=int(getattr(spec.dataset, '_seed', 0)),
+            )
+            return PyGDataLoader(
+                dataset=spec.dataset,
+                batch_sampler=sampler,
+                num_workers=spec.num_workers,
+                persistent_workers=spec.num_workers > 0,
+                worker_init_fn=wif,
+            )
         return PyGDataLoader(
             dataset=spec.dataset,
             batch_size=spec.batch_size,
             shuffle=spec.shuffle,
             num_workers=spec.num_workers,
             persistent_workers=spec.num_workers > 0,
-            worker_init_fn=dataset_worker_init_fn if spec.num_workers > 0 else None,
+            worker_init_fn=wif,
         )
 
     def _make_train_loader(self, spec: DatasetSpecification) -> PyGDataLoader:
@@ -169,6 +286,23 @@ class GenericPlainDataModule(_GenericDataModuleBase):
     """
 
     def _make_loader(self, spec: DatasetSpecification) -> torch.utils.data.DataLoader:
+        wif = dataset_worker_init_fn if spec.num_workers > 0 else None
+        if spec.group_by_k:
+            sampler = KGroupedBatchSampler(
+                dataset=spec.dataset,
+                batch_size=spec.batch_size,
+                shuffle=spec.shuffle,
+                drop_last=False,
+                seed=int(getattr(spec.dataset, '_seed', 0)),
+            )
+            return torch.utils.data.DataLoader(
+                dataset=spec.dataset,
+                batch_sampler=sampler,
+                num_workers=spec.num_workers,
+                persistent_workers=spec.num_workers > 0,
+                collate_fn=spec.collate_fn,
+                worker_init_fn=wif,
+            )
         return torch.utils.data.DataLoader(
             dataset=spec.dataset,
             batch_size=spec.batch_size,
@@ -176,7 +310,7 @@ class GenericPlainDataModule(_GenericDataModuleBase):
             num_workers=spec.num_workers,
             persistent_workers=spec.num_workers > 0,
             collate_fn=spec.collate_fn,
-            worker_init_fn=dataset_worker_init_fn if spec.num_workers > 0 else None,
+            worker_init_fn=wif,
         )
 
     def _make_train_loader(self, spec: DatasetSpecification) -> torch.utils.data.DataLoader:
@@ -203,25 +337,40 @@ class GenericMixedDataModule(_GenericDataModuleBase):
 
     def _make_loader(self, spec: DatasetSpecification):
         wif = dataset_worker_init_fn if spec.num_workers > 0 else None
-        if spec.collate_fn is not None:
-            return torch.utils.data.DataLoader(
+        sampler = None
+        if spec.group_by_k:
+            sampler = KGroupedBatchSampler(
                 dataset=spec.dataset,
                 batch_size=spec.batch_size,
                 shuffle=spec.shuffle,
+                drop_last=False,
+                seed=int(getattr(spec.dataset, '_seed', 0)),
+            )
+        if spec.collate_fn is not None:
+            kwargs = dict(
+                dataset=spec.dataset,
                 num_workers=spec.num_workers,
                 persistent_workers=spec.num_workers > 0,
                 collate_fn=spec.collate_fn,
                 worker_init_fn=wif,
             )
+            if sampler is not None:
+                kwargs['batch_sampler'] = sampler
+            else:
+                kwargs.update(batch_size=spec.batch_size, shuffle=spec.shuffle)
+            return torch.utils.data.DataLoader(**kwargs)
         else:
-            return PyGDataLoader(
+            kwargs = dict(
                 dataset=spec.dataset,
-                batch_size=spec.batch_size,
-                shuffle=spec.shuffle,
                 num_workers=spec.num_workers,
                 persistent_workers=spec.num_workers > 0,
                 worker_init_fn=wif,
             )
+            if sampler is not None:
+                kwargs['batch_sampler'] = sampler
+            else:
+                kwargs.update(batch_size=spec.batch_size, shuffle=spec.shuffle)
+            return PyGDataLoader(**kwargs)
 
     def _make_train_loader(self, spec: DatasetSpecification):
         return self._make_loader(spec)
