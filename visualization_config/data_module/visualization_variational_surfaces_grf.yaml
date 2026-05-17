@@ -1,0 +1,62 @@
+_target_: neural_local_laplacian.data_modules.common.GenericPygDataModule
+train_dataset_specification:
+  _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+  dataset:
+    _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
+
+    # Same polynomial Monge surface family as visualization_variational_surfaces.yaml
+    # so the GRF sampler is the only thing that differs side-by-side.
+    surface_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
+      order_range: [4, 6]
+      coefficient_scale_range: [0.2, 1.0]
+      polynomial_offset_range: [0.0]
+      coeff_generation_method:
+        _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+        _args_: ['uniform']
+
+    num_vertices_range: 200
+    grid_radius: 2.0
+    position_noise_std: [0.0]
+    k: [6, 15]
+
+    # Gaussian Random Field test functions — closed-form sum of M RBFs
+    # per probe, drop-in replacement for MonomialBasisTestFunctionSampler
+    # in the matching visualization_variational_surfaces.yaml.
+    #
+    # In the viz UI the "Probe field" / "GT Laplacian (all pts)" /
+    # "GT Gradient (all pts)" sliders will sweep through the GRF probes,
+    # which should look noticeably smoother and more isotropic than
+    # the monomial basis.
+    #
+    # center_range matches grid_radius above so RBF centers are drawn
+    # across the full parameter domain (default [-1, 1] would concentrate
+    # them in the middle quarter when grid_radius is 2.0).
+    test_func_sampler:
+      _target_: neural_local_laplacian.datasets.synthetic_datasets.GaussianRandomFieldTestFunctionSampler
+      num_test_funcs: 16
+      num_centers_range: [4, 12]
+      sigma_range: [0.3, 1.0]
+      center_range: [-2.0, 2.0]
+      amplitude_scale: 1.0
+      derivative_mode: analytic
+      normalize_target: none
+      compute_continuous_bilinear: false
+      compute_continuous_energy: false
+      compute_lb_all_points: true
+      compute_gradients_all_points: true
+      verbose: false
+
+    seed: ${globals.seed}
+    epoch_size: 1000
+
+    # GT geodesics — same as the sibling viz config so the "GT Geodesics"
+    # UI section is populated.  Independent of the test-function sampler.
+    compute_geodesics: true
+    num_geodesic_sources: 4
+    geodesic_source_method: farthest_point_sampling
+    geodesic_reference_resolution: 80
+  batch_size: 1
+  num_workers: 0
+  shuffle: True
+val_dataset_specifications: null
