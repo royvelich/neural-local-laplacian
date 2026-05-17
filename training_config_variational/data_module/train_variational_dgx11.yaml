@@ -16,7 +16,7 @@ module:
           _args_: ['uniform']
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: 60
+      num_vertices_range: [60, 120]
       grid_radius: 1.0
       position_noise_std: [0.01, 0.05]
       k: 15
@@ -32,7 +32,7 @@ module:
       # loss consumes it — saves the Gauss-Legendre cost per surface.
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomFamilyTestFunctionSampler
-        num_test_funcs: 16
+        num_test_funcs: 20
         include_coordinates: false
         verbose: false
         normalize_target: none
@@ -57,14 +57,10 @@ module:
             center_range: [-1.0, 1.0]
 
       seed: ${globals.training_seed}
-      epoch_size: 32000
-    # Cross-surface batching is supported (see _VariationalSurfaceData);
-    # ``k`` must be fixed across surfaces (it is, above), and enabling
-    # ``compute_heat_kernel`` / ``compute_geodesics`` requires uniform
-    # ``num_vertices_range`` in that case.  batch_size > 1 acts as
-    # gradient accumulation — the variational training step still
-    # iterates surfaces one at a time.
-    batch_size: 500
+      epoch_size: 8000
+    # batch_size MUST be 1 for v1 (variational batching across surfaces is
+    # not yet implemented in _VariationalSurfaceData.__inc__ for ``knn``).
+    batch_size: 20
     num_workers: 0
     shuffle: True
 
