@@ -3277,11 +3277,15 @@ class MongeSurfaceVariationalDataset(Dataset):
             if heat_kernel_reference_resolution is None
             else int(heat_kernel_reference_resolution))
 
-        # k may be a scalar or a 2-element [lo, hi] range; a fresh value
-        # is drawn per surface in get().  Each surface internally has a
-        # fixed k (since build_patches_from_vertices takes a single k);
-        # variation across surfaces exposes the model to multiple
-        # neighbour-count regimes.
+        # k may be a scalar or a 2-element [lo, hi] range.  When it's a
+        # range, the value for each epoch index is pre-sampled at
+        # __init__ from an independent RNG stream and exposed via
+        # ``k_for_idx(idx)``; ``get(idx)`` reads it back instead of
+        # drawing a fresh value.  This lets :class:`KGroupedBatchSampler`
+        # build k-homogeneous batches (cross-surface batching in
+        # :class:`_VariationalSurfaceData` requires uniform k across the
+        # batch, since ``knn``, ``x``, ``pos`` concatenate on dim 0 and
+        # need matching trailing dims).
         self._k_range = _coerce_scalar_or_range(k, name='k', cast=int)
         if self._k_range[0] < 1:
             raise ValueError(f"k must be >= 1, got range {self._k_range}")
@@ -3302,10 +3306,37 @@ class MongeSurfaceVariationalDataset(Dataset):
         self._seed = int(seed)
         self._rng = np.random.default_rng(seed=seed)
 
+        # Pre-sample k per epoch index from an independent RNG stream so
+        # the assignment is fixed for the dataset's lifetime and survives
+        # worker_init_fn reseeding of ``self._rng``.  When k is fixed
+        # (lo == hi) we skip the array and let ``k_for_idx`` return the
+        # constant directly.
+        k_lo, k_hi = self._k_range
+        if k_lo == k_hi:
+            self._k_per_idx = None
+        else:
+            k_rng = np.random.default_rng(seed=int(seed) + 1)
+            self._k_per_idx = k_rng.integers(
+                low=k_lo, high=k_hi + 1,
+                size=self._epoch_size).astype(np.int64)
+
     # PyG Dataset hooks ----------------------------------------------------
 
     def len(self) -> int:
         return self._epoch_size
+
+    def k_for_idx(self, idx: int) -> int:
+        """Return the patch size ``k`` that ``get(idx)`` will use.
+
+        Stable across the dataset's lifetime and across DataLoader
+        workers — reads from a pre-sampled array built at __init__ from
+        an RNG independent of ``self._rng`` (which is reseeded per
+        worker for sample-content reproducibility).  Used by
+        :class:`KGroupedBatchSampler` to bucket indices by matching k.
+        """
+        if self._k_per_idx is None:
+            return int(self._k_range[0])
+        return int(self._k_per_idx[int(idx)])
 
     def get(self, idx) -> _VariationalSurfaceData:
         # 1. Sample a Monge surface from the configured family.
@@ -3364,10 +3395,11 @@ class MongeSurfaceVariationalDataset(Dataset):
         else:
             noisy_pos = clean_pos
 
-        # 6. Build k-NN patches.  k is drawn fresh per surface from its
-        # configured range (forward() handles any per-surface k internally).
-        k_lo, k_hi = self._k_range
-        k_this = int(self._rng.integers(low=k_lo, high=k_hi + 1)) if k_lo != k_hi else k_lo
+        # 6. Build k-NN patches.  k is read from the pre-sampled
+        # per-idx assignment (see __init__ and k_for_idx) so it's stable
+        # across runs / workers and so KGroupedBatchSampler can bucket
+        # batches by matching k.
+        k_this = self.k_for_idx(idx)
         patch = build_patches_from_vertices(noisy_pos, k=k_this, device=None)
         # patch: pos (n*k, 3), x (n*k, 3), patch_idx (n*k,),
         #        vertex_indices (n*k,), neighbor_index_matrix (n, k)
