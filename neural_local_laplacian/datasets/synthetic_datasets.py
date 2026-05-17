@@ -1513,11 +1513,36 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
         num_test_funcs:    P, number of probes per surface.
         num_centers_range: ``[M_lo, M_hi]`` — RBF centers per probe.
         sigma_range:       ``[σ_lo, σ_hi]`` — RBF width per probe.
-        center_range:      ``[c_lo, c_hi]`` — bbox for RBF center
-                           sampling on the parameter domain.  Default
+                           In ``center_mode='parameter'`` this is a 2D
+                           length on the chart; in ``'surface'`` mode it
+                           is a 3D Euclidean length on the embedding.
+        center_range:      ``[c_lo, c_hi]`` — bbox for ``(cx, cy)``
+                           draws on the parameter domain.  Default
                            ``[-1.0, 1.0]`` matches the default
-                           Monge-patch grid radius.
+                           Monge-patch grid radius.  Same knob for both
+                           ``center_mode`` values; in ``'surface'`` mode
+                           the resulting 3D positions are obtained by
+                           lifting ``(cx, cy)`` through ``surface_func``.
         amplitude_scale:   stddev of ``c_{p,m} ~ N(0, scale²)``.
+        center_mode:       Where the Gaussian distance is measured.
+                           ``'parameter'`` (default) — 2D Gaussian on
+                           ``(u, v)``; centers live on the chart.  Pure
+                           2D, analytic origin derivatives are
+                           closed-form.
+                           ``'surface'`` — 3D Gaussian on the embedded
+                           surface; centers are lifted to ``p_m =
+                           (cx_m, cy_m, f(cx_m, cy_m))`` and the
+                           distance is the ambient Euclidean
+                           ``‖p(u, v) − p_m‖`` with
+                           ``p(u, v) = (u, v, f(u, v))``.  The function
+                           stays differentiable through autograd
+                           (because ``f`` is), so LB and gradient
+                           targets work; the analytic closed-form
+                           origin-derivative path falls back to autograd
+                           in this mode (closed-form would need
+                           surface 2nd derivatives evaluated at every
+                           center — implementable but not worth the
+                           bookkeeping; autograd is already correct).
         + standard :class:`BaseTestFunctionSampler` kwargs.
     """
 
@@ -1528,6 +1553,7 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
             sigma_range=(0.3, 1.0),
             center_range=(-1.0, 1.0),
             amplitude_scale: float = 1.0,
+            center_mode: str = 'parameter',
             normalize_target: str = 'none',
             compute_lb_all_points: bool = False,
             compute_gradients_all_points: bool = False,
@@ -1577,6 +1603,12 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
                 f"amplitude_scale must be > 0, got {amplitude_scale}")
         self.amplitude_scale = amp
 
+        if center_mode not in ('parameter', 'surface'):
+            raise ValueError(
+                f"center_mode must be 'parameter' or 'surface', "
+                f"got '{center_mode}'")
+        self.center_mode = center_mode
+
     # ----- spec sampling --------------------------------------------------
 
     def _sample_params(self, rng: np.random.Generator) -> Dict[str, Any]:
@@ -1598,27 +1630,67 @@ class GaussianRandomFieldTestFunctionSampler(BaseTestFunctionSampler):
         return [self._sample_params(rng) for _ in range(self.num_test_funcs)]
 
     @staticmethod
-    def _params_to_callable(params: Dict[str, Any]):
+    def _params_to_callable(params: Dict[str, Any],
+                            center_mode: str = 'parameter',
+                            surface_func=None):
         cx, cy, c, sigma = params['cx'], params['cy'], params['c'], params['sigma']
         two_s2 = 2.0 * (sigma ** 2)
 
+        if center_mode == 'parameter':
+            def h(x, y):
+                # Add a trailing axis to broadcast against the (M,) centers.
+                # Works for x of any shape: (K,) -> (K, M); (K, 1) -> (K, 1, M);
+                # 0-d scalar -> (1, M).  Sum on dim=-1 collapses back to input shape.
+                x_e = x.unsqueeze(-1)
+                y_e = y.unsqueeze(-1)
+                dx = x_e - cx
+                dy = y_e - cy
+                g = torch.exp(-(dx ** 2 + dy ** 2) / two_s2)    # (..., M)
+                return (g * c).sum(dim=-1)                       # (...,)
+            return h
+
+        if surface_func is None:
+            raise ValueError(
+                "center_mode='surface' requires surface_func to lift "
+                "(cx, cy) -> (cx, cy, f(cx, cy)); _specs_to_callables "
+                "must pass it through.")
+
+        # Lift centers to 3D once.  ``no_grad`` detaches cz from any
+        # graph — only ``p(u, v)`` evaluated inside ``h`` carries the
+        # autograd-tracked surface dependency.
+        with torch.no_grad():
+            cz = surface_func(cx, cy)
+            if cz.dim() == 0:
+                cz = cz.reshape(1)
+
         def h(x, y):
-            # Add a trailing axis to broadcast against the (M,) centers.
-            # Works for x of any shape: (K,) -> (K, M); (K, 1) -> (K, 1, M);
-            # 0-d scalar -> (1, M).  Sum on dim=-1 collapses back to input shape.
+            # ``z = surface_func(x, y)`` must follow the same broadcasting
+            # convention as x/y (any of (K,), (K, 1), or 0-d).
+            z = surface_func(x, y)
             x_e = x.unsqueeze(-1)
             y_e = y.unsqueeze(-1)
+            z_e = z.unsqueeze(-1)
             dx = x_e - cx
             dy = y_e - cy
-            g = torch.exp(-(dx ** 2 + dy ** 2) / two_s2)        # (..., M)
+            dz = z_e - cz
+            dist2 = dx ** 2 + dy ** 2 + dz ** 2                  # (..., M)
+            g = torch.exp(-dist2 / two_s2)
             return (g * c).sum(dim=-1)                           # (...,)
 
         return h
 
     def _specs_to_callables(self, specs, surface_func):
-        return [self._params_to_callable(p) for p in specs]
+        return [self._params_to_callable(p, self.center_mode, surface_func)
+                for p in specs]
 
     def _specs_to_analytic_data(self, specs, x_grid, y_grid):
+        # In 'surface' mode the closed-form derivatives at the origin
+        # would need surface 2nd-derivatives evaluated at every center;
+        # cheaper to defer to the base class's autograd path (which is
+        # already correct for arbitrary differentiable callables).
+        if self.center_mode == 'surface':
+            return None
+
         P = len(specs)
         K = len(x_grid)
         if P == 0:
