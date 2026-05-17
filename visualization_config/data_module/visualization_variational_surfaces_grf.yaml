@@ -15,7 +15,7 @@ train_dataset_specification:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
         _args_: ['uniform']
 
-    num_vertices_range: 200
+    num_vertices_range: 300
     grid_radius: 1.0
     position_noise_std: [0.0]
     k: [6, 15]
@@ -34,17 +34,18 @@ train_dataset_specification:
     # them in the middle quarter when grid_radius is 2.0).
     test_func_sampler:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.GaussianRandomFieldTestFunctionSampler
-      num_test_funcs: 16
-      num_centers_range: [4, 12]
-      sigma_range: [0.3, 1.0]
-      center_range: [-2.0, 2.0]
-      amplitude_scale: 1.0
+      num_test_funcs: 50
+      num_centers_range: [50, 100]
+      sigma_range: [0.1, 1.0]
+      center_range: [-3.0, 3.0]
+      amplitude_scale: 2.0
       derivative_mode: analytic
       normalize_target: none
       compute_continuous_bilinear: false
       compute_continuous_energy: false
       compute_lb_all_points: true
       compute_gradients_all_points: true
+      center_mode: parameter
       verbose: false
 
     seed: ${globals.seed}
