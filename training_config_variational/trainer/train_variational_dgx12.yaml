@@ -5,9 +5,9 @@ accelerator: 'auto'
 strategy: 'auto'
 num_sanity_val_steps: 0
 log_every_n_steps: 1
-check_val_every_n_epoch: 5
+check_val_every_n_epoch: 1
 enable_progress_bar: True
-gradient_clip_val: 0.5
+gradient_clip_val: 0.0
 logger:
  _target_: lightning.pytorch.loggers.WandbLogger
  project: neural-cotangent-weights-variational
@@ -17,6 +17,6 @@ callbacks:
   - _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: "./checkpoints"
     filename: "last-model-{epoch:010d}"
-    every_n_epochs: 5
+    every_n_epochs: 1
     verbose: False
     save_on_train_epoch_end: True
