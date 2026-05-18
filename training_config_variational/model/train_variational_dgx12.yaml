@@ -1,19 +1,19 @@
 module:
   _target_: neural_local_laplacian.modules.variational_modules.VariationalLaplacianTransformerModule
   input_dim: 3
-  d_model: 768
-  nhead: 8
-  num_encoder_layers: 1
-  dim_feedforward: 768
+  d_model: 128
+  nhead: 1
+  num_encoder_layers: 2
+  dim_feedforward: 128
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.2
+  dropout: 0.0
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
   input_projection_hidden_dims: null
   output_projection_hidden_dims: null
 
-  detach_area_head: false           # area head is trained by LaplacianActionTestLoss
+  detach_area_head: true           # area head is trained by LaplacianActionTestLoss
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
