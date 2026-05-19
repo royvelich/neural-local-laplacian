@@ -1835,6 +1835,88 @@ class LaplacianActionTestLoss(_VariationalTestLoss):
         return self._reduce(per)
 
 
+class AreaOnlyLogMagnitudeTestLoss(_VariationalTestLoss):
+    r"""Per-vertex log-magnitude anchor on the Laplacian action, gradient through ``A_i`` only.
+
+    Variational analog of :class:`AreaOnlyLogMagnitudeLoss`.  At each
+    vertex ``i``, compares the L2 magnitude of the predicted P-dim
+    Laplacian-action signature against the GT signature, with the
+    stiffness contribution detached so gradient flows *only* through
+    the area head:
+
+        num_i^{(ℓ)}    =  Σ_j  s_ij · (h_ℓ(v_j) − h_ℓ(v_i))               # (n, P), detached
+        pred_mag_i     =  ‖num_i / A_i‖₂   over probes                    # = ‖num_i‖₂ / A_i
+        target_mag_i   =  ‖Δ_g h_ℓ (v_i)‖₂   over probes
+        L_i            =  ( log(pred_mag_i)  −  log(target_mag_i) )²
+
+    Because ``A_i > 0`` is a scalar per vertex, ``‖num / A_i‖₂ = ‖num‖₂ / A_i``,
+    so the detached numerator can be computed once and only the
+    division by ``A_i`` carries autograd — **no gradient reaches s_ij
+    or the encoder via this loss.**
+
+    Designed to pair with :class:`LaplacianActionTestLoss` in
+    ``loss_mode='cosine'`` (which pins the per-vertex *direction* of
+    the LB signature across probes but is per-vertex scale-invariant):
+    cosine shapes direction, this anchors magnitude.  Together they
+    fully constrain ``s · A^{-1}`` per vertex without conflicting
+    gradients between direction and scale.
+
+    Reads from ``ctx`` (same fields as LaplacianActionTestLoss):
+        stiffness_weights                  (n, k)        — read, not trained
+        areas                              (n,)          — only gradient path
+        knn                                (n, k)
+        test_func_values                   (n, P)
+        test_func_laplacians_at_vertices   (n, P)        — analytic GT
+
+    The dataset must be configured with
+    ``test_func_sampler.compute_lb_all_points: true`` so the analytic
+    per-vertex Laplacian targets are populated.
+
+    Args:
+        reduction:     ``'mean'`` / ``'sum'`` / ``'none'`` over vertices.
+        eps:           numerical floor inside the logs and the
+                       ``A_i`` denominator.
+        area_weighted: if True, weight each per-vertex loss by ``A_i``
+                       before reducing.  Off by default — every vertex
+                       contributes one log-magnitude error and density
+                       is irrelevant to the anchor.
+    """
+
+    def __init__(self, reduction: str = 'mean', eps: float = 1e-8,
+                 area_weighted: bool = False):
+        super().__init__(reduction=reduction)
+        self.eps = float(eps)
+        self.area_weighted = bool(area_weighted)
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        self._check_required(ctx, [
+            'stiffness_weights', 'areas', 'knn',
+            'test_func_values', 'test_func_laplacians_at_vertices'])
+
+        neighbour_values = ctx.test_func_values[ctx.knn]            # (n, k, P)
+        center_values    = ctx.test_func_values.unsqueeze(1)        # (n, 1, P)
+        deltas           = neighbour_values - center_values          # (n, k, P)
+
+        # Detach the stiffness contribution so the only autograd path
+        # to the area head is via the 1/A_i denominator below.
+        s = ctx.stiffness_weights                                   # (n, k)
+        numerator = (s.unsqueeze(-1) * deltas).sum(dim=1).detach()  # (n, P), detached
+
+        num_mag = torch.norm(numerator, p=2, dim=-1)                # (n,), detached
+        pred_mag = num_mag / (ctx.areas + self.eps)                 # (n,), grad only via ctx.areas
+
+        target_mag = torch.norm(
+            ctx.test_func_laplacians_at_vertices, p=2, dim=-1)      # (n,)
+
+        log_err_sq = (torch.log(pred_mag + self.eps)
+                      - torch.log(target_mag + self.eps)) ** 2       # (n,)
+
+        if self.area_weighted:
+            log_err_sq = ctx.areas * log_err_sq
+
+        return self._reduce(log_err_sq)
+
+
 class MeanCurvatureDirectionCosineTestLoss(_VariationalTestLoss):
     r"""Cosine-similarity direction loss on the discrete mean curvature vector.
 
