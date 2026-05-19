@@ -1761,20 +1761,38 @@ class LaplacianActionTestLoss(_VariationalTestLoss):
     per-vertex Laplacian targets are populated.
 
     Args:
-        loss_mode: scalar error metric — ``'mse'`` / ``'relative'`` / ``'signed_log'``.
-        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over (vertex × probe).
-        eps: numerical floor for relative mode.
-        area_weighted: if True, weight each (i, ℓ) entry by ``A_i`` before
+        loss_mode: per-element scalar metric — ``'mse'`` / ``'relative'``
+            / ``'signed_log'`` — *or* ``'cosine'``, which behaves
+            differently from the scalar modes:
+
+              * ``'mse'`` / ``'relative'`` / ``'signed_log'``: per-element
+                error on the ``(n, P)`` tensors, reduced over both axes.
+              * ``'cosine'``: per-vertex cosine similarity *across the
+                probe axis*.  Each vertex ``i`` contributes
+                ``1 - cos(pred[i, :], target[i, :])``, a scalar; the
+                resulting ``(n,)`` tensor is then optionally area-weighted
+                and reduced.  Scale-invariant under per-vertex scalar
+                rescaling — i.e. the model can rescale ``s_ij / A_i`` at
+                each vertex independently and still get cosine = 1.
+                Measures whether the *pattern* of LB values across probes
+                at each vertex matches GT, ignoring local magnitude.
+        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over (vertex × probe)
+            for the scalar modes, or over vertices for cosine.
+        eps: numerical floor for relative / cosine.
+        area_weighted: if True, weight each entry by ``A_i`` before
             reducing.  Off by default — the per-vertex match is already
-            normalised by ``A_i`` inside the predicted Laplacian.
+            normalised by ``A_i`` inside the predicted Laplacian.  In
+            ``cosine`` mode this multiplies the per-vertex ``(n,)``
+            tensor by ``ctx.areas``.
     """
 
     def __init__(self, loss_mode: str = 'mse', reduction: str = 'mean',
                  eps: float = 1e-8, area_weighted: bool = False):
         super().__init__(reduction=reduction)
-        if loss_mode not in ('mse', 'relative', 'signed_log'):
+        if loss_mode not in ('mse', 'relative', 'signed_log', 'cosine'):
             raise ValueError(
-                f"loss_mode must be 'mse' / 'relative' / 'signed_log', got '{loss_mode}'")
+                f"loss_mode must be 'mse' / 'relative' / 'signed_log' / "
+                f"'cosine', got '{loss_mode}'")
         self.loss_mode = loss_mode
         self.eps = eps
         self.area_weighted = area_weighted
@@ -1798,6 +1816,15 @@ class LaplacianActionTestLoss(_VariationalTestLoss):
         predicted = numerator / ctx.areas.unsqueeze(-1)             # (n, P)
 
         target = ctx.test_func_laplacians_at_vertices               # (n, P)
+
+        if self.loss_mode == 'cosine':
+            # Per-vertex cosine similarity across the P probes.
+            cos_sim = F.cosine_similarity(
+                predicted, target, dim=-1, eps=self.eps)            # (n,)
+            per = 1.0 - cos_sim                                      # (n,)
+            if self.area_weighted:
+                per = ctx.areas * per                                # (n,)
+            return self._reduce(per)
 
         per = _scalar_error_per_element(
             predicted, target, self.loss_mode, eps=self.eps)        # (n, P)
