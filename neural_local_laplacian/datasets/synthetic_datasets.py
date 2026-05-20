@@ -3499,6 +3499,8 @@ class MongeSurfaceVariationalDataset(Dataset):
         vertex_indices                 (n*k,)    global vertex idx per row
         vertex_pos                     (n, 3)    vertex positions
         vertex_normals                 (n, 3)    analytic surface normals
+        vertex_mcv                     (n, 3)    analytic GT mean-curvature
+                                                 vector 2·H·n̂ (signed)
         vertex_areas                   (n,)      density-aware √det g(v_i) · |U|/n
         knn                            (n, k)    global neighbour indices
         test_func_values               (n, P)    probe values at vertices
@@ -3647,24 +3649,51 @@ class MongeSurfaceVariationalDataset(Dataset):
         v = torch.from_numpy(self._rng.uniform(
             low=-self._grid_radius, high=self._grid_radius, size=n)).float()
 
-        # 3. Lift vertices to ℝ³ and compute analytic normals via autograd.
-        # Compute both partials in a single grad() call so the graph is freed
-        # exactly once (PyTorch frees saved tensors after the first call
-        # unless retain_graph=True; computing both at once avoids that).
+        # 3. Lift vertices to ℝ³ and compute analytic normals + mean
+        # curvature via autograd.  ``create_graph=True`` on the first
+        # grad() so the second derivatives (h_uu, h_uv, h_vv) — needed
+        # for the GT mean-curvature vector — can be differentiated out
+        # of h_u / h_v.
         with torch.enable_grad():
             u_g = u.clone().requires_grad_(True)
             v_g = v.clone().requires_grad_(True)
             z_g = surface_func(u_g, v_g)
             h_u, h_v = torch.autograd.grad(
-                z_g.sum(), [u_g, v_g], create_graph=False)
+                z_g.sum(), [u_g, v_g], create_graph=True)
+            h_uu, h_uv = torch.autograd.grad(
+                h_u.sum(), [u_g, v_g], create_graph=False,
+                retain_graph=True, allow_unused=True)
+            h_vv = torch.autograd.grad(
+                h_v.sum(), [v_g], create_graph=False, allow_unused=True)[0]
         z = z_g.detach()
         h_u = h_u.detach()
         h_v = h_v.detach()
+        # allow_unused → a partial may be None if the surface genuinely
+        # doesn't couple u and v; substitute zeros.
+        _zero = torch.zeros_like(u)
+        h_uu = _zero if h_uu is None else h_uu.detach()
+        h_uv = _zero if h_uv is None else h_uv.detach()
+        h_vv = _zero if h_vv is None else h_vv.detach()
 
         clean_pos = torch.stack([u, v, z], dim=-1)                     # (n, 3)
         normal_unnorm = torch.stack(
             [-h_u, -h_v, torch.ones_like(h_u)], dim=-1)
         vertex_normals = F.normalize(normal_unnorm, p=2, dim=-1)        # (n, 3)
+
+        # Analytic mean curvature of the Monge patch z = f(u, v):
+        #   H = ((1+f_u²)·f_vv − 2 f_u f_v f_uv + (1+f_v²)·f_uu) / (2 W³)
+        # with W = √(1 + f_u² + f_v²).  The GT mean-curvature vector uses
+        # the same 2·H·n̂ convention as the patch pipeline
+        # (``target_mcv`` in laplacian_modules.py), so dgx15's signed
+        # MeanCurvatureDirectionCosineTestLoss matches the non-variational
+        # DirectionCosineLoss.  (Magnitude is convention-dependent; the
+        # cosine loss only uses the direction / sign.)
+        W2 = 1.0 + h_u ** 2 + h_v ** 2                                  # (n,)
+        H_mean = ((1.0 + h_u ** 2) * h_vv
+                  - 2.0 * h_u * h_v * h_uv
+                  + (1.0 + h_v ** 2) * h_uu) / (2.0 * W2 ** 1.5)        # (n,)
+        vertex_mcv = (2.0 * H_mean.unsqueeze(-1)
+                      * vertex_normals).float()                         # (n, 3)
 
         # 4. Per-vertex GT area: density-aware Monte-Carlo cell estimate.
         # Reuses h_u, h_v already computed at the vertices in step 3.
@@ -3715,6 +3744,7 @@ class MongeSurfaceVariationalDataset(Dataset):
             knn=patch.neighbor_index_matrix,
             vertex_pos=noisy_pos,
             vertex_normals=vertex_normals,
+            vertex_mcv=vertex_mcv,
             vertex_areas=vertex_areas,
             test_func_values=tf['test_func_values'],
         )

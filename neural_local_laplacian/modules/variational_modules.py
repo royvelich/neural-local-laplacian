@@ -82,6 +82,7 @@ class _VariationalTrainingMixin:
             knn = getattr(surface, 'knn', None)
             vertex_pos = getattr(surface, 'vertex_pos', None)
             vertex_normals = getattr(surface, 'vertex_normals', None)
+            vertex_mcv = getattr(surface, 'vertex_mcv', None)
             test_func_values = getattr(surface, 'test_func_values', None)
             tf_continuous_bilinear = getattr(
                 surface, 'test_func_continuous_bilinear', None)
@@ -115,6 +116,7 @@ class _VariationalTrainingMixin:
                 knn=knn,
                 vertex_pos=vertex_pos,
                 vertex_normals=vertex_normals,
+                vertex_mcv=vertex_mcv,
                 test_func_values=test_func_values,
                 test_func_continuous_bilinear=tf_continuous_bilinear,
                 test_func_continuous_energy=tf_continuous_energy,

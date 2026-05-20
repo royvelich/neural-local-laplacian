@@ -39,6 +39,7 @@ class LossContext:
     knn: Optional[torch.Tensor] = None                              # (n, k)
     vertex_pos: Optional[torch.Tensor] = None                       # (n, 3)
     vertex_normals: Optional[torch.Tensor] = None                   # (n, 3)
+    vertex_mcv: Optional[torch.Tensor] = None                       # (n, 3) — signed GT MCV 2·H·n̂
     test_func_values: Optional[torch.Tensor] = None                 # (n, P)
     test_func_continuous_bilinear: Optional[torch.Tensor] = None    # (P, P)
     test_func_continuous_energy: Optional[torch.Tensor] = None      # (P,)
@@ -1922,43 +1923,63 @@ class MeanCurvatureDirectionCosineTestLoss(_VariationalTestLoss):
 
     Variational analog of :class:`DirectionCosineLoss`.  Computes the
     per-vertex MCV from the **learned stiffness head** acting on vertex
-    positions and compares its direction to the analytic surface normal:
+    positions and compares its direction to a per-vertex GT direction:
 
         MCV_i  =  (Σ_j s_ij · (p_{knn[i,j]} - p_i)) / A_i
-        L_i    =  1 − |⟨MCV_i / ‖MCV_i‖,  n̂_i⟩|       (signed=False, default)
-        L_i    =  1 −  ⟨MCV_i / ‖MCV_i‖,  n̂_i⟩         (signed=True)
+        L_i    =  1 − |⟨MCV_i / ‖MCV_i‖,  t̂_i⟩|       (signed=False)
+        L_i    =  1 −  ⟨MCV_i / ‖MCV_i‖,  t̂_i⟩         (signed=True)
 
-    The sign-agnostic form is the default since :class:`MongeSurfaceVariationalDataset`
-    only carries the (unsigned) surface normal, not the signed mean
-    curvature.  Use ``signed=True`` only when you know the dataset's
-    normal convention matches the MCV sign convention you expect.
+    where the target ``t_i`` is selected by ``target``:
+
+      * ``target='normal'`` — ``t_i = n̂_i`` (``ctx.vertex_normals``), the
+        unsigned analytic surface normal.  Pair with ``signed=False``
+        (``1 - |cos|``): enforces the MCV is colinear with the normal
+        (zero tangential component) but is agnostic to the convex /
+        concave sign.
+
+      * ``target='mcv'`` — ``t_i = 2 H_i n̂_i`` (``ctx.vertex_mcv``), the
+        signed analytic GT mean-curvature vector attached by
+        :class:`MongeSurfaceVariationalDataset`.  Pair with
+        ``signed=True`` for a full signed match — the variational
+        equivalent of the non-variational :class:`DirectionCosineLoss`,
+        including the convexity sign.
 
     Reads from ``ctx``:
         stiffness_weights  (n, k)
         areas              (n,)
         knn                (n, k)
         vertex_pos         (n, 3)
-        vertex_normals     (n, 3)
+        vertex_normals     (n, 3)        — when target='normal'
+        vertex_mcv         (n, 3)        — when target='mcv'
 
     Args:
-        signed: if True, use ``1 - cos`` (assumes consistent sign convention);
-            otherwise use ``1 - |cos|`` (direction-only, sign-agnostic).
+        target: ``'normal'`` (default, unsigned surface normal) or
+            ``'mcv'`` (signed GT mean-curvature vector).
+        signed: if True, use ``1 - cos``; otherwise ``1 - |cos|``
+            (direction-only, sign-agnostic).
         reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over vertices.
         eps: numerical floor for normalisation.
         area_weighted: if True, weight each vertex by ``A_i`` before reducing.
     """
 
-    def __init__(self, signed: bool = False, reduction: str = 'mean',
-                 eps: float = 1e-8, area_weighted: bool = False):
+    def __init__(self, target: str = 'normal', signed: bool = False,
+                 reduction: str = 'mean', eps: float = 1e-8,
+                 area_weighted: bool = False):
         super().__init__(reduction=reduction)
+        if target not in ('normal', 'mcv'):
+            raise ValueError(
+                f"target must be 'normal' or 'mcv', got '{target}'")
+        self.target = target
         self.signed = bool(signed)
         self.eps = float(eps)
         self.area_weighted = bool(area_weighted)
 
     def forward(self, ctx: LossContext) -> torch.Tensor:
+        target_field = ('vertex_normals' if self.target == 'normal'
+                        else 'vertex_mcv')
         self._check_required(ctx, [
             'stiffness_weights', 'areas', 'knn',
-            'vertex_pos', 'vertex_normals'])
+            'vertex_pos', target_field])
 
         p = ctx.vertex_pos                                  # (n, 3)
         neighbour_pos = p[ctx.knn]                          # (n, k, 3)
@@ -1969,8 +1990,9 @@ class MeanCurvatureDirectionCosineTestLoss(_VariationalTestLoss):
         mcv = numerator / ctx.areas.unsqueeze(-1)           # (n, 3)
 
         mcv_unit = F.normalize(mcv, p=2, dim=-1, eps=self.eps)
-        normal_unit = F.normalize(ctx.vertex_normals, p=2, dim=-1, eps=self.eps)
-        cos = (mcv_unit * normal_unit).sum(dim=-1)          # (n,)
+        target_unit = F.normalize(
+            getattr(ctx, target_field), p=2, dim=-1, eps=self.eps)
+        cos = (mcv_unit * target_unit).sum(dim=-1)          # (n,)
         if not self.signed:
             cos = cos.abs()
         per_vertex = 1.0 - cos                              # (n,)

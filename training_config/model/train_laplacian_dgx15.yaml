@@ -1,0 +1,99 @@
+module:
+  _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
+  input_dim: 3
+  d_model: 768
+  nhead: 8
+  num_encoder_layers: 1
+  dim_feedforward: 768
+  num_eigenvalues: ${globals.num_eigenvalues}
+  dropout: 0.1
+  normalize_loss_weights: False
+  normalize_patch_features: True
+  scale_areas_by_patch_size: True
+  input_projection_hidden_dims: null
+  output_projection_hidden_dims: null
+
+  area_activation: bounded_sigmoid
+  area_bound_C: 50.0
+
+  mcv_mode: 'diagonal_gram'   # MCV weights = the learned stiffness head
+
+  # Learned stiffness head, ≥ 0 (softplus output) — a SEPARATE output head,
+  # decoupled from ‖g_ij‖².  Variant of dgx14, which uses the default
+  # 'diagonal_gram' (stiffness derived from the gradient head, no
+  # separate head).  With a learned head the patch pipeline has THREE
+  # heads — gradient, stiffness, area — and each needs its own loss:
+  #   • stiffness  ← DirectionCosineLoss  (MCV direction; MCV is built
+  #                  from the learned s in mcv_mode='diagonal_gram')
+  #   • area       ← AreaOnlyLogMagnitudeLoss  (||MCV|| via the area head)
+  #   • gradient   ← TangentPlaneProjectorLoss  (pins Σ_j g_ij ⊗ p_j to
+  #                  the GT tangent-plane projector I - n̂n̂ᵀ)
+  # Without the third loss the gradient head receives zero gradient (the
+  # MCV no longer reads ‖g‖²) and DDP would raise an unused-parameter
+  # error.  __init__ auto-coerces val_laplacian.assembly and every
+  # fmap_val_cfg.eval_laplacians[].assembly to 'from_stiffness' since the
+  # stiffness head is learned — look for the INFO log at startup.
+  stiffness_mode: 'learned_positive'
+  normalize_grad_by_sqrt_k: true
+
+  val_laplacian:
+    assembly: diagonal_gram     # auto-coerced to from_stiffness
+    pruning: none
+
+  fmap_val_cfg:
+    k: 15
+    num_eigenvectors: 100
+    max_vertices_val: 5000
+    eval_laplacians:
+      - assembly: diagonal_gram # auto-coerced to from_stiffness
+        pruning: none
+        area_weighted: false
+    geo_cache_dir: ./geo_cache
+    use_geomfum_eval: true
+    geomfum_descriptors: [hks, wks]
+    geomfum_zoomout: false
+    geomfum_zoomout_k_init: 20
+    geomfum_zoomout_k_final: 50
+    geomfum_zoomout_n_iters: 10
+    fmap_lmbda: 1.0
+    fmap_resolvent_gamma: 1.0
+
+  feature_extractor: null
+  loss_configs:
+    # ── Stiffness head ───────────────────────────────────────────────
+    # Direction-only cosine loss on the MCV.  In mcv_mode='diagonal_gram'
+    # with a learned stiffness head, the MCV is built from s_ij, so this
+    # trains the learned stiffness head's direction.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 1.0
+
+    # ── Area head ────────────────────────────────────────────────────
+    # Log-magnitude loss with gradient ONLY through the area head —
+    # anchors ||MCV|| scale without disturbing the stiffness ratios.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+      weight: 1.0
+
+    # ── Gradient head ────────────────────────────────────────────────
+    # Pins the predicted gradient projector Σ_j g_ij ⊗ p_j to the GT
+    # tangent-plane projector I - n̂n̂ᵀ (n̂ = ctx.normals, the analytic
+    # origin normal from PolynomialSurfaceDataset).  Required: without
+    # it the gradient head is unsupervised dead weight under a learned
+    # stiffness mode.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
+      weight: 1.0
+
+    # ── Optional: tie the stiffness head to the gradient head ────────
+    # StiffnessNormalAlignmentLoss enforces that the stiffness action
+    # Σ_j s_ij p_j is normal to the tangent plane defined by g's
+    # projector.  Enable for a geometric consistency constraint between
+    # the two heads.
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.StiffnessNormalAlignmentLoss
+#      weight: 1.0
