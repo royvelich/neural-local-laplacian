@@ -63,11 +63,17 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeTestLoss
         target: mcv
-      weight: 1.0
+      weight: 2.0
 
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
         target: mcv
         signed: true
+      weight: 1.0
+
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
+        loss_mode: log_mse
       weight: 1.0
