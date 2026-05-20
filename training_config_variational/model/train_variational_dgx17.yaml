@@ -28,7 +28,7 @@ module:
   # ``[stiffness_mode=learned_positive] coercing ... to 'from_stiffness'``
   # at the start of the run to confirm.
   mcv_mode: 'diagonal_gram'
-  stiffness_mode: 'diagonal_gram'
+  stiffness_mode: 'learned_positive'
   normalize_grad_by_k: true
   normalize_stiffness_by_k: true
 
@@ -66,11 +66,11 @@ module:
         loss_mode: log_mse
       weight: 1.0
     # Stiffness head — direction of per-vertex LB signature across probes
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
-#        loss_mode: cosine
-#      weight: 5.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
+        loss_mode: cosine
+      weight: 5.0
     # Area head — magnitude anchor on per-vertex LB signature
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
