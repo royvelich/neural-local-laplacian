@@ -1837,43 +1837,57 @@ class LaplacianActionTestLoss(_VariationalTestLoss):
 
 
 class AreaOnlyLogMagnitudeTestLoss(_VariationalTestLoss):
-    r"""Per-vertex log-magnitude anchor on the Laplacian action, gradient through ``A_i`` only.
+    r"""Per-vertex log-magnitude anchor on the operator action, gradient through ``A_i`` only.
 
     Variational analog of :class:`AreaOnlyLogMagnitudeLoss`.  At each
-    vertex ``i``, compares the L2 magnitude of the predicted P-dim
-    Laplacian-action signature against the GT signature, with the
-    stiffness contribution detached so gradient flows *only* through
-    the area head:
+    vertex ``i``, compares the L2 magnitude of a predicted per-vertex
+    operator action against its analytic GT, with the stiffness
+    contribution detached so gradient flows *only* through the area
+    head.  ``target`` selects which operator action is anchored:
 
-        num_i^{(ℓ)}    =  Σ_j  s_ij · (h_ℓ(v_j) − h_ℓ(v_i))               # (n, P), detached
-        pred_mag_i     =  ‖num_i / A_i‖₂   over probes                    # = ‖num_i‖₂ / A_i
-        target_mag_i   =  ‖Δ_g h_ℓ (v_i)‖₂   over probes
-        L_i            =  ( log(pred_mag_i)  −  log(target_mag_i) )²
+      * ``target='laplacian'`` (default) — the P-dim discrete Laplacian
+        action on the test functions:
 
-    Because ``A_i > 0`` is a scalar per vertex, ``‖num / A_i‖₂ = ‖num‖₂ / A_i``,
-    so the detached numerator can be computed once and only the
-    division by ``A_i`` carries autograd — **no gradient reaches s_ij
-    or the encoder via this loss.**
+            num_i^{(ℓ)}   =  Σ_j  s_ij · (h_ℓ(v_j) − h_ℓ(v_i))     # (n, P)
+            target_mag_i  =  ‖Δ_g h_ℓ (v_i)‖₂      over P probes
 
-    Designed to pair with :class:`LaplacianActionTestLoss` in
-    ``loss_mode='cosine'`` (which pins the per-vertex *direction* of
-    the LB signature across probes but is per-vertex scale-invariant):
-    cosine shapes direction, this anchors magnitude.  Together they
-    fully constrain ``s · A^{-1}`` per vertex without conflicting
-    gradients between direction and scale.
+        Pairs with :class:`LaplacianActionTestLoss` in
+        ``loss_mode='cosine'``.
 
-    Reads from ``ctx`` (same fields as LaplacianActionTestLoss):
-        stiffness_weights                  (n, k)        — read, not trained
-        areas                              (n,)          — only gradient path
+      * ``target='mcv'`` — the 3-vector discrete mean-curvature vector,
+        i.e. the discrete Laplacian action on the *coordinate*
+        functions:
+
+            num_i         =  Σ_j  s_ij · (p_j − p_i)                # (n, 3)
+            target_mag_i  =  ‖2 H_i n̂_i‖₂   ( = ‖ctx.vertex_mcv_i‖₂ )
+
+        Pairs with :class:`MeanCurvatureDirectionCosineTestLoss`
+        (``target='mcv'``) — cosine shapes the MCV direction, this
+        anchors its magnitude.  The variational equivalent of the
+        non-variational ``DirectionCosineLoss`` + ``AreaOnlyLogMagnitudeLoss``
+        pair.
+
+    In both modes: ``pred_mag_i = ‖num_i / A_i‖₂ = ‖num_i‖₂ / A_i``
+    (since ``A_i > 0`` is a scalar per vertex), and
+    ``L_i = (log pred_mag_i − log target_mag_i)²``.  The numerator is
+    detached, so **no gradient reaches s_ij or the encoder** — purely
+    an area-head anchor.
+
+    Reads from ``ctx``:
+        stiffness_weights                  (n, k)   — read, not trained
+        areas                              (n,)     — only gradient path
         knn                                (n, k)
-        test_func_values                   (n, P)
-        test_func_laplacians_at_vertices   (n, P)        — analytic GT
+        test_func_values                   (n, P)   — target='laplacian'
+        test_func_laplacians_at_vertices   (n, P)   — target='laplacian'
+        vertex_pos                         (n, 3)   — target='mcv'
+        vertex_mcv                         (n, 3)   — target='mcv'
 
-    The dataset must be configured with
-    ``test_func_sampler.compute_lb_all_points: true`` so the analytic
-    per-vertex Laplacian targets are populated.
+    ``target='laplacian'`` needs ``test_func_sampler.compute_lb_all_points:
+    true``; ``target='mcv'`` needs the ``vertex_mcv`` field that
+    :class:`MongeSurfaceVariationalDataset` attaches per surface.
 
     Args:
+        target:        ``'laplacian'`` (default) or ``'mcv'``.
         reduction:     ``'mean'`` / ``'sum'`` / ``'none'`` over vertices.
         eps:           numerical floor inside the logs and the
                        ``A_i`` denominator.
@@ -1883,31 +1897,43 @@ class AreaOnlyLogMagnitudeTestLoss(_VariationalTestLoss):
                        is irrelevant to the anchor.
     """
 
-    def __init__(self, reduction: str = 'mean', eps: float = 1e-8,
-                 area_weighted: bool = False):
+    def __init__(self, target: str = 'laplacian', reduction: str = 'mean',
+                 eps: float = 1e-8, area_weighted: bool = False):
         super().__init__(reduction=reduction)
+        if target not in ('laplacian', 'mcv'):
+            raise ValueError(
+                f"target must be 'laplacian' or 'mcv', got '{target}'")
+        self.target = target
         self.eps = float(eps)
         self.area_weighted = bool(area_weighted)
 
     def forward(self, ctx: LossContext) -> torch.Tensor:
-        self._check_required(ctx, [
-            'stiffness_weights', 'areas', 'knn',
-            'test_func_values', 'test_func_laplacians_at_vertices'])
-
-        neighbour_values = ctx.test_func_values[ctx.knn]            # (n, k, P)
-        center_values    = ctx.test_func_values.unsqueeze(1)        # (n, 1, P)
-        deltas           = neighbour_values - center_values          # (n, k, P)
+        if self.target == 'laplacian':
+            self._check_required(ctx, [
+                'stiffness_weights', 'areas', 'knn',
+                'test_func_values', 'test_func_laplacians_at_vertices'])
+            # δ over the P test functions: (n, k, P)
+            deltas = (ctx.test_func_values[ctx.knn]
+                      - ctx.test_func_values.unsqueeze(1))
+            target_vec = ctx.test_func_laplacians_at_vertices       # (n, P)
+        else:  # 'mcv'
+            self._check_required(ctx, [
+                'stiffness_weights', 'areas', 'knn',
+                'vertex_pos', 'vertex_mcv'])
+            # δ over the 3 coordinate functions: (n, k, 3)
+            deltas = (ctx.vertex_pos[ctx.knn]
+                      - ctx.vertex_pos.unsqueeze(1))
+            target_vec = ctx.vertex_mcv                             # (n, 3)
 
         # Detach the stiffness contribution so the only autograd path
         # to the area head is via the 1/A_i denominator below.
         s = ctx.stiffness_weights                                   # (n, k)
-        numerator = (s.unsqueeze(-1) * deltas).sum(dim=1).detach()  # (n, P), detached
+        numerator = (s.unsqueeze(-1) * deltas).sum(dim=1).detach()  # (n, P|3)
 
         num_mag = torch.norm(numerator, p=2, dim=-1)                # (n,), detached
         pred_mag = num_mag / (ctx.areas + self.eps)                 # (n,), grad only via ctx.areas
 
-        target_mag = torch.norm(
-            ctx.test_func_laplacians_at_vertices, p=2, dim=-1)      # (n,)
+        target_mag = torch.norm(target_vec, p=2, dim=-1)            # (n,)
 
         log_err_sq = (torch.log(pred_mag + self.eps)
                       - torch.log(target_mag + self.eps)) ** 2       # (n,)
