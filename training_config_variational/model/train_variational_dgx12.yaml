@@ -58,35 +58,20 @@ module:
 
   feature_extractor: null
   loss_configs:
-    # ── Gradient head ────────────────────────────────────────────────
-    # Pointwise vector match: ĝ_i^{(ℓ)} ≈ ∇_g f_ℓ(v_i).  Strongest signal
-    # for the gradient head — pins direction, magnitude, and tangency.
-    # Requires data_module test_func_sampler.compute_gradients_all_points: true.
+    # Gradient head — direction & magnitude on per-(vertex, probe) ∇h
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
-        loss_mode: 'log_mse'        # log-compressed; preserves direction
-        area_weighted: false
+        loss_mode: cosine
       weight: 1.0
-
-    # ── Stiffness head ───────────────────────────────────────────────
-    # Per-vertex match of the discrete Laplacian action:
-    #   (Σ_j s_ij · δh_ℓ_j) / A_i  ≈  Δ_g h_ℓ(v_i)
-    # Routes gradient through s_ij and A_i.  Required to train the
-    # learned stiffness head — no other variational loss reads s.
-    # Requires data_module test_func_sampler.compute_lb_all_points: true.
+    # Stiffness head — direction of per-vertex LB signature across probes
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
-        loss_mode: 'signed_log'     # scale-robust; handles signed Δ values
+        loss_mode: cosine
       weight: 1.0
-
-    # ── Optional: area gauge anchor ──────────────────────────────────
-    # GradientVectorTestLoss anchors g; LaplacianActionTestLoss anchors
-    # the product s · A via the /A_i denominator.  AreaSupervisionLoss
-    # adds a direct anchor on A against the density-aware GT
-    # √det g(v_i) · |U|/n.  Enable if you find A drifting.
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.AreaSupervisionLoss
-#      weight: 0.1
+    # Area head — magnitude anchor on per-vertex LB signature
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeTestLoss
+      weight: 1.0
