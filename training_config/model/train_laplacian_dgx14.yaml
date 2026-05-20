@@ -1,0 +1,62 @@
+module:
+  _target_: neural_local_laplacian.modules.laplacian_modules.LaplacianTransformerModule
+  input_dim: 3
+  d_model: 768
+  nhead: 8
+  num_encoder_layers: 1
+  dim_feedforward: 768
+  num_eigenvalues: ${globals.num_eigenvalues}
+  dropout: 0.1
+  normalize_loss_weights: False
+  normalize_patch_features: True
+  scale_areas_by_patch_size: True
+  input_projection_hidden_dims: null
+  output_projection_hidden_dims: null
+
+  area_activation: bounded_sigmoid
+  area_bound_C: 50.0
+
+  mcv_mode: 'diagonal_gram'   # isotropic, always positive
+  normalize_grad_by_sqrt_k: true
+
+  val_laplacian:
+    assembly: diagonal_gram
+    pruning: none
+
+  # Fmap-correspondence validation (val dataloader idx 2 — DT4D Animals).
+  # stiffness_mode is the default 'diagonal_gram' (not learned), so the
+  # eval_laplacians assembly below is NOT coerced — the Laplacian is built
+  # from grad_coeffs, consistent with the patch-level MCV pipeline.
+  fmap_val_cfg:
+    k: 15
+    num_eigenvectors: 100
+    max_vertices_val: 5000
+    eval_laplacians:
+      - assembly: diagonal_gram
+        pruning: none
+        area_weighted: false
+    geo_cache_dir: ./geo_cache
+    use_geomfum_eval: true
+    geomfum_descriptors: [hks, wks]
+    geomfum_zoomout: false
+    geomfum_zoomout_k_init: 20
+    geomfum_zoomout_k_final: 50
+    geomfum_zoomout_n_iters: 10
+    fmap_lmbda: 1.0
+    fmap_resolvent_gamma: 1.0
+
+  feature_extractor: null
+  loss_configs:
+    # Direction-only cosine loss on the MCV: 1 - cos(pred_mcv, target_mcv).
+    # Trains the gradient / stiffness weights to match the MCV direction.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
+      weight: 1.0
+    # Log-magnitude loss with gradient ONLY through the area head — anchors
+    # ||MCV|| scale without disturbing the weight ratios DirectionCosineLoss
+    # shaped.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
+      weight: 1.0
