@@ -28,7 +28,7 @@ module:
   # ``[stiffness_mode=learned_positive] coercing ... to 'from_stiffness'``
   # at the start of the run to confirm.
   mcv_mode: 'diagonal_gram'
-  stiffness_mode: 'learned_positive'
+  stiffness_mode: 'diagonal_gram'
   normalize_grad_by_k: true
   normalize_stiffness_by_k: true
 
@@ -59,21 +59,34 @@ module:
 
   feature_extractor: null
   loss_configs:
+    # Gradient head — direction & magnitude on per-(vertex, probe) ∇h
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
+        loss_mode: log_mse
+      weight: 1.0
+    # Stiffness head — direction of per-vertex LB signature across probes
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
+#        loss_mode: cosine
+#      weight: 5.0
+    # Area head — magnitude anchor on per-vertex LB signature
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeTestLoss
-        target: mcv
-      weight: 2.0
-
+      weight: 1.0
+    # Mean-curvature vector — signed direction match against the analytic
+    # GT MCV 2·H·n̂ attached per vertex by MongeSurfaceVariationalDataset.
+    # The variational equivalent of the non-variational DirectionCosineLoss:
+    # treats the coordinate functions as test functions whose discrete
+    # Laplacian (the MCV, built from the learned stiffness head) must point
+    # along the analytic mean-curvature vector — including the convex /
+    # concave sign.  Adds a position-space anchor to the stiffness head on
+    # top of the test-function LB signal from LaplacianActionTestLoss.
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
         target: mcv
         signed: true
-      weight: 1.0
-
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
-        loss_mode: log_mse
       weight: 1.0
