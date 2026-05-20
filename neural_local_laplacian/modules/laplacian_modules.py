@@ -285,6 +285,7 @@ class LaplacianLocalModule(LaplacianModuleBase):
                  use_uniform_mass: bool = False,
                  val_laplacian: Optional[Dict] = None,
                  fmap_val_cfg: Optional[Dict] = None,
+                 coerce_val_assembly: bool = False,
                  enable_nan_diagnostics: bool = True,
                  nan_diag_log_every_n_steps: int = 50,
                  **kwargs):
@@ -346,18 +347,20 @@ class LaplacianLocalModule(LaplacianModuleBase):
         self._normalize_stiffness_by_k = normalize_stiffness_by_k
         self._detach_area_head = detach_area_head
         self._use_uniform_mass = use_uniform_mass
+        self._coerce_val_assembly = bool(coerce_val_assembly)
 
         # [DIAG] NaN/Inf diagnostics — see training_step and on_before_optimizer_step
         self._enable_nan_diagnostics = enable_nan_diagnostics
         self._nan_diag_log_every = max(int(nan_diag_log_every_n_steps), 1)
 
-        # Validation Laplacian config.  When the stiffness head is learned
-        # (``stiffness_mode='learned' / 'learned_positive'``), the gradient
-        # head and the stiffness head are independent — so a Gram-based
-        # assembly that reads only ``grad_coeffs`` would silently ignore
-        # the learned stiffness.  Coerce the assembly to ``'from_stiffness'``
-        # in that regime so the assembled Laplacian uses the head that the
-        # training losses are actually supervising.
+        # Validation Laplacian config.  The configured ``assembly`` is
+        # honoured verbatim by default (``coerce_val_assembly=False``) —
+        # the validation Laplacian is exactly what the yaml asks for,
+        # even under a learned stiffness mode (in which case it is built
+        # from ``grad_coeffs`` rather than the learned stiffness head).
+        # Set ``coerce_val_assembly=True`` to instead force the assembly
+        # to ``'from_stiffness'`` whenever ``stiffness_mode`` is learned,
+        # so validation reads the same head the training losses supervise.
         _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
         self._val_lap_config = self._coerce_lap_cfg_for_stiffness_mode(
             LaplacianConfig(**_val_lap), origin='val_laplacian')
@@ -425,26 +428,32 @@ class LaplacianLocalModule(LaplacianModuleBase):
 
     def _coerce_lap_cfg_for_stiffness_mode(
             self, cfg: LaplacianConfig, *, origin: str) -> LaplacianConfig:
-        """Make a :class:`LaplacianConfig` consistent with ``self._stiffness_mode``.
+        """Optionally coerce a :class:`LaplacianConfig` for ``self._stiffness_mode``.
 
-        For learned stiffness modes the gradient head and the stiffness
-        head are independent network outputs — a Gram-based assembly
-        (``'diagonal_gram'`` / ``'full_gram'``) would build the Laplacian
-        from ``grad_coeffs`` and silently ignore the learned stiffness.
-        Override to ``'from_stiffness'`` so validation reads the head that
-        the training losses actually supervise as the stiffness.
+        The configured ``assembly`` is honoured verbatim by default.
+        When ``self._coerce_val_assembly`` is True *and* the stiffness
+        mode is learned, a Gram-based assembly (``'diagonal_gram'`` /
+        ``'full_gram'``) — which would build the Laplacian from
+        ``grad_coeffs`` and ignore the learned stiffness head — is
+        overridden to ``'from_stiffness'`` so validation reads the head
+        the training losses actually supervise.
 
-        For derived stiffness modes the existing assembly choices are
-        consistent with the stiffness derivation and are passed through
+        Either way, when a learned stiffness mode is paired with a
+        non-``from_stiffness`` assembly an INFO line records which
+        operator validation will assemble, since it differs from the
+        trained one.  Derived stiffness modes are always passed through
         unchanged.
         """
-        if self._stiffness_mode in ('learned', 'learned_positive'):
-            if cfg.assembly != 'from_stiffness':
-                import logging
-                logging.getLogger(__name__).info(
-                    f"[stiffness_mode={self._stiffness_mode}] coercing "
-                    f"{origin}.assembly from '{cfg.assembly}' to 'from_stiffness' "
-                    f"so the assembled Laplacian reads the learned stiffness head.")
+        if (self._stiffness_mode in ('learned', 'learned_positive')
+                and cfg.assembly != 'from_stiffness'):
+            import logging
+            _log = logging.getLogger(__name__)
+            if self._coerce_val_assembly:
+                _log.info(
+                    f"[stiffness_mode={self._stiffness_mode}] coerce_val_assembly="
+                    f"True — coercing {origin}.assembly from '{cfg.assembly}' to "
+                    f"'from_stiffness' so the assembled Laplacian reads the learned "
+                    f"stiffness head.")
                 cfg = LaplacianConfig(
                     assembly='from_stiffness',
                     pruning=cfg.pruning,
@@ -453,10 +462,12 @@ class LaplacianLocalModule(LaplacianModuleBase):
                     torch_sparse=cfg.torch_sparse,
                     area_weighted=cfg.area_weighted,
                 )
-        else:
-            # Derived modes: caller's assembly choice (incl. 'from_stiffness'
-            # for power users) is honoured as-is.
-            pass
+            else:
+                _log.info(
+                    f"[stiffness_mode={self._stiffness_mode}] honouring "
+                    f"{origin}.assembly='{cfg.assembly}' — the validation Laplacian "
+                    f"is assembled from grad_coeffs, NOT the learned stiffness head "
+                    f"that the training losses supervise.")
         return cfg
 
     def _apply_area_activation(self, areas_raw: torch.Tensor,
