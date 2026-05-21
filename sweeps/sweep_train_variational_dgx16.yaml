@@ -7,8 +7,11 @@
 #   * the weight of the newly-added DirichletEnergyConsistencyTestLoss —
 #     0.0 is one of the options, so the sweep can decide whether the
 #     self-supervised consistency regulariser helps at all.
-# The mesh validation runs BOTH val-Laplacian flavours side-by-side
-# (from_stiffness + diagonal_gram), logged under val/<tag>/<name>.
+# Both validation paths run BOTH Laplacian flavours (from_stiffness +
+# diagonal_gram) side-by-side: mesh validation via val_laplacian (logged
+# under val/<tag>/<name>) and fmap validation via fmap_val_cfg.eval_laplacians
+# (logged under val_fmap/animals/<tag>_fmap_hks_wks/<name>).  The sweep
+# metric is the from_stiffness fmap geo_at_05pct.
 #
 # Usage:
 #   wandb sweep sweeps/sweep_train_variational_dgx16.yaml
@@ -21,7 +24,11 @@ command:
 method: bayes
 metric:
   goal: maximize
-  name: val_fmap/animals/fmap_hks_wks/geo_at_05pct
+  # fmap_val_cfg.eval_laplacians has two entries, so evaluate_pair
+  # tag-prefixes every fmap metric set (val_fmap/animals/<tag>_fmap_hks_wks/…).
+  # The sweep optimises the from_stiffness flavour — the operator the
+  # losses actually train.
+  name: val_fmap/animals/from_stiffness_fmap_hks_wks/geo_at_05pct
 #run_cap: 80
 parameters:
   # ===================================================================
@@ -264,8 +271,15 @@ parameters:
           k: 15
           num_eigenvectors: 100
           max_vertices_val: 5000
+          # Both Laplacian flavours, like val_laplacian above.  With >1
+          # entry evaluate_pair tag-prefixes each metric set:
+          #   val_fmap/animals/from_stiffness_fmap_hks_wks/…
+          #   val_fmap/animals/diagonal_gram_fmap_hks_wks/…
           eval_laplacians:
             - assembly: from_stiffness
+              pruning: none
+              area_weighted: false
+            - assembly: diagonal_gram
               pruning: none
               area_weighted: false
           geo_cache_dir: ./geo_cache
@@ -357,8 +371,8 @@ parameters:
       callbacks:
         - _target_: lightning.pytorch.callbacks.ModelCheckpoint
           dirpath: "./checkpoints"
-          filename: "best-{epoch:010d}-{val_fmap/animals/fmap_hks_wks/geo_at_05pct:.4f}"
-          monitor: val_fmap/animals/fmap_hks_wks/geo_at_05pct
+          filename: "best-{epoch:010d}-{val_fmap/animals/from_stiffness_fmap_hks_wks/geo_at_05pct:.4f}"
+          monitor: val_fmap/animals/from_stiffness_fmap_hks_wks/geo_at_05pct
           mode: max
           save_top_k: 3
           verbose: False
