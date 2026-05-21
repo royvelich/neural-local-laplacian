@@ -354,16 +354,34 @@ class LaplacianLocalModule(LaplacianModuleBase):
         self._nan_diag_log_every = max(int(nan_diag_log_every_n_steps), 1)
 
         # Validation Laplacian config.  The configured ``assembly`` is
-        # honoured verbatim by default (``coerce_val_assembly=False``) —
-        # the validation Laplacian is exactly what the yaml asks for,
-        # even under a learned stiffness mode (in which case it is built
-        # from ``grad_coeffs`` rather than the learned stiffness head).
-        # Set ``coerce_val_assembly=True`` to instead force the assembly
-        # to ``'from_stiffness'`` whenever ``stiffness_mode`` is learned,
-        # so validation reads the same head the training losses supervise.
-        _val_lap = val_laplacian or {'assembly': 'diagonal_gram', 'pruning': 'none'}
-        self._val_lap_config = self._coerce_lap_cfg_for_stiffness_mode(
-            LaplacianConfig(**_val_lap), origin='val_laplacian')
+        # Validation Laplacian config(s).  ``val_laplacian`` may be either:
+        #   * a single dict — one validation Laplacian; mesh metrics are
+        #     logged unprefixed (``val/<name>``), the historical layout.
+        #   * a list of dicts — assemble & evaluate each one; every metric
+        #     set is prefixed by the config's ``tag`` (``val/<tag>/<name>``)
+        #     so e.g. a 'from_stiffness' vs 'diagonal_gram' comparison can
+        #     run side-by-side, mirroring fmap_val_cfg.eval_laplacians.
+        # The configured ``assembly`` is honoured verbatim by default
+        # (``coerce_val_assembly=False``); set ``coerce_val_assembly=True``
+        # to force it to ``'from_stiffness'`` under a learned stiffness mode.
+        _val_lap = val_laplacian if val_laplacian else {
+            'assembly': 'diagonal_gram', 'pruning': 'none'}
+        _val_lap_dicts = [_val_lap] if hasattr(_val_lap, 'keys') else list(_val_lap)
+        self._val_lap_configs = [
+            self._coerce_lap_cfg_for_stiffness_mode(
+                LaplacianConfig(**d),
+                origin=(f'val_laplacian[{i}]' if len(_val_lap_dicts) > 1
+                        else 'val_laplacian'))
+            for i, d in enumerate(_val_lap_dicts)]
+        if len(self._val_lap_configs) > 1:
+            _tags = [c.tag for c in self._val_lap_configs]
+            if len(set(_tags)) != len(_tags):
+                raise ValueError(
+                    f"val_laplacian entries produce duplicate tags {_tags}; "
+                    f"each entry needs a distinct assembly / pruning / "
+                    f"area_weighted combination so its metrics don't collide.")
+        # Back-compat alias for any external reader of the singular field.
+        self._val_lap_config = self._val_lap_configs[0]
 
         # Fmap validation config (optional — enables pair-based correspondence eval)
         self._fmap_val_cfg = fmap_val_cfg
@@ -1414,29 +1432,39 @@ class LaplacianLocalModule(LaplacianModuleBase):
         knn = mesh_batch.vertex_indices.reshape(N, k_val).to(device)
         areas = forward_result['areas'].detach()
 
-        # Eigendecomposition: uses config.area_weighted to decide
-        with torch.no_grad():
-            # Pass both heads through; the configured ``val_laplacian.assembly``
-            # (coerced in __init__ for learned stiffness modes) decides which
-            # one is used.
-            L = assemble_laplacian(
-                forward_result['grad_coeffs'], knn,
-                self._val_lap_config, areas=areas,
-                stiffness_weights=forward_result.get('stiffness_weights'))
-
-        stiffness_matrix = to_scipy_sparse(L)
         mass_matrix = mass_matrix_to_scipy(areas)
-        self._last_stiffness_matrix = stiffness_matrix
-        self._last_mass_matrix = mass_matrix
-
-        pred_evals, pred_evecs = _eigh_full_gram(L, areas, self._num_eigenvalues)
         gt_evals, gt_evecs = mesh_data.gt_eigen
+        # Multi-config: prefix each metric set with the config's tag so the
+        # different assemblies don't collide; single config keeps the
+        # historical unprefixed ``val/<name>`` layout.
+        multi = len(self._val_lap_configs) > 1
 
-        metrics = self._compute_spectral_comparison_metrics(
-            pred_evals, pred_evecs, gt_evals, gt_evecs)
+        metrics: Dict[str, float] = {}
+        for cfg in self._val_lap_configs:
+            # Eigendecomposition: uses config.area_weighted to decide.
+            # Pass both heads through; the config's ``assembly`` decides
+            # which one is used.
+            with torch.no_grad():
+                L = assemble_laplacian(
+                    forward_result['grad_coeffs'], knn, cfg, areas=areas,
+                    stiffness_weights=forward_result.get('stiffness_weights'))
 
-        metrics.update(self._compute_geodesic_validation_metrics(
-            mesh_data, stiffness_matrix, mass_matrix, forward_result, mesh_batch))
+            stiffness_matrix = to_scipy_sparse(L)
+            self._last_stiffness_matrix = stiffness_matrix
+            self._last_mass_matrix = mass_matrix
+
+            pred_evals, pred_evecs = _eigh_full_gram(
+                L, areas, self._num_eigenvalues)
+
+            cfg_metrics = self._compute_spectral_comparison_metrics(
+                pred_evals, pred_evecs, gt_evals, gt_evecs)
+            cfg_metrics.update(self._compute_geodesic_validation_metrics(
+                mesh_data, stiffness_matrix, mass_matrix,
+                forward_result, mesh_batch))
+
+            prefix = f'{cfg.tag}/' if multi else ''
+            for name, val in cfg_metrics.items():
+                metrics[f'{prefix}{name}'] = val
         return metrics
 
     def _compute_geodesic_validation_metrics(
