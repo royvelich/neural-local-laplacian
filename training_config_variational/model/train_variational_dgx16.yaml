@@ -36,7 +36,7 @@ module:
   # value below is overridden in __init__ to 'from_stiffness' because
   # stiffness_mode is learned; you can leave it as-is.
   val_laplacian:
-    assembly: diagonal_gram
+    assembly: from_stiffness
     pruning: none
 
   fmap_val_cfg:
@@ -44,7 +44,7 @@ module:
     num_eigenvectors: 100
     max_vertices_val: 5000
     eval_laplacians:
-      - assembly: diagonal_gram     # auto-coerced to from_stiffness
+      - assembly: from_stiffness     # auto-coerced to from_stiffness
         pruning: none
         area_weighted: false
     geo_cache_dir: ./geo_cache
