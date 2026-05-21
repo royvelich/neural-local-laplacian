@@ -1574,6 +1574,103 @@ class DirichletEnergyTestLoss(_VariationalTestLoss):
         return self._reduce(per_probe)
 
 
+class DirichletEnergyConsistencyTestLoss(_VariationalTestLoss):
+    r"""Per-vertex Dirichlet-energy consistency between the stiffness and gradient heads.
+
+    Variational analog of :class:`DirichletEnergyConsistencyLoss`.  For a
+    probe function ``f`` and per-neighbour differences
+    ``δf_ji = f(v_j) − f(v_i)``, the Dirichlet-energy contribution at
+    vertex ``i`` can be written two ways:
+
+        S-path:  E_S_i^{(ℓ)} = Σ_j  s_ij · (δf_ji^{(ℓ)})²
+        G-path:  E_G_i^{(ℓ)} = A_i · ‖ Σ_j g_ij · δf_ji^{(ℓ)} ‖²
+
+    with ``s_ij = ctx.stiffness_weights`` (the stiffness head),
+    ``g_ij = ctx.grad_coeffs`` (the gradient head) and
+    ``A_i = ctx.areas`` (the area head).  A consistent operator has
+    ``E_S ≈ E_G``; the loss penalises the relative discrepancy per
+    ``(vertex, probe)``:
+
+        L = reduce_{i,ℓ}  (E_S − E_G)² / (E_S² + ε)
+
+    Unlike the patch-level :class:`DirichletEnergyConsistencyLoss` —
+    where ``s_ij`` is hardwired to ``‖g_ij‖²`` so the check only sees
+    the area scale and the off-diagonal Gram terms — the variational
+    pipeline reads ``ctx.stiffness_weights`` directly.  Under
+    ``stiffness_mode='learned' / 'learned_positive'`` that is an
+    independent head, so the loss genuinely **couples all three heads**:
+    it is minimised only when the learned stiffness, the gradient
+    operator and the area head agree on the Dirichlet energy.  Under a
+    derived stiffness mode ``ctx.stiffness_weights`` already equals
+    ``‖g_ij‖²`` and the loss reduces to the patch-level check.  Fully
+    self-supervised — no analytic GT needed.
+
+    Probe functions (``probe_mode``):
+      * ``'test_functions'`` (default) — the sampled probes
+        ``ctx.test_func_values`` (n, P); deltas via the knn gather.
+      * ``'coordinates'``             — the 3 coordinate functions
+        from ``ctx.vertex_pos`` (P = 3).  Couples with MCV supervision
+        since Δ applied to the coordinates is the mean-curvature vector.
+      * ``'random'``                  — ``δf ~ N(0, 1)`` (``num_random_probes``).
+
+    Reads from ``ctx``: ``grad_coeffs``, ``stiffness_weights``,
+    ``areas``, ``knn``, plus ``test_func_values`` / ``vertex_pos``
+    depending on ``probe_mode``.
+
+    Args:
+        probe_mode: ``'test_functions'`` / ``'coordinates'`` / ``'random'``.
+        num_random_probes: P for ``probe_mode='random'``.
+        reduction: ``'mean'`` / ``'sum'`` / ``'none'`` over (vertex × probe).
+        eps: numerical floor in the relative-error denominator.
+    """
+
+    def __init__(self, probe_mode: str = 'test_functions',
+                 num_random_probes: int = 8, reduction: str = 'mean',
+                 eps: float = 1e-8):
+        super().__init__(reduction=reduction)
+        if probe_mode not in ('test_functions', 'coordinates', 'random'):
+            raise ValueError(
+                f"probe_mode must be 'test_functions' / 'coordinates' / "
+                f"'random', got '{probe_mode}'")
+        self.probe_mode = probe_mode
+        self.num_random_probes = int(num_random_probes)
+        self.eps = float(eps)
+
+    def forward(self, ctx: LossContext) -> torch.Tensor:
+        required = ['grad_coeffs', 'stiffness_weights', 'areas', 'knn']
+        if self.probe_mode == 'test_functions':
+            required.append('test_func_values')
+        elif self.probe_mode == 'coordinates':
+            required.append('vertex_pos')
+        self._check_required(ctx, required)
+
+        g = ctx.grad_coeffs                                  # (n, k, 3)
+        s = ctx.stiffness_weights                            # (n, k)
+        knn = ctx.knn                                        # (n, k)
+        n, k = knn.shape
+
+        # Per-vertex per-probe neighbour differences δf_ji  (n, k, P)
+        if self.probe_mode == 'test_functions':
+            vals = ctx.test_func_values                      # (n, P)
+            delta_f = vals[knn] - vals.unsqueeze(1)          # (n, k, P)
+        elif self.probe_mode == 'coordinates':
+            p = ctx.vertex_pos                               # (n, 3)
+            delta_f = p[knn] - p.unsqueeze(1)                # (n, k, 3)
+        else:  # 'random'
+            delta_f = torch.randn(
+                n, k, self.num_random_probes,
+                device=g.device, dtype=g.dtype)              # (n, k, P)
+
+        # S-path:  E_S_i^{(ℓ)} = Σ_j s_ij · δf_ji²
+        E_S = (s.unsqueeze(-1) * delta_f ** 2).sum(dim=1)    # (n, P)
+        # G-path:  E_G_i^{(ℓ)} = A_i · ‖Σ_j g_ij · δf_ji‖²
+        grad_f = torch.einsum('nkd,nkp->ndp', g, delta_f)    # (n, 3, P)
+        E_G = ctx.areas.unsqueeze(-1) * (grad_f ** 2).sum(dim=1)   # (n, P)
+
+        per = (E_S - E_G) ** 2 / (E_S ** 2 + self.eps)       # (n, P)
+        return self._reduce(per)
+
+
 class BilinearFormTestLoss(_VariationalTestLoss):
     r"""Match the discrete and continuous Dirichlet bilinear forms.
 
