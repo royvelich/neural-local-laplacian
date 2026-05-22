@@ -3542,14 +3542,6 @@ class RealTimeEigenanalysisVisualizer:
 
         # STEP 2: Re-run model inference (timing is inside perform_model_inference)
         print(f"STEP 2: Re-running model inference...")
-        # The app sits idle in the polyscope event loop between user actions,
-        # during which the GPU downclocks to a low-power state. The first
-        # forward after that idle wait then runs at a fraction of boost clock
-        # (observed ~6x slower). A short matmul burst ramps the clock back up
-        # before the timed inference.
-        _warm_s = self._gpu_clock_warmup(self.current_device)
-        if _warm_s:
-            print(f"  [TIMING] GPU clock warmup: {_warm_s * 1000:.1f} ms")
         new_inference_result = self.perform_model_inference(
             self.current_model, new_patch_data, self.current_device,
             preserve_lap_config=True,
@@ -3888,26 +3880,6 @@ class RealTimeEigenanalysisVisualizer:
     def _warmup_cuda(self, model: LaplacianTransformerModule, device: torch.device, k: int):
         """CUDA warmup — delegates to shared cuda_warmup() in utils."""
         cuda_warmup(model, device, k)
-
-    def _gpu_clock_warmup(self, device: Optional[torch.device],
-                          min_ms: float = 50.0) -> float:
-        """Run a short matmul burst so the GPU clock boosts before a timed op.
-
-        While the visualizer waits for user input in the polyscope event loop
-        the GPU downclocks to a low-power state, making the next forward run
-        far slower than its warm speed. A sustained burst of matmuls ramps the
-        clock back up. Returns the elapsed time in seconds (0.0 on CPU).
-        """
-        if device is None or device.type != 'cuda':
-            return 0.0
-        t0 = time.perf_counter()
-        a = torch.randn(2048, 2048, device=device, dtype=torch.float32)
-        while (time.perf_counter() - t0) * 1000.0 < min_ms:
-            for _ in range(8):
-                a = torch.mm(a, a)
-                a = a / (a.norm() + 1e-8)
-            torch.cuda.synchronize()
-        return time.perf_counter() - t0
 
     def compute_eigendecomposition(self, stiffness_matrix: scipy.sparse.csr_matrix,
                                    k: int = 50,
@@ -8622,6 +8594,10 @@ class RealTimeEigenanalysisVisualizer:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
 
+        # Pin the GPU clock so interactive re-inference runs at warm speed
+        # (best-effort; needs an elevated process, otherwise a no-op).
+        lock_gpu_clocks(device)
+
         # Check for diagnostic mode (disable optimizations to debug timing issues)
         diagnostic_mode = getattr(cfg, 'diagnostic_mode', False)
         skip_robust = getattr(cfg, 'skip_robust', False)  # Debug: skip robust computation
@@ -8759,6 +8735,59 @@ class RealTimeEigenanalysisVisualizer:
             self._aggregate_and_save_results(all_mesh_metrics, csv_path)
 
         print(f"\n[OK] Completed processing all batches!")
+
+
+def lock_gpu_clocks(device: torch.device) -> bool:
+    """Best-effort: pin the GPU graphics clock to its max via ``nvidia-smi``.
+
+    The visualizer is interactive — between user actions the GPU downclocks
+    to a low-power state, so the next inference runs several times slower
+    than its warm speed. Pinning the clock keeps it boosted.
+
+    Requires an elevated process (admin on Windows, root on Linux); without
+    it ``nvidia-smi -lgc`` fails and this is a graceful no-op. On success an
+    ``atexit`` handler runs ``nvidia-smi -rgc`` so the GPU is left as found.
+
+    Returns True if the clock was locked.
+    """
+    if device.type != 'cuda':
+        return False
+    import subprocess
+    import atexit
+    idx = str(torch.cuda.current_device())
+    try:
+        out = subprocess.run(
+            ['nvidia-smi', '--query-gpu=clocks.max.graphics',
+             '--format=csv,noheader,nounits', '-i', idx],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            print(f"[GPU clock] could not query max clock: {out.stderr.strip()}")
+            return False
+        max_mhz = int(out.stdout.strip().splitlines()[0])
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired) as e:
+        print(f"[GPU clock] nvidia-smi unavailable, skipping clock lock ({e})")
+        return False
+
+    lock = subprocess.run(
+        ['nvidia-smi', '-i', idx, '-lgc', f'{max_mhz},{max_mhz}'],
+        capture_output=True, text=True, timeout=10)
+    if lock.returncode != 0:
+        msg = (lock.stderr or lock.stdout).strip()
+        print(f"[GPU clock] could not lock clocks ({msg}).")
+        print(f"[GPU clock] run the visualizer from an elevated terminal, or "
+              f"lock manually: nvidia-smi -lgc {max_mhz},{max_mhz}")
+        return False
+
+    print(f"[GPU clock] locked graphics clock to {max_mhz} MHz "
+          f"(keeps re-inference at warm speed)")
+
+    def _reset_gpu_clocks():
+        subprocess.run(['nvidia-smi', '-i', idx, '-rgc'],
+                       capture_output=True, text=True, timeout=10)
+        print("[GPU clock] reset to default")
+
+    atexit.register(_reset_gpu_clocks)
+    return True
 
 
 @hydra.main(version_base="1.2", config_path='./visualization_config')
