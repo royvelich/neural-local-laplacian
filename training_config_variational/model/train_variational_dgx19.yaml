@@ -66,11 +66,11 @@ module:
         loss_mode: log_mse
       weight: 1.0
     # Stiffness head — direction of per-vertex LB signature across probes
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
-        loss_mode: cosine
-      weight: 5.0
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
+#        loss_mode: cosine
+#      weight: 5.0
     # Area head — magnitude anchor on per-vertex LB signature
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
@@ -89,4 +89,4 @@ module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
         target: mcv
         signed: true
-      weight: 1.0
+      weight: 3.0
