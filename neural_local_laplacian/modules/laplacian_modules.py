@@ -288,6 +288,9 @@ class LaplacianLocalModule(LaplacianModuleBase):
                  coerce_val_assembly: bool = False,
                  enable_nan_diagnostics: bool = True,
                  nan_diag_log_every_n_steps: int = 50,
+                 topk_prune_target: Optional[int] = None,
+                 topk_prune_start: Optional[int] = None,
+                 topk_prune_anneal_steps: int = 0,
                  **kwargs):
         # **kwargs absorbs legacy hparams (operator_mode, patch_mcv_mode,
         # val_laplacian_mode) from old checkpoints.
@@ -352,6 +355,22 @@ class LaplacianLocalModule(LaplacianModuleBase):
         # [DIAG] NaN/Inf diagnostics — see training_step and on_before_optimizer_step
         self._enable_nan_diagnostics = enable_nan_diagnostics
         self._nan_diag_log_every = max(int(nan_diag_log_every_n_steps), 1)
+
+        # Train-time top-k operator-support pruning (optional).  When
+        # ``topk_prune_target`` is set, ``forward`` masks the stiffness
+        # weights to the strongest ``k`` neighbours per patch, so the model
+        # trains under a sparse operator support.  During training ``k`` is
+        # annealed linearly from ``topk_prune_start`` (default: full support,
+        # i.e. no pruning) down to ``topk_prune_target`` over
+        # ``topk_prune_anneal_steps`` optimizer steps — a curriculum that lets
+        # every edge receive gradient early and only tightens the support
+        # once the model has learned which edges matter.  In eval the
+        # fully-annealed target is used.
+        self._topk_prune_target = (int(topk_prune_target)
+                                   if topk_prune_target is not None else None)
+        self._topk_prune_start = (int(topk_prune_start)
+                                  if topk_prune_start is not None else None)
+        self._topk_prune_anneal_steps = max(int(topk_prune_anneal_steps), 0)
 
         # Validation Laplacian config.  The configured ``assembly`` is
         # Validation Laplacian config(s).  ``val_laplacian`` may be either:
@@ -688,6 +707,52 @@ class LaplacianLocalModule(LaplacianModuleBase):
         return out
 
     # ------------------------------------------------------------------
+    # Train-time top-k operator-support pruning
+    # ------------------------------------------------------------------
+    def _current_topk_support(self, max_k: int) -> Optional[int]:
+        """Annealed top-k support for train-time stiffness pruning.
+
+        Returns ``None`` when pruning is disabled.  During training ``k`` is
+        annealed linearly from ``topk_prune_start`` (default ``max_k`` — no
+        pruning) down to ``topk_prune_target`` over ``topk_prune_anneal_steps``
+        optimizer steps; in eval the fully-annealed target is returned.
+        """
+        target = self._topk_prune_target
+        if target is None:
+            return None
+        start = (self._topk_prune_start
+                 if self._topk_prune_start is not None else max_k)
+        steps = self._topk_prune_anneal_steps
+        if self.training and steps > 0:
+            progress = min(1.0, float(self.global_step) / float(steps))
+            k = round(start + (target - start) * progress)
+        else:
+            k = target
+        return int(max(1, min(k, max_k)))
+
+    @staticmethod
+    def _apply_topk_pruning(stiffness_weights: torch.Tensor,
+                            attention_mask: torch.Tensor,
+                            k: int) -> torch.Tensor:
+        """Keep the ``k`` largest-magnitude stiffness weights per patch, zero
+        the rest.
+
+        Differentiable: gradient flows only to the kept entries (a hard gate);
+        the top-k *selection* is non-differentiable, as intended.
+        """
+        K = stiffness_weights.shape[1]
+        if k >= K:
+            return stiffness_weights
+        mag = stiffness_weights.abs().masked_fill(~attention_mask, float('-inf'))
+        topk_idx = mag.topk(k, dim=1).indices                       # (B, k)
+        keep = torch.zeros_like(stiffness_weights, dtype=torch.bool)
+        keep.scatter_(1, topk_idx, True)
+        # A patch with fewer real neighbours than k keeps only its real ones —
+        # never a padded slot (top-k fills the remainder with padding).
+        keep = keep & attention_mask
+        return stiffness_weights * keep
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -814,6 +879,17 @@ class LaplacianLocalModule(LaplacianModuleBase):
         # the learned modes it scales the head output directly.
         if self._normalize_stiffness_by_k:
             stiffness_weights = stiffness_weights / k_per_patch[:, None]
+
+        # ── Train-time top-k operator-support pruning (annealed) ─────
+        # Mask the stiffness weights to the strongest few neighbours per
+        # patch so the model trains under a sparse operator support.
+        topk = self._current_topk_support(max_k)
+        if topk is not None:
+            stiffness_weights = self._apply_topk_pruning(
+                stiffness_weights, attention_mask, topk)
+            if self.training:
+                self.log('train/topk_support', float(topk),
+                         on_step=True, on_epoch=False)
 
         # ── Area prediction ──────────────────────────────────────────
         if self._use_uniform_mass:
