@@ -708,6 +708,67 @@ def prune_to_topk(L: torch.Tensor, k: int) -> torch.Tensor:
     return L_pruned
 
 
+def prune_to_topk_sparse(
+    L: scipy.sparse.spmatrix,
+    k: int,
+    symmetry: str = 'union',
+) -> scipy.sparse.csr_matrix:
+    """Keep the k largest-magnitude off-diagonal entries per row of a sparse
+    Laplacian, symmetrise, and recompute the diagonal for zero row sums.
+
+    The scipy-sparse analogue of :func:`prune_to_topk`: it never materialises
+    a dense (N, N) matrix, so it scales to large meshes.  Used to prune an
+    assembled operator down to a fixed support ('operator support' pruning).
+
+    Args:
+        L: (N, N) scipy sparse Laplacian (any format).
+        k: number of off-diagonal entries to keep per row.
+        symmetry: 'union' keeps edge (i, j) if either endpoint selected it;
+                  'intersection' keeps it only if both endpoints did.
+
+    Returns:
+        L_pruned: (N, N) scipy.sparse.csr_matrix, symmetric, zero row sums.
+    """
+    if symmetry not in ('union', 'intersection'):
+        raise ValueError(
+            f"symmetry must be 'union' or 'intersection', got: {symmetry}")
+
+    L = scipy.sparse.csr_matrix(L)
+    N = L.shape[0]
+
+    # Off-diagonal part only; the diagonal is recomputed at the end.
+    L_off = (L - scipy.sparse.diags(L.diagonal())).tocsr()
+    L_off.eliminate_zeros()
+
+    indptr, indices, data = L_off.indptr, L_off.indices, L_off.data
+    sel_rows, sel_cols = [], []
+    for i in range(N):
+        start, end = indptr[i], indptr[i + 1]
+        cols = indices[start:end]
+        if cols.size <= k:
+            keep_cols = cols
+        else:
+            keep = np.argpartition(np.abs(data[start:end]), -k)[-k:]
+            keep_cols = cols[keep]
+        sel_cols.append(keep_cols)
+        sel_rows.append(np.full(keep_cols.shape, i, dtype=np.int64))
+
+    rows = np.concatenate(sel_rows) if sel_rows else np.empty(0, dtype=np.int64)
+    cols = np.concatenate(sel_cols) if sel_cols else np.empty(0, dtype=np.int64)
+    mask = scipy.sparse.csr_matrix(
+        (np.ones(rows.shape[0], dtype=bool), (rows, cols)), shape=(N, N))
+
+    if symmetry == 'union':
+        sym = mask.maximum(mask.T)
+    else:
+        sym = mask.minimum(mask.T)
+
+    pruned_off = L_off.multiply(sym).tocsr()
+    row_sums = np.asarray(pruned_off.sum(axis=1)).ravel()
+    L_pruned = (pruned_off - scipy.sparse.diags(row_sums)).tocsr()
+    return L_pruned
+
+
 # =============================================================================
 # Conversion helpers
 # =============================================================================
