@@ -761,37 +761,16 @@ class RealTimeEigenanalysisVisualizer:
             self.current_lap_config.area_weighted
         )
 
-        # Pruning. Selecting knn/topk forces the dense assembly path
-        # (sparse=(pruning=='none') below); on that path 'from_stiffness'
-        # honours pruning just like the from-gradient assemblies, so the
-        # combo is available for every assembly variant.
-        pruning_options = ['none', 'knn', 'topk']
-        k_prune_changed = False
-        current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
-            if self.current_lap_config.pruning in pruning_options else 0
-        pruning_changed, new_pruning_idx = psim.Combo(
-            "Pruning", current_pruning_idx, pruning_options
-        )
-        new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
-        if pruning_options[new_pruning_idx] in ('knn', 'topk'):
-            k_prune_changed, new_k_prune = psim.InputInt(
-                "k_prune",
-                new_k_prune,
-                flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
-            )
-            new_k_prune = max(3, min(100, new_k_prune))
-        if new_assembly == 'from_stiffness' and pruning_options[new_pruning_idx] != 'none':
-            psim.TextColored((0.7, 0.7, 0.7, 1.0),
-                "Pruning on from_stiffness uses the dense assembly path.")
-
-        if assembly_changed or pruning_changed or k_prune_changed or aw_changed:
-            new_pruning = pruning_options[new_pruning_idx]
+        # The visualizer always assembles the Laplacian on the sparse path
+        # (pruning='none', sparse=True).  Top-k pruning is applied afterwards,
+        # entirely on the sparse matrix, by the "PRED Top-k Weight Pruning"
+        # panel above — that is the single source of truth for pruning.
+        if assembly_changed or aw_changed:
             new_config = LaplacianConfig(
                 assembly=new_assembly,
-                pruning=new_pruning,
-                k_prune=new_k_prune if new_pruning in ('knn', 'topk') else None,
+                pruning='none',
                 area_weighted=new_aw,
-                sparse=(new_pruning == 'none'),
+                sparse=True,
             )
             if new_config.tag != self.current_lap_config.tag:
                 print(f"[*] Laplacian config changed: {self.current_lap_config.tag} -> {new_config.tag}")
@@ -4418,14 +4397,14 @@ class RealTimeEigenanalysisVisualizer:
             else:
                 base_lap_config = getattr(model, '_val_lap_config',
                                           LaplacianConfig(assembly='diagonal_gram'))
-            # Sparse assembly is only supported on the unpruned path; pruned
-            # configs (knn / topk) must use the dense assembly path.
+            # The visualizer always assembles on the sparse path, unpruned.
+            # Top-k pruning is a separate sparse post-process (the panel) —
+            # there is no dense assembly anywhere in the visualizer.
             val_lap_config = LaplacianConfig(
                 assembly=base_lap_config.assembly,
-                pruning=base_lap_config.pruning,
-                k_prune=base_lap_config.k_prune,
+                pruning='none',
                 area_weighted=base_lap_config.area_weighted,
-                sparse=(base_lap_config.pruning == 'none'),
+                sparse=True,
             )
             self.current_lap_config = val_lap_config
             # Pass stiffness_weights through so 'from_stiffness' assembly
