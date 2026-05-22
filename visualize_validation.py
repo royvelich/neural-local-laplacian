@@ -3542,14 +3542,6 @@ class RealTimeEigenanalysisVisualizer:
 
         # STEP 2: Re-run model inference (timing is inside perform_model_inference)
         print(f"STEP 2: Re-running model inference...")
-        # The app sits idle in the polyscope event loop between user actions,
-        # during which the GPU downclocks to a low-power state. The first
-        # forward after that idle wait then runs at a fraction of boost clock
-        # (observed ~6x slower). A short matmul burst ramps the clock back up
-        # before the timed inference.
-        _warm_s = self._gpu_clock_warmup(self.current_device)
-        if _warm_s:
-            print(f"  [TIMING] GPU clock warmup: {_warm_s * 1000:.1f} ms")
         new_inference_result = self.perform_model_inference(
             self.current_model, new_patch_data, self.current_device,
             preserve_lap_config=True,
@@ -3888,26 +3880,6 @@ class RealTimeEigenanalysisVisualizer:
     def _warmup_cuda(self, model: LaplacianTransformerModule, device: torch.device, k: int):
         """CUDA warmup — delegates to shared cuda_warmup() in utils."""
         cuda_warmup(model, device, k)
-
-    def _gpu_clock_warmup(self, device: Optional[torch.device],
-                          min_ms: float = 50.0) -> float:
-        """Run a short matmul burst so the GPU clock boosts before a timed op.
-
-        While the visualizer waits for user input in the polyscope event loop
-        the GPU downclocks to a low-power state, making the next forward run
-        far slower than its warm speed. A sustained burst of matmuls ramps the
-        clock back up. Returns the elapsed time in seconds (0.0 on CPU).
-        """
-        if device is None or device.type != 'cuda':
-            return 0.0
-        t0 = time.perf_counter()
-        a = torch.randn(2048, 2048, device=device, dtype=torch.float32)
-        while (time.perf_counter() - t0) * 1000.0 < min_ms:
-            for _ in range(8):
-                a = torch.mm(a, a)
-                a = a / (a.norm() + 1e-8)
-            torch.cuda.synchronize()
-        return time.perf_counter() - t0
 
     def compute_eigendecomposition(self, stiffness_matrix: scipy.sparse.csr_matrix,
                                    k: int = 50,
