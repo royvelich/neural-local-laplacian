@@ -81,6 +81,7 @@ from neural_local_laplacian.utils.utils import (
 from neural_local_laplacian.utils.laplacian_assembly import (
     LaplacianConfig,
     assemble_laplacian,
+    prune_to_topk_sparse,
     to_scipy_sparse,
     mass_matrix_to_scipy,
 )
@@ -760,33 +761,28 @@ class RealTimeEigenanalysisVisualizer:
             self.current_lap_config.area_weighted
         )
 
-        # Pruning: only meaningful on the sparse from-gradient paths. The
-        # sparse 'from_stiffness' builders ignore pruning, so disable the
-        # combo (and force pruning='none') when from_stiffness is selected.
+        # Pruning. Selecting knn/topk forces the dense assembly path
+        # (sparse=(pruning=='none') below); on that path 'from_stiffness'
+        # honours pruning just like the from-gradient assemblies, so the
+        # combo is available for every assembly variant.
         pruning_options = ['none', 'knn', 'topk']
-        pruning_changed = False
         k_prune_changed = False
-        if new_assembly == 'from_stiffness':
-            new_pruning_idx = 0  # 'none'
-            new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
-            psim.TextColored((0.7, 0.7, 0.7, 1.0),
-                "Pruning: none  (ignored on sparse from_stiffness path)")
-            if self.current_lap_config.pruning != 'none':
-                pruning_changed = True  # force flip back to 'none'
-        else:
-            current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
-                if self.current_lap_config.pruning in pruning_options else 0
-            pruning_changed, new_pruning_idx = psim.Combo(
-                "Pruning", current_pruning_idx, pruning_options
+        current_pruning_idx = pruning_options.index(self.current_lap_config.pruning) \
+            if self.current_lap_config.pruning in pruning_options else 0
+        pruning_changed, new_pruning_idx = psim.Combo(
+            "Pruning", current_pruning_idx, pruning_options
+        )
+        new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
+        if pruning_options[new_pruning_idx] in ('knn', 'topk'):
+            k_prune_changed, new_k_prune = psim.InputInt(
+                "k_prune",
+                new_k_prune,
+                flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
             )
-            new_k_prune = self.current_lap_config.k_prune or self.reconstruction_settings.current_pred_k
-            if pruning_options[new_pruning_idx] in ('knn', 'topk'):
-                k_prune_changed, new_k_prune = psim.InputInt(
-                    "k_prune",
-                    new_k_prune,
-                    flags=psim.ImGuiInputTextFlags_EnterReturnsTrue
-                )
-                new_k_prune = max(3, min(100, new_k_prune))
+            new_k_prune = max(3, min(100, new_k_prune))
+        if new_assembly == 'from_stiffness' and pruning_options[new_pruning_idx] != 'none':
+            psim.TextColored((0.7, 0.7, 0.7, 1.0),
+                "Pruning on from_stiffness uses the dense assembly path.")
 
         if assembly_changed or pruning_changed or k_prune_changed or aw_changed:
             new_pruning = pruning_options[new_pruning_idx]
@@ -2323,6 +2319,31 @@ class RealTimeEigenanalysisVisualizer:
         else:
             print(f"  Failed to compute eigendecomposition for k={new_k}")
 
+    def _apply_topk_weight_pruning(self, stiffness_matrix, receptive_k: int):
+        """Apply the 'PRED Top-k Weight Pruning' panel to an assembled Laplacian.
+
+        When the panel is enabled, keeps only the ``pred_top_k`` strongest
+        off-diagonal entries per row (the 'operator support'), symmetrised per
+        ``symmetry_policy``, and recomputes the diagonal for zero row sums.
+        Returns the matrix unchanged when the panel is disabled.
+
+        Args:
+            stiffness_matrix: assembled scipy-sparse Laplacian.
+            receptive_k: the k-NN receptive field used for assembly; the kept
+                support is capped at ``receptive_k - 1``.
+        """
+        rs = self.reconstruction_settings
+        if not rs.enable_top_k_pruning:
+            return stiffness_matrix
+        k2 = max(1, min(rs.pred_top_k, receptive_k - 1))
+        nnz_before = stiffness_matrix.nnz
+        pruned = prune_to_topk_sparse(stiffness_matrix, k2, symmetry=rs.symmetry_policy)
+        n_rows = stiffness_matrix.shape[0]
+        print(f"  [top-k weight pruning] k2={k2} ({rs.symmetry_policy}): "
+              f"{nnz_before} -> {pruned.nnz} nnz "
+              f"({pruned.nnz / max(n_rows, 1):.1f}/row)")
+        return pruned
+
     def _reassemble_with_config(self, new_config: LaplacianConfig):
         """
         Reassemble Laplacian from cached forward result with a new config.
@@ -2347,6 +2368,8 @@ class RealTimeEigenanalysisVisualizer:
         L = assemble_laplacian(grad_coeffs, self.current_knn, new_config,
                                areas=areas, stiffness_weights=stiffness_weights)
         new_stiffness_matrix = to_scipy_sparse(L)
+        new_stiffness_matrix = self._apply_topk_weight_pruning(
+            new_stiffness_matrix, self.current_knn.shape[1])
         new_mass_matrix = mass_matrix_to_scipy(areas)
 
         print(f"  Assembled: {new_stiffness_matrix.shape} ({new_stiffness_matrix.nnz} non-zeros)")
@@ -2448,6 +2471,8 @@ class RealTimeEigenanalysisVisualizer:
             areas=areas_for_assembly, stiffness_weights=stiffness_weights,
         )
         new_stiffness_matrix = to_scipy_sparse(L)
+        new_stiffness_matrix = self._apply_topk_weight_pruning(
+            new_stiffness_matrix, self.current_knn.shape[1])
 
         print(f"  Assembled S: {new_stiffness_matrix.shape} "
               f"({new_stiffness_matrix.nnz} non-zeros)")
@@ -4412,6 +4437,7 @@ class RealTimeEigenanalysisVisualizer:
                                    areas=areas,
                                    stiffness_weights=stiffness_weights)
             stiffness_matrix = to_scipy_sparse(L)
+            stiffness_matrix = self._apply_topk_weight_pruning(stiffness_matrix, k_val)
             mass_matrix = mass_matrix_to_scipy(areas)
 
             t_assembly_end = time.perf_counter()
