@@ -4309,6 +4309,28 @@ class RealTimeEigenanalysisVisualizer:
                 print("  Using mixed precision: FP16")
 
         with torch.no_grad():
+            # Warm-up iterations: run the forward untimed so the timed
+            # measurement below reflects steady-state, back-to-back inference
+            # speed — emulating a deployment that runs many inferences in a
+            # row — rather than a cold GPU. The visualizer otherwise sits idle
+            # in the event loop between user actions and the GPU downclocks,
+            # making a single re-inference a cold-start outlier. Not counted
+            # in the [TIMING] Model inference number below.
+            n_warmup = 5
+            if n_warmup > 0:
+                t_warmup_start = time.perf_counter()
+                for _ in range(n_warmup):
+                    if use_amp:
+                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                            model(batch_data)
+                    else:
+                        model(batch_data)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                warmup_time = time.perf_counter() - t_warmup_start
+                print(f"  [TIMING] Inference warmup ({n_warmup} iters): "
+                      f"{warmup_time * 1000:.1f} ms")
+
             # === Single timed inference ===
             if device.type == 'cuda':
                 torch.cuda.synchronize()
