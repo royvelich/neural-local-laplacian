@@ -4312,6 +4312,21 @@ class RealTimeEigenanalysisVisualizer:
             # === Single timed inference ===
             if device.type == 'cuda':
                 torch.cuda.synchronize()
+
+            # [MEM] Allocator state BEFORE the forward. If the GPU is full
+            # after batch-1 artifacts, the forward can't be served from the
+            # caching allocator's free blocks and must fall back to
+            # synchronous cudaMalloc — which stalls the forward.
+            if device.type == 'cuda':
+                _mem_alloc_before = torch.cuda.memory_allocated()
+                _mem_reserved_before = torch.cuda.memory_reserved()
+                _stats_before = torch.cuda.memory_stats()
+                _retries_before = _stats_before.get('num_alloc_retries', 0)
+                _ooms_before = _stats_before.get('num_ooms', 0)
+                print(f"  [MEM] before forward: allocated="
+                      f"{_mem_alloc_before / 1024 ** 2:.0f} MB, reserved="
+                      f"{_mem_reserved_before / 1024 ** 2:.0f} MB")
+
             t_inference_start = time.perf_counter()
 
             # [DIAG:NORM] Report the normalization flag values the model will
@@ -4337,6 +4352,19 @@ class RealTimeEigenanalysisVisualizer:
             pred_inference_time = time.perf_counter() - t_inference_start
 
             print(f"  [TIMING] Model inference: {pred_inference_time * 1000:.2f} ms")
+
+            # [MEM] Did the allocator have to grow its reservation (i.e. call
+            # cudaMalloc) during the forward?  reserved-grew > 0 or
+            # alloc_retries > 0 means the forward stalled on driver-level
+            # allocation — the prime suspect for a slow re-inference.
+            if device.type == 'cuda':
+                _stats_after = torch.cuda.memory_stats()
+                _reserved_grew = torch.cuda.memory_reserved() - _mem_reserved_before
+                _retries_delta = _stats_after.get('num_alloc_retries', 0) - _retries_before
+                _ooms_delta = _stats_after.get('num_ooms', 0) - _ooms_before
+                print(f"  [MEM] during forward: reserved grew by "
+                      f"{_reserved_grew / 1024 ** 2:+.0f} MB, "
+                      f"alloc_retries +{_retries_delta}, ooms +{_ooms_delta}")
 
             # === TIME: Result extraction and conversion ===
             t_extract_start = time.perf_counter()
