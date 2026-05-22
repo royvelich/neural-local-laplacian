@@ -3527,6 +3527,7 @@ class MongeSurfaceVariationalDataset(Dataset):
         heat_kernel_num_eigenpairs: int = 50,
         heat_kernel_diagonal_only: bool = True,
         heat_kernel_reference_resolution: Optional[int] = None,
+        rescale_gt_to_unit_patch: bool = False,
     ):
         super().__init__()
         self._surface_sampler = surface_sampler
@@ -3572,6 +3573,13 @@ class MongeSurfaceVariationalDataset(Dataset):
             self._geodesic_reference_resolution
             if heat_kernel_reference_resolution is None
             else int(heat_kernel_reference_resolution))
+
+        # Optional per-patch unit-sphere rescaling of length-dependent GT
+        # fields, to match the convention the model's
+        # ``normalize_patch_features`` puts the input in.  Mirrors what the
+        # patch-based dataset's ``_normalize_surface_to_unit_sphere`` does,
+        # but applied per-vertex.  See ``get()``.
+        self._rescale_gt_to_unit_patch = bool(rescale_gt_to_unit_patch)
 
         # k may be a scalar or a 2-element [lo, hi] range.  When it's a
         # range, the value for each epoch index is pre-sampled at
@@ -3727,6 +3735,19 @@ class MongeSurfaceVariationalDataset(Dataset):
         # patch: pos (n*k, 3), x (n*k, 3), patch_idx (n*k,),
         #        vertex_indices (n*k,), neighbor_index_matrix (n, k)
 
+        # 6b. Per-patch unit-sphere scale ``d_i = max_j ‖p_j − p_i‖`` over
+        # ``j ∈ knn(i)`` — the same quantity ``normalize_patch_features``
+        # computes inside the model's forward.  Stored on the Data so
+        # downstream losses can put length-dependent quantities into the
+        # per-patch unit-sphere convention.  ``vertex_pos`` itself is NOT
+        # rescaled — each vertex appears in patches with different scales.
+        _nbr_pos = noisy_pos[patch.neighbor_index_matrix]                # (n, k, 3)
+        vertex_patch_scale = ((_nbr_pos - noisy_pos.unsqueeze(1))
+                              .norm(dim=-1)
+                              .amax(dim=1)
+                              .clamp(min=1e-8)
+                              .float())                                  # (n,)
+
         # 7. Probe values at vertices and continuous bilinear / energy GT.
         tf = self._test_func_sampler.sample(
             surface_func=surface_func,
@@ -3734,6 +3755,24 @@ class MongeSurfaceVariationalDataset(Dataset):
             rng=self._rng,
             U_bounds=U_bounds,
         )
+
+        # 7b. Optional per-patch unit-sphere rescaling of length-dependent
+        # GT fields.  Mirrors ``_normalize_surface_to_unit_sphere`` for the
+        # patch-based dataset, but applied per-vertex.  Direction-only
+        # fields (``vertex_normals``) are scale-invariant and untouched.
+        if self._rescale_gt_to_unit_patch:
+            d = vertex_patch_scale                                        # (n,)
+            d2 = d * d                                                    # (n,)
+            vertex_mcv = vertex_mcv * d.unsqueeze(-1).to(vertex_mcv.dtype)  # 2H ~ 1/length
+            vertex_areas = vertex_areas / d2.to(vertex_areas.dtype)        # area ~ length²
+            for _key, _scale_vec in (
+                ('test_func_gradients_all_points', d),                   # ∇h ~ 1/length
+                ('test_func_lb_all_points', d2),                          # Δh ~ 1/length²
+            ):
+                if _key in tf:
+                    _t = tf[_key]
+                    _bcast = (_t.shape[0],) + (1,) * (_t.dim() - 1)
+                    tf[_key] = _t * _scale_vec.view(_bcast).to(_t.dtype)
 
         # 8. Bundle into a single PyG Data object.
         data = _VariationalSurfaceData(
@@ -3746,6 +3785,7 @@ class MongeSurfaceVariationalDataset(Dataset):
             vertex_normals=vertex_normals,
             vertex_mcv=vertex_mcv,
             vertex_areas=vertex_areas,
+            vertex_patch_scale=vertex_patch_scale,
             test_func_values=tf['test_func_values'],
         )
         if 'test_func_continuous_bilinear' in tf:
