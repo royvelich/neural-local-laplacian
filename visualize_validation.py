@@ -1723,10 +1723,16 @@ class RealTimeEigenanalysisVisualizer:
         try:
             print(f"\nRecomputing Green's function for {method_key} ({len(self._source_indices)} sources)...")
             _t_greens_start = time.perf_counter()
-            device = self.current_device if method_key in ('PRED', 'NeLo') else None
+
+            # Factorize (L + reg*M) ONCE, then solve for every source. The
+            # per-source path re-factorizes the matrix on every call, which
+            # dominates the cost for dense / top-k-pruned PRED Laplacians.
+            batch_results = self.compute_greens_function_batch(
+                L, M, list(self._source_indices)
+            )
 
             for source_idx in self._source_indices:
-                result = self.compute_greens_function(L, M, source_idx, device=device)
+                result = batch_results.get(source_idx)
                 if result is not None:
                     greens_values, residual = result
                     gt_greens = self._greens_gt_values.get(source_idx) if self._greens_gt_values else None
@@ -1764,19 +1770,17 @@ class RealTimeEigenanalysisVisualizer:
             if first_src in self._all_greens_results:
                 self.current_greens_results = self._all_greens_results[first_src]
 
-            # Update Polyscope visualization for first source
+            # Update Polyscope visualization for the display source — reuse
+            # the values already computed by the batch solve above.
             display_src = self._source_indices[self._current_source_display_idx]
             mesh_structure = self.current_mesh_structure
             if mesh_structure is not None and not self._quantitative_mode:
-                if display_src in self._all_greens_results and method_key in self._all_greens_results[display_src]:
-                    # Recompute greens_values for display source
-                    result = self.compute_greens_function(L, M, display_src, device=device)
-                    if result is not None:
-                        greens_values, _ = result
-                        mesh_structure.add_scalar_quantity(
-                            name=f"J1 Green's Function - {method_key}",
-                            values=greens_values, enabled=False, cmap='coolwarm'
-                        )
+                greens_values = self._all_greens_values.get(display_src, {}).get(method_key)
+                if greens_values is not None:
+                    mesh_structure.add_scalar_quantity(
+                        name=f"J1 Green's Function - {method_key}",
+                        values=greens_values, enabled=False, cmap='coolwarm'
+                    )
 
             agg = self._aggregated_greens_metrics.get(method_key)
             if agg:
@@ -1952,15 +1956,13 @@ class RealTimeEigenanalysisVisualizer:
             if first_src in self._all_geodesic_results:
                 self.current_heat_geodesic_results = self._all_geodesic_results[first_src]
 
-            # Update Polyscope visualization for display source
+            # Update Polyscope visualization for display source — reuse the
+            # distances already computed above (no extra factorization/solve).
             display_src = self._source_indices[self._current_source_display_idx]
             mesh_structure = self.current_mesh_structure
             if mesh_structure is not None and not self._quantitative_mode:
                 exact_distances = self._exact_geodesics.get(display_src)
-                distances = self._compute_geodesic_single_source(
-                    method_key, display_src, vertices, L, M,
-                    mesh_grad_op=mesh_grad_op, mesh_face_areas=mesh_face_areas
-                )
+                distances = self._all_geodesic_distances.get(display_src, {}).get(result_key)
                 if distances is not None and exact_distances is not None:
                     d_norm = normalize_distances(distances)
                     is_bad = distances.max() > 1e3
@@ -3537,7 +3539,8 @@ class RealTimeEigenanalysisVisualizer:
         # STEP 2: Re-run model inference (timing is inside perform_model_inference)
         print(f"STEP 2: Re-running model inference...")
         new_inference_result = self.perform_model_inference(
-            self.current_model, new_patch_data, self.current_device
+            self.current_model, new_patch_data, self.current_device,
+            preserve_lap_config=True,
         )
 
         if new_inference_result['predicted_eigenvalues'] is None:
@@ -4253,7 +4256,8 @@ class RealTimeEigenanalysisVisualizer:
             'top6_frac_mean': float(top6_frac.mean()) if k >= 6 else float(top3_frac.mean()),
         }
 
-    def perform_model_inference(self, model: LaplacianTransformerModule, batch_data: Data, device: torch.device) -> Dict[str, Any]:
+    def perform_model_inference(self, model: LaplacianTransformerModule, batch_data: Data, device: torch.device,
+                                preserve_lap_config: bool = False) -> Dict[str, Any]:
         """
         Perform model inference and compute predicted quantities.
 
@@ -4261,6 +4265,11 @@ class RealTimeEigenanalysisVisualizer:
             model: Trained LaplacianTransformerModule
             batch_data: Preprocessed batch data from MeshDataset
             device: Device for computation
+            preserve_lap_config: If True, keep the user-selected
+                ``self.current_lap_config`` assembly instead of resetting to
+                the model's configured validation assembly. Set on re-inference
+                (PRED k / top-k / normalize-flag changes) so a user's assembly
+                choice is not silently reverted to the model default.
 
         Returns:
             Dictionary containing predicted quantities, stiffness and mass matrices
@@ -4376,15 +4385,22 @@ class RealTimeEigenanalysisVisualizer:
                   f"min={_g2_min:.4e}, max={_g2_max:.4e}")
 
             knn_t = batch_data.vertex_indices.reshape(N, k_val).to(device)
-            val_lap_config = getattr(model, '_val_lap_config',
-                                     LaplacianConfig(assembly='diagonal_gram'))
-            # Always use sparse assembly in the visualizer (dense N×N is wasteful)
+            # On re-inference (PRED k / top-k / normalize-flag change) keep the
+            # user's selected assembly; on the first inference for a mesh adopt
+            # the model's configured validation assembly.
+            if preserve_lap_config and self.current_lap_config is not None:
+                base_lap_config = self.current_lap_config
+            else:
+                base_lap_config = getattr(model, '_val_lap_config',
+                                          LaplacianConfig(assembly='diagonal_gram'))
+            # Sparse assembly is only supported on the unpruned path; pruned
+            # configs (knn / topk) must use the dense assembly path.
             val_lap_config = LaplacianConfig(
-                assembly=val_lap_config.assembly,
-                pruning=val_lap_config.pruning,
-                k_prune=val_lap_config.k_prune,
-                area_weighted=val_lap_config.area_weighted,
-                sparse=(val_lap_config.pruning == 'none'),
+                assembly=base_lap_config.assembly,
+                pruning=base_lap_config.pruning,
+                k_prune=base_lap_config.k_prune,
+                area_weighted=base_lap_config.area_weighted,
+                sparse=(base_lap_config.pruning == 'none'),
             )
             self.current_lap_config = val_lap_config
             # Pass stiffness_weights through so 'from_stiffness' assembly
@@ -5681,7 +5697,8 @@ class RealTimeEigenanalysisVisualizer:
             _t_fact = time.perf_counter()
             factor = sparse_factorize(A)
             _t_fact_done = time.perf_counter()
-            print(f"    Factorize: {(_t_fact_done - _t_fact)*1000:.1f} ms (backend: {factor._backend})")
+            print(f"    Factorize: {(_t_fact_done - _t_fact)*1000:.1f} ms "
+                  f"(backend: {getattr(factor, '_backend', 'splu')})")
         except Exception as e:
             print(f"  [!] Green's function batch factorization failed: {e}")
             return {src: None for src in source_indices}
