@@ -741,22 +741,28 @@ def prune_to_topk_sparse(
     L_off.eliminate_zeros()
 
     indptr, indices, data = L_off.indptr, L_off.indices, L_off.data
-    sel_rows, sel_cols = [], []
-    for i in range(N):
-        start, end = indptr[i], indptr[i + 1]
-        cols = indices[start:end]
-        if cols.size <= k:
-            keep_cols = cols
-        else:
-            keep = np.argpartition(np.abs(data[start:end]), -k)[-k:]
-            keep_cols = cols[keep]
-        sel_cols.append(keep_cols)
-        sel_rows.append(np.full(keep_cols.shape, i, dtype=np.int64))
+    counts = np.diff(indptr)
+    nnz = data.size
 
-    rows = np.concatenate(sel_rows) if sel_rows else np.empty(0, dtype=np.int64)
-    cols = np.concatenate(sel_cols) if sel_cols else np.empty(0, dtype=np.int64)
-    mask = scipy.sparse.csr_matrix(
-        (np.ones(rows.shape[0], dtype=bool), (rows, cols)), shape=(N, N))
+    if nnz == 0 or k >= int(counts.max() if nnz else 0):
+        # Nothing to drop — every row already has <= k off-diagonal entries.
+        mask = L_off.astype(bool)
+    else:
+        # Vectorised top-k per row with no global sort: scatter |value| into a
+        # dense (N, max_row_degree) buffer and argpartition along the row axis.
+        max_c = int(counts.max())
+        row_of_entry = np.repeat(np.arange(N), counts)
+        within = np.arange(nnz) - indptr[row_of_entry]   # 0..count-1 per row
+        padded = np.full((N, max_c), -1.0)               # empty slots rank last
+        padded[row_of_entry, within] = np.abs(data)
+        top_pos = np.argpartition(padded, max_c - k, axis=1)[:, max_c - k:]
+        rows_g = np.repeat(np.arange(N), top_pos.shape[1])
+        pos_g = top_pos.ravel()
+        valid = pos_g < counts[rows_g]                   # drop padded slots
+        sel = indptr[rows_g[valid]] + pos_g[valid]
+        mask = scipy.sparse.csr_matrix(
+            (np.ones(sel.size, dtype=bool), (rows_g[valid], indices[sel])),
+            shape=(N, N))
 
     if symmetry == 'union':
         sym = mask.maximum(mask.T)
