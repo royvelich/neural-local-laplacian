@@ -5,6 +5,8 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
 
+      rescale_gt_to_unit_patch: true
+
       # Polynomial Monge surface family.
       surface_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
