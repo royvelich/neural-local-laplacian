@@ -69,7 +69,8 @@ class MeshDataset(Dataset):
             verbose_diagnostics: bool = False,
             skip_eigendecomposition: bool = False,
             # Backward compatibility: singular form still accepted
-            mesh_folder_path: Union[str, Path] = None
+            mesh_folder_path: Union[str, Path] = None,
+            **kwargs
     ):
         """
         Initialize the MeshDataset.
