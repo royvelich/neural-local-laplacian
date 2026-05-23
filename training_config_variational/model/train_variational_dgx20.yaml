@@ -64,18 +64,18 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
         loss_mode: log_mse
-      weight: 0.1
+      weight: 1.0
     # Stiffness head — direction of per-vertex LB signature across probes
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
         loss_mode: cosine
-      weight: 0.1
+      weight: 1.0
     # Area head — magnitude anchor on per-vertex LB signature
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeTestLoss
-      weight: 5.0
+      weight: 2.0
     # Mean-curvature vector — signed direction match against the analytic
     # GT MCV 2·H·n̂ attached per vertex by MongeSurfaceVariationalDataset.
     # The variational equivalent of the non-variational DirectionCosineLoss:
@@ -89,4 +89,9 @@ module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
         target: mcv
         signed: true
+      weight: 1.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.DirichletEnergyConsistencyTestLoss
+        probe_mode: test_functions
       weight: 1.0
