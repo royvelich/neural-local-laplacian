@@ -1,0 +1,92 @@
+module:
+  _target_: neural_local_laplacian.modules.variational_modules.VariationalLaplacianTransformerModule
+  input_dim: 3
+  d_model: 768
+  nhead: 8
+  num_encoder_layers: 1
+  dim_feedforward: 768
+  num_eigenvalues: ${globals.num_eigenvalues}
+  dropout: 0.0
+  normalize_loss_weights: False
+  normalize_patch_features: True
+  scale_areas_by_patch_size: True
+  input_projection_hidden_dims: null
+  output_projection_hidden_dims: null
+
+  detach_area_head: true           # area head is trained by LaplacianActionTestLoss
+  use_uniform_mass: false
+
+  area_activation: bounded_sigmoid
+  area_bound_C: 12.0
+
+  # Learned stiffness head, ≥ 0 (softplus output).  Decouples s_ij from
+  # ‖g_ij‖²; the gradient head and stiffness head are trained by separate
+  # losses below.  __init__ auto-coerces val_laplacian.assembly and every
+  # fmap_val_cfg.eval_laplacians[].assembly to 'from_stiffness' so the
+  # assembled Laplacian used by validation reads the learned head — the
+  # same one LaplacianActionTestLoss supervises.  Look for an INFO log
+  # ``[stiffness_mode=learned_positive] coercing ... to 'from_stiffness'``
+  # at the start of the run to confirm.
+  mcv_mode: 'diagonal_gram'
+  stiffness_mode: 'learned_positive'
+  normalize_grad_by_k: true
+  normalize_stiffness_by_k: true
+
+  # Validation-only Laplacian config.  The user-facing 'diagonal_gram'
+  # value below is overridden in __init__ to 'from_stiffness' because
+  # stiffness_mode is learned; you can leave it as-is.
+  val_laplacian:
+    assembly: from_stiffness
+    pruning: none
+
+  fmap_val_cfg:
+    k: 15
+    num_eigenvectors: 100
+    max_vertices_val: 5000
+    eval_laplacians:
+      - assembly: from_stiffness     # auto-coerced to from_stiffness
+        pruning: none
+        area_weighted: false
+    geo_cache_dir: ./geo_cache
+    use_geomfum_eval: true
+    geomfum_descriptors: [hks, wks]
+    geomfum_zoomout: false
+    geomfum_zoomout_k_init: 20
+    geomfum_zoomout_k_final: 50
+    geomfum_zoomout_n_iters: 10
+    fmap_lmbda: 1.0
+    fmap_resolvent_gamma: 1.0
+
+  feature_extractor: null
+  loss_configs:
+    # Gradient head — direction & magnitude on per-(vertex, probe) ∇h
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
+        loss_mode: log_mse
+      weight: 0.1
+    # Stiffness head — direction of per-vertex LB signature across probes
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
+        loss_mode: cosine
+      weight: 0.1
+    # Area head — magnitude anchor on per-vertex LB signature
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeTestLoss
+      weight: 5.0
+    # Mean-curvature vector — signed direction match against the analytic
+    # GT MCV 2·H·n̂ attached per vertex by MongeSurfaceVariationalDataset.
+    # The variational equivalent of the non-variational DirectionCosineLoss:
+    # treats the coordinate functions as test functions whose discrete
+    # Laplacian (the MCV, built from the learned stiffness head) must point
+    # along the analytic mean-curvature vector — including the convex /
+    # concave sign.  Adds a position-space anchor to the stiffness head on
+    # top of the test-function LB signal from LaplacianActionTestLoss.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
+        target: mcv
+        signed: true
+      weight: 1.0
