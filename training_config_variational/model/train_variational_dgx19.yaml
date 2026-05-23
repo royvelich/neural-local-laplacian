@@ -17,7 +17,12 @@ module:
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
-  area_bound_C: 5.0
+  area_bound_C: 2.0
+
+  # Train-time top-k operator-support pruning (annealed).
+  topk_prune_target: 15        # final per-patch support k
+  topk_prune_start: 40        # initial k (default: max neighbour count, i.e. no pruning)
+  topk_prune_anneal_steps: 5000   # linearly anneal start -> target over this many optimizer steps
 
   # Learned stiffness head, ≥ 0 (softplus output).  Decouples s_ij from
   # ‖g_ij‖²; the gradient head and stiffness head are trained by separate
@@ -36,15 +41,15 @@ module:
   # value below is overridden in __init__ to 'from_stiffness' because
   # stiffness_mode is learned; you can leave it as-is.
   val_laplacian:
-    assembly: from_stiffness
+    assembly: diagonal_gram
     pruning: none
 
   fmap_val_cfg:
-    k: 35
+    k: 15
     num_eigenvectors: 100
     max_vertices_val: 5000
     eval_laplacians:
-      - assembly: from_stiffness     # auto-coerced to from_stiffness
+      - assembly: diagonal_gram     # auto-coerced to from_stiffness
         pruning: none
         area_weighted: false
     geo_cache_dir: ./geo_cache
@@ -66,11 +71,11 @@ module:
         loss_mode: log_mse
       weight: 1.0
     # Stiffness head — direction of per-vertex LB signature across probes
-#    - _target_: neural_local_laplacian.modules.losses.LossConfig
-#      loss_module:
-#        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
-#        loss_mode: cosine
-#      weight: 5.0
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
+        loss_mode: cosine
+      weight: 5.0
     # Area head — magnitude anchor on per-vertex LB signature
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
@@ -89,4 +94,4 @@ module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
         target: mcv
         signed: true
-      weight: 3.0
+      weight: 1.0
