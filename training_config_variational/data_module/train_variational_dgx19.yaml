@@ -5,8 +5,6 @@ module:
     dataset:
       _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
 
-      rescale_gt_to_unit_patch: true
-
       # Polynomial Monge surface family.
       surface_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
@@ -31,7 +29,7 @@ module:
       # the dgx13 model config trains exactly the same way.
       test_func_sampler:
         _target_: neural_local_laplacian.datasets.synthetic_datasets.GaussianRandomFieldTestFunctionSampler
-        num_test_funcs: 25
+        num_test_funcs: 80
         num_centers_range: [20, 100]
         sigma_range: [0.1, 1.0]
         center_range: [-2.0, 2.0]
