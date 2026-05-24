@@ -31,9 +31,7 @@ module:
     batch_size: 20
     num_workers: 10
     shuffle: True
-
   val_dataset_specifications:
-    # --- [0] Mesh spectral/geodesic validation ---
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
@@ -49,7 +47,6 @@ module:
       num_workers: 0
       shuffle: False
 
-    # --- [1] Fmap: DT4D Animals intra ---
     - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
       dataset:
         _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset

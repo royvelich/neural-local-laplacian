@@ -10,7 +10,7 @@ enable_progress_bar: True
 gradient_clip_val: 0.5
 logger:
  _target_: lightning.pytorch.loggers.WandbLogger
- project: neural-cotangent-weights-variational
+ project: neural-cotangent-weights
  save_dir: 'wandb'
  log_model: 'all'
 callbacks:
