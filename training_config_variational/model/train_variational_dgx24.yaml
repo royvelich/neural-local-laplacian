@@ -49,14 +49,29 @@ module:
 
   feature_extractor: null
   loss_configs:
+    # MCV direction (coordinate functions) — analytic GT 2·H·n̂.
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.DirectionCosineLoss
       weight: 1.0
+    # Area-head magnitude anchor on the MCV signature.
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 2.0
+    # Gradient head supervised against per-patch analytic ∇_S h
+    # for every test function emitted by GaussianRandomFieldTestFunctionSampler.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
+        loss_mode: log_mse
+      weight: 1.0
+    # Discrete Laplacian action supervised against per-patch analytic Δ_LB h.
+    - _target_: neural_local_laplacian.modules.losses.LossConfig
+      loss_module:
+        _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
+        loss_mode: signed_log
+      weight: 1.0
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
