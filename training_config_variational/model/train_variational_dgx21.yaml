@@ -6,7 +6,7 @@ module:
   num_encoder_layers: 1
   dim_feedforward: 768
   num_eigenvalues: ${globals.num_eigenvalues}
-  dropout: 0.0
+  dropout: 0.2
   normalize_loss_weights: False
   normalize_patch_features: True
   scale_areas_by_patch_size: True
@@ -20,12 +20,12 @@ module:
   area_bound_C: 5.0
 
   mcv_mode: 'diagonal_gram'
-  stiffness_mode: 'learned_positive'
+  stiffness_mode: 'diagonal_gram'
   normalize_grad_by_k: true
   normalize_stiffness_by_k: true
 
   val_laplacian:
-    assembly: from_stiffness
+    assembly: diagonal_gram
     pruning: none
 
   fmap_val_cfg:
@@ -56,7 +56,7 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeLoss
       weight: 2.0
-    - _target_: neural_local_laplacian.modules.losses.LossConfig
-      loss_module:
-        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
-      weight: 0.1
+#    - _target_: neural_local_laplacian.modules.losses.LossConfig
+#      loss_module:
+#        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
+#      weight: 0.1
