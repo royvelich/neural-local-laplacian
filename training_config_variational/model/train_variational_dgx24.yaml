@@ -65,13 +65,13 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GeneralizedGradientSupervisionLoss
         loss_mode: log_mse
-      weight: 1.0
+      weight: 0.1
     # Discrete Laplacian action supervised against per-patch analytic Δ_LB h.
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
         _target_: neural_local_laplacian.modules.losses.GeneralizedLaplacianTestLoss
         loss_mode: signed_log
-      weight: 1.0
+      weight: 0.1
 #    - _target_: neural_local_laplacian.modules.losses.LossConfig
 #      loss_module:
 #        _target_: neural_local_laplacian.modules.losses.TangentPlaneProjectorLoss
