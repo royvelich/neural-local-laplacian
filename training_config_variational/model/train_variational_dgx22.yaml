@@ -48,7 +48,7 @@ module:
     pruning: none
 
   fmap_val_cfg:
-    k: 15
+    k: 30
     num_eigenvectors: 100
     max_vertices_val: 5000
     eval_laplacians:

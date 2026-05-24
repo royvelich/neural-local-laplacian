@@ -98,7 +98,7 @@ module:
         file_size_range_mb: [0.5, 4]
         require_manifold: True
         shuffle: True
-        k: 8
+        k: 30
         num_geodesic_sources: 5
         geodesic_source_method: "farthest_point_sampling"
       batch_size: 1
