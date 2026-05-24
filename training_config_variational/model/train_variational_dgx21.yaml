@@ -17,13 +17,15 @@ module:
   use_uniform_mass: false
 
   area_activation: bounded_sigmoid
-  area_bound_C: 2.0
+  area_bound_C: 5.0
 
   mcv_mode: 'diagonal_gram'
+  stiffness_mode: 'learned_positive'
   normalize_grad_by_k: true
+  normalize_stiffness_by_k: true
 
   val_laplacian:
-    assembly: diagonal_gram
+    assembly: from_stiffness
     pruning: none
 
   fmap_val_cfg:
