@@ -47,9 +47,9 @@ parameters:
 
       # ── Optimiser ─────────────────────────────────────────────────
       lr:
-        distribution: log_uniform_values
-        min: 1.0e-5
-        max: 5.0e-4
+        values:
+          - 1.0e-5
+          - 5.0e-5
 
       gradient_clip_val:
         values:
@@ -65,12 +65,12 @@ parameters:
       # to d_model below.
       d_model_nhead_pair:
         values:
-          - [384, 6]
-          - [512, 8]
+          - [128, 1]
+          - [256, 1]
+          - [512, 4]
           - [768, 8]
-          - [768, 12]
+          - [768, 4]
           - [1024, 8]
-          - [1024, 16]
 
       dropout:
         values:
@@ -110,8 +110,6 @@ parameters:
       points_scale_range:
         values:
           - [1.0]
-          - [0.5, 1.5]
-          - [0.5, 2.0]
 
       coefficient_scale_range:
         values:
@@ -170,7 +168,7 @@ parameters:
             flip_normal_if_negative_curvature: False
             normalize_to_unit_sphere: True
           batch_size: 20
-          num_workers: 10
+          num_workers: 14
           shuffle: True
         val_dataset_specifications:
           # Mesh val (pinned)
@@ -298,13 +296,13 @@ parameters:
   trainer:
     value:
       _target_: lightning.pytorch.Trainer
-      max_epochs: 50
+      max_epochs: 500
       devices: -1
       accelerator: 'auto'
       strategy: 'auto'
       num_sanity_val_steps: 0
       log_every_n_steps: 1
-      check_val_every_n_epoch: 5
+      check_val_every_n_epoch: 25
       enable_progress_bar: True
       gradient_clip_val: ${globals.gradient_clip_val}
       logger:
