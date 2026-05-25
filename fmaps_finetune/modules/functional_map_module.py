@@ -1078,6 +1078,43 @@ class FunctionalMapModule(LaplacianModuleBase):
             normalize_patch_features=True, scale_areas_by_patch_size=True,
         )
 
+        # When the loaded checkpoint was trained with a learned stiffness
+        # head, a Gram-based assembly (``diagonal_gram`` / ``full_gram``)
+        # silently ignores the head and rebuilds s_ij from ``grad_coeffs``
+        # — i.e. finetunes / evaluates a different operator than the one
+        # the upstream losses supervised.  Coerce both train and eval
+        # assemblies to ``from_stiffness`` here so YAML written before
+        # learned_positive existed keeps working with new checkpoints.
+        ckpt_stiffness_mode = getattr(self.model, '_stiffness_mode', None)
+        if ckpt_stiffness_mode in ('learned', 'learned_positive'):
+            import logging
+            _log = logging.getLogger(__name__)
+
+            def _coerce(cfg: LaplacianConfig, origin: str) -> LaplacianConfig:
+                if cfg.assembly == 'from_stiffness':
+                    return cfg
+                _log.warning(
+                    f"[stiffness_mode={ckpt_stiffness_mode}] coercing "
+                    f"{origin}.assembly from '{cfg.assembly}' to "
+                    f"'from_stiffness' so the assembled Laplacian reads "
+                    f"the learned stiffness head from the checkpoint."
+                )
+                return LaplacianConfig(
+                    assembly='from_stiffness',
+                    pruning=cfg.pruning,
+                    k_prune=cfg.k_prune,
+                    sparse=cfg.sparse,
+                    torch_sparse=cfg.torch_sparse,
+                    area_weighted=cfg.area_weighted,
+                )
+
+            self._train_lap_config = _coerce(self._train_lap_config,
+                                             'train_laplacian')
+            self._eval_lap_configs = [
+                _coerce(cfg, f'eval_laplacians[{i}]')
+                for i, cfg in enumerate(self._eval_lap_configs)
+            ]
+
         if hp.random_init:
             areas_state: Optional[dict] = None
             if hp.keep_areas_head:

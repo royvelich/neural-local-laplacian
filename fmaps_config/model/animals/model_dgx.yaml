@@ -13,15 +13,27 @@ module:
 
 #  geo_cache_workers: 4
 
+  # When the loaded checkpoint was trained with ``stiffness_mode='learned'``
+  # / ``'learned_positive'``, both train_laplacian and eval_laplacians MUST
+  # use ``assembly: from_stiffness`` so the assembled Laplacian reads the
+  # learned stiffness head (the operator the upstream losses supervised).
+  # ``'diagonal_gram'`` silently ignores the head and rebuilds s_ij from
+  # ``grad_coeffs`` — i.e. finetunes / evaluates the wrong operator.
+  # FunctionalMapModule.setup() also auto-coerces any Gram-based assembly
+  # to ``from_stiffness`` for learned checkpoints (logged at INFO level),
+  # so the YAML below is the explicit, intended choice.
   train_laplacian:
-    assembly: diagonal_gram
+    assembly: from_stiffness
     pruning: none
 
-  # Eval with both variants
+  # Eval with both variants side-by-side: ``from_stiffness`` is the
+  # operator the model actually learnt; ``diagonal_gram`` is the
+  # grad-coeffs fallback, kept for diagnostic comparison.  evaluate_pair
+  # tag-prefixes every metric set when there is more than one entry, so
+  # the two flavours land under separate keys in W&B.
   eval_laplacians:
-    - assembly: diagonal_gram              # FEM-like (default)
-#    - assembly: diagonal_gram
-#      area_weighted: true                  # graph-Laplacian-like
+    - assembly: from_stiffness             # learned head (the trained operator)
+    - assembly: diagonal_gram              # gram fallback (diagnostic only)
 
   baselines: [robust, model]
 
