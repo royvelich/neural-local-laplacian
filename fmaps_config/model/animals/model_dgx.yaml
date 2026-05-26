@@ -57,12 +57,12 @@ module:
     # grad_coeffs gets no gradient and DDP crashes on unused params.
     - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
       weight: 1.0
-      num_landmarks: 32
-      num_sample_vertices: 512
+      num_landmarks: 256
+      num_sample_vertices: 1024
       landmark_ratio: null      # set 0 < r < 1 to use bijective corr only
       landmark_seed: 0
       eps: 1.0e-6
-      normalize: true
+      normalize: false
   random_init: false
   keep_areas_head: false
   freeze_input_projection: false
