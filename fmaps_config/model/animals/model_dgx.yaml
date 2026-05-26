@@ -49,6 +49,20 @@ module:
         - 10.0
       num_sample_vertices: 1024
       normalize: false
+    # Heat-method geodesic loss — the only loss in this config that
+    # backprops into grad_coeffs (steps 2 & 3 are _apply_gradient /
+    # _apply_divergence on the gradient head).  Required if you want
+    # to finetune the gradient head under stiffness_mode='learned_positive'
+    # in DDP — every other loss touches only the stiffness head, so
+    # grad_coeffs gets no gradient and DDP crashes on unused params.
+#    - _target_: fmaps_finetune.modules.functional_map_module.HeatMethodGeodesicLoss
+#      weight: 1.0
+#      num_landmarks: 32
+#      num_sample_vertices: 512
+#      landmark_ratio: null      # set 0 < r < 1 to use bijective corr only
+#      landmark_seed: 0
+#      eps: 1.0e-6
+#      normalize: true
   random_init: false
   keep_areas_head: false
   freeze_input_projection: false
