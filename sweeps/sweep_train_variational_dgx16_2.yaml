@@ -152,6 +152,29 @@ parameters:
           - true
           - false
 
+      # ── Train-time top-k operator-support pruning ─────────────────
+      # When ``topk_prune_target`` is null the model trains under the
+      # full kNN support (no pruning).  Otherwise the support is annealed
+      # linearly from ``topk_prune_start`` (default: full k=15) down to
+      # ``topk_prune_target`` over ``topk_prune_anneal_steps`` optimizer
+      # steps; anneal_steps=0 keeps k constant at the target from step 0.
+      topk_prune_target:
+        values:
+          - null   # no pruning (full support)
+          - 5
+          - 8
+          - 10
+
+      topk_prune_start:
+        value: 15
+
+      topk_prune_anneal_steps:
+        values:
+          - 0         # constant k (no curriculum)
+          - 1000
+          - 5000
+          - 10000
+
       # ── Loss weights (dgx16 defaults: 1 / 5 / 1 / 1) ──────────────
       w_gradient_vector:
         distribution: log_uniform_values
@@ -311,6 +334,13 @@ parameters:
         stiffness_mode: 'learned_positive'
         normalize_grad_by_k: ${globals.normalize_grad_by_k}
         normalize_stiffness_by_k: ${globals.normalize_stiffness_by_k}
+
+        # Train-time top-k operator-support pruning (see globals).  When
+        # topk_prune_target is null pruning is disabled; otherwise k is
+        # annealed from topk_prune_start (full support) down to the target.
+        topk_prune_target: ${globals.topk_prune_target}
+        topk_prune_start: ${globals.topk_prune_start}
+        topk_prune_anneal_steps: ${globals.topk_prune_anneal_steps}
 
         # Mesh validation runs BOTH Laplacian flavours side-by-side —
         # from_stiffness (the learned head) and diagonal_gram (the
