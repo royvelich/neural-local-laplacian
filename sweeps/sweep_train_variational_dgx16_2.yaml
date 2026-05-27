@@ -1,0 +1,427 @@
+# W&B sweep: variational training (train_variational.py) on Monge
+# surfaces, mirrors training_config_variational/*/train_variational_dgx16.yaml.
+#
+# Bayes search over the surface-distribution (PolynomialMongeSurfaceSampler)
+# knobs, the test-function (GaussianRandomFieldTestFunctionSampler) knobs,
+# data-augmentation knobs (num_vertices_range, position_noise_std), the
+# transformer regularisation / capacity knobs (dropout, nhead — d_model is
+# pinned at 768), the gradient/stiffness normalisation flags, and the four
+# dgx16 loss weights.
+#
+# Both validation paths run BOTH Laplacian flavours (from_stiffness +
+# diagonal_gram) side-by-side: mesh validation via val_laplacian (logged
+# under val/<tag>/<name>) and fmap validation via fmap_val_cfg.eval_laplacians
+# (logged under val_fmap/animals/<tag>_fmap_hks_wks/<name>).  The sweep
+# metric is the from_stiffness fmap geo_at_05pct — the operator the losses
+# actually train.
+#
+# Usage:
+#   wandb sweep sweeps/sweep_train_variational_dgx16_2.yaml
+#   python train_variational.py --sweep-id <entity/project/sweep_id>
+
+program: ./train_variational.py
+command:
+  - python
+  - ${program}
+method: bayes
+metric:
+  goal: maximize
+  name: val_fmap/animals/from_stiffness_fmap_hks_wks/geo_at_05pct
+#run_cap: 80
+parameters:
+  # ===================================================================
+  # Globals (sweep knobs live here; every other block reads them via
+  # ${globals.<name>} interpolation).
+  # ===================================================================
+  globals:
+    parameters:
+      training_seed:
+        value: 42
+
+      validation_seed:
+        value: 3
+
+      num_eigenvalues:
+        value: 50
+
+      ckpt_path:
+        value: null
+
+      lr:
+        value: 5.0e-5
+
+      # ── Surface sampler (PolynomialMongeSurfaceSampler) ───────────
+      surf_order_range:
+        values:
+          - [2, 2]
+          - [2, 3]
+          - [2, 4]
+          - [3, 4]
+
+      surf_coefficient_scale_range:
+        values:
+          - [0.25, 1.5]
+          - [0.5,  3.0]
+          - [0.5,  5.0]
+          - [1.0,  5.0]
+
+      surf_polynomial_offset_range:
+        values:
+          - [0.0, 0.5]
+          - [0.0, 1.0]
+          - [0.0, 2.0]
+
+      # ── Patch / vertex sampling on the surface ────────────────────
+      num_vertices_range:
+        values:
+          - [40,  80]
+          - [60,  120]
+          - [80,  160]
+          - [120, 240]
+
+      position_noise_std:
+        values:
+          - [0.0,  0.0]
+          - [0.0,  0.01]
+          - [0.01, 0.05]
+          - [0.02, 0.1]
+
+      # ── GRF test-function sampler knobs ───────────────────────────
+      grf_num_test_funcs:
+        values:
+          - 25
+          - 50
+          - 100
+
+      grf_num_centers_range:
+        values:
+          - [5, 20]
+          - [20, 100]
+          - [50, 200]
+
+      grf_sigma_range:
+        values:
+          - [0.05, 0.3]
+          - [0.1, 1.0]
+          - [0.3, 1.5]
+
+      grf_center_range:
+        values:
+          - [-1.0, 1.0]
+          - [-2.0, 2.0]
+          - [-3.0, 3.0]
+
+      grf_amplitude_scale:
+        values:
+          - 1.0
+          - [0.5, 1.5]
+          - [0.5, 3.0]
+          - [0.5, 5.0]
+
+      grf_center_mode:
+        values:
+          - parameter
+          - surface
+
+      # ── Model regularisation / capacity ───────────────────────────
+      dropout:
+        values:
+          - 0.0
+          - 0.1
+          - 0.2
+          - 0.3
+
+      # d_model is pinned at 768; valid heads are divisors of 768.
+      nhead:
+        values:
+          - 4
+          - 6
+          - 8
+          - 12
+          - 16
+          - 24
+
+      # ── Stiffness / gradient normalisation toggles ────────────────
+      normalize_grad_by_k:
+        values:
+          - true
+          - false
+
+      normalize_stiffness_by_k:
+        values:
+          - true
+          - false
+
+      # ── Loss weights (dgx16 defaults: 1 / 5 / 1 / 1) ──────────────
+      w_gradient_vector:
+        distribution: log_uniform_values
+        min: 0.1
+        max: 10.0
+
+      w_laplacian_action:
+        distribution: log_uniform_values
+        min: 0.5
+        max: 20.0
+
+      w_area_only:
+        distribution: log_uniform_values
+        min: 0.1
+        max: 10.0
+
+      w_mcv_direction:
+        distribution: log_uniform_values
+        min: 0.1
+        max: 10.0
+
+  # ===================================================================
+  # Data module (dgx16 — surface_sampler / num_vertices_range /
+  # position_noise_std / test_func_sampler read sweep knobs)
+  # ===================================================================
+  data_module:
+    value:
+      module:
+        _target_: neural_local_laplacian.data_modules.common.GenericMixedDataModule
+        train_dataset_specification:
+          _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+          dataset:
+            _target_: neural_local_laplacian.datasets.synthetic_datasets.MongeSurfaceVariationalDataset
+            surface_sampler:
+              _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialMongeSurfaceSampler
+              order_range: ${globals.surf_order_range}
+              coefficient_scale_range: ${globals.surf_coefficient_scale_range}
+              polynomial_offset_range: ${globals.surf_polynomial_offset_range}
+              coeff_generation_method:
+                _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+                _args_: ['uniform']
+            num_vertices_range: ${globals.num_vertices_range}
+            grid_radius: 1.0
+            position_noise_std: ${globals.position_noise_std}
+            k: 15
+            test_func_sampler:
+              _target_: neural_local_laplacian.datasets.synthetic_datasets.GaussianRandomFieldTestFunctionSampler
+              num_test_funcs: ${globals.grf_num_test_funcs}
+              num_centers_range: ${globals.grf_num_centers_range}
+              sigma_range: ${globals.grf_sigma_range}
+              center_range: ${globals.grf_center_range}
+              amplitude_scale: ${globals.grf_amplitude_scale}
+              center_mode: ${globals.grf_center_mode}
+              derivative_mode: analytic
+              normalize_target: none
+              compute_continuous_bilinear: false
+              compute_continuous_energy: false
+              compute_lb_all_points: true
+              compute_gradients_all_points: true
+              verbose: false
+            seed: ${globals.training_seed}
+            epoch_size: 8000
+          batch_size: 20
+          num_workers: 0
+          shuffle: True
+        val_dataset_specifications:
+          # Patch-level MCV validation (synthetic patches with analytic H, n̂)
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: neural_local_laplacian.datasets.synthetic_datasets.PolynomialSurfaceDataset
+              seed: ${globals.validation_seed}
+              epoch_size: 200
+              position_noise_std: [0.0, 0.05]
+              grid_radius_range: [0.5, 2.0]
+              polynomial_offset_range: [0.0, 1.0]
+              points_scale_range: [1.0]
+              coefficient_scale_range: [0.5, 3.0]
+              order_range: [2, 3]
+              grid_samplers:
+                - _target_: neural_local_laplacian.datasets.synthetic_datasets.RandomGridSampler
+                  num_points_range: [6, 30]
+              conv_k_nearest: null
+              pose_transformers: null
+              coeff_generation_method:
+                _target_: neural_local_laplacian.datasets.synthetic_datasets.CoeffGenerationMethod
+                _args_: ['uniform']
+              diff_geom_components:
+                - _target_: neural_local_laplacian.datasets.synthetic_datasets.DifferentialGeometryComponent
+                  _args_: ['mean_curvature']
+              diff_geom_at_origin_only: True
+              include_origin_in_grid: False
+              flip_normal_if_negative_curvature: False
+              normalize_to_unit_sphere: True
+            batch_size: 8
+            num_workers: 0
+            shuffle: False
+          # Mesh spectral / geodesic validation
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: neural_local_laplacian.datasets.mesh_datasets.MeshDataset
+              mesh_folder_path: '/workspace/datasets/shrec15'
+              max_meshes: 80
+              file_size_range_mb: [0.5, 4]
+              require_manifold: True
+              shuffle: True
+              k: 8
+              num_geodesic_sources: 5
+              geodesic_source_method: "farthest_point_sampling"
+            batch_size: 1
+            num_workers: 0
+            shuffle: False
+          # Fmap: DT4D Animals intra
+          - _target_: neural_local_laplacian.data_modules.common.DatasetSpecification
+            dataset:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.ValPairDataset
+              pair_generator:
+                _target_: fmaps_finetune.datasets.functional_map_dataset.DT4DAnimalsPairGenerator
+                root: '/workspace/datasets/DeformingThings4DMatching-Animals'
+                pairs: ["0.7:1.0"]
+              val_poses_per_pair: 2
+              seed: ${globals.training_seed}
+            batch_size: 1
+            num_workers: 0
+            shuffle: false
+            collate_fn:
+              _target_: fmaps_finetune.datasets.functional_map_dataset.pair_collate_fn
+              _partial_: true
+
+  # ===================================================================
+  # Model (dgx16 — dropout / nhead / normalize_*_by_k / loss weights
+  # read sweep knobs; val_laplacian runs both flavours)
+  # ===================================================================
+  model:
+    value:
+      module:
+        _target_: neural_local_laplacian.modules.variational_modules.VariationalLaplacianTransformerModule
+        input_dim: 3
+        d_model: 768
+        nhead: ${globals.nhead}
+        num_encoder_layers: 1
+        dim_feedforward: 768
+        num_eigenvalues: ${globals.num_eigenvalues}
+        dropout: ${globals.dropout}
+        normalize_loss_weights: False
+        normalize_patch_features: True
+        scale_areas_by_patch_size: True
+        input_projection_hidden_dims: null
+        output_projection_hidden_dims: null
+
+        detach_area_head: true
+        use_uniform_mass: false
+
+        area_activation: bounded_sigmoid
+        area_bound_C: 2.0
+
+        mcv_mode: 'diagonal_gram'
+        stiffness_mode: 'learned_positive'
+        normalize_grad_by_k: ${globals.normalize_grad_by_k}
+        normalize_stiffness_by_k: ${globals.normalize_stiffness_by_k}
+
+        # Mesh validation runs BOTH Laplacian flavours side-by-side —
+        # from_stiffness (the learned head) and diagonal_gram (the
+        # grad-coeffs Gram).  coerce_val_assembly defaults to False so
+        # each is honoured verbatim; metrics are logged under
+        # val/from_stiffness/<name> and val/diagonal_gram/<name>.
+        val_laplacian:
+          - assembly: from_stiffness
+            pruning: none
+          - assembly: diagonal_gram
+            pruning: none
+
+        fmap_val_cfg:
+          k: 15
+          num_eigenvectors: 100
+          max_vertices_val: 5000
+          # Both Laplacian flavours, like val_laplacian above.  With >1
+          # entry evaluate_pair tag-prefixes each metric set:
+          #   val_fmap/animals/from_stiffness_fmap_hks_wks/…
+          #   val_fmap/animals/diagonal_gram_fmap_hks_wks/…
+          eval_laplacians:
+            - assembly: from_stiffness
+              pruning: none
+              area_weighted: false
+            - assembly: diagonal_gram
+              pruning: none
+              area_weighted: false
+          geo_cache_dir: ./geo_cache
+          use_geomfum_eval: true
+          geomfum_descriptors: [hks, wks]
+          geomfum_zoomout: false
+          geomfum_zoomout_k_init: 20
+          geomfum_zoomout_k_final: 50
+          geomfum_zoomout_n_iters: 10
+          fmap_lmbda: 1.0
+          fmap_resolvent_gamma: 1.0
+
+        feature_extractor: null
+        loss_configs:
+          # Gradient head — direction & magnitude on per-(vertex, probe) ∇h
+          - _target_: neural_local_laplacian.modules.losses.LossConfig
+            loss_module:
+              _target_: neural_local_laplacian.modules.losses.GradientVectorTestLoss
+              loss_mode: log_mse
+            weight: ${globals.w_gradient_vector}
+          # Stiffness head — direction of per-vertex LB signature across probes
+          - _target_: neural_local_laplacian.modules.losses.LossConfig
+            loss_module:
+              _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
+              loss_mode: cosine
+            weight: ${globals.w_laplacian_action}
+          # Area head — magnitude anchor on per-vertex LB signature
+          - _target_: neural_local_laplacian.modules.losses.LossConfig
+            loss_module:
+              _target_: neural_local_laplacian.modules.losses.AreaOnlyLogMagnitudeTestLoss
+            weight: ${globals.w_area_only}
+          # Mean-curvature vector — signed direction match vs 2·H·n̂
+          - _target_: neural_local_laplacian.modules.losses.LossConfig
+            loss_module:
+              _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
+              target: mcv
+              signed: true
+            weight: ${globals.w_mcv_direction}
+
+  # ===================================================================
+  # Optimizer (dgx16 — pinned)
+  # ===================================================================
+  optimizer:
+    value:
+      _target_: torch.optim.AdamW
+      _partial_: true
+      lr: ${globals.lr}
+
+  # ===================================================================
+  # Scheduler (dgx16 — pinned)
+  # ===================================================================
+  scheduler:
+    value:
+      _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+      _partial_: true
+      T_max: 5000
+      eta_min: 1.0e-6
+      last_epoch: -1
+
+  # ===================================================================
+  # Trainer (dgx16 — capped at 50 epochs for sweep tractability;
+  # ModelCheckpoint monitors the sweep metric)
+  # ===================================================================
+  trainer:
+    value:
+      _target_: lightning.pytorch.Trainer
+      max_epochs: 50
+      devices: -1
+      accelerator: 'auto'
+      strategy: 'auto'
+      num_sanity_val_steps: 0
+      log_every_n_steps: 1
+      check_val_every_n_epoch: 5
+      enable_progress_bar: True
+      gradient_clip_val: 0.5
+      logger:
+        _target_: lightning.pytorch.loggers.WandbLogger
+        project: neural-cotangent-weights-variational
+        save_dir: 'wandb'
+        log_model: 'all'
+      callbacks:
+        - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+          dirpath: "./checkpoints"
+          filename: "best-{epoch:010d}-{val_fmap/animals/from_stiffness_fmap_hks_wks/geo_at_05pct:.4f}"
+          monitor: val_fmap/animals/from_stiffness_fmap_hks_wks/geo_at_05pct
+          mode: max
+          save_top_k: 3
+          verbose: False
+          save_on_train_epoch_end: False
