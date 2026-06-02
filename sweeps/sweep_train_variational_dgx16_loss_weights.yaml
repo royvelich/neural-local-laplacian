@@ -41,7 +41,7 @@ parameters:
         value: null
 
       lr:
-        value: 5.0e-5
+        value: 1.0e-4
 
       # ── Loss weights (dgx16 defaults: 1 / 5 / 1 / 1) ──────────────
       w_gradient_vector:
@@ -269,13 +269,13 @@ parameters:
   trainer:
     value:
       _target_: lightning.pytorch.Trainer
-      max_epochs: 50
+      max_epochs: 200
       devices: -1
       accelerator: 'auto'
       strategy: 'auto'
       num_sanity_val_steps: 0
       log_every_n_steps: 1
-      check_val_every_n_epoch: 5
+      check_val_every_n_epoch: 10
       enable_progress_bar: True
       gradient_clip_val: 0.5
       logger:

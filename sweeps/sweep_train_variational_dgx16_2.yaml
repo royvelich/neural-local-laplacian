@@ -82,7 +82,6 @@ parameters:
       position_noise_std:
         values:
           - [0.0,  0.0]
-          - [0.0,  0.01]
           - [0.01, 0.05]
           - [0.02, 0.1]
 
@@ -129,27 +128,23 @@ parameters:
           - 0.0
           - 0.1
           - 0.2
-          - 0.3
 
       # d_model is pinned at 768; valid heads are divisors of 768.
       nhead:
         values:
+          - 2
           - 4
-          - 6
           - 8
-          - 12
-          - 16
-          - 24
 
       # ── Stiffness / gradient normalisation toggles ────────────────
       normalize_grad_by_k:
         values:
-          - true
+#          - true
           - false
 
       normalize_stiffness_by_k:
         values:
-          - true
+#          - true
           - false
 
       # ── Train-time top-k operator-support pruning ─────────────────
@@ -161,9 +156,7 @@ parameters:
       topk_prune_target:
         values:
           - null   # no pruning (full support)
-          - 5
-          - 8
-          - 10
+          - 15
 
       topk_prune_start:
         value: 15
@@ -432,7 +425,7 @@ parameters:
   trainer:
     value:
       _target_: lightning.pytorch.Trainer
-      max_epochs: 50
+      max_epochs: 40
       devices: -1
       accelerator: 'auto'
       strategy: 'auto'
@@ -440,7 +433,7 @@ parameters:
       log_every_n_steps: 1
       check_val_every_n_epoch: 5
       enable_progress_bar: True
-      gradient_clip_val: 0.5
+      gradient_clip_val: 1.0
       logger:
         _target_: lightning.pytorch.loggers.WandbLogger
         project: neural-cotangent-weights-variational
