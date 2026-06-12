@@ -70,7 +70,7 @@ module:
       loss_module:
         _target_: neural_local_laplacian.modules.losses.LaplacianActionTestLoss
         loss_mode: cosine
-      weight: 10.0
+      weight: 2.0
     # Area head — magnitude anchor on per-vertex LB signature
     - _target_: neural_local_laplacian.modules.losses.LossConfig
       loss_module:
