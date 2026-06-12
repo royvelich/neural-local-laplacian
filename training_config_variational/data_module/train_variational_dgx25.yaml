@@ -16,7 +16,7 @@ module:
           _args_: ['uniform']
 
       # Vertex sampling on U = [-grid_radius, grid_radius]^2.
-      num_vertices_range: [20, 60]
+      num_vertices_range: [100, 300]
       grid_radius: 1.0
       position_noise_std: [0.01, 0.05]
       k: 15
