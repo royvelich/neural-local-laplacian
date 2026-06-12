@@ -40,7 +40,7 @@ module:
         compute_continuous_energy: false
         compute_lb_all_points: true
         compute_gradients_all_points: true
-        center_mode: parameter
+        center_mode: surface
         verbose: false
 
       seed: ${globals.training_seed}

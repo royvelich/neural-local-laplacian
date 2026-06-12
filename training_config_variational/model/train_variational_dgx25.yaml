@@ -89,4 +89,4 @@ module:
         _target_: neural_local_laplacian.modules.losses.MeanCurvatureDirectionCosineTestLoss
         target: mcv
         signed: true
-      weight: 5.0
+      weight: 1.0
