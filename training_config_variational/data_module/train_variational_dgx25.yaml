@@ -19,7 +19,7 @@ module:
       num_vertices_range: [60, 120]
       grid_radius: 1.0
       position_noise_std: [0.0]
-      k: 15
+      k: 30
 
       # Test functions: closed-form Gaussian Random Field as a sum of M
       # RBFs per probe.  Drop-in replacement for dgx11's
